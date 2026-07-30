@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Suede</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --ink: #16191d; --muted: #667085; --line: #e3e6ea;
+  --accent: #3b5bdb; --ok: #2f9e44; --warn: #e8a317; --bad: #d64545; --shadow: 0 1px 3px rgba(0,0,0,.08);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a; --panel: #1c1f25; --ink: #e8eaed; --muted: #9aa4b2; --line: #2b3038;
+    --accent: #7d92f0; --ok: #51cf66; --warn: #f0b849; --bad: #ff6b6b; --shadow: none;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+  position: sticky; top: 0; z-index: 10;
+}
+h1 { font-size: 18px; margin: 0; letter-spacing: -.01em; }
+h2 { font-size: 15px; margin: 0 0 12px; }
+.grow { flex: 1; }
+.pill {
+  font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--line); white-space: nowrap;
+}
+.pill.ok { color: var(--ok); border-color: currentColor; }
+.pill.warn { color: var(--warn); border-color: currentColor; }
+.pill.bad { color: var(--bad); border-color: currentColor; }
+.pill.muted { color: var(--muted); }
+main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow);
+}
+nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
+nav button {
+  background: transparent; border: 1px solid transparent; color: var(--muted);
+  padding: 7px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 500;
+}
+nav button:hover { color: var(--ink); }
+nav button[aria-selected="true"] { background: var(--panel); border-color: var(--line); color: var(--ink); }
+button.action {
+  background: var(--accent); color: #fff; border: 0; padding: 7px 14px;
+  border-radius: 7px; cursor: pointer; font: inherit; font-weight: 500;
+}
+button.action.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button.action:disabled { opacity: .5; cursor: not-allowed; }
+#layout {
+  position: relative; background: var(--bg); border: 1px dashed var(--line);
+  border-radius: 8px; height: 220px; overflow: hidden; margin-bottom: 16px;
+}
+.screen {
+  position: absolute; border: 2px solid var(--accent); border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-size: 12px; cursor: pointer; overflow: hidden; padding: 4px; text-align: center;
+}
+.screen.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
+.screen.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
+.screen b { font-size: 13px; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+tr:last-child td { border-bottom: 0; }
+label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
+input, select, textarea {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px;
+  background: var(--bg); color: var(--ink); font: inherit;
+}
+textarea { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; min-height: 380px; }
+.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.banner { border-left: 3px solid var(--warn); padding: 10px 14px; margin-bottom: 10px; border-radius: 0 8px 8px 0;
+  background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 14px; }
+.banner.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.banner .row { margin-top: 8px; }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.hidden { display: none; }
+#toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: var(--ink); color: var(--bg); padding: 10px 18px; border-radius: 8px;
+  font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50;
+}
+#toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Suede</h1>
+  <span class="pill muted" id="version">—</span>
+  <span class="grow"></span>
+  <span class="pill muted" id="live">connecting…</span>
+  <span class="pill muted" id="sync">—</span>
+</header>
+
+<main>
+  <div id="alerts"></div>
+
+  <nav role="tablist">
+    <button role="tab" aria-selected="true" data-tab="displays">Displays</button>
+    <button role="tab" aria-selected="false" data-tab="apps">Apps</button>
+    <button role="tab" aria-selected="false" data-tab="audio">Audio</button>
+    <button role="tab" aria-selected="false" data-tab="system">System</button>
+    <button role="tab" aria-selected="false" data-tab="config">Raw config</button>
+  </nav>
+
+  <section id="tab-displays">
+    <div class="panel">
+      <h2>Layout</h2>
+      <div id="layout"></div>
+      <p class="muted" id="layout-hint">Click a display to configure it.</p>
+    </div>
+    <div class="panel hidden" id="output-editor">
+      <h2>Configure <span id="output-name" class="mono"></span></h2>
+      <div class="fields">
+        <div><label for="o-enable">Enabled</label>
+          <select id="o-enable"><option value="true">Yes</option><option value="false">No</option></select></div>
+        <div><label for="o-mode">Mode</label><select id="o-mode"></select></div>
+        <div><label for="o-x">Position X</label><input id="o-x" type="number" step="1"></div>
+        <div><label for="o-y">Position Y</label><input id="o-y" type="number" step="1"></div>
+        <div><label for="o-scale">Scale</label><input id="o-scale" type="number" step="0.25" min="0.25"></div>
+        <div><label for="o-transform">Transform</label><select id="o-transform">
+          <option>normal</option><option>90</option><option>180</option><option>270</option>
+          <option>flipped</option><option>flipped-90</option><option>flipped-180</option><option>flipped-270</option>
+        </select></div>
+        <div><label for="o-adaptive">Adaptive sync</label>
+          <select id="o-adaptive"><option value="false">Off</option><option value="true">On</option></select></div>
+        <div><label for="o-tearing">Allow tearing</label>
+          <select id="o-tearing"><option value="false">No</option><option value="true">Yes</option></select></div>
+      </div>
+      <div class="row">
+        <button class="action" id="o-save">Save</button>
+        <button class="action ghost" id="o-remove">Remove from config</button>
+        <button class="action ghost" id="o-cancel">Cancel</button>
+        <span class="muted" id="o-note"></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-apps" class="hidden">
+    <div class="panel">
+      <h2>Managed applications</h2>
+      <table id="apps"><thead><tr>
+        <th>Id</th><th>State</th><th>PID</th><th>Restarts</th><th>Detail</th><th></th>
+      </tr></thead><tbody></tbody></table>
+      <p class="muted" id="apps-empty">No applications configured yet.</p>
+    </div>
+    <div class="panel">
+      <h2>Add or update an application</h2>
+      <div class="fields">
+        <div><label for="a-id">Id</label><input id="a-id" placeholder="renderer-1"></div>
+        <div><label for="a-kind">Launcher</label><select id="a-kind">
+          <option value="chromium-kiosk">Chromium kiosk</option>
+          <option value="firefox-kiosk">Firefox kiosk</option>
+          <option value="exec">Command</option>
+        </select></div>
+        <div style="grid-column: span 2"><label for="a-uri">URI or command</label>
+          <input id="a-uri" placeholder="http://media-server.local/render/1"></div>
+        <div><label for="a-output">Output</label><select id="a-output"></select></div>
+        <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
+        <div><label for="a-heartbeat">Content watchdog</label>
+          <select id="a-heartbeat"><option value="false">Off</option><option value="true">On</option></select></div>
+      </div>
+      <div class="row"><button class="action" id="a-save">Save application</button>
+        <span class="muted">Placeholders <span class="mono">{appId}</span> and
+        <span class="mono">{heartbeatUrl}</span> are expanded at launch.</span></div>
+    </div>
+  </section>
+
+  <section id="tab-audio" class="hidden">
+    <div class="panel">
+      <h2>Audio sinks</h2>
+      <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
+      <p class="muted" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
+    </div>
+  </section>
+
+  <section id="tab-system" class="hidden">
+    <div class="panel"><h2>System</h2><table id="system"><tbody></tbody></table></div>
+    <div class="panel"><h2>Health checks</h2>
+      <table id="checks"><thead><tr><th>Check</th><th>Status</th><th>Detail</th><th></th></tr></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <section id="tab-config" class="hidden">
+    <div class="panel">
+      <h2>Desired state document</h2>
+      <textarea id="config-json" spellcheck="false"></textarea>
+      <div class="row" style="margin-top:12px">
+        <button class="action" id="c-save">Save</button>
+        <button class="action ghost" id="c-reload">Reload</button>
+        <button class="action ghost" id="c-reconcile">Force reconcile</button>
+        <span class="muted" id="c-note"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const API = "/api/v1";
+const $ = (id) => document.getElementById(id);
+let outputs = [], config = null, apps = [], sinks = [], selected = null;
+
+// --- helpers -------------------------------------------------------------
+
+async function api(path, options) {
+  const response = await fetch(API + path, options);
+  if (!response.ok) {
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch {}
+    throw new Error(detail);
+  }
+  return response.status === 204 ? null : response.json();
+}
+
+async function save(path, body) {
+  return api(path, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+let toastTimer;
+function toast(message, isError) {
+  const element = $("toast");
+  element.textContent = message;
+  element.style.background = isError ? "var(--bad)" : "var(--ink)";
+  element.style.color = isError ? "#fff" : "var(--bg)";
+  element.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => element.classList.remove("show"), 2600);
+}
+
+const escape = (value) =>
+  String(value ?? "").replace(/[&<>"]/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+
+const modeLabel = (mode) =>
+  mode ? `${mode.width}×${mode.height} @ ${Math.round(mode.refreshHz * 100) / 100}Hz` : "—";
+
+// --- rendering -----------------------------------------------------------
+
+function renderLayout() {
+  const container = $("layout");
+  container.innerHTML = "";
+  const active = outputs.filter((output) => output.active && output.rect.width > 0);
+  if (!active.length) {
+    $("layout-hint").textContent = outputs.length
+      ? "No outputs are enabled. Click one below to enable it."
+      : "No outputs detected.";
+  } else {
+    $("layout-hint").textContent = "Click a display to configure it.";
+  }
+
+  // Scale the whole desktop into the box, leaving room for inactive outputs.
+  const spanX = Math.max(...active.map((o) => o.rect.x + o.rect.width), 1920);
+  const spanY = Math.max(...active.map((o) => o.rect.y + o.rect.height), 1080);
+  const box = container.getBoundingClientRect();
+  const scale = Math.min((box.width - 20) / spanX, (box.height - 60) / spanY);
+
+  outputs.forEach((output, index) => {
+    const element = document.createElement("div");
+    element.className = "screen" + (output.active ? "" : " inactive") +
+      (selected === output.name ? " selected" : "");
+    if (output.active && output.rect.width > 0) {
+      element.style.left = `${10 + output.rect.x * scale}px`;
+      element.style.top = `${10 + output.rect.y * scale}px`;
+      element.style.width = `${output.rect.width * scale}px`;
+      element.style.height = `${output.rect.height * scale}px`;
+    } else {
+      element.style.left = `${10 + index * 130}px`;
+      element.style.bottom = "10px";
+      element.style.width = "120px";
+      element.style.height = "40px";
+    }
+    element.innerHTML =
+      `<b>${escape(output.name)}</b><span>${output.active ? escape(modeLabel(output.currentMode)) : "disabled"}</span>`;
+    element.onclick = () => selectOutput(output.name);
+    container.appendChild(element);
+  });
+}
+
+function selectOutput(name) {
+  selected = name;
+  const output = outputs.find((o) => o.name === name);
+  const existing = (config?.outputs ?? []).find((o) => o.match?.name === name);
+  if (!output) return;
+
+  $("output-editor").classList.remove("hidden");
+  $("output-name").textContent = name;
+  $("o-enable").value = String(existing?.enable ?? true);
+
+  const modes = output.modes.length ? output.modes : (output.currentMode ? [output.currentMode] : []);
+  $("o-mode").innerHTML =
+    `<option value="">Leave to sway</option>` +
+    modes.map((mode) =>
+      `<option value="${mode.width}x${mode.height}x${mode.refreshHz}">${escape(modeLabel(mode))}</option>`
+    ).join("");
+  const wanted = existing?.mode ?? output.currentMode;
+  if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
+
+  $("o-x").value = existing?.position?.x ?? output.rect.x ?? 0;
+  $("o-y").value = existing?.position?.y ?? output.rect.y ?? 0;
+  $("o-scale").value = existing?.scale ?? output.scale ?? 1;
+  $("o-transform").value = existing?.transform ?? output.transform ?? "normal";
+  $("o-adaptive").value = String(existing?.adaptiveSync ?? false);
+  $("o-tearing").value = String(existing?.allowTearing ?? false);
+  $("o-note").textContent = existing ? "" : "not yet in the configuration";
+  renderLayout();
+}
+
+function renderApps() {
+  const body = document.querySelector("#apps tbody");
+  body.innerHTML = "";
+  const configured = config?.apps ?? [];
+  $("apps-empty").classList.toggle("hidden", configured.length > 0);
+
+  configured.forEach((app) => {
+    const status = apps.find((a) => a.id === app.id);
+    const state = status?.state ?? "stopped";
+    const tone = { running: "ok", starting: "warn", backoff: "warn",
+                   waitingforoutput: "warn", crashed: "bad" }[state.toLowerCase()] ?? "muted";
+    const row = document.createElement("tr");
+    row.innerHTML =
+      `<td class="mono">${escape(app.id)}</td>` +
+      `<td><span class="pill ${tone}">${escape(state)}</span></td>` +
+      `<td class="mono">${status?.pid ?? "—"}</td>` +
+      `<td>${status?.restartCount ?? 0}</td>` +
+      `<td class="muted">${escape(status?.detail ?? "")}</td>` +
+      `<td class="row"></td>`;
+    const actions = row.lastElementChild;
+
+    const restart = document.createElement("button");
+    restart.className = "action ghost";
+    restart.textContent = "Restart";
+    restart.onclick = () => run(() => api(`/apps/${encodeURIComponent(app.id)}/restart`,
+      { method: "POST" }), `restarted ${app.id}`);
+
+    const toggle = document.createElement("button");
+    toggle.className = "action ghost";
+    toggle.textContent = app.enabled === false ? "Enable" : "Disable";
+    toggle.onclick = () => run(() =>
+      save(`/config/apps/${encodeURIComponent(app.id)}`, { ...app, enabled: app.enabled === false }),
+      `${app.enabled === false ? "enabled" : "disabled"} ${app.id}`);
+
+    const remove = document.createElement("button");
+    remove.className = "action ghost";
+    remove.textContent = "Delete";
+    remove.onclick = () => run(() => api(`/config/apps/${encodeURIComponent(app.id)}`,
+      { method: "DELETE" }), `deleted ${app.id}`);
+
+    actions.append(restart, toggle, remove);
+    body.appendChild(row);
+  });
+}
+
+function renderSinks() {
+  const body = document.querySelector("#sinks tbody");
+  body.innerHTML = "";
+  $("sinks-empty").classList.toggle("hidden", sinks.length > 0);
+  sinks.forEach((sink) => {
+    const row = document.createElement("tr");
+    row.innerHTML =
+      `<td class="mono">${escape(sink.id)}</td>` +
+      `<td>${escape(sink.description ?? "")}</td>` +
+      `<td>${sink.isDefault ? '<span class="pill ok">default</span>' : ""}` +
+      `${sink.isNullSink ? '<span class="pill muted">silent</span>' : ""}</td>`;
+    body.appendChild(row);
+  });
+
+  const select = $("a-audio");
+  select.innerHTML = `<option value="">Leave untouched</option>` +
+    `<option value="__null__">Silent (null sink)</option>` +
+    sinks.filter((s) => !s.isNullSink)
+      .map((s) => `<option value="${escape(s.id)}">${escape(s.description ?? s.id)}</option>`).join("");
+}
+
+function renderOutputChoices() {
+  $("a-output").innerHTML = `<option value="">Any output</option>` +
+    outputs.map((o) => `<option value="${escape(o.name)}">${escape(o.name)}</option>`).join("");
+}
+
+function renderStatus(status) {
+  const pill = $("sync");
+  pill.textContent = status.state;
+  pill.className = "pill " + ({ synced: "ok", degraded: "bad", reconciling: "warn" }[status.state] ?? "muted");
+  renderAlerts(status.divergences ?? []);
+}
+
+let currentChecks = [];
+function renderAlerts(divergences) {
+  const container = $("alerts");
+  container.innerHTML = "";
+
+  divergences.forEach((divergence) => {
+    const banner = document.createElement("div");
+    banner.className = "banner";
+    banner.innerHTML = `<b>${escape(divergence.kind)}</b> — ${escape(divergence.detail)}`;
+    container.appendChild(banner);
+  });
+
+  currentChecks.filter((check) => check.status !== "pass").forEach((check) => {
+    const banner = document.createElement("div");
+    banner.className = "banner" + (check.status === "fail" ? " bad" : "");
+    banner.innerHTML = `<b>${escape(check.title)}</b> — ${escape(check.detail)}`;
+    const row = document.createElement("div");
+    row.className = "row";
+    if (check.docsUrl) {
+      const link = document.createElement("a");
+      link.href = check.docsUrl;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "Documentation";
+      row.appendChild(link);
+    }
+    if (check.fixAvailable) {
+      const fix = document.createElement("button");
+      fix.className = "action";
+      fix.textContent = "Fix this";
+      fix.title = check.fixDescription ?? "";
+      fix.onclick = () => run(async () => {
+        const outcome = await api(`/system/checks/${encodeURIComponent(check.id)}/fix`, { method: "POST" });
+        await loadChecks();
+        return outcome;
+      }, `fixed ${check.title}`);
+      row.appendChild(fix);
+    }
+    if (row.childElementCount) banner.appendChild(row);
+    container.appendChild(banner);
+  });
+}
+
+function renderSystem(system) {
+  $("version").textContent = "v" + system.suedeVersion;
+  const rows = [
+    ["Sway", system.swayVersion ?? "not detected"],
+    ["Tearing control", system.supportsTearing ? "available" : "unavailable"],
+    ["Hostname", system.hostname ?? "—"],
+    ["Uptime", `${Math.floor(system.uptimeSeconds / 60)} min`],
+    ...system.packages.map((p) => [p.name, p.version ?? "not installed"]),
+  ];
+  document.querySelector("#system tbody").innerHTML = rows
+    .map(([k, v]) => `<tr><th>${escape(k)}</th><td class="mono">${escape(v)}</td></tr>`).join("");
+}
+
+function renderChecks() {
+  document.querySelector("#checks tbody").innerHTML = currentChecks.map((check) => {
+    const tone = { pass: "ok", warn: "warn", fail: "bad" }[check.status];
+    return `<tr><td>${escape(check.title)}</td>` +
+      `<td><span class="pill ${tone}">${escape(check.status)}</span></td>` +
+      `<td class="muted">${escape(check.detail)}</td>` +
+      `<td>${check.fixAvailable ? "fixable" : ""}</td></tr>`;
+  }).join("");
+}
+
+// --- actions -------------------------------------------------------------
+
+async function run(operation, successMessage) {
+  try {
+    await operation();
+    await loadConfig();
+    toast(successMessage);
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+$("o-save").onclick = () => run(async () => {
+  const name = $("output-name").textContent;
+  const [width, height, refreshHz] = ($("o-mode").value || "").split("x").map(Number);
+  await save(`/config/outputs/${encodeURIComponent(name)}`, {
+    match: { name },
+    enable: $("o-enable").value === "true",
+    mode: width ? { width, height, refreshHz } : null,
+    position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
+    scale: Number($("o-scale").value) || 1,
+    transform: $("o-transform").value,
+    adaptiveSync: $("o-adaptive").value === "true",
+    allowTearing: $("o-tearing").value === "true",
+  });
+}, "saved display configuration");
+
+$("o-remove").onclick = () => run(() =>
+  api(`/config/outputs/${encodeURIComponent($("output-name").textContent)}`, { method: "DELETE" }),
+  "removed from configuration");
+
+$("o-cancel").onclick = () => { selected = null; $("output-editor").classList.add("hidden"); renderLayout(); };
+
+$("a-save").onclick = () => run(async () => {
+  const id = $("a-id").value.trim();
+  if (!id) throw new Error("an id is required");
+  const kind = $("a-kind").value;
+  const value = $("a-uri").value.trim();
+  const launcher = kind === "exec"
+    ? { kind, command: value.split(" ")[0], args: value.split(" ").slice(1) }
+    : { kind, uri: value };
+  const audio = $("a-audio").value;
+  const output = $("a-output").value;
+
+  await save(`/config/apps/${encodeURIComponent(id)}`, {
+    id, enabled: true, launcher,
+    output: output ? { name: output } : null,
+    fullscreen: true,
+    audio: audio === "" ? null : { output: audio === "__null__" ? null : audio },
+    heartbeat: $("a-heartbeat").value === "true"
+      ? { enabled: true, timeoutSeconds: 25, startupGraceSeconds: 60 } : null,
+  });
+  $("a-id").value = ""; $("a-uri").value = "";
+}, "saved application");
+
+$("c-save").onclick = () => run(async () => {
+  await save("/config", JSON.parse($("config-json").value));
+}, "saved configuration");
+$("c-reload").onclick = () => run(async () => {}, "reloaded");
+$("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
+
+document.querySelectorAll("nav button").forEach((button) => {
+  button.onclick = () => {
+    document.querySelectorAll("nav button").forEach((other) =>
+      other.setAttribute("aria-selected", String(other === button)));
+    document.querySelectorAll("main > section").forEach((section) =>
+      section.classList.toggle("hidden", section.id !== "tab-" + button.dataset.tab));
+  };
+});
+
+// --- loading and live updates -------------------------------------------
+
+async function loadConfig() {
+  config = await api("/config");
+  $("config-json").value = JSON.stringify(config, null, 2);
+  renderApps();
+}
+
+async function loadChecks() {
+  currentChecks = await api("/system/checks");
+  renderChecks();
+  renderAlerts((await api("/status")).divergences ?? []);
+}
+
+async function loadAll() {
+  outputs = await api("/outputs");
+  sinks = await api("/audio/outputs");
+  apps = await api("/apps");
+  await loadConfig();
+  renderLayout();
+  renderSinks();
+  renderOutputChoices();
+  renderStatus(await api("/status"));
+  renderSystem(await api("/system"));
+  await loadChecks();
+}
+
+function connect() {
+  const source = new EventSource(API + "/events");
+
+  source.onopen = () => {
+    $("live").textContent = "live";
+    $("live").className = "pill ok";
+    // Events are state-based, not replayed, so resynchronise on every connect.
+    loadAll().catch((error) => toast(error.message, true));
+  };
+  source.onerror = () => {
+    $("live").textContent = "reconnecting…";
+    $("live").className = "pill bad";
+  };
+
+  source.addEventListener("outputs_changed", (event) => {
+    outputs = JSON.parse(event.data);
+    renderLayout();
+    renderOutputChoices();
+  });
+  source.addEventListener("audio_outputs_changed", (event) => {
+    sinks = JSON.parse(event.data);
+    renderSinks();
+  });
+  source.addEventListener("app_status_changed", (event) => {
+    const status = JSON.parse(event.data);
+    apps = apps.filter((a) => a.id !== status.id).concat(status);
+    renderApps();
+  });
+  source.addEventListener("status_changed", (event) => renderStatus(JSON.parse(event.data)));
+  source.addEventListener("config_changed", () => loadConfig());
+  source.addEventListener("checks_changed", (event) => {
+    currentChecks = JSON.parse(event.data);
+    renderChecks();
+    api("/status").then((status) => renderAlerts(status.divergences ?? []));
+  });
+}
+
+window.addEventListener("resize", renderLayout);
+loadAll().catch((error) => toast(error.message, true));
+connect();
+</script>
+</body>
+</html>

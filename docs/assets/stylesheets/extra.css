@@ -1,0 +1,38 @@
+/* Feature cards on the home page. */
+.md-typeset .grid.cards > ul {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 1rem;
+  padding: 0;
+  margin: 1em 0;
+  list-style: none;
+}
+
+.md-typeset .grid.cards > ul > li {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.5rem;
+  padding: 1rem 1.2rem;
+  margin: 0;
+  transition: border-color 125ms, box-shadow 125ms;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  border-color: var(--md-accent-fg-color);
+  box-shadow: 0 0 0.4rem rgba(0, 0, 0, 0.07);
+}
+
+.md-typeset .grid.cards > ul > li > p:first-child {
+  margin-top: 0;
+  font-weight: 600;
+}
+
+/* Keep wide tables and diagrams inside their own scroll area. */
+.md-typeset table:not([class]) {
+  display: block;
+  overflow-x: auto;
+}
+
+/* Sway commands and PipeWire node names read better slightly tighter. */
+.md-typeset code {
+  font-size: 0.85em;
+}

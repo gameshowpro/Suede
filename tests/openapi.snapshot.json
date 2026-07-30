@@ -1,0 +1,1995 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Suede",
+    "description": "Remote management for Sway-based display appliances. Clients write desired state; a reconciler drives the live session toward it.",
+    "contact": {
+      "name": "Hamish Barjonas"
+    },
+    "license": {
+      "name": "MIT",
+      "url": "https://github.com/gameshowpro/Suede/blob/main/LICENSE"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/apps": {
+      "get": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "list_apps",
+        "responses": {
+          "200": {
+            "description": "Status of every managed app",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AppStatus"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/apps/{id}/heartbeat": {
+      "post": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "heartbeat",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Heartbeat recorded"
+          },
+          "403": {
+            "description": "Only loopback callers may post heartbeats"
+          },
+          "404": {
+            "description": "No such app"
+          }
+        }
+      }
+    },
+    "/api/v1/apps/{id}/restart": {
+      "post": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "restart_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Status after the restart",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such app"
+          }
+        }
+      }
+    },
+    "/api/v1/apps/{id}/status": {
+      "get": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "get_app_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Runtime status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppStatus"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such app"
+          }
+        }
+      }
+    },
+    "/api/v1/audio/outputs": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "list_audio_outputs",
+        "responses": {
+          "200": {
+            "description": "Audio sinks reported by PipeWire",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AudioSink"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/config": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "The desired-state document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_config",
+        "parameters": [
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesiredState"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "If-Match revision is stale"
+          },
+          "422": {
+            "description": "Validation failed"
+          }
+        }
+      }
+    },
+    "/api/v1/config/apps": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_apps",
+        "responses": {
+          "200": {
+            "description": "Configured apps",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AppConfig"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_apps",
+        "parameters": [
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/AppConfig"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/config/apps/{id}": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The app configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppConfig"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such app"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "delete_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such app"
+          }
+        }
+      }
+    },
+    "/api/v1/config/outputs": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_outputs",
+        "responses": {
+          "200": {
+            "description": "Configured outputs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OutputConfig"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_outputs",
+        "parameters": [
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/OutputConfig"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/config/outputs/{key}": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_output",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Match key, e.g. HDMI-A-1",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The output configuration",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutputConfig"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such entry"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_output",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Match key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OutputConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "delete_output",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Match key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such entry"
+          }
+        }
+      }
+    },
+    "/api/v1/config/settings": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_settings",
+        "responses": {
+          "200": {
+            "description": "Daemon settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_settings",
+        "parameters": [
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Settings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "events"
+        ],
+        "operationId": "stream",
+        "responses": {
+          "200": {
+            "description": "Stream of named server-sent events",
+            "content": {
+              "text/event-stream": {}
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/outputs": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "list_outputs",
+        "responses": {
+          "200": {
+            "description": "Outputs reported by sway",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Output"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/outputs/{name}": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "get_output",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Connector name, e.g. HDMI-A-1",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The output",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Output"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such output"
+          }
+        }
+      }
+    },
+    "/api/v1/reconcile": {
+      "post": {
+        "tags": [
+          "control"
+        ],
+        "operationId": "reconcile_now",
+        "responses": {
+          "200": {
+            "description": "Status after the pass",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "get_status",
+        "responses": {
+          "200": {
+            "description": "Reconciliation status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sway/command": {
+      "post": {
+        "tags": [
+          "control"
+        ],
+        "operationId": "run_sway_command",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwayCommand"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Sway accepted the command"
+          },
+          "403": {
+            "description": "Raw commands are disabled"
+          },
+          "503": {
+            "description": "Sway rejected the command"
+          }
+        }
+      }
+    },
+    "/api/v1/system": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "get_system",
+        "responses": {
+          "200": {
+            "description": "Daemon and environment information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/checks": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "list_checks",
+        "responses": {
+          "200": {
+            "description": "Environment health checks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Check"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/system/checks/{id}/fix": {
+      "post": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "fix_check",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Check identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What the fix did",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FixOutcome"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No automated fix exists for this check"
+          }
+        }
+      }
+    },
+    "/api/v1/windows": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "list_windows",
+        "responses": {
+          "200": {
+            "description": "Windows in sway's tree",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Window"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "AppConfig": {
+        "type": "object",
+        "description": "A managed application: a launch specification, not a window.",
+        "required": [
+          "id",
+          "launcher"
+        ],
+        "properties": {
+          "audio": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AudioConfig",
+                "description": "Audio routing. Absent leaves routing untouched; `{\"output\": null}` silences."
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "fullscreen": {
+            "type": "boolean"
+          },
+          "heartbeat": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HeartbeatConfig"
+              }
+            ]
+          },
+          "id": {
+            "type": "string",
+            "description": "Client-chosen, unique, stable identifier."
+          },
+          "launcher": {
+            "$ref": "#/components/schemas/Launcher"
+          },
+          "output": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputMatch",
+                "description": "Output the window is moved to. When absent, Sway's default placement applies."
+              }
+            ]
+          },
+          "persistProfile": {
+            "type": "boolean",
+            "description": "Keep the browser profile between launches instead of wiping it."
+          },
+          "restart": {
+            "$ref": "#/components/schemas/RestartPolicy"
+          }
+        }
+      },
+      "AppState": {
+        "type": "string",
+        "description": "Lifecycle state of a supervised application.",
+        "enum": [
+          "starting",
+          "running",
+          "stopped",
+          "crashed",
+          "backoff",
+          "waitingforoutput"
+        ]
+      },
+      "AppStatus": {
+        "type": "object",
+        "description": "Runtime status of a supervised application.",
+        "required": [
+          "id",
+          "state",
+          "restartCount",
+          "windowIds"
+        ],
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable detail for the current state."
+          },
+          "id": {
+            "type": "string"
+          },
+          "lastExitCode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "lastHeartbeat": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the most recent heartbeat, when the watchdog is enabled.",
+            "minimum": 0
+          },
+          "lastRestartReason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RestartReason"
+              }
+            ]
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "restartCount": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "startedAt": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds when the current process was spawned.",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/AppState"
+          },
+          "windowIds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64"
+            },
+            "description": "Sway container ids currently attributed to this app."
+          }
+        }
+      },
+      "AudioConfig": {
+        "type": "object",
+        "description": "Where an application's audio should go.",
+        "properties": {
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "PipeWire `node.name` of the target sink. `null` routes to silence."
+          }
+        }
+      },
+      "AudioSink": {
+        "type": "object",
+        "description": "An audio sink reported by PipeWire.",
+        "required": [
+          "id",
+          "isNullSink",
+          "isDefault"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable `node.description`."
+          },
+          "id": {
+            "type": "string",
+            "description": "PipeWire `node.name` — stable across reboots and replugging."
+          },
+          "isDefault": {
+            "type": "boolean",
+            "description": "True when this is PipeWire's current default sink."
+          },
+          "isNullSink": {
+            "type": "boolean",
+            "description": "True for the null sink Suede manages for silent routing."
+          },
+          "outputHint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Video connector this sink is associated with, where derivable."
+          }
+        }
+      },
+      "Check": {
+        "type": "object",
+        "description": "An environment health check, as served by `GET /system/checks`.",
+        "required": [
+          "id",
+          "title",
+          "status",
+          "detail",
+          "fixAvailable"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Explanation of the current result."
+          },
+          "docsUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Link to the documentation page describing manual resolution."
+          },
+          "fixAvailable": {
+            "type": "boolean",
+            "description": "Whether `POST /system/checks/{id}/fix` can remediate this check."
+          },
+          "fixDescription": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What the fix would do, shown before it is invoked."
+          },
+          "id": {
+            "type": "string",
+            "description": "Stable identifier, e.g. `sway-socket`."
+          },
+          "status": {
+            "$ref": "#/components/schemas/CheckStatus"
+          },
+          "title": {
+            "type": "string",
+            "description": "Short human-readable name."
+          }
+        }
+      },
+      "CheckStatus": {
+        "type": "string",
+        "description": "Result of a single environment health check.",
+        "enum": [
+          "pass",
+          "warn",
+          "fail"
+        ]
+      },
+      "ConfigChange": {
+        "type": "object",
+        "description": "Payload of the `config_changed` event.",
+        "required": [
+          "revision",
+          "section"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "section": {
+            "type": "string",
+            "description": "Which part of the document changed: `all`, `outputs`, `apps`, `settings`."
+          }
+        }
+      },
+      "DesiredState": {
+        "type": "object",
+        "description": "The complete desired-state document.",
+        "properties": {
+          "apps": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AppConfig"
+            },
+            "default": []
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OutputConfig"
+            },
+            "default": []
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Monotonic revision, incremented by Suede on every accepted write.",
+            "default": 0,
+            "minimum": 0
+          },
+          "schemaVersion": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Document schema version, managed by Suede.",
+            "default": 0,
+            "minimum": 0
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Settings"
+              }
+            ],
+            "default": {
+              "allowRawSwayCommands": false,
+              "hideCursor": true,
+              "outputPollIntervalSeconds": 5
+            }
+          }
+        }
+      },
+      "Divergence": {
+        "type": "object",
+        "description": "Something desired that could not be realized.",
+        "required": [
+          "kind",
+          "subject",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation."
+          },
+          "kind": {
+            "type": "string",
+            "description": "Machine-readable kind, e.g. `output_not_connected`."
+          },
+          "subject": {
+            "type": "string",
+            "description": "Resource the divergence concerns, e.g. an output name or app id."
+          }
+        }
+      },
+      "FixOutcome": {
+        "type": "object",
+        "description": "What a remediation did.",
+        "required": [
+          "id",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
+      "HeartbeatConfig": {
+        "type": "object",
+        "description": "Content-level watchdog settings.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "startupGraceSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Time allowed after launch for the first heartbeat to arrive.",
+            "minimum": 0
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Silence tolerated once armed, before the app is killed and relaunched.",
+            "minimum": 0
+          }
+        }
+      },
+      "Launcher": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Chromium with Suede's kiosk argument set.",
+            "required": [
+              "uri",
+              "kind"
+            ],
+            "properties": {
+              "extraArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Appended after the preset's arguments."
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "chromium-kiosk"
+                ]
+              },
+              "showFpsCounter": {
+                "type": "boolean"
+              },
+              "uri": {
+                "type": "string",
+                "description": "URI to load. Supports `{appId}` and `{heartbeatUrl}` placeholders."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Firefox with its kiosk argument set.",
+            "required": [
+              "uri",
+              "kind"
+            ],
+            "properties": {
+              "extraArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "firefox-kiosk"
+                ]
+              },
+              "uri": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Any executable, launched verbatim.",
+            "required": [
+              "command",
+              "kind"
+            ],
+            "properties": {
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "command": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "exec"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How an application is launched."
+      },
+      "Mode": {
+        "type": "object",
+        "description": "A display mode. Refresh is in Hz (Sway reports mHz on the wire).",
+        "required": [
+          "width",
+          "height",
+          "refreshHz"
+        ],
+        "properties": {
+          "height": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "refreshHz": {
+            "type": "number",
+            "format": "double"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "Output": {
+        "type": "object",
+        "description": "A video output as reported by Sway's `get_outputs`.",
+        "required": [
+          "name",
+          "active",
+          "modes",
+          "rect"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Whether Sway currently has this output enabled."
+          },
+          "adaptiveSyncStatus": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "currentMode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Mode",
+                "description": "Mode currently applied."
+              }
+            ]
+          },
+          "make": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EDID manufacturer."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EDID model."
+          },
+          "modes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Mode"
+            },
+            "description": "All modes the display advertises, deduplicated."
+          },
+          "name": {
+            "type": "string",
+            "description": "Connector name, e.g. `HDMI-A-1`."
+          },
+          "rect": {
+            "$ref": "#/components/schemas/Rect",
+            "description": "Position and size in the global layout."
+          },
+          "scale": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "serial": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EDID serial, where the display provides one."
+          },
+          "transform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "OutputConfig": {
+        "type": "object",
+        "description": "Desired configuration for one output.",
+        "required": [
+          "match"
+        ],
+        "properties": {
+          "adaptiveSync": {
+            "type": "boolean"
+          },
+          "allowTearing": {
+            "type": "boolean",
+            "description": "Applied only when the detected Sway version supports it (≥ 1.10)."
+          },
+          "enable": {
+            "type": "boolean",
+            "description": "Whether the output should be enabled. `false` actively disables it."
+          },
+          "match": {
+            "$ref": "#/components/schemas/OutputMatch",
+            "description": "Which physical output this entry applies to."
+          },
+          "maxRenderTimeMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum milliseconds allowed to render a frame; `null` means off.",
+            "minimum": 0
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Mode",
+                "description": "Mode to apply. When absent, Sway's preferred mode is left in place."
+              }
+            ]
+          },
+          "position": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Position",
+                "description": "Position in the global layout. Suede performs no layout arithmetic."
+              }
+            ]
+          },
+          "scale": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "transform": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Transform"
+              }
+            ]
+          }
+        }
+      },
+      "OutputMatch": {
+        "type": "object",
+        "description": "Rule selecting which physical output a config entry applies to.",
+        "properties": {
+          "make": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EDID manufacturer."
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EDID model."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Connector name, e.g. `HDMI-A-1`. The default and most direct way to match."
+          },
+          "serial": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "EDID serial."
+          }
+        }
+      },
+      "PackageVersion": {
+        "type": "object",
+        "description": "Version of a package relevant to Suede's operation.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "Position": {
+        "type": "object",
+        "required": [
+          "x",
+          "y"
+        ],
+        "properties": {
+          "x": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "Problem": {
+        "type": "object",
+        "description": "RFC 9457 problem document.",
+        "required": [
+          "type",
+          "title",
+          "status",
+          "detail"
+        ],
+        "properties": {
+          "detail": {
+            "type": "string",
+            "description": "Human-readable explanation specific to this occurrence."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP status code.",
+            "minimum": 0
+          },
+          "title": {
+            "type": "string",
+            "description": "Short human-readable summary."
+          },
+          "type": {
+            "type": "string",
+            "description": "URI reference identifying the error type."
+          }
+        }
+      },
+      "Rect": {
+        "type": "object",
+        "required": [
+          "x",
+          "y",
+          "width",
+          "height"
+        ],
+        "properties": {
+          "height": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "width": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "x": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "y": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "RestartPolicy": {
+        "type": "object",
+        "required": [
+          "policy",
+          "delayMs",
+          "maxDelayMs"
+        ],
+        "properties": {
+          "delayMs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Initial delay before relaunching.",
+            "minimum": 0
+          },
+          "maxDelayMs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Ceiling for the exponential backoff.",
+            "minimum": 0
+          },
+          "policy": {
+            "$ref": "#/components/schemas/RestartPolicyKind"
+          }
+        }
+      },
+      "RestartPolicyKind": {
+        "type": "string",
+        "description": "Restart behaviour after an application exits.",
+        "enum": [
+          "always",
+          "on-failure",
+          "never"
+        ]
+      },
+      "RestartReason": {
+        "type": "string",
+        "description": "Why an app was last restarted.",
+        "enum": [
+          "process_exited",
+          "heartbeat_timeout",
+          "window_never_appeared",
+          "config_changed",
+          "api_request"
+        ]
+      },
+      "Settings": {
+        "type": "object",
+        "description": "Daemon-level settings that belong to desired state.",
+        "required": [
+          "hideCursor",
+          "outputPollIntervalSeconds",
+          "allowRawSwayCommands"
+        ],
+        "properties": {
+          "allowRawSwayCommands": {
+            "type": "boolean",
+            "description": "Enable the raw `POST /sway/command` passthrough."
+          },
+          "hideCursor": {
+            "type": "boolean",
+            "description": "Hide the pointer and park it beyond the layout."
+          },
+          "outputPollIntervalSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Backstop poll interval for output changes.",
+            "minimum": 0
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "description": "Reconciliation status, as served by `GET /status`.",
+        "required": [
+          "state",
+          "divergences",
+          "revision"
+        ],
+        "properties": {
+          "divergences": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Divergence"
+            }
+          },
+          "lastReconciled": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix seconds of the last completed reconciliation pass.",
+            "minimum": 0
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Desired-state revision the last pass applied.",
+            "minimum": 0
+          },
+          "state": {
+            "$ref": "#/components/schemas/SyncState"
+          }
+        }
+      },
+      "SwayCommand": {
+        "type": "object",
+        "description": "A raw Sway command, for debugging.",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "string"
+          }
+        }
+      },
+      "SyncState": {
+        "type": "string",
+        "description": "Overall reconciliation state.",
+        "enum": [
+          "synced",
+          "reconciling",
+          "degraded"
+        ]
+      },
+      "SystemInfo": {
+        "type": "object",
+        "description": "Daemon and environment information, as served by `GET /system`.",
+        "required": [
+          "suedeVersion",
+          "uptimeSeconds",
+          "packages",
+          "supportsTearing",
+          "webUiEnabled"
+        ],
+        "properties": {
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "packages": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PackageVersion"
+            }
+          },
+          "suedeVersion": {
+            "type": "string"
+          },
+          "supportsTearing": {
+            "type": "boolean",
+            "description": "Feature gates resolved from the detected Sway version."
+          },
+          "swayVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "uptimeSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds since the daemon started.",
+            "minimum": 0
+          },
+          "webUiEnabled": {
+            "type": "boolean",
+            "description": "True when the reference web UI is being served."
+          }
+        }
+      },
+      "Transform": {
+        "type": "string",
+        "description": "Screen rotation and flipping, as accepted by `sway-output(5)`.",
+        "enum": [
+          "normal",
+          "90",
+          "180",
+          "270",
+          "flipped",
+          "flipped-90",
+          "flipped-180",
+          "flipped-270"
+        ]
+      },
+      "Window": {
+        "type": "object",
+        "description": "A window in Sway's tree.",
+        "required": [
+          "id",
+          "fullscreenMode",
+          "rect"
+        ],
+        "properties": {
+          "app": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Id of the Suede-managed app that owns this window, where known."
+          },
+          "appId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fullscreenMode": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Sway container id."
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Name of the output this window is displayed on, where known."
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "rect": {
+            "$ref": "#/components/schemas/Rect"
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visible": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      },
+      "WindowChange": {
+        "type": "object",
+        "description": "Payload of the `windows_changed` event.",
+        "required": [
+          "change",
+          "window"
+        ],
+        "properties": {
+          "change": {
+            "type": "string",
+            "description": "Sway change type: `new`, `close`, `title`, `move`, `fullscreen_mode`, `floating`."
+          },
+          "window": {
+            "$ref": "#/components/schemas/Window"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Optional. When a token is configured, every endpoint except /healthz and the heartbeat endpoint requires it."
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "observed",
+      "description": "Live state reported by sway and PipeWire"
+    },
+    {
+      "name": "config",
+      "description": "Desired state, persisted and reconciled"
+    },
+    {
+      "name": "apps",
+      "description": "Managed application status and control"
+    },
+    {
+      "name": "control",
+      "description": "Imperative escape hatches"
+    },
+    {
+      "name": "events",
+      "description": "Server-sent change notification"
+    }
+  ]
+}

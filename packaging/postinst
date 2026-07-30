@@ -1,0 +1,45 @@
+#!/bin/sh
+# Debian post-installation script.
+#
+# Deliberately conservative: it reloads unit definitions and restarts a running
+# instance, but never enables anything or edits a user's session. That is the
+# job of provision.sh, which the operator runs explicitly.
+set -e
+
+case "$1" in
+  configure)
+    chmod 0755 /usr/share/suede/provision.sh 2>/dev/null || true
+
+    # Pick up the new unit definition for every logged-in user.
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # Restart a running instance so an upgrade takes effect immediately.
+    # Desired state lives in $XDG_STATE_HOME and is untouched by this.
+    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+      runuser_env="XDG_RUNTIME_DIR=/run/user/${uid}"
+      if env $runuser_env systemctl --user --machine="${uid}@" is-active suede.service \
+           >/dev/null 2>&1; then
+        echo "Restarting suede for uid ${uid}"
+        env $runuser_env systemctl --user --machine="${uid}@" daemon-reload >/dev/null 2>&1 || true
+        env $runuser_env systemctl --user --machine="${uid}@" restart suede.service \
+          >/dev/null 2>&1 || true
+      fi
+    done
+
+    if [ -z "${SUEDE_QUIET_INSTALL:-}" ]; then
+      cat <<'EOF'
+
+Suede is installed.
+
+  First-time setup on this machine:
+    sudo /usr/share/suede/provision.sh
+
+  Already provisioned? Nothing more to do — the service was restarted.
+
+  Documentation: https://suede.gameshow.pro/getting-started/
+EOF
+    fi
+    ;;
+esac
+
+exit 0

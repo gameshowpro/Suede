@@ -1,0 +1,28 @@
+# Suede bootstrap configuration.
+#
+# Copy to $XDG_CONFIG_HOME/suede/suede.toml (usually ~/.config/suede/suede.toml).
+# Every value here can be overridden by the matching SUEDE_* environment
+# variable, which wins.
+#
+# This file holds only what must be known *before* the API can serve.
+# Everything else — outputs, applications, audio routing — is desired state,
+# written through the API and persisted separately.
+
+# Address the HTTP server binds to.  Env: SUEDE_BIND
+bind = "0.0.0.0:7071"
+
+# Optional bearer token.  Env: SUEDE_TOKEN
+#
+# Leave unset on a trusted production LAN, which is the expected deployment.
+# Setting it requires `Authorization: Bearer <token>` on every endpoint except
+# /healthz and the loopback-only heartbeat endpoint — and disables the
+# reference web UI, which could not embed the token without exposing it.
+# token = "change-me"
+
+# Where the desired-state document is persisted.  Env: SUEDE_STATE_DIR
+# Defaults to $XDG_STATE_HOME/suede (usually ~/.local/state/suede).
+# state_dir = "/var/lib/suede"
+
+# Base URL used to build documentation links in health checks.
+# Env: SUEDE_DOCS_BASE_URL
+docs_base_url = "https://suede.gameshow.pro/"

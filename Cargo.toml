@@ -1,0 +1,70 @@
+[package]
+name = "suede"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Remote management daemon for Sway-based display appliances"
+authors = ["Hamish Barjonas"]
+license = "MIT"
+repository = "https://github.com/gameshowpro/Suede"
+readme = "README.md"
+default-run = "suede"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json", "tokio", "http1"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "process", "signal", "sync", "time", "io-util", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tracing-journald = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Packaging is driven entirely from here; there is no separate packaging tree
+# to keep in step. Build with `cargo deb`.
+[package.metadata.deb]
+maintainer = "Hamish Barjonas <suede@gameshow.pro>"
+copyright = "2026, Barjonas LLC"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+Suede turns a Linux box running the sway compositor into a remotely manageable \
+display appliance. It exposes a documented REST and SSE API for configuring \
+video outputs, routing audio, and supervising kiosk browsers, and it persists \
+that configuration so the machine boots straight back into its configured \
+state without operator intervention."""
+section = "video"
+priority = "optional"
+depends = "$auto, sway, pipewire, pipewire-pulse"
+recommends = "chromium | firefox"
+maintainer-scripts = "packaging"
+assets = [
+    ["target/release/suede", "usr/bin/", "755"],
+    ["packaging/suede.service", "usr/lib/systemd/user/", "644"],
+    ["packaging/provision.sh", "usr/share/suede/", "755"],
+    ["README.md", "usr/share/doc/suede/README.md", "644"],
+    ["docs/examples/suede.toml", "usr/share/doc/suede/examples/suede.toml", "644"],
+    ["docs/examples/four-output-appliance.json", "usr/share/doc/suede/examples/four-output-appliance.json", "644"],
+]

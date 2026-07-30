@@ -1,0 +1,83 @@
+[
+  {
+    "id": 30,
+    "type": "PipeWire:Interface:Metadata",
+    "props": { "metadata.name": "default" },
+    "metadata": [
+      {
+        "subject": 0,
+        "key": "default.audio.sink",
+        "type": "Spa:String:JSON",
+        "value": { "name": "alsa_output.pci-0000_01_00.1.hdmi-stereo" }
+      },
+      {
+        "subject": 0,
+        "key": "default.audio.source",
+        "type": "Spa:String:JSON",
+        "value": { "name": "alsa_input.pci-0000_00_1f.3.analog-stereo" }
+      }
+    ]
+  },
+  {
+    "id": 42,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "node.name": "alsa_output.pci-0000_01_00.1.hdmi-stereo",
+        "node.description": "Acme HDMI / DisplayPort",
+        "media.class": "Audio/Sink",
+        "api.alsa.path": "hdmi:CARD=HDMI,DEV=0",
+        "device.id": 41,
+        "factory.name": "api.alsa.pcm.sink"
+      }
+    }
+  },
+  {
+    "id": 43,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "node.name": "alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1",
+        "node.description": "Acme HDMI / DisplayPort 2",
+        "media.class": "Audio/Sink",
+        "api.alsa.path": "hdmi:CARD=HDMI,DEV=1",
+        "device.id": 41
+      }
+    }
+  },
+  {
+    "id": 44,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "node.name": "alsa_input.pci-0000_00_1f.3.analog-stereo",
+        "node.description": "Built-in Audio Analog Stereo",
+        "media.class": "Audio/Source",
+        "device.id": 45
+      }
+    }
+  },
+  {
+    "id": 60,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "node.name": "suede-null",
+        "node.description": "Suede silent sink",
+        "media.class": "Audio/Sink",
+        "factory.name": "support.null-audio-sink",
+        "object.linger": true
+      }
+    }
+  },
+  {
+    "id": 70,
+    "type": "PipeWire:Interface:Device",
+    "info": {
+      "props": {
+        "device.name": "alsa_card.pci-0000_01_00.1",
+        "media.class": "Audio/Device"
+      }
+    }
+  }
+]

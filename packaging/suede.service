@@ -1,0 +1,20 @@
+[Unit]
+Description=Suede display appliance daemon
+Documentation=https://suede.gameshow.pro/
+# Bound to the graphical session: Suede needs to reach sway's IPC socket.
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/suede run
+# Suede waits for the sway socket itself, so a restart loop is not a busy loop.
+Restart=always
+RestartSec=2
+# Managed browsers are children of this unit; take them down with it.
+KillMode=control-group
+TimeoutStopSec=15
+Environment=RUST_LOG=suede=info,warn
+
+[Install]
+WantedBy=sway-session.target

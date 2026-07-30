@@ -1,0 +1,96 @@
+{
+  "id": 1,
+  "type": "root",
+  "name": "root",
+  "rect": { "x": 0, "y": 0, "width": 3840, "height": 1080 },
+  "nodes": [
+    {
+      "id": 2,
+      "type": "output",
+      "name": "__i3",
+      "rect": { "x": 0, "y": 0, "width": 0, "height": 0 },
+      "nodes": [
+        {
+          "id": 6,
+          "type": "workspace",
+          "name": "__i3_scratch",
+          "rect": { "x": 0, "y": 0, "width": 0, "height": 0 },
+          "nodes": [],
+          "floating_nodes": []
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "id": 3,
+      "type": "output",
+      "name": "HDMI-A-1",
+      "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+      "nodes": [
+        {
+          "id": 7,
+          "type": "workspace",
+          "name": "1",
+          "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+          "nodes": [
+            {
+              "id": 8,
+              "type": "con",
+              "name": null,
+              "layout": "splith",
+              "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+              "nodes": [
+                {
+                  "id": 9,
+                  "type": "con",
+                  "name": "Renderer 1",
+                  "app_id": "chromium",
+                  "pid": 4242,
+                  "visible": true,
+                  "fullscreen_mode": 1,
+                  "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+                  "nodes": [],
+                  "floating_nodes": []
+                }
+              ],
+              "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        }
+      ],
+      "floating_nodes": []
+    },
+    {
+      "id": 4,
+      "type": "output",
+      "name": "HDMI-A-2",
+      "rect": { "x": 1920, "y": 0, "width": 1920, "height": 1080 },
+      "nodes": [
+        {
+          "id": 10,
+          "type": "workspace",
+          "name": "2",
+          "rect": { "x": 1920, "y": 0, "width": 1920, "height": 1080 },
+          "nodes": [
+            {
+              "id": 11,
+              "type": "con",
+              "name": "Renderer 2",
+              "app_id": "chromium",
+              "pid": 4343,
+              "visible": true,
+              "fullscreen_mode": 1,
+              "rect": { "x": 1920, "y": 0, "width": 1920, "height": 1080 },
+              "nodes": [],
+              "floating_nodes": []
+            }
+          ],
+          "floating_nodes": []
+        }
+      ],
+      "floating_nodes": []
+    }
+  ],
+  "floating_nodes": []
+}

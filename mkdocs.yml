@@ -1,0 +1,92 @@
+site_name: Suede
+site_description: Remote management for Sway-based display appliances. Configure outputs, route audio, supervise kiosk browsers, and survive reboots.
+site_url: https://suede.gameshow.pro/
+repo_url: https://github.com/gameshowpro/Suede
+repo_name: gameshowpro/Suede
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: black
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.instant
+    - navigation.sections
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+
+extra_css:
+  - assets/stylesheets/extra.css
+
+docs_dir: docs
+use_directory_urls: true
+edit_uri: edit/main/docs/
+not_in_nav: |
+  generated/**
+  examples/**
+
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Configuration: configuration.md
+  - API reference: api.md
+  - Troubleshooting: troubleshooting.md
+  - Developer:
+      - Architecture: developer/architecture.md
+      - Deployment: developer/deployment.md
+      - Specification: specification.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.details
+  - pymdownx.snippets:
+      base_path: docs
+      check_paths: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+extra:
+  version: !ENV [SUEDE_DOCS_VERSION, "dev"]
+  generator: false
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/gameshowpro/Suede
+      name: GitHub Repository
+    - icon: fontawesome/solid/heart
+      link: https://github.com/sponsors/gameshowpro
+      name: Sponsor on GitHub
+    - icon: fontawesome/brands/paypal
+      link: https://paypal.me/barjonas
+      name: Donate via PayPal
+
+copyright: © 2026 Barjonas LLC

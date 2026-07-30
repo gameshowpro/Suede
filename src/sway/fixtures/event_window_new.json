@@ -1,0 +1,15 @@
+{
+  "change": "new",
+  "container": {
+    "id": 9,
+    "type": "con",
+    "name": "Renderer 1",
+    "app_id": "chromium",
+    "pid": 4242,
+    "visible": true,
+    "fullscreen_mode": 0,
+    "rect": { "x": 0, "y": 0, "width": 1920, "height": 1080 },
+    "nodes": [],
+    "floating_nodes": []
+  }
+}

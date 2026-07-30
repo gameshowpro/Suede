@@ -1,0 +1,268 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      docs_only:
+        description: 'Skip the app build, only regenerate and deploy the docs site'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.resolve.outputs.app }}
+      docs: ${{ steps.resolve.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            app:
+              - 'src/**'
+              - 'tests/**'
+              - 'packaging/**'
+              - 'scripts/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+            docs:
+              - 'docs/**'
+              - 'mkdocs.yml'
+              - 'README.md'
+              - '.github/workflows/ci.yml'
+      - name: Resolve change outputs
+        id: resolve
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            if [[ "${{ inputs.docs_only }}" == "true" ]]; then
+              echo "app=false" >> $GITHUB_OUTPUT
+              echo "docs=true" >> $GITHUB_OUTPUT
+            else
+              echo "app=true" >> $GITHUB_OUTPUT
+              echo "docs=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "app=${{ steps.filter.outputs.app }}" >> $GITHUB_OUTPUT
+            echo "docs=${{ steps.filter.outputs.docs }}" >> $GITHUB_OUTPUT
+          fi
+
+  # Lint and test need neither sway nor PipeWire: every compositor and audio
+  # interaction sits behind a trait, exercised with recorded fixtures.
+  test:
+    needs: changes
+    if: needs.changes.outputs.app == 'true' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all-targets
+
+      # Proves the OpenAPI document builds with no compositor and no network,
+      # which is what the docs job depends on.
+      - name: OpenAPI generates standalone
+        run: |
+          cargo run --quiet -- openapi > /tmp/openapi.json
+          python3 -c "import json;d=json.load(open('/tmp/openapi.json'));print(len(d['paths']),'paths')"
+
+      - name: End-to-end smoke test
+        run: |
+          cargo build
+          BIN=target/debug/suede bash scripts/smoke-test.sh
+
+  build:
+    needs: [changes, test]
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version from Cargo.toml
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "tag=v$version" >> $GITHUB_OUTPUT
+
+      - name: Install cross and cargo-deb
+        run: |
+          cargo install cross --locked || true
+          cargo install cargo-deb --locked
+
+      # `cross` gives a working aarch64 linker without a hand-built sysroot.
+      # Suede has no native library dependencies, which is what keeps this easy.
+      - name: Build release binary
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
+            cargo build --release --target ${{ matrix.target }}
+          else
+            cross build --release --target ${{ matrix.target }}
+          fi
+
+      - name: Verify the binary is self-contained
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          echo "Dynamic dependencies:"
+          ldd target/${{ matrix.target }}/release/suede
+          # Anything beyond libc/libm/pthread/dl means a native dependency crept in.
+          if ldd target/${{ matrix.target }}/release/suede \
+             | grep -vqE 'linux-vdso|ld-linux|libc\.so|libm\.so|libgcc_s|libpthread|libdl|=>.*$' ; then
+            echo "unexpected dynamic dependency" && exit 1
+          fi
+
+      - name: Build .deb
+        run: |
+          cargo deb --no-build --target ${{ matrix.target }} --output \
+            suede_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
+
+      - name: Upload package
+        uses: actions/upload-artifact@v5
+        with:
+          name: suede-${{ matrix.arch }}
+          path: suede_*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: suede-*
+          merge-multiple: true
+
+      - name: Tag the release if the version is new
+        id: tag
+        run: |
+          tag="${{ needs.build.outputs.tag }}"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            echo "Tag $tag already exists; skipping release."
+            echo "new=false" >> $GITHUB_OUTPUT
+          else
+            git tag "$tag"
+            git push origin "$tag"
+            echo "new=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create the GitHub release
+        if: steps.tag.outputs.new == 'true'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: Suede ${{ needs.build.outputs.tag }}
+          generate_release_notes: true
+          files: suede_*.deb
+          fail_on_unmatched_files: true
+
+  build-docs:
+    needs: [changes, test]
+    if: |
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.docs == 'true' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Install MkDocs
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r docs/requirements.txt
+
+      # Generates the API reference from the exact code being deployed, and
+      # vendors the Scalar bundle so the published page needs no CDN.
+      - name: Generate API reference assets
+        run: bash scripts/build-docs.sh
+
+      - name: Resolve docs version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
+          echo "tag=v$version" >> $GITHUB_OUTPUT
+
+      - name: Build the site
+        env:
+          SUEDE_DOCS_VERSION: ${{ steps.version.outputs.tag }}
+        run: mkdocs build --strict
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy-docs:
+    needs: build-docs
+    if: |
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
+      needs.build-docs.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
