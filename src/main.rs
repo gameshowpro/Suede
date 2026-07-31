@@ -13,7 +13,7 @@ use suede::audio::{mock::MockAudio, pw::PipeWireMonitor, AudioMonitor};
 use suede::checks::CheckRunner;
 use suede::config::BootstrapConfig;
 use suede::events::EventHub;
-use suede::reconciler::Reconciler;
+use suede::reconciler::{Reconciler, ReconcilerDeps};
 use suede::snapshot::Snapshot;
 use suede::state::StateStore;
 use suede::supervisor::{LaunchContext, Supervisor};
@@ -148,15 +148,16 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     let wallpapers = Arc::new(suede::wallpapers::WallpaperStore::new(
         bootstrap.state_dir.join("wallpapers"),
     ));
-    let reconciler = Arc::new(Reconciler::new(
-        sway.clone(),
-        audio.clone(),
-        store.clone(),
-        snapshot.clone(),
-        supervisor.clone(),
-        events.clone(),
-        wallpapers.clone(),
-    ));
+    let reconciler = Arc::new(Reconciler::new(ReconcilerDeps {
+        sway: sway.clone(),
+        audio: audio.clone(),
+        store: store.clone(),
+        snapshot: snapshot.clone(),
+        supervisor: supervisor.clone(),
+        events: events.clone(),
+        wallpapers: wallpapers.clone(),
+        docs_base_url: bootstrap.docs_base_url.clone(),
+    }));
     let checks = Arc::new(CheckRunner::new(
         bootstrap.clone(),
         sway.clone(),

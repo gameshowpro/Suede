@@ -248,6 +248,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 pub mod test_support {
     use super::*;
     use crate::audio::mock::MockAudio;
+    use crate::reconciler::ReconcilerDeps;
     use crate::supervisor::LaunchContext;
     use crate::sway::mock::MockSway;
 
@@ -284,15 +285,16 @@ pub mod test_support {
                 api_base: "http://127.0.0.1:7071/api/v1".into(),
             },
         ));
-        let reconciler = Arc::new(Reconciler::new(
-            sway.clone(),
-            audio.clone(),
-            store.clone(),
-            snapshot.clone(),
-            supervisor.clone(),
-            hub.clone(),
-            wallpapers.clone(),
-        ));
+        let reconciler = Arc::new(Reconciler::new(ReconcilerDeps {
+            sway: sway.clone(),
+            audio: audio.clone(),
+            store: store.clone(),
+            snapshot: snapshot.clone(),
+            supervisor: supervisor.clone(),
+            events: hub.clone(),
+            wallpapers: wallpapers.clone(),
+            docs_base_url: bootstrap.docs_base_url.clone(),
+        }));
         let checks = Arc::new(CheckRunner::new(
             bootstrap.clone(),
             sway.clone(),

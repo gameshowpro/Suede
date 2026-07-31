@@ -257,6 +257,12 @@ pub struct Divergence {
     pub subject: String,
     /// Human-readable explanation.
     pub detail: String,
+    /// Where to read about this kind of problem.
+    ///
+    /// Carried here, rather than left for each client to work out, so that
+    /// anything consuming the API can offer the same help the bundled UI does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs_url: Option<String>,
 }
 
 impl Divergence {
@@ -265,7 +271,42 @@ impl Divergence {
             kind: kind.to_string(),
             subject: subject.into(),
             detail: detail.into(),
+            docs_url: None,
         }
+    }
+
+    /// Every kind the reconciler can raise.
+    ///
+    /// Listed so a test can prove each one leads the operator somewhere; a new
+    /// kind without documentation is a dead end in the UI.
+    pub const KINDS: &'static [&'static str] = &[
+        "output_not_connected",
+        "mode_unsupported",
+        "command_failed",
+        "app_waiting_for_output",
+        "app_output_disabled",
+        "audio_sink_not_present",
+        "null_sink_unavailable",
+        "wallpaper_not_found",
+        "tearing_unsupported",
+    ];
+
+    /// Documentation page for a divergence kind, relative to the docs root.
+    pub fn docs_path(kind: &str) -> Option<&'static str> {
+        Some(match kind {
+            "output_not_connected" | "mode_unsupported" | "command_failed" => {
+                "troubleshooting/#a-display-stays-dark"
+            }
+            "app_waiting_for_output" | "app_output_disabled" => {
+                "troubleshooting/#a-browser-will-not-start"
+            }
+            "audio_sink_not_present" | "null_sink_unavailable" => {
+                "troubleshooting/#audio-goes-to-the-wrong-place-or-nowhere"
+            }
+            "wallpaper_not_found" => "configuration/#backgrounds-and-wallpapers",
+            "tearing_unsupported" => "configuration/#outputs",
+            _ => return None,
+        })
     }
 }
 
@@ -572,5 +613,18 @@ mod tests {
         let max = output.maximum_mode().unwrap();
         assert_eq!((max.width, max.height), (3840, 2160));
         assert_eq!(max.refresh_hz, 60.0);
+    }
+
+    #[test]
+    fn every_divergence_kind_leads_somewhere() {
+        // A divergence with no fix and no documentation leaves the operator
+        // holding a complaint and nothing to do about it.
+        for kind in Divergence::KINDS {
+            assert!(
+                Divergence::docs_path(kind).is_some(),
+                "{kind} has no documentation page"
+            );
+        }
+        assert_eq!(Divergence::docs_path("invented_kind"), None);
     }
 }

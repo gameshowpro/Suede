@@ -90,9 +90,49 @@ mod tests {
             "/system/checks",
             "/events",
             "/reconcile",
+            "/wallpapers",
         ] {
             assert!(INDEX.contains(path), "the UI never calls {path}");
         }
+    }
+
+    #[test]
+    fn the_page_covers_every_configurable_field() {
+        // The UI is the reference client; a field it cannot reach is a field
+        // an operator can only set by hand-editing the raw document.
+        for field in [
+            "spanOutputs",
+            "readiness",
+            "background",
+            "allowTearing",
+            "maxRenderTimeMs",
+            "adaptiveSync",
+            "heartbeat",
+            "env",
+        ] {
+            assert!(INDEX.contains(field), "the UI never sets {field}");
+        }
+    }
+
+    #[test]
+    fn warnings_offer_a_way_forward() {
+        // Every alert should end in either a fix or a documentation link, and
+        // a fix writes to the operator's machine, so it must be confirmed
+        // rather than applied on one stray click.
+        assert!(INDEX.contains("fixAvailable"), "fixable checks unused");
+        assert!(
+            INDEX.contains("fixDescription"),
+            "the fix is applied unexplained"
+        );
+        assert!(INDEX.contains("/fix"), "the fix endpoint is never called");
+        assert!(
+            INDEX.contains("docsUrl"),
+            "documentation links are never shown"
+        );
+        assert!(
+            INDEX.contains("divergence.docsUrl"),
+            "divergences carry docs links too, and should use them"
+        );
     }
 
     #[test]

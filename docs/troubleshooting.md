@@ -8,6 +8,30 @@ curl -s http://appliance:7071/api/v1/system/checks | python3 -m json.tool
 
 Then look at `GET /api/v1/status`, which lists every piece of desired state that could not be realized.
 
+## How warnings reach you {: #how-warnings-reach-you }
+
+Suede raises two kinds of complaint, and both are built so that they end somewhere you can act.
+
+A **check** is a fact about the machine — a missing package, a compositor setting that will silently break spanning. Each carries a `status` of `pass`, `warn` or `fail`, and:
+
+| Field | Meaning |
+| --- | --- |
+| `docsUrl` | The page on <https://suede.gameshow.pro> describing the problem and its manual remedy. |
+| `fixAvailable` | Whether Suede can apply the remedy itself. |
+| `fixDescription` | Exactly what applying it would change, so you can decide before it happens. |
+
+A **divergence** is a fact about your configuration — something you asked for that could not be applied. It carries a `kind`, the `subject` it concerns, and its own `docsUrl`. Divergences have no fix button, because the remedy is always to change what you asked for or to change the hardware.
+
+`docsBaseUrl` in the bootstrap file decides where those links point; set it if you host your own copy of these pages.
+
+The web UI collects both into a banner above every tab, failures first, and shows the fix description with a confirmation step before anything is applied — a fix writes to the machine, so it should never happen on a stray click. Applying one calls:
+
+```bash
+curl -X POST http://appliance:7071/api/v1/system/checks/direct-scanout/fix
+```
+
+which returns what it did. Only four checks offer this: `direct-scanout`, `sway-config`, `systemd-unit` and `pipewire`. Everything else needs a package installed or a cable moved, and says so.
+
 ## Suede is not reachable
 
 ```bash

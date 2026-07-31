@@ -63,18 +63,38 @@ pub struct Reconciler {
     capabilities: Mutex<Capabilities>,
     cursor_parked_at: Mutex<Option<i32>>,
     wallpapers: Arc<WallpaperStore>,
+    /// Base for the documentation links attached to divergences.
+    docs_base_url: String,
+}
+
+/// Everything a [`Reconciler`] collaborates with.
+///
+/// Named fields rather than a long positional argument list: four of these are
+/// `Arc<dyn …>` and two are plain strings, so a transposition would compile.
+pub struct ReconcilerDeps {
+    pub sway: Arc<dyn SwayClient>,
+    pub audio: Arc<dyn AudioMonitor>,
+    pub store: Arc<StateStore>,
+    pub snapshot: Arc<Snapshot>,
+    pub supervisor: Arc<Supervisor>,
+    pub events: EventHub,
+    pub wallpapers: Arc<WallpaperStore>,
+    /// Base for the documentation links attached to divergences.
+    pub docs_base_url: String,
 }
 
 impl Reconciler {
-    pub fn new(
-        sway: Arc<dyn SwayClient>,
-        audio: Arc<dyn AudioMonitor>,
-        store: Arc<StateStore>,
-        snapshot: Arc<Snapshot>,
-        supervisor: Arc<Supervisor>,
-        events: EventHub,
-        wallpapers: Arc<WallpaperStore>,
-    ) -> Self {
+    pub fn new(deps: ReconcilerDeps) -> Self {
+        let ReconcilerDeps {
+            sway,
+            audio,
+            store,
+            snapshot,
+            supervisor,
+            events,
+            wallpapers,
+            docs_base_url,
+        } = deps;
         Self {
             sway,
             audio,
@@ -83,6 +103,7 @@ impl Reconciler {
             supervisor,
             events,
             wallpapers,
+            docs_base_url,
             pass: Mutex::new(()),
             applied: Mutex::new(HashMap::new()),
             capabilities: Mutex::new(Capabilities::default()),
@@ -246,6 +267,13 @@ impl Reconciler {
 
         let windows = self.refresh_windows().await;
         self.supervisor.tick(&windows).await;
+
+        // Every divergence gains a documentation link here, so the pure
+        // planner stays free of deployment concerns and no producer can forget.
+        for divergence in &mut divergences {
+            divergence.docs_url = Divergence::docs_path(&divergence.kind)
+                .map(|path| format!("{}/{}", self.docs_base_url.trim_end_matches('/'), path));
+        }
 
         let status = Status {
             state: if divergences.is_empty() {
@@ -464,15 +492,16 @@ mod tests {
                 api_base: "http://127.0.0.1:7071/api/v1".into(),
             },
         ));
-        let reconciler = Arc::new(Reconciler::new(
-            sway.clone(),
-            audio.clone(),
-            store.clone(),
-            snapshot.clone(),
-            supervisor.clone(),
-            events.clone(),
-            Arc::new(WallpaperStore::new(dir.path().join("wallpapers"))),
-        ));
+        let reconciler = Arc::new(Reconciler::new(ReconcilerDeps {
+            sway: sway.clone(),
+            audio: audio.clone(),
+            store: store.clone(),
+            snapshot: snapshot.clone(),
+            supervisor: supervisor.clone(),
+            events: events.clone(),
+            wallpapers: Arc::new(WallpaperStore::new(dir.path().join("wallpapers"))),
+            docs_base_url: "https://suede.gameshow.pro/".to_string(),
+        }));
         Harness {
             reconciler,
             sway,

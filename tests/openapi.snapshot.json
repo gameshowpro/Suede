@@ -1445,6 +1445,13 @@
             "type": "string",
             "description": "Human-readable explanation."
           },
+          "docsUrl": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where to read about this kind of problem.\n\nCarried here, rather than left for each client to work out, so that\nanything consuming the API can offer the same help the bundled UI does."
+          },
           "kind": {
             "type": "string",
             "description": "Machine-readable kind, e.g. `output_not_connected`."

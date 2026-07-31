@@ -6,91 +6,104 @@
 <title>Suede</title>
 <style>
 :root {
-  --bg: #f6f7f9; --panel: #fff; --ink: #16191d; --muted: #667085; --line: #e3e6ea;
-  --accent: #3b5bdb; --ok: #2f9e44; --warn: #e8a317; --bad: #d64545; --shadow: 0 1px 3px rgba(0,0,0,.08);
+  --bg: #f5f6f8; --panel: #fff; --sunken: #f0f2f5; --ink: #16191d; --muted: #667085;
+  --line: #e2e6ea; --accent: #3b5bdb; --ok: #2f9e44; --warn: #b8860b; --bad: #c92a2a;
+  --shadow: 0 1px 3px rgba(0,0,0,.07);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --bg: #14161a; --panel: #1c1f25; --ink: #e8eaed; --muted: #9aa4b2; --line: #2b3038;
-    --accent: #7d92f0; --ok: #51cf66; --warn: #f0b849; --bad: #ff6b6b; --shadow: none;
+    --bg: #13151a; --panel: #1b1e24; --sunken: #15171c; --ink: #e8eaed; --muted: #98a2b3;
+    --line: #2a2f38; --accent: #7d92f0; --ok: #51cf66; --warn: #f0b849; --bad: #ff6b6b;
+    --shadow: none;
   }
 }
 * { box-sizing: border-box; }
-body {
-  margin: 0; background: var(--bg); color: var(--ink);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
-}
-header {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-  padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
-  position: sticky; top: 0; z-index: 10;
-}
-h1 { font-size: 18px; margin: 0; letter-spacing: -.01em; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 13px 20px;
+  background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
 h2 { font-size: 15px; margin: 0 0 12px; }
+h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: .04em; }
 .grow { flex: 1; }
-.pill {
-  font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
-  border: 1px solid var(--line); white-space: nowrap;
-}
+main { padding: 18px 20px 60px; max-width: 1180px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
+.pill { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
+  border: 1px solid var(--line); white-space: nowrap; }
 .pill.ok { color: var(--ok); border-color: currentColor; }
 .pill.warn { color: var(--warn); border-color: currentColor; }
 .pill.bad { color: var(--bad); border-color: currentColor; }
 .pill.muted { color: var(--muted); }
-main { padding: 20px; max-width: 1100px; margin: 0 auto; }
-.panel {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-  padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow);
-}
 nav { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 16px; }
-nav button {
-  background: transparent; border: 1px solid transparent; color: var(--muted);
-  padding: 7px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 500;
-}
+nav button { background: transparent; border: 1px solid transparent; color: var(--muted);
+  padding: 7px 14px; border-radius: 8px; cursor: pointer; font: inherit; font-weight: 500; }
 nav button:hover { color: var(--ink); }
 nav button[aria-selected="true"] { background: var(--panel); border-color: var(--line); color: var(--ink); }
-button.action {
-  background: var(--accent); color: #fff; border: 0; padding: 7px 14px;
-  border-radius: 7px; cursor: pointer; font: inherit; font-weight: 500;
-}
+nav .count { font-size: 11px; padding: 1px 6px; border-radius: 999px; margin-left: 6px;
+  background: var(--bad); color: #fff; font-weight: 700; }
+button.action { background: var(--accent); color: #fff; border: 0; padding: 7px 14px;
+  border-radius: 7px; cursor: pointer; font: inherit; font-weight: 500; }
 button.action.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
+button.action.danger { background: transparent; color: var(--bad); border: 1px solid var(--line); }
 button.action:disabled { opacity: .5; cursor: not-allowed; }
-#layout {
-  position: relative; background: var(--bg); border: 1px dashed var(--line);
-  border-radius: 8px; height: 220px; overflow: hidden; margin-bottom: 16px;
-}
-.screen {
-  position: absolute; border: 2px solid var(--accent); border-radius: 4px;
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  font-size: 12px; cursor: pointer; overflow: hidden; padding: 4px; text-align: center;
-}
-.screen.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
-.screen.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
-.screen b { font-size: 13px; }
+a { color: var(--accent); }
+
+/* --- alerts: the operator's first stop ------------------------------- */
+.alert { border: 1px solid var(--line); border-left: 4px solid var(--muted);
+  border-radius: 0 9px 9px 0; padding: 12px 14px; margin-bottom: 10px; background: var(--panel); }
+.alert.fail { border-left-color: var(--bad); }
+.alert.warn { border-left-color: var(--warn); }
+.alert.diverged { border-left-color: var(--accent); }
+.alert .head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.alert .title { font-weight: 600; }
+.alert .detail { color: var(--muted); font-size: 14px; margin-top: 5px; }
+.alert .actions { display: flex; gap: 8px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
+.alert .confirm { margin-top: 10px; padding: 10px 12px; background: var(--sunken);
+  border-radius: 8px; font-size: 14px; }
+.alert .confirm p { margin: 0 0 9px; }
+.alert .outcome { margin-top: 9px; font-size: 14px; color: var(--ok); }
+.hint { color: var(--muted); font-size: 13px; }
+
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 tr:last-child td { border-bottom: 0; }
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
-input, select, textarea {
-  width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 7px;
-  background: var(--bg); color: var(--ink); font: inherit;
-}
-textarea { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; min-height: 380px; }
-.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 14px; }
+input, select, textarea { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
+  border-radius: 7px; background: var(--sunken); color: var(--ink); font: inherit; }
+input[type=file] { padding: 6px; }
+textarea { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+textarea.json { min-height: 420px; }
+.fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 6px; }
+.fields.wide { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.span2 { grid-column: span 2; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.banner { border-left: 3px solid var(--warn); padding: 10px 14px; margin-bottom: 10px; border-radius: 0 8px 8px 0;
-  background: color-mix(in srgb, var(--warn) 10%, transparent); font-size: 14px; }
-.banner.bad { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 10%, transparent); }
-.banner .row { margin-top: 8px; }
+fieldset { border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; margin: 14px 0 0; }
+legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
+  text-transform: uppercase; letter-spacing: .04em; }
+#layout { position: relative; background: var(--sunken); border: 1px dashed var(--line);
+  border-radius: 8px; height: 230px; overflow: hidden; margin-bottom: 14px; }
+.screen { position: absolute; border: 2px solid var(--accent); border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 12%, transparent); display: flex; flex-direction: column;
+  align-items: center; justify-content: center; font-size: 12px; cursor: pointer; overflow: hidden;
+  padding: 4px; text-align: center; }
+.screen.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
+.screen.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
+.screen b { font-size: 13px; }
+.gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
+.card { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--sunken); }
+.card img { width: 100%; height: 108px; object-fit: cover; display: block; background: #0b1020; }
+.card .body { padding: 9px 11px; }
+.card .body b { font-size: 13px; }
+.card .body div { font-size: 12px; color: var(--muted); }
 .muted { color: var(--muted); }
 .mono { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
 .hidden { display: none; }
-#toast {
-  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+#toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
   background: var(--ink); color: var(--bg); padding: 10px 18px; border-radius: 8px;
-  font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50;
-}
+  font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; max-width: 80vw; }
 #toast.show { opacity: 1; }
 </style>
 </head>
@@ -109,16 +122,18 @@ textarea { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font
   <nav role="tablist">
     <button role="tab" aria-selected="true" data-tab="displays">Displays</button>
     <button role="tab" aria-selected="false" data-tab="apps">Apps</button>
+    <button role="tab" aria-selected="false" data-tab="wallpapers">Wallpapers</button>
     <button role="tab" aria-selected="false" data-tab="audio">Audio</button>
-    <button role="tab" aria-selected="false" data-tab="system">System</button>
+    <button role="tab" aria-selected="false" data-tab="system">System<span id="check-badge"></span></button>
     <button role="tab" aria-selected="false" data-tab="config">Raw config</button>
   </nav>
 
+  <!-- Displays -->
   <section id="tab-displays">
     <div class="panel">
       <h2>Layout</h2>
       <div id="layout"></div>
-      <p class="muted" id="layout-hint">Click a display to configure it.</p>
+      <p class="hint" id="layout-hint">Click a display to configure it.</p>
     </div>
     <div class="panel hidden" id="output-editor">
       <h2>Configure <span id="output-name" class="mono"></span></h2>
@@ -137,70 +152,149 @@ textarea { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font
           <select id="o-adaptive"><option value="false">Off</option><option value="true">On</option></select></div>
         <div><label for="o-tearing">Allow tearing</label>
           <select id="o-tearing"><option value="false">No</option><option value="true">Yes</option></select></div>
+        <div><label for="o-mrt">Max render time (ms)</label>
+          <input id="o-mrt" type="number" min="1" placeholder="off"></div>
       </div>
-      <div class="row">
+
+      <fieldset>
+        <legend>Background</legend>
+        <p class="hint">Shown whenever no window covers this output — during a
+          relaunch, or before the first app starts.</p>
+        <div class="fields">
+          <div><label for="o-bg-wallpaper">Wallpaper</label><select id="o-bg-wallpaper"></select></div>
+          <div><label for="o-bg-mode">Scaling</label><select id="o-bg-mode">
+            <option value="fill">fill</option><option value="fit">fit</option>
+            <option value="stretch">stretch</option><option value="center">center</option>
+            <option value="tile">tile</option></select></div>
+          <div><label for="o-bg-color">Colour</label>
+            <input id="o-bg-color" placeholder="#101820"></div>
+        </div>
+      </fieldset>
+
+      <div class="row" style="margin-top:14px">
         <button class="action" id="o-save">Save</button>
         <button class="action ghost" id="o-remove">Remove from config</button>
         <button class="action ghost" id="o-cancel">Cancel</button>
-        <span class="muted" id="o-note"></span>
+        <span class="hint" id="o-note"></span>
       </div>
     </div>
   </section>
 
+  <!-- Apps -->
   <section id="tab-apps" class="hidden">
     <div class="panel">
       <h2>Managed applications</h2>
       <table id="apps"><thead><tr>
         <th>Id</th><th>State</th><th>PID</th><th>Restarts</th><th>Detail</th><th></th>
       </tr></thead><tbody></tbody></table>
-      <p class="muted" id="apps-empty">No applications configured yet.</p>
+      <p class="hint" id="apps-empty">No applications configured yet.</p>
     </div>
+
     <div class="panel">
-      <h2>Add or update an application</h2>
+      <h2 id="a-heading">Add an application</h2>
       <div class="fields">
         <div><label for="a-id">Id</label><input id="a-id" placeholder="renderer-1"></div>
         <div><label for="a-kind">Launcher</label><select id="a-kind">
           <option value="chromium-kiosk">Chromium kiosk</option>
           <option value="firefox-kiosk">Firefox kiosk</option>
-          <option value="exec">Command</option>
-        </select></div>
-        <div style="grid-column: span 2"><label for="a-uri">URI or command</label>
+          <option value="exec">Command</option></select></div>
+        <div class="span2"><label for="a-uri">URI or command</label>
           <input id="a-uri" placeholder="http://media-server.local/render/1"></div>
         <div><label for="a-output">Output</label><select id="a-output"></select></div>
+        <div><label for="a-span">Span all outputs</label>
+          <select id="a-span"><option value="false">No — fill one output</option>
+            <option value="true">Yes — one window across every output</option></select></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div><label for="a-heartbeat">Content watchdog</label>
           <select id="a-heartbeat"><option value="false">Off</option><option value="true">On</option></select></div>
       </div>
-      <div class="row"><button class="action" id="a-save">Save application</button>
-        <span class="muted">Placeholders <span class="mono">{appId}</span> and
-        <span class="mono">{heartbeatUrl}</span> are expanded at launch.</span></div>
+
+      <fieldset>
+        <legend>Wait for a service</legend>
+        <p class="hint">A browser started before its service is serving shows an
+          error page and stays there. Suede can hold the launch until a URL answers.</p>
+        <div class="fields">
+          <div class="span2"><label for="a-ready-url">Readiness URL (http:// only)</label>
+            <input id="a-ready-url" placeholder="http://127.0.0.1:8080/healthz"></div>
+          <div><label for="a-ready-interval">Poll every (s)</label>
+            <input id="a-ready-interval" type="number" min="1" value="2"></div>
+          <div><label for="a-ready-timeout">Attempt timeout (s)</label>
+            <input id="a-ready-timeout" type="number" min="1" value="5"></div>
+          <div><label for="a-ready-giveup">Give up after (s)</label>
+            <input id="a-ready-giveup" type="number" min="0" placeholder="never"></div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Environment</legend>
+        <p class="hint">One <span class="mono">NAME=value</span> per line. Applied last,
+          so these override anything the launcher preset sets — this is where
+          graphics acceleration is usually configured.</p>
+        <textarea id="a-env" rows="4" spellcheck="false"
+          placeholder="LIBVA_DRIVER_NAME=nvidia&#10;NVD_BACKEND=direct"></textarea>
+      </fieldset>
+
+      <div class="row" style="margin-top:14px">
+        <button class="action" id="a-save">Save application</button>
+        <button class="action ghost hidden" id="a-clear">Clear form</button>
+        <span class="hint">Placeholders <span class="mono">{appId}</span> and
+          <span class="mono">{heartbeatUrl}</span> are expanded at launch.</span>
+      </div>
     </div>
   </section>
 
+  <!-- Wallpapers -->
+  <section id="tab-wallpapers" class="hidden">
+    <div class="panel">
+      <h2>Upload a wallpaper</h2>
+      <div class="fields">
+        <div><label for="w-id">Id</label><input id="w-id" placeholder="lobby"></div>
+        <div class="span2"><label for="w-file">Image (PNG or JPEG, up to 32 MB)</label>
+          <input id="w-file" type="file" accept="image/png,image/jpeg"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="action" id="w-upload">Upload</button>
+        <span class="hint">Assign it to a display from the Displays tab.</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>Stored wallpapers</h2>
+      <div class="gallery" id="wallpapers"></div>
+      <p class="hint" id="wallpapers-empty">Nothing uploaded yet.</p>
+    </div>
+  </section>
+
+  <!-- Audio -->
   <section id="tab-audio" class="hidden">
     <div class="panel">
       <h2>Audio sinks</h2>
       <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
-      <p class="muted" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
+      <p class="hint" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
     </div>
   </section>
 
+  <!-- System -->
   <section id="tab-system" class="hidden">
     <div class="panel"><h2>System</h2><table id="system"><tbody></tbody></table></div>
-    <div class="panel"><h2>Health checks</h2>
-      <table id="checks"><thead><tr><th>Check</th><th>Status</th><th>Detail</th><th></th></tr></thead><tbody></tbody></table>
+    <div class="panel">
+      <h2>Health checks</h2>
+      <p class="hint">Anything not passing also appears at the top of every tab,
+        with its documentation and any fix Suede can apply itself.</p>
+      <div id="checks"></div>
     </div>
   </section>
 
+  <!-- Raw config -->
   <section id="tab-config" class="hidden">
     <div class="panel">
       <h2>Desired state document</h2>
-      <textarea id="config-json" spellcheck="false"></textarea>
+      <p class="hint">Every field, including any the forms do not cover.</p>
+      <textarea id="config-json" class="json" spellcheck="false"></textarea>
       <div class="row" style="margin-top:12px">
         <button class="action" id="c-save">Save</button>
         <button class="action ghost" id="c-reload">Reload</button>
         <button class="action ghost" id="c-reconcile">Force reconcile</button>
-        <span class="muted" id="c-note"></span>
+        <span class="hint" id="c-note"></span>
       </div>
     </div>
   </section>
@@ -211,85 +305,224 @@ textarea { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font
 <script>
 const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
-let outputs = [], config = null, apps = [], sinks = [], selected = null;
+let outputs = [], config = null, apps = [], sinks = [], checks = [], status = null,
+    wallpapers = [], selected = null, editingApp = null;
 
 // --- helpers -------------------------------------------------------------
 
 async function api(path, options) {
   const response = await fetch(API + path, options);
   if (!response.ok) {
-    let detail = response.statusText;
+    let detail = `${response.status} ${response.statusText}`;
     try { detail = (await response.json()).detail || detail; } catch {}
     throw new Error(detail);
   }
-  return response.status === 204 ? null : response.json();
+  if (response.status === 204) return null;
+  const type = response.headers.get("content-type") || "";
+  return type.includes("json") ? response.json() : response.blob();
 }
-
-async function save(path, body) {
-  return api(path, {
-    method: "PUT",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-}
+const save = (path, body) => api(path, {
+  method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+});
 
 let toastTimer;
 function toast(message, isError) {
-  const element = $("toast");
-  element.textContent = message;
-  element.style.background = isError ? "var(--bad)" : "var(--ink)";
-  element.style.color = isError ? "#fff" : "var(--bg)";
-  element.classList.add("show");
+  const el = $("toast");
+  el.textContent = message;
+  el.style.background = isError ? "var(--bad)" : "var(--ink)";
+  el.style.color = isError ? "#fff" : "var(--bg)";
+  el.classList.add("show");
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => element.classList.remove("show"), 2600);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 3200);
 }
 
-const escape = (value) =>
-  String(value ?? "").replace(/[&<>"]/g, (c) =>
-    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const escape = (v) => String(v ?? "").replace(/[&<>"]/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const modeLabel = (m) => m ? `${m.width}×${m.height} @ ${Math.round(m.refreshHz * 100) / 100}Hz` : "—";
+const bytes = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} kB`;
 
-const modeLabel = (mode) =>
-  mode ? `${mode.width}×${mode.height} @ ${Math.round(mode.refreshHz * 100) / 100}Hz` : "—";
+async function run(operation, successMessage) {
+  try {
+    const result = await operation();
+    await loadConfig();
+    if (successMessage) toast(successMessage);
+    return result;
+  } catch (error) { toast(error.message, true); throw error; }
+}
 
-// --- rendering -----------------------------------------------------------
+// --- alerts: warnings, what they mean, and what to do about them ---------
+//
+// Everything the operator might need to act on is gathered here, ordered by
+// severity, and each item carries whichever of the two escape routes exists:
+// a fix Suede can apply itself, or the documentation page describing the
+// manual remedy. Anything with neither would be a dead end, so the renderer
+// says so explicitly rather than leaving a bare complaint.
+
+function alerts() {
+  const items = [];
+  for (const check of checks) {
+    if (check.status === "pass") continue;
+    items.push({
+      severity: check.status === "fail" ? "fail" : "warn",
+      title: check.title,
+      detail: check.detail,
+      docsUrl: check.docsUrl,
+      fix: check.fixAvailable ? { id: check.id, description: check.fixDescription } : null,
+      key: `check:${check.id}`,
+    });
+  }
+  for (const divergence of (status?.divergences ?? [])) {
+    items.push({
+      severity: "diverged",
+      title: `${divergence.subject}: ${divergence.kind.replace(/_/g, " ")}`,
+      detail: divergence.detail,
+      docsUrl: divergence.docsUrl,
+      fix: null,
+      key: `div:${divergence.kind}:${divergence.subject}`,
+    });
+  }
+  const order = { fail: 0, warn: 1, diverged: 2 };
+  items.sort((a, b) => order[a.severity] - order[b.severity]);
+  return items;
+}
+
+const pendingFix = new Set();
+const fixOutcome = new Map();
+
+function renderAlerts() {
+  const container = $("alerts");
+  container.innerHTML = "";
+  const items = alerts();
+
+  const badge = $("check-badge");
+  const failing = items.filter((i) => i.severity === "fail").length;
+  badge.className = failing ? "count" : "";
+  badge.textContent = failing || "";
+
+  for (const item of items) {
+    const el = document.createElement("div");
+    el.className = `alert ${item.severity}`;
+
+    const label = { fail: "needs attention", warn: "warning", diverged: "not applied" }[item.severity];
+    const tone = { fail: "bad", warn: "warn", diverged: "muted" }[item.severity];
+    el.innerHTML =
+      `<div class="head"><span class="pill ${tone}">${label}</span>` +
+      `<span class="title">${escape(item.title)}</span></div>` +
+      `<div class="detail">${escape(item.detail)}</div>`;
+
+    const actions = document.createElement("div");
+    actions.className = "actions";
+
+    if (item.fix && !pendingFix.has(item.key)) {
+      const button = document.createElement("button");
+      button.className = "action";
+      button.textContent = "Fix this";
+      button.onclick = () => { pendingFix.add(item.key); renderAlerts(); };
+      actions.appendChild(button);
+    }
+    if (item.docsUrl) {
+      const link = document.createElement("a");
+      link.href = item.docsUrl;
+      link.target = "_blank";
+      link.rel = "noreferrer";
+      link.textContent = "Read the documentation ↗";
+      actions.appendChild(link);
+    }
+    // Neither a fix nor a page would leave the operator stuck, so be honest.
+    if (!item.fix && !item.docsUrl) {
+      const note = document.createElement("span");
+      note.className = "hint";
+      note.textContent = "No automatic fix — see the daemon log for detail.";
+      actions.appendChild(note);
+    }
+    if (actions.childElementCount) el.appendChild(actions);
+
+    // A fix writes to the operator's machine, so it says what it will do and
+    // waits to be confirmed rather than acting on a single stray click.
+    if (item.fix && pendingFix.has(item.key)) {
+      const confirm = document.createElement("div");
+      confirm.className = "confirm";
+      confirm.innerHTML = `<p><b>This will:</b> ${escape(item.fix.description || "apply the documented remedy")}</p>`;
+      const row = document.createElement("div");
+      row.className = "row";
+
+      const go = document.createElement("button");
+      go.className = "action";
+      go.textContent = "Apply it";
+      go.onclick = async () => {
+        go.disabled = true; go.textContent = "Applying…";
+        try {
+          const outcome = await api(`/system/checks/${encodeURIComponent(item.fix.id)}/fix`,
+                                    { method: "POST" });
+          fixOutcome.set(item.key, outcome.detail);
+          pendingFix.delete(item.key);
+          await loadChecks();
+          toast("Fix applied");
+        } catch (error) {
+          fixOutcome.set(item.key, `Failed: ${error.message}`);
+          pendingFix.delete(item.key);
+          renderAlerts();
+          toast(error.message, true);
+        }
+      };
+
+      const cancel = document.createElement("button");
+      cancel.className = "action ghost";
+      cancel.textContent = "Cancel";
+      cancel.onclick = () => { pendingFix.delete(item.key); renderAlerts(); };
+
+      row.append(go, cancel);
+      confirm.appendChild(row);
+      el.appendChild(confirm);
+    }
+
+    if (fixOutcome.has(item.key)) {
+      const outcome = document.createElement("div");
+      outcome.className = "outcome";
+      outcome.textContent = fixOutcome.get(item.key);
+      el.appendChild(outcome);
+    }
+
+    container.appendChild(el);
+  }
+}
+
+// --- displays ------------------------------------------------------------
 
 function renderLayout() {
   const container = $("layout");
   container.innerHTML = "";
-  const active = outputs.filter((output) => output.active && output.rect.width > 0);
-  if (!active.length) {
-    $("layout-hint").textContent = outputs.length
-      ? "No outputs are enabled. Click one below to enable it."
-      : "No outputs detected.";
-  } else {
-    $("layout-hint").textContent = "Click a display to configure it.";
-  }
+  const active = outputs.filter((o) => o.active && o.rect.width > 0);
+  $("layout-hint").textContent = active.length
+    ? "Click a display to configure it."
+    : (outputs.length ? "No outputs are enabled. Click one below to enable it."
+                      : "No outputs detected.");
 
-  // Scale the whole desktop into the box, leaving room for inactive outputs.
   const spanX = Math.max(...active.map((o) => o.rect.x + o.rect.width), 1920);
   const spanY = Math.max(...active.map((o) => o.rect.y + o.rect.height), 1080);
   const box = container.getBoundingClientRect();
-  const scale = Math.min((box.width - 20) / spanX, (box.height - 60) / spanY);
+  const scale = Math.min((box.width - 20) / spanX, (box.height - 62) / spanY);
 
   outputs.forEach((output, index) => {
-    const element = document.createElement("div");
-    element.className = "screen" + (output.active ? "" : " inactive") +
-      (selected === output.name ? " selected" : "");
+    const el = document.createElement("div");
+    el.className = "screen" + (output.active ? "" : " inactive")
+                 + (selected === output.name ? " selected" : "");
     if (output.active && output.rect.width > 0) {
-      element.style.left = `${10 + output.rect.x * scale}px`;
-      element.style.top = `${10 + output.rect.y * scale}px`;
-      element.style.width = `${output.rect.width * scale}px`;
-      element.style.height = `${output.rect.height * scale}px`;
+      el.style.left = `${10 + output.rect.x * scale}px`;
+      el.style.top = `${10 + output.rect.y * scale}px`;
+      el.style.width = `${output.rect.width * scale}px`;
+      el.style.height = `${output.rect.height * scale}px`;
     } else {
-      element.style.left = `${10 + index * 130}px`;
-      element.style.bottom = "10px";
-      element.style.width = "120px";
-      element.style.height = "40px";
+      el.style.left = `${10 + index * 130}px`;
+      el.style.bottom = "10px"; el.style.width = "120px"; el.style.height = "42px";
     }
-    element.innerHTML =
-      `<b>${escape(output.name)}</b><span>${output.active ? escape(modeLabel(output.currentMode)) : "disabled"}</span>`;
-    element.onclick = () => selectOutput(output.name);
-    container.appendChild(element);
+    const configured = (config?.outputs ?? []).find((o) => o.match?.name === output.name);
+    const bg = configured?.background;
+    el.innerHTML = `<b>${escape(output.name)}</b>` +
+      `<span>${output.active ? escape(modeLabel(output.currentMode)) : "disabled"}</span>` +
+      (bg ? `<span class="muted">bg: ${escape(bg.wallpaper || bg.color || "")}</span>` : "");
+    el.onclick = () => selectOutput(output.name);
+    container.appendChild(el);
   });
 }
 
@@ -304,11 +537,8 @@ function selectOutput(name) {
   $("o-enable").value = String(existing?.enable ?? true);
 
   const modes = output.modes.length ? output.modes : (output.currentMode ? [output.currentMode] : []);
-  $("o-mode").innerHTML =
-    `<option value="">Leave to sway</option>` +
-    modes.map((mode) =>
-      `<option value="${mode.width}x${mode.height}x${mode.refreshHz}">${escape(modeLabel(mode))}</option>`
-    ).join("");
+  $("o-mode").innerHTML = `<option value="">Leave to sway</option>` + modes.map((m) =>
+    `<option value="${m.width}x${m.height}x${m.refreshHz}">${escape(modeLabel(m))}</option>`).join("");
   const wanted = existing?.mode ?? output.currentMode;
   if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
 
@@ -318,9 +548,50 @@ function selectOutput(name) {
   $("o-transform").value = existing?.transform ?? output.transform ?? "normal";
   $("o-adaptive").value = String(existing?.adaptiveSync ?? false);
   $("o-tearing").value = String(existing?.allowTearing ?? false);
+  $("o-mrt").value = existing?.maxRenderTimeMs ?? "";
+
+  $("o-bg-wallpaper").innerHTML = `<option value="">None</option>` +
+    wallpapers.map((w) => `<option value="${escape(w.id)}">${escape(w.id)}</option>`).join("");
+  $("o-bg-wallpaper").value = existing?.background?.wallpaper ?? "";
+  $("o-bg-mode").value = existing?.background?.mode ?? "fill";
+  $("o-bg-color").value = existing?.background?.color ?? "";
+
   $("o-note").textContent = existing ? "" : "not yet in the configuration";
   renderLayout();
 }
+
+$("o-save").onclick = () => run(async () => {
+  const name = $("output-name").textContent;
+  const [width, height, refreshHz] = ($("o-mode").value || "").split("x").map(Number);
+  const wallpaper = $("o-bg-wallpaper").value;
+  const color = $("o-bg-color").value.trim();
+  const background = (wallpaper || color)
+    ? { wallpaper: wallpaper || null, color: color || null, mode: $("o-bg-mode").value }
+    : null;
+  const mrt = $("o-mrt").value.trim();
+
+  await save(`/config/outputs/${encodeURIComponent(name)}`, {
+    match: { name },
+    enable: $("o-enable").value === "true",
+    mode: width ? { width, height, refreshHz } : null,
+    position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
+    scale: Number($("o-scale").value) || 1,
+    transform: $("o-transform").value,
+    adaptiveSync: $("o-adaptive").value === "true",
+    allowTearing: $("o-tearing").value === "true",
+    maxRenderTimeMs: mrt ? Number(mrt) : null,
+    background,
+  });
+}, "saved display configuration");
+
+$("o-remove").onclick = () => run(() =>
+  api(`/config/outputs/${encodeURIComponent($("output-name").textContent)}`, { method: "DELETE" }),
+  "removed from configuration");
+$("o-cancel").onclick = () => {
+  selected = null; $("output-editor").classList.add("hidden"); renderLayout();
+};
+
+// --- apps ----------------------------------------------------------------
 
 function renderApps() {
   const body = document.querySelector("#apps tbody");
@@ -328,26 +599,28 @@ function renderApps() {
   const configured = config?.apps ?? [];
   $("apps-empty").classList.toggle("hidden", configured.length > 0);
 
-  configured.forEach((app) => {
-    const status = apps.find((a) => a.id === app.id);
-    const state = status?.state ?? "stopped";
-    const tone = { running: "ok", starting: "warn", backoff: "warn",
-                   waitingforoutput: "warn", crashed: "bad" }[state.toLowerCase()] ?? "muted";
+  for (const app of configured) {
+    const live = apps.find((a) => a.id === app.id);
+    const state = live?.state ?? "stopped";
+    const tone = { running: "ok", starting: "warn", backoff: "warn", waitingforoutput: "warn",
+                   waitingfordependency: "warn", crashed: "bad" }[state.toLowerCase()] ?? "muted";
     const row = document.createElement("tr");
     row.innerHTML =
-      `<td class="mono">${escape(app.id)}</td>` +
+      `<td class="mono">${escape(app.id)}${app.spanOutputs ? ' <span class="pill muted">spans</span>' : ""}</td>` +
       `<td><span class="pill ${tone}">${escape(state)}</span></td>` +
-      `<td class="mono">${status?.pid ?? "—"}</td>` +
-      `<td>${status?.restartCount ?? 0}</td>` +
-      `<td class="muted">${escape(status?.detail ?? "")}</td>` +
-      `<td class="row"></td>`;
+      `<td class="mono">${live?.pid ?? "—"}</td>` +
+      `<td>${live?.restartCount ?? 0}</td>` +
+      `<td class="muted">${escape(live?.detail ?? "")}</td><td class="row"></td>`;
     const actions = row.lastElementChild;
 
+    const edit = document.createElement("button");
+    edit.className = "action ghost"; edit.textContent = "Edit";
+    edit.onclick = () => editApp(app);
+
     const restart = document.createElement("button");
-    restart.className = "action ghost";
-    restart.textContent = "Restart";
-    restart.onclick = () => run(() => api(`/apps/${encodeURIComponent(app.id)}/restart`,
-      { method: "POST" }), `restarted ${app.id}`);
+    restart.className = "action ghost"; restart.textContent = "Restart";
+    restart.onclick = () => run(() =>
+      api(`/apps/${encodeURIComponent(app.id)}/restart`, { method: "POST" }), `restarted ${app.id}`);
 
     const toggle = document.createElement("button");
     toggle.className = "action ghost";
@@ -357,32 +630,151 @@ function renderApps() {
       `${app.enabled === false ? "enabled" : "disabled"} ${app.id}`);
 
     const remove = document.createElement("button");
-    remove.className = "action ghost";
-    remove.textContent = "Delete";
-    remove.onclick = () => run(() => api(`/config/apps/${encodeURIComponent(app.id)}`,
-      { method: "DELETE" }), `deleted ${app.id}`);
+    remove.className = "action danger"; remove.textContent = "Delete";
+    remove.onclick = () => run(() =>
+      api(`/config/apps/${encodeURIComponent(app.id)}`, { method: "DELETE" }), `deleted ${app.id}`);
 
-    actions.append(restart, toggle, remove);
+    actions.append(edit, restart, toggle, remove);
     body.appendChild(row);
-  });
+  }
 }
+
+function editApp(app) {
+  editingApp = app.id;
+  $("a-heading").textContent = `Edit ${app.id}`;
+  $("a-clear").classList.remove("hidden");
+  $("a-id").value = app.id;
+  $("a-kind").value = app.launcher.kind;
+  $("a-uri").value = app.launcher.kind === "exec"
+    ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
+    : app.launcher.uri;
+  $("a-output").value = app.output?.name ?? "";
+  $("a-span").value = String(!!app.spanOutputs);
+  $("a-audio").value = app.audio ? (app.audio.output === null ? "__null__" : app.audio.output) : "";
+  $("a-heartbeat").value = String(!!app.heartbeat?.enabled);
+  $("a-ready-url").value = app.readiness?.url ?? "";
+  $("a-ready-interval").value = app.readiness?.intervalSeconds ?? 2;
+  $("a-ready-timeout").value = app.readiness?.timeoutSeconds ?? 5;
+  $("a-ready-giveup").value = app.readiness?.giveUpAfterSeconds ?? "";
+  $("a-env").value = Object.entries(app.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n");
+  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+}
+
+function clearAppForm() {
+  editingApp = null;
+  $("a-heading").textContent = "Add an application";
+  $("a-clear").classList.add("hidden");
+  for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env"]) $(id).value = "";
+  $("a-span").value = "false"; $("a-heartbeat").value = "false";
+  $("a-ready-interval").value = 2; $("a-ready-timeout").value = 5;
+}
+$("a-clear").onclick = clearAppForm;
+
+$("a-save").onclick = () => run(async () => {
+  const id = $("a-id").value.trim();
+  if (!id) throw new Error("an id is required");
+  const kind = $("a-kind").value;
+  const value = $("a-uri").value.trim();
+  const launcher = kind === "exec"
+    ? { kind, command: value.split(" ")[0], args: value.split(" ").slice(1) }
+    : { kind, uri: value };
+
+  const env = {};
+  for (const line of $("a-env").value.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const index = trimmed.indexOf("=");
+    if (index < 1) throw new Error(`environment line is not NAME=value: ${trimmed}`);
+    env[trimmed.slice(0, index).trim()] = trimmed.slice(index + 1).trim();
+  }
+
+  const readinessUrl = $("a-ready-url").value.trim();
+  const giveUp = $("a-ready-giveup").value.trim();
+  const audio = $("a-audio").value;
+  const output = $("a-output").value;
+
+  await save(`/config/apps/${encodeURIComponent(id)}`, {
+    id, enabled: true, launcher,
+    output: output ? { name: output } : null,
+    fullscreen: true,
+    spanOutputs: $("a-span").value === "true",
+    env,
+    audio: audio === "" ? null : { output: audio === "__null__" ? null : audio },
+    readiness: readinessUrl ? {
+      url: readinessUrl,
+      intervalSeconds: Number($("a-ready-interval").value) || 2,
+      timeoutSeconds: Number($("a-ready-timeout").value) || 5,
+      giveUpAfterSeconds: giveUp === "" ? null : Number(giveUp),
+    } : null,
+    heartbeat: $("a-heartbeat").value === "true"
+      ? { enabled: true, timeoutSeconds: 25, startupGraceSeconds: 60 } : null,
+  });
+  clearAppForm();
+}, "saved application");
+
+// --- wallpapers ----------------------------------------------------------
+
+function renderWallpapers() {
+  const gallery = $("wallpapers");
+  gallery.innerHTML = "";
+  $("wallpapers-empty").classList.toggle("hidden", wallpapers.length > 0);
+
+  const inUse = new Set((config?.outputs ?? [])
+    .map((o) => o.background?.wallpaper).filter(Boolean));
+
+  for (const wallpaper of wallpapers) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const used = inUse.has(wallpaper.id);
+    card.innerHTML =
+      `<img src="${API}/wallpapers/${encodeURIComponent(wallpaper.id)}" alt="${escape(wallpaper.id)}">` +
+      `<div class="body"><b>${escape(wallpaper.id)}</b>` +
+      `<div>${escape(wallpaper.contentType)} · ${bytes(wallpaper.bytes)}` +
+      (used ? " · in use" : "") + `</div></div>`;
+    const body = card.querySelector(".body");
+    const remove = document.createElement("button");
+    remove.className = "action danger";
+    remove.style.marginTop = "8px";
+    remove.textContent = "Delete";
+    remove.disabled = used;
+    remove.title = used ? "Assigned to a display; change that display first" : "";
+    remove.onclick = () => run(async () => {
+      await api(`/wallpapers/${encodeURIComponent(wallpaper.id)}`, { method: "DELETE" });
+      await loadWallpapers();
+    }, `deleted ${wallpaper.id}`);
+    body.appendChild(remove);
+    gallery.appendChild(card);
+  }
+}
+
+$("w-upload").onclick = () => run(async () => {
+  const file = $("w-file").files[0];
+  if (!file) throw new Error("choose an image first");
+  const id = ($("w-id").value.trim() || file.name.replace(/\.[^.]+$/, ""));
+  await api(`/wallpapers/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "content-type": file.type || "application/octet-stream" },
+    body: await file.arrayBuffer(),
+  });
+  $("w-id").value = ""; $("w-file").value = "";
+  await loadWallpapers();
+}, "wallpaper uploaded");
+
+// --- audio, system, checks ----------------------------------------------
 
 function renderSinks() {
   const body = document.querySelector("#sinks tbody");
   body.innerHTML = "";
   $("sinks-empty").classList.toggle("hidden", sinks.length > 0);
-  sinks.forEach((sink) => {
+  for (const sink of sinks) {
     const row = document.createElement("tr");
-    row.innerHTML =
-      `<td class="mono">${escape(sink.id)}</td>` +
+    row.innerHTML = `<td class="mono">${escape(sink.id)}</td>` +
       `<td>${escape(sink.description ?? "")}</td>` +
       `<td>${sink.isDefault ? '<span class="pill ok">default</span>' : ""}` +
       `${sink.isNullSink ? '<span class="pill muted">silent</span>' : ""}</td>`;
     body.appendChild(row);
-  });
-
-  const select = $("a-audio");
-  select.innerHTML = `<option value="">Leave untouched</option>` +
+  }
+  $("a-audio").innerHTML = `<option value="">Leave untouched</option>` +
     `<option value="__null__">Silent (null sink)</option>` +
     sinks.filter((s) => !s.isNullSink)
       .map((s) => `<option value="${escape(s.id)}">${escape(s.description ?? s.id)}</option>`).join("");
@@ -393,54 +785,11 @@ function renderOutputChoices() {
     outputs.map((o) => `<option value="${escape(o.name)}">${escape(o.name)}</option>`).join("");
 }
 
-function renderStatus(status) {
+function renderStatus() {
   const pill = $("sync");
-  pill.textContent = status.state;
-  pill.className = "pill " + ({ synced: "ok", degraded: "bad", reconciling: "warn" }[status.state] ?? "muted");
-  renderAlerts(status.divergences ?? []);
-}
-
-let currentChecks = [];
-function renderAlerts(divergences) {
-  const container = $("alerts");
-  container.innerHTML = "";
-
-  divergences.forEach((divergence) => {
-    const banner = document.createElement("div");
-    banner.className = "banner";
-    banner.innerHTML = `<b>${escape(divergence.kind)}</b> — ${escape(divergence.detail)}`;
-    container.appendChild(banner);
-  });
-
-  currentChecks.filter((check) => check.status !== "pass").forEach((check) => {
-    const banner = document.createElement("div");
-    banner.className = "banner" + (check.status === "fail" ? " bad" : "");
-    banner.innerHTML = `<b>${escape(check.title)}</b> — ${escape(check.detail)}`;
-    const row = document.createElement("div");
-    row.className = "row";
-    if (check.docsUrl) {
-      const link = document.createElement("a");
-      link.href = check.docsUrl;
-      link.target = "_blank";
-      link.rel = "noreferrer";
-      link.textContent = "Documentation";
-      row.appendChild(link);
-    }
-    if (check.fixAvailable) {
-      const fix = document.createElement("button");
-      fix.className = "action";
-      fix.textContent = "Fix this";
-      fix.title = check.fixDescription ?? "";
-      fix.onclick = () => run(async () => {
-        const outcome = await api(`/system/checks/${encodeURIComponent(check.id)}/fix`, { method: "POST" });
-        await loadChecks();
-        return outcome;
-      }, `fixed ${check.title}`);
-      row.appendChild(fix);
-    }
-    if (row.childElementCount) banner.appendChild(row);
-    container.appendChild(banner);
-  });
+  pill.textContent = status?.state ?? "—";
+  pill.className = "pill " + ({ synced: "ok", degraded: "bad", reconciling: "warn" }[status?.state] ?? "muted");
+  renderAlerts();
 }
 
 function renderSystem(system) {
@@ -457,75 +806,23 @@ function renderSystem(system) {
 }
 
 function renderChecks() {
-  document.querySelector("#checks tbody").innerHTML = currentChecks.map((check) => {
+  const container = $("checks");
+  container.innerHTML = "";
+  for (const check of checks) {
     const tone = { pass: "ok", warn: "warn", fail: "bad" }[check.status];
-    return `<tr><td>${escape(check.title)}</td>` +
-      `<td><span class="pill ${tone}">${escape(check.status)}</span></td>` +
-      `<td class="muted">${escape(check.detail)}</td>` +
-      `<td>${check.fixAvailable ? "fixable" : ""}</td></tr>`;
-  }).join("");
-}
-
-// --- actions -------------------------------------------------------------
-
-async function run(operation, successMessage) {
-  try {
-    await operation();
-    await loadConfig();
-    toast(successMessage);
-  } catch (error) {
-    toast(error.message, true);
+    const el = document.createElement("div");
+    el.className = "alert" + (check.status === "pass" ? "" : ` ${check.status}`);
+    el.innerHTML = `<div class="head"><span class="pill ${tone}">${escape(check.status)}</span>` +
+      `<span class="title">${escape(check.title)}</span>` +
+      `<span class="hint mono">${escape(check.id)}</span></div>` +
+      `<div class="detail">${escape(check.detail)}</div>` +
+      (check.docsUrl ? `<div class="actions"><a href="${escape(check.docsUrl)}" target="_blank" ` +
+        `rel="noreferrer">Read the documentation ↗</a></div>` : "");
+    container.appendChild(el);
   }
 }
 
-$("o-save").onclick = () => run(async () => {
-  const name = $("output-name").textContent;
-  const [width, height, refreshHz] = ($("o-mode").value || "").split("x").map(Number);
-  await save(`/config/outputs/${encodeURIComponent(name)}`, {
-    match: { name },
-    enable: $("o-enable").value === "true",
-    mode: width ? { width, height, refreshHz } : null,
-    position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
-    scale: Number($("o-scale").value) || 1,
-    transform: $("o-transform").value,
-    adaptiveSync: $("o-adaptive").value === "true",
-    allowTearing: $("o-tearing").value === "true",
-  });
-}, "saved display configuration");
-
-$("o-remove").onclick = () => run(() =>
-  api(`/config/outputs/${encodeURIComponent($("output-name").textContent)}`, { method: "DELETE" }),
-  "removed from configuration");
-
-$("o-cancel").onclick = () => { selected = null; $("output-editor").classList.add("hidden"); renderLayout(); };
-
-$("a-save").onclick = () => run(async () => {
-  const id = $("a-id").value.trim();
-  if (!id) throw new Error("an id is required");
-  const kind = $("a-kind").value;
-  const value = $("a-uri").value.trim();
-  const launcher = kind === "exec"
-    ? { kind, command: value.split(" ")[0], args: value.split(" ").slice(1) }
-    : { kind, uri: value };
-  const audio = $("a-audio").value;
-  const output = $("a-output").value;
-
-  await save(`/config/apps/${encodeURIComponent(id)}`, {
-    id, enabled: true, launcher,
-    output: output ? { name: output } : null,
-    fullscreen: true,
-    audio: audio === "" ? null : { output: audio === "__null__" ? null : audio },
-    heartbeat: $("a-heartbeat").value === "true"
-      ? { enabled: true, timeoutSeconds: 25, startupGraceSeconds: 60 } : null,
-  });
-  $("a-id").value = ""; $("a-uri").value = "";
-}, "saved application");
-
-$("c-save").onclick = () => run(async () => {
-  await save("/config", JSON.parse($("config-json").value));
-}, "saved configuration");
-$("c-reload").onclick = () => run(async () => {}, "reloaded");
-$("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
+// --- tabs, loading, live updates ----------------------------------------
 
 document.querySelectorAll("nav button").forEach((button) => {
   button.onclick = () => {
@@ -533,71 +830,62 @@ document.querySelectorAll("nav button").forEach((button) => {
       other.setAttribute("aria-selected", String(other === button)));
     document.querySelectorAll("main > section").forEach((section) =>
       section.classList.toggle("hidden", section.id !== "tab-" + button.dataset.tab));
+    // The layout is sized from the panel's measured width, which is zero while
+    // the tab is hidden, so anything drawn during that time has to be redrawn.
+    if (button.dataset.tab === "displays") renderLayout();
   };
 });
 
-// --- loading and live updates -------------------------------------------
-
 async function loadConfig() {
   config = await api("/config");
-  $("config-json").value = JSON.stringify(config, null, 2);
-  renderApps();
+  // Another client's change should not wipe out an edit in progress here.
+  if (document.activeElement !== $("config-json")) {
+    $("config-json").value = JSON.stringify(config, null, 2);
+  }
+  renderApps(); renderLayout(); renderWallpapers();
 }
-
+async function loadWallpapers() { wallpapers = await api("/wallpapers"); renderWallpapers(); }
 async function loadChecks() {
-  currentChecks = await api("/system/checks");
-  renderChecks();
-  renderAlerts((await api("/status")).divergences ?? []);
+  checks = await api("/system/checks");
+  status = await api("/status");
+  renderChecks(); renderStatus();
 }
-
 async function loadAll() {
   outputs = await api("/outputs");
   sinks = await api("/audio/outputs");
   apps = await api("/apps");
+  wallpapers = await api("/wallpapers");
   await loadConfig();
-  renderLayout();
-  renderSinks();
-  renderOutputChoices();
-  renderStatus(await api("/status"));
+  renderSinks(); renderOutputChoices();
   renderSystem(await api("/system"));
   await loadChecks();
 }
 
+$("c-save").onclick = () => run(() => save("/config", JSON.parse($("config-json").value)), "saved configuration");
+$("c-reload").onclick = () => run(async () => $("config-json").blur(), "reloaded from the daemon");
+$("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
+
 function connect() {
   const source = new EventSource(API + "/events");
-
   source.onopen = () => {
-    $("live").textContent = "live";
-    $("live").className = "pill ok";
+    $("live").textContent = "live"; $("live").className = "pill ok";
     // Events are state-based, not replayed, so resynchronise on every connect.
     loadAll().catch((error) => toast(error.message, true));
   };
-  source.onerror = () => {
-    $("live").textContent = "reconnecting…";
-    $("live").className = "pill bad";
-  };
+  source.onerror = () => { $("live").textContent = "reconnecting…"; $("live").className = "pill bad"; };
 
-  source.addEventListener("outputs_changed", (event) => {
-    outputs = JSON.parse(event.data);
-    renderLayout();
-    renderOutputChoices();
+  source.addEventListener("outputs_changed", (e) => {
+    outputs = JSON.parse(e.data); renderLayout(); renderOutputChoices();
   });
-  source.addEventListener("audio_outputs_changed", (event) => {
-    sinks = JSON.parse(event.data);
-    renderSinks();
-  });
-  source.addEventListener("app_status_changed", (event) => {
-    const status = JSON.parse(event.data);
-    apps = apps.filter((a) => a.id !== status.id).concat(status);
+  source.addEventListener("audio_outputs_changed", (e) => { sinks = JSON.parse(e.data); renderSinks(); });
+  source.addEventListener("app_status_changed", (e) => {
+    const updated = JSON.parse(e.data);
+    apps = apps.filter((a) => a.id !== updated.id).concat(updated);
     renderApps();
   });
-  source.addEventListener("status_changed", (event) => renderStatus(JSON.parse(event.data)));
+  source.addEventListener("status_changed", (e) => { status = JSON.parse(e.data); renderStatus(); });
   source.addEventListener("config_changed", () => loadConfig());
-  source.addEventListener("checks_changed", (event) => {
-    currentChecks = JSON.parse(event.data);
-    renderChecks();
-    api("/status").then((status) => renderAlerts(status.divergences ?? []));
-  });
+  source.addEventListener("checks_changed", (e) => { checks = JSON.parse(e.data); renderChecks(); renderAlerts(); });
 }
 
 window.addEventListener("resize", renderLayout);
