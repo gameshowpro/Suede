@@ -892,6 +892,135 @@
         }
       }
     },
+    "/api/v1/wallpapers": {
+      "get": {
+        "tags": [
+          "wallpapers"
+        ],
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "description": "Stored wallpapers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Wallpaper"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/wallpapers/{id}": {
+      "get": {
+        "tags": [
+          "wallpapers"
+        ],
+        "operationId": "download",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Wallpaper identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The image itself",
+            "content": {
+              "image/png": {}
+            }
+          },
+          "404": {
+            "description": "No such wallpaper"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "wallpapers"
+        ],
+        "operationId": "upload",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Wallpaper identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Raw PNG or JPEG image",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored wallpaper",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Wallpaper"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Not a PNG or JPEG, or too large"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "wallpapers"
+        ],
+        "operationId": "delete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Wallpaper identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "404": {
+            "description": "No such wallpaper"
+          },
+          "409": {
+            "description": "Still referenced by an output"
+          }
+        }
+      }
+    },
     "/api/v1/windows": {
       "get": {
         "tags": [
@@ -985,6 +1114,17 @@
             "type": "boolean",
             "description": "Keep the browser profile between launches instead of wiping it."
           },
+          "readiness": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReadinessConfig",
+                "description": "Wait for this URL to answer before launching."
+              }
+            ]
+          },
           "restart": {
             "$ref": "#/components/schemas/RestartPolicy"
           },
@@ -1003,7 +1143,8 @@
           "stopped",
           "crashed",
           "backoff",
-          "waitingForOutput"
+          "waitingForOutput",
+          "waitingForDependency"
         ]
       },
       "AppStatus": {
@@ -1136,6 +1277,40 @@
             "description": "Video connector this sink is associated with, where derivable."
           }
         }
+      },
+      "Background": {
+        "type": "object",
+        "description": "What an output shows behind, or instead of, any window.\n\nAn appliance with a blank screen looks broken even when it is merely\nbetween launches, so a background gives it something deliberate to show\nwhile a browser restarts or before the first app starts.",
+        "properties": {
+          "color": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`#rrggbb`, shown where the wallpaper does not reach, or on its own."
+          },
+          "mode": {
+            "$ref": "#/components/schemas/BackgroundMode"
+          },
+          "wallpaper": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Id of an uploaded wallpaper. Absent means use `color` alone."
+          }
+        }
+      },
+      "BackgroundMode": {
+        "type": "string",
+        "description": "How a wallpaper is scaled onto an output, matching `sway-output(5)`.",
+        "enum": [
+          "fill",
+          "fit",
+          "stretch",
+          "center",
+          "tile"
+        ]
       },
       "Check": {
         "type": "object",
@@ -1524,6 +1699,17 @@
             "type": "boolean",
             "description": "Applied only when the detected Sway version supports it (≥ 1.10)."
           },
+          "background": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Background",
+                "description": "What this output shows when no window covers it."
+              }
+            ]
+          },
           "enable": {
             "type": "boolean",
             "description": "Whether the output should be enabled. `false` actively disables it."
@@ -1678,6 +1864,49 @@
           "type": {
             "type": "string",
             "description": "URI reference identifying the error type."
+          }
+        }
+      },
+      "ReadinessConfig": {
+        "type": "object",
+        "description": "Wait for a URL to answer before launching an application.\n\nA kiosk browser started before the service it points at is serving shows an\nerror page and stays there, since nothing reloads it. Gating the launch on\nthe service answering removes that race entirely.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "expectStatus": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "description": "Status codes that mean ready. Empty means any 2xx."
+          },
+          "giveUpAfterSeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Give up waiting after this long and launch anyway. `null` waits forever,\nwhich is usually right for an appliance: showing an error page is worse\nthan showing the background until the service appears.",
+            "minimum": 0
+          },
+          "intervalSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long between attempts.",
+            "minimum": 0
+          },
+          "timeoutSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How long a single attempt may take.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "URL to poll. Only `http://` is supported."
           }
         }
       },
@@ -1896,6 +2125,37 @@
           "flipped-270"
         ]
       },
+      "Wallpaper": {
+        "type": "object",
+        "description": "Metadata for a stored wallpaper, as served by the API.",
+        "required": [
+          "id",
+          "contentType",
+          "bytes",
+          "uploadedAt"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "contentType": {
+            "type": "string",
+            "description": "`image/png` or `image/jpeg`."
+          },
+          "id": {
+            "type": "string",
+            "description": "Client-chosen identifier, referenced from an output's background."
+          },
+          "uploadedAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix seconds when it was stored.",
+            "minimum": 0
+          }
+        }
+      },
       "Window": {
         "type": "object",
         "description": "A window in Sway's tree.",
@@ -2004,6 +2264,10 @@
     {
       "name": "events",
       "description": "Server-sent change notification"
+    },
+    {
+      "name": "wallpapers",
+      "description": "Images shown when no window covers an output"
     }
   ]
 }

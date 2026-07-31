@@ -20,6 +20,7 @@ use crate::snapshot::Snapshot;
 use crate::state::StateStore;
 use crate::supervisor::Supervisor;
 use crate::sway::{SwayClient, SwayEvent};
+use crate::wallpapers::WallpaperStore;
 
 pub use plan::{
     cursor_commands, placement_commands, plan_outputs, resolve_app_targets, AppTarget,
@@ -61,6 +62,7 @@ pub struct Reconciler {
     applied: Mutex<HashMap<String, AppliedOutput>>,
     capabilities: Mutex<Capabilities>,
     cursor_parked_at: Mutex<Option<i32>>,
+    wallpapers: Arc<WallpaperStore>,
 }
 
 impl Reconciler {
@@ -71,6 +73,7 @@ impl Reconciler {
         snapshot: Arc<Snapshot>,
         supervisor: Arc<Supervisor>,
         events: EventHub,
+        wallpapers: Arc<WallpaperStore>,
     ) -> Self {
         Self {
             sway,
@@ -79,6 +82,7 @@ impl Reconciler {
             snapshot,
             supervisor,
             events,
+            wallpapers,
             pass: Mutex::new(()),
             applied: Mutex::new(HashMap::new()),
             capabilities: Mutex::new(Capabilities::default()),
@@ -174,11 +178,17 @@ impl Reconciler {
         // --- outputs ---
         let output_plan = {
             let applied = self.applied.lock().await;
-            plan_outputs(
+            crate::reconciler::plan::plan_outputs_with(
                 &self.snapshot.outputs(),
                 &desired.outputs,
                 &applied,
                 capabilities,
+                |id| {
+                    self.wallpapers
+                        .resolve(id)
+                        .ok()
+                        .map(|path| path.display().to_string())
+                },
             )
         };
         divergences.extend(output_plan.divergences.iter().cloned());
@@ -461,6 +471,7 @@ mod tests {
             snapshot.clone(),
             supervisor.clone(),
             events.clone(),
+            Arc::new(WallpaperStore::new(dir.path().join("wallpapers"))),
         ));
         Harness {
             reconciler,
@@ -497,6 +508,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio,
             heartbeat: None,
             restart: RestartPolicy::default(),

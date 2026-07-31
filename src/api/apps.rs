@@ -111,6 +111,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio: None,
             heartbeat: Some(HeartbeatConfig {
                 enabled: true,

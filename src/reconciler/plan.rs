@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{AppConfig, Divergence, Output, OutputConfig};
+use crate::model::{AppConfig, Background, Divergence, Output, OutputConfig};
 
 /// Version-gated compositor features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,6 +49,25 @@ pub fn plan_outputs(
     previously_applied: &HashMap<String, AppliedOutput>,
     capabilities: Capabilities,
 ) -> OutputPlan {
+    plan_outputs_with(observed, desired, previously_applied, capabilities, |_| {
+        None
+    })
+}
+
+/// As [`plan_outputs`], with a resolver from wallpaper id to file path.
+///
+/// Injected rather than read from disk here, so the planner stays pure and the
+/// background rules remain testable without any files existing.
+pub fn plan_outputs_with<F>(
+    observed: &[Output],
+    desired: &[OutputConfig],
+    previously_applied: &HashMap<String, AppliedOutput>,
+    capabilities: Capabilities,
+    resolve_wallpaper: F,
+) -> OutputPlan
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut plan = OutputPlan::default();
 
     for (index, config) in desired.iter().enumerate() {
@@ -198,6 +217,19 @@ pub fn plan_outputs(
                 .push(format!("output {name} max_render_time {value}"));
         }
 
+        // Sway does not report the background in `get_outputs`, so like tearing
+        // it is diffed against what Suede last applied.
+        if let Some(background) = &config.background {
+            let changed = applied.is_none_or(|a| a.config.background.as_ref() != Some(background));
+            if force || changed {
+                match background_command(name, background, &resolve_wallpaper) {
+                    Ok(Some(command)) => plan.commands.push(command),
+                    Ok(None) => {}
+                    Err(divergence) => plan.divergences.push(divergence),
+                }
+            }
+        }
+
         // Pinning a workspace to the output makes app placement deterministic.
         if force || applied.is_none_or(|a| a.workspace != workspace) {
             plan.commands
@@ -320,6 +352,44 @@ pub fn placement_commands(
     commands
 }
 
+/// The `output … bg` command for a background, if it asks for anything.
+///
+/// Sway takes either a file with a scaling mode, or a solid colour. A missing
+/// wallpaper is a divergence rather than a failure: the output keeps working,
+/// and the operator is told which id could not be found.
+fn background_command<F>(
+    name: &str,
+    background: &Background,
+    resolve_wallpaper: &F,
+) -> Result<Option<String>, Divergence>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if background.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(id) = &background.wallpaper {
+        let Some(path) = resolve_wallpaper(id) else {
+            return Err(Divergence::new(
+                "wallpaper_not_found",
+                name,
+                format!("{name} refers to wallpaper {id:?}, which is not stored"),
+            ));
+        };
+        let mut command = format!("output {name} bg {path} {}", background.mode.as_sway());
+        // Sway paints this wherever the image does not reach.
+        if let Some(color) = background.sway_color() {
+            command.push_str(&format!(" #{color}"));
+        }
+        return Ok(Some(command));
+    }
+
+    Ok(background
+        .sway_color()
+        .map(|color| format!("output {name} bg #{color} solid_color")))
+}
+
 /// The `fullscreen_mode` sway should report once placement has taken effect.
 ///
 /// 0 = windowed, 1 = fills its output, 2 = spans the whole layout.
@@ -357,7 +427,9 @@ fn format_number(value: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Launcher, Mode, OutputMatch, Position, Rect, RestartPolicy, Transform};
+    use crate::model::{
+        BackgroundMode, Launcher, Mode, OutputMatch, Position, Rect, RestartPolicy, Transform,
+    };
 
     fn output(name: &str, active: bool) -> Output {
         Output {
@@ -429,6 +501,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),
@@ -892,6 +965,158 @@ mod tests {
             commands.iter().filter(|c| c.contains("fullscreen")).count(),
             1
         );
+    }
+
+    fn with_background(name: &str, background: Background) -> OutputConfig {
+        let mut config = config(name);
+        config.background = Some(background);
+        config
+    }
+
+    #[test]
+    fn a_colour_background_is_a_solid_colour() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: None,
+                color: Some("#101820".into()),
+                mode: BackgroundMode::Fill,
+            },
+        );
+        let plan = plan_outputs(&observed, &[desired], &HashMap::new(), tearing_capable());
+        assert!(plan
+            .commands
+            .contains(&"output HDMI-A-1 bg #101820 solid_color".to_string()));
+        assert!(plan.divergences.is_empty());
+    }
+
+    #[test]
+    fn a_wallpaper_background_names_the_file_and_mode() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: Some("lobby".into()),
+                color: None,
+                mode: BackgroundMode::Fit,
+            },
+        );
+        let plan = plan_outputs_with(
+            &observed,
+            &[desired],
+            &HashMap::new(),
+            tearing_capable(),
+            |id| Some(format!("/state/wallpapers/{id}.png")),
+        );
+        assert!(plan
+            .commands
+            .contains(&"output HDMI-A-1 bg /state/wallpapers/lobby.png fit".to_string()));
+    }
+
+    #[test]
+    fn a_wallpaper_can_carry_a_fallback_colour() {
+        // `fit` letterboxes, so the colour decides what the bars look like.
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: Some("lobby".into()),
+                color: Some("#000000".into()),
+                mode: BackgroundMode::Fit,
+            },
+        );
+        let plan = plan_outputs_with(
+            &observed,
+            &[desired],
+            &HashMap::new(),
+            tearing_capable(),
+            |_| Some("/w/lobby.png".to_string()),
+        );
+        assert!(plan
+            .commands
+            .contains(&"output HDMI-A-1 bg /w/lobby.png fit #000000".to_string()));
+    }
+
+    #[test]
+    fn a_missing_wallpaper_is_a_divergence_not_a_broken_command() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: Some("gone".into()),
+                color: None,
+                mode: BackgroundMode::Fill,
+            },
+        );
+        let plan = plan_outputs_with(
+            &observed,
+            &[desired],
+            &HashMap::new(),
+            tearing_capable(),
+            |_| None,
+        );
+        assert!(!plan.commands.iter().any(|c| c.contains(" bg ")));
+        assert!(plan
+            .divergences
+            .iter()
+            .any(|d| d.kind == "wallpaper_not_found"));
+    }
+
+    #[test]
+    fn an_unchanged_background_is_not_reapplied() {
+        // Sway does not report the background back, so this is diffed against
+        // what Suede last applied; without that it would be re-issued forever.
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: None,
+                color: Some("#101820".into()),
+                mode: BackgroundMode::Fill,
+            },
+        );
+        let first = plan_outputs(
+            &observed,
+            std::slice::from_ref(&desired),
+            &HashMap::new(),
+            tearing_capable(),
+        );
+        assert!(first.commands.iter().any(|c| c.contains(" bg ")));
+
+        let second = plan_outputs(&observed, &[desired], &first.applied, tearing_capable());
+        assert!(
+            !second.commands.iter().any(|c| c.contains(" bg ")),
+            "second pass re-applied the background: {:?}",
+            second.commands
+        );
+    }
+
+    #[test]
+    fn changing_the_background_reapplies_it() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let before = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: None,
+                color: Some("#101820".into()),
+                mode: BackgroundMode::Fill,
+            },
+        );
+        let first = plan_outputs(&observed, &[before], &HashMap::new(), tearing_capable());
+
+        let after = with_background(
+            "HDMI-A-1",
+            Background {
+                wallpaper: None,
+                color: Some("#204060".into()),
+                mode: BackgroundMode::Fill,
+            },
+        );
+        let second = plan_outputs(&observed, &[after], &first.applied, tearing_capable());
+        assert!(second
+            .commands
+            .contains(&"output HDMI-A-1 bg #204060 solid_color".to_string()));
     }
 
     #[test]

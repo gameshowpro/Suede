@@ -6,6 +6,7 @@ pub mod docs;
 pub mod events;
 pub mod observed;
 pub mod ui;
+pub mod wallpapers;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -42,6 +43,7 @@ pub struct ApiState {
     pub reconciler: Arc<Reconciler>,
     pub trigger: ReconcileTrigger,
     pub checks: Arc<CheckRunner>,
+    pub wallpapers: Arc<crate::wallpapers::WallpaperStore>,
     pub started_at: Instant,
 }
 
@@ -153,6 +155,18 @@ pub fn router(state: ApiState) -> Router {
         // Imperative escape hatches.
         .route("/reconcile", post(observed::reconcile_now))
         .route("/sway/command", post(observed::run_sway_command))
+        // Wallpapers.
+        .route("/wallpapers", get(wallpapers::list))
+        .route(
+            "/wallpapers/{id}",
+            get(wallpapers::download)
+                .put(wallpapers::upload)
+                .delete(wallpapers::delete),
+        )
+        // Uploads are images, well over axum's default 2 MB body limit.
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::wallpapers::MAX_BYTES,
+        ))
         // Events.
         .route("/events", get(events::stream));
 
@@ -258,6 +272,9 @@ pub mod test_support {
         let store = Arc::new(StateStore::ephemeral(dir.path().to_path_buf()));
         let snapshot = Arc::new(Snapshot::new());
         let hub = EventHub::new();
+        let wallpapers = Arc::new(crate::wallpapers::WallpaperStore::new(
+            dir.path().join("wallpapers"),
+        ));
         let supervisor = Arc::new(Supervisor::new(
             sway.clone(),
             hub.clone(),
@@ -274,6 +291,7 @@ pub mod test_support {
             snapshot.clone(),
             supervisor.clone(),
             hub.clone(),
+            wallpapers.clone(),
         ));
         let checks = Arc::new(CheckRunner::new(
             bootstrap.clone(),
@@ -295,6 +313,7 @@ pub mod test_support {
             reconciler,
             trigger,
             checks,
+            wallpapers,
             started_at: Instant::now(),
         };
 

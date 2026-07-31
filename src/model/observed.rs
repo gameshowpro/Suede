@@ -166,6 +166,8 @@ pub enum AppState {
     Backoff,
     /// Enabled, but its target output is not currently connected.
     WaitingForOutput,
+    /// Enabled, but the URL it depends on is not answering yet.
+    WaitingForDependency,
 }
 
 /// Why an app was last restarted.

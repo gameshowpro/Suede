@@ -45,6 +45,7 @@ The document carries a server-managed `revision`. Send it back as `If-Match` to 
 | `adaptiveSync` | bool | `false` | Variable refresh rate |
 | `allowTearing` | bool | `false` | Applied only on Sway 1.10+; reported as a divergence otherwise |
 | `maxRenderTimeMs` | number \| null | null | Frame render deadline; null means off |
+| `background` | object \| null | null | What the output shows when no window covers it |
 
 `match` selects by connector name, which is the normal case:
 
@@ -66,6 +67,45 @@ Every field you specify must match. A configured output that is not currently co
 !!! warning "Connected outputs with no entry are left alone"
     Suede only touches outputs you have configured. To turn one off, give it an entry with `"enable": false`.
 
+### Backgrounds and wallpapers
+
+A blank screen looks broken even when it is only a browser restarting. A
+background gives an output something deliberate to show whenever no window
+covers it — during a relaunch, or before the first app starts.
+
+```json
+{
+  "match": { "name": "HDMI-A-1" },
+  "enable": true,
+  "background": { "wallpaper": "lobby", "mode": "fill", "color": "#101820" }
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `wallpaper` | string \| null | null | Id of an uploaded image |
+| `color` | string \| null | null | `#rrggbb`, used alone or where the image does not reach |
+| `mode` | string | `fill` | `fill`, `fit`, `stretch`, `center`, `tile` |
+
+Upload images first, then refer to them by id:
+
+```bash
+curl -X PUT --data-binary @lobby.png http://appliance:7071/api/v1/wallpapers/lobby
+curl http://appliance:7071/api/v1/wallpapers          # list
+curl -X DELETE http://appliance:7071/api/v1/wallpapers/lobby
+```
+
+PNG and JPEG are accepted, up to 32 MB. The format is detected from the file's
+own bytes rather than the request, so a mislabelled upload is refused outright
+instead of leaving a background that silently fails to draw. A wallpaper still
+referenced by an output cannot be deleted.
+
+!!! warning "Backgrounds need swaybg"
+    Sway draws them by running `swaybg`. Without it the command *succeeds* and
+    nothing appears — a black screen with no error anywhere. The `swaybg`
+    health check fails whenever an output configures a background and the
+    program is missing.
+
 ### Applications
 
 An application is a *launch specification*, not a window. That is what makes it restorable after a reboot.
@@ -78,6 +118,7 @@ An application is a *launch specification*, not a window. That is what makes it 
 | `output` | object \| null | null | Output to place the window on |
 | `fullscreen` | bool | `true` | Fill the target output |
 | `spanOutputs` | bool | `false` | Stretch one window across **every** output |
+| `readiness` | object \| null | null | Wait for a URL to answer before launching |
 | `env` | object | `{}` | Extra environment variables for the process |
 | `audio` | object \| null | null | Absent leaves routing alone; see below |
 | `heartbeat` | object \| null | null | Content watchdog |
@@ -193,6 +234,43 @@ environment variables rather than command-line flags:
     Rasterisation, compositing, WebGL and CSS animation are a separate path and
     generally work without any of this — check the WebGL renderer string is
     your GPU rather than `llvmpipe` or `SwiftShader`.
+
+#### Waiting for a service to be ready
+
+A kiosk browser started before the service it points at is serving shows an
+error page — and stays on it, because nothing reloads the tab. `readiness`
+removes that race by gating the launch on the service answering:
+
+```json
+{
+  "id": "renderer-1",
+  "launcher": { "kind": "chromium-kiosk", "uri": "http://127.0.0.1:8080/wall" },
+  "readiness": { "url": "http://127.0.0.1:8080/healthz" }
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `url` | string | required | URL to poll; `http://` only |
+| `expectStatus` | array | `[]` | Status codes meaning ready; empty means any 2xx |
+| `intervalSeconds` | number | `2` | Time between attempts |
+| `timeoutSeconds` | number | `5` | Time allowed for one attempt |
+| `giveUpAfterSeconds` | number \| null | null | Launch anyway after this long; null waits forever |
+
+While waiting, the app reports `waitingForDependency` with the last failure in
+its `detail`, so the reason is visible rather than guessed.
+
+Waiting forever is the default deliberately: on an appliance, showing the
+background until the service appears is better than showing an error page that
+nobody will reload. Set `giveUpAfterSeconds` if you would rather see whatever
+the browser makes of it.
+
+!!! note "Only http://"
+    The probe reads the status line and nothing more, so it deliberately has no
+    TLS stack — that keeps Suede a single binary with no native dependencies.
+    A readiness URL is almost always a loopback service. An `https://` URL is
+    rejected when the configuration is written, rather than failing silently at
+    launch.
 
 #### URI placeholders
 

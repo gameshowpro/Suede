@@ -37,6 +37,7 @@ pub mod ids {
     pub const DIRECT_SCANOUT: &str = "direct-scanout";
     pub const REAL_DISPLAYS: &str = "real-displays";
     pub const VIDEO_DECODE: &str = "video-decode";
+    pub const SWAYBG: &str = "swaybg";
     pub const BROWSERS: &str = "browsers";
     pub const PIPEWIRE: &str = "pipewire";
     pub const SYSTEMD_UNIT: &str = "systemd-unit";
@@ -84,6 +85,7 @@ impl CheckRunner {
             self.check_direct_scanout(),
             self.check_real_displays().await,
             self.check_video_decode(),
+            self.check_swaybg().await,
             self.check_browsers().await,
             self.check_pipewire().await,
             self.check_systemd_unit().await,
@@ -426,6 +428,49 @@ impl CheckRunner {
             status,
             detail,
             Some("configuration/#environment-and-hardware-acceleration"),
+        )
+    }
+
+    /// Sway draws output backgrounds by running `swaybg`. Without it the
+    /// `bg` command succeeds and nothing appears, which is the worst
+    /// combination: a screen that stays black with no error anywhere.
+    async fn check_swaybg(&self) -> Check {
+        let wanted = self
+            .store
+            .get()
+            .outputs
+            .iter()
+            .filter(|output| output.background.as_ref().is_some_and(|b| !b.is_empty()))
+            .count();
+        let installed = crate::supervisor::launcher::resolve_program(&["swaybg".to_string()]);
+
+        let (status, detail) = match (wanted, &installed) {
+            (0, Some(path)) => (
+                CheckStatus::Pass,
+                format!("available at {}", path.display()),
+            ),
+            (0, None) => (
+                CheckStatus::Pass,
+                "not installed, but no output asks for a background".to_string(),
+            ),
+            (n, Some(path)) => (
+                CheckStatus::Pass,
+                format!("{n} output(s) use a background; swaybg is at {}", path.display()),
+            ),
+            (n, None) => (
+                CheckStatus::Fail,
+                format!(
+                    "{n} output(s) configure a background but swaybg is not installed, so                      sway will accept the command and draw nothing. Install `swaybg`."
+                ),
+            ),
+        };
+
+        self.check(
+            ids::SWAYBG,
+            "Backgrounds can be drawn",
+            status,
+            detail,
+            Some("configuration/#backgrounds-and-wallpapers"),
         )
     }
 
@@ -987,7 +1032,7 @@ mod tests {
     async fn every_check_reports_something() {
         let dir = tempfile::tempdir().unwrap();
         let checks = runner(dir.path().to_path_buf()).run_all().await;
-        assert_eq!(checks.len(), 11);
+        assert_eq!(checks.len(), 12);
         for id in [
             ids::SWAY_SOCKET,
             ids::SWAY_VERSION,
@@ -999,6 +1044,7 @@ mod tests {
             ids::DIRECT_SCANOUT,
             ids::REAL_DISPLAYS,
             ids::VIDEO_DECODE,
+            ids::SWAYBG,
         ] {
             assert!(checks.iter().any(|check| check.id == id), "missing {id}");
         }

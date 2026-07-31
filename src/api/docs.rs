@@ -72,6 +72,10 @@ impl Modify for SecurityAddon {
         super::config_routes::get_settings,
         super::config_routes::put_settings,
         super::events::stream,
+        super::wallpapers::list,
+        super::wallpapers::upload,
+        super::wallpapers::download,
+        super::wallpapers::delete,
     ),
     components(schemas(
         crate::model::Mode,
@@ -103,6 +107,10 @@ impl Modify for SecurityAddon {
         crate::model::HeartbeatConfig,
         crate::model::AppConfig,
         crate::model::Settings,
+        crate::model::Background,
+        crate::model::BackgroundMode,
+        crate::model::ReadinessConfig,
+        crate::wallpapers::Wallpaper,
         crate::error::Problem,
         super::observed::FixOutcome,
         super::observed::SwayCommand,
@@ -114,6 +122,7 @@ impl Modify for SecurityAddon {
         (name = "apps", description = "Managed application status and control"),
         (name = "control", description = "Imperative escape hatches"),
         (name = "events", description = "Server-sent change notification"),
+        (name = "wallpapers", description = "Images shown when no window covers an output"),
     )
 )]
 pub struct ApiDoc;

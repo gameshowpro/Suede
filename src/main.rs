@@ -145,6 +145,9 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
             api_base: format!("http://127.0.0.1:{}/api/v1", bootstrap.bind.port()),
         },
     ));
+    let wallpapers = Arc::new(suede::wallpapers::WallpaperStore::new(
+        bootstrap.state_dir.join("wallpapers"),
+    ));
     let reconciler = Arc::new(Reconciler::new(
         sway.clone(),
         audio.clone(),
@@ -152,6 +155,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         snapshot.clone(),
         supervisor.clone(),
         events.clone(),
+        wallpapers.clone(),
     ));
     let checks = Arc::new(CheckRunner::new(
         bootstrap.clone(),
@@ -190,6 +194,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         reconciler,
         trigger,
         checks,
+        wallpapers,
         started_at: Instant::now(),
     };
 

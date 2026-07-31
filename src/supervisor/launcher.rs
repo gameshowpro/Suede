@@ -232,6 +232,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),

@@ -60,6 +60,25 @@ impl DesiredState {
                     errors.push(format!("{prefix}.scale must be a positive number"));
                 }
             }
+            if let Some(background) = &output.background {
+                if let Some(color) = &background.color {
+                    let digits = color.trim_start_matches('#');
+                    let valid = matches!(digits.len(), 6 | 8)
+                        && digits.chars().all(|c| c.is_ascii_hexdigit());
+                    if !valid {
+                        errors.push(format!(
+                            "{prefix}.background.color {color:?} must be #rrggbb or #rrggbbaa"
+                        ));
+                    }
+                }
+                if let Some(id) = &background.wallpaper {
+                    if id.is_empty() || id.contains("..") || id.contains('/') {
+                        errors.push(format!(
+                            "{prefix}.background.wallpaper {id:?} is not a valid wallpaper id"
+                        ));
+                    }
+                }
+            }
         }
 
         let mut seen_apps = std::collections::HashSet::new();
@@ -121,6 +140,23 @@ impl DesiredState {
             for key in app.env.keys() {
                 if key.is_empty() || key.contains('=') || key.contains('\0') {
                     errors.push(format!("{prefix}.env has an invalid variable name {key:?}"));
+                }
+            }
+            if let Some(readiness) = &app.readiness {
+                // Caught here rather than at launch, where a bad URL would
+                // present as an application that simply never starts.
+                if let Err(error) = crate::probe::parse_url(&readiness.url) {
+                    errors.push(format!("{prefix}.readiness.url {error}"));
+                }
+                if readiness.interval_seconds == 0 {
+                    errors.push(format!(
+                        "{prefix}.readiness.intervalSeconds must be greater than zero"
+                    ));
+                }
+                if readiness.timeout_seconds == 0 {
+                    errors.push(format!(
+                        "{prefix}.readiness.timeoutSeconds must be greater than zero"
+                    ));
                 }
             }
         }
@@ -289,6 +325,115 @@ pub struct OutputConfig {
     /// Maximum milliseconds allowed to render a frame; `null` means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_render_time_ms: Option<u32>,
+    /// What this output shows when no window covers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Background>,
+}
+
+/// How a wallpaper is scaled onto an output, matching `sway-output(5)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundMode {
+    /// Scale to cover, cropping the overflow. The usual choice for signage.
+    #[default]
+    Fill,
+    /// Scale to fit entirely, letterboxing the remainder.
+    Fit,
+    /// Scale to the output exactly, ignoring aspect ratio.
+    Stretch,
+    /// Original size, centred.
+    Center,
+    /// Original size, repeated.
+    Tile,
+}
+
+impl BackgroundMode {
+    pub fn as_sway(self) -> &'static str {
+        match self {
+            Self::Fill => "fill",
+            Self::Fit => "fit",
+            Self::Stretch => "stretch",
+            Self::Center => "center",
+            Self::Tile => "tile",
+        }
+    }
+}
+
+/// What an output shows behind, or instead of, any window.
+///
+/// An appliance with a blank screen looks broken even when it is merely
+/// between launches, so a background gives it something deliberate to show
+/// while a browser restarts or before the first app starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Background {
+    /// Id of an uploaded wallpaper. Absent means use `color` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wallpaper: Option<String>,
+    /// `#rrggbb`, shown where the wallpaper does not reach, or on its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub mode: BackgroundMode,
+}
+
+impl Background {
+    /// Whether this asks for anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.wallpaper.is_none() && self.color.is_none()
+    }
+
+    /// Sway wants `#rrggbb` without the hash.
+    pub fn sway_color(&self) -> Option<String> {
+        self.color
+            .as_ref()
+            .map(|value| value.trim_start_matches('#').to_string())
+    }
+}
+
+/// Wait for a URL to answer before launching an application.
+///
+/// A kiosk browser started before the service it points at is serving shows an
+/// error page and stays there, since nothing reloads it. Gating the launch on
+/// the service answering removes that race entirely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadinessConfig {
+    /// URL to poll. Only `http://` is supported.
+    pub url: String,
+    /// Status codes that mean ready. Empty means any 2xx.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expect_status: Vec<u16>,
+    /// How long between attempts.
+    #[serde(default = "default_readiness_interval")]
+    pub interval_seconds: u64,
+    /// How long a single attempt may take.
+    #[serde(default = "default_readiness_timeout")]
+    pub timeout_seconds: u64,
+    /// Give up waiting after this long and launch anyway. `null` waits forever,
+    /// which is usually right for an appliance: showing an error page is worse
+    /// than showing the background until the service appears.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub give_up_after_seconds: Option<u64>,
+}
+
+impl ReadinessConfig {
+    /// Whether a status code counts as ready.
+    pub fn accepts(&self, status: u16) -> bool {
+        if self.expect_status.is_empty() {
+            (200..300).contains(&status)
+        } else {
+            self.expect_status.contains(&status)
+        }
+    }
+}
+
+fn default_readiness_interval() -> u64 {
+    2
+}
+
+fn default_readiness_timeout() -> u64 {
+    5
 }
 
 impl OutputConfig {
@@ -303,6 +448,7 @@ impl OutputConfig {
             adaptive_sync: false,
             allow_tearing: false,
             max_render_time_ms: None,
+            background: None,
         }
     }
 }
@@ -475,6 +621,9 @@ pub struct AppConfig {
     /// `NVD_BACKEND` rather than any command-line flag.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
+    /// Wait for this URL to answer before launching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<ReadinessConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<HeartbeatConfig>,
     #[serde(default)]
@@ -631,6 +780,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),
@@ -657,6 +807,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),
@@ -685,6 +836,7 @@ mod tests {
                 fullscreen: true,
                 span_outputs: false,
                 env: Default::default(),
+                readiness: None,
                 audio: None,
                 heartbeat: None,
                 restart: RestartPolicy::default(),

@@ -39,6 +39,15 @@ struct ManagedApp {
     /// Set when the restart policy declined to relaunch, so nothing may
     /// auto-start this app until the configuration changes or the API asks.
     halted: bool,
+    /// Whether the app's readiness URL has answered acceptably.
+    ///
+    /// Latched: once a dependency has been seen up, a later blip must not stop
+    /// a crashed app from being relaunched.
+    dependency_ready: bool,
+    /// When the last readiness probe ran, to honour the configured interval.
+    last_probe: Option<Instant>,
+    /// When Suede first started waiting, for the give-up timer.
+    waiting_since: Option<Instant>,
 }
 
 impl ManagedApp {
@@ -55,6 +64,9 @@ impl ManagedApp {
             last_heartbeat_at: None,
             placed: false,
             halted: false,
+            dependency_ready: false,
+            last_probe: None,
+            waiting_since: None,
         }
     }
 
@@ -119,10 +131,17 @@ impl Supervisor {
                     stop(managed).await;
                     managed.status.last_restart_reason = Some(RestartReason::ConfigChanged);
                 }
-                // A new specification earns a halted app another attempt.
+                // A new specification earns a halted app another attempt, and
+                // a changed readiness URL must be re-probed rather than
+                // inheriting the old verdict.
                 managed.halted = false;
                 managed.attempts = 0;
                 managed.restart_at = Some(Instant::now());
+                if managed.config.readiness != config.readiness {
+                    managed.dependency_ready = false;
+                    managed.last_probe = None;
+                    managed.waiting_since = None;
+                }
             }
             managed.config = config.clone();
             managed.target = target;
@@ -134,11 +153,98 @@ impl Supervisor {
 
     /// Reap exits, run the watchdog, place new windows, and honour restart timers.
     pub async fn tick(&self, windows: &[Window]) {
+        // Readiness probes talk to the network, so they run before the lock is
+        // taken. Holding it across a probe would stall every API request behind
+        // a service that is slow to answer — exactly when it is least welcome.
+        self.probe_dependencies().await;
+
         let mut apps = self.apps.lock().await;
         self.reap(&mut apps).await;
         self.check_watchdogs(&mut apps).await;
         self.place_windows(&mut apps, windows).await;
         self.advance(&mut apps).await;
+    }
+
+    /// Poll the readiness URL of any app still waiting on one.
+    async fn probe_dependencies(&self) {
+        // Decide what to probe under the lock, then release it.
+        let due: Vec<(String, crate::model::ReadinessConfig)> = {
+            let apps = self.apps.lock().await;
+            let now = Instant::now();
+            apps.values()
+                .filter(|managed| managed.config.enabled && !managed.dependency_ready)
+                .filter_map(|managed| {
+                    let readiness = managed.config.readiness.clone()?;
+                    let due = managed.last_probe.is_none_or(|last| {
+                        last.elapsed() >= Duration::from_secs(readiness.interval_seconds)
+                    });
+                    let _ = now;
+                    due.then(|| (managed.config.id.clone(), readiness))
+                })
+                .collect()
+        };
+        if due.is_empty() {
+            return;
+        }
+
+        let results =
+            futures::future::join_all(due.into_iter().map(|(id, readiness)| async move {
+                let outcome = crate::probe::status_of(
+                    &readiness.url,
+                    Duration::from_secs(readiness.timeout_seconds),
+                )
+                .await;
+                (id, readiness, outcome)
+            }))
+            .await;
+
+        let mut apps = self.apps.lock().await;
+        for (id, readiness, outcome) in results {
+            let Some(managed) = apps.get_mut(&id) else {
+                continue;
+            };
+            managed.last_probe = Some(Instant::now());
+            let detail = match outcome {
+                Ok(status) if readiness.accepts(status) => {
+                    tracing::info!(app = %id, url = %readiness.url, status, "dependency is ready");
+                    managed.dependency_ready = true;
+                    managed.waiting_since = None;
+                    continue;
+                }
+                Ok(status) => format!("{} answered {status}", readiness.url),
+                Err(error) => format!("{}: {error}", readiness.url),
+            };
+
+            let waited = managed
+                .waiting_since
+                .get_or_insert_with(Instant::now)
+                .elapsed();
+
+            // Giving up is opt-in: for an appliance, showing the background
+            // until the service appears beats showing a browser error page
+            // that nothing will ever reload.
+            if let Some(limit) = readiness.give_up_after_seconds {
+                if waited >= Duration::from_secs(limit) {
+                    tracing::warn!(
+                        app = %id,
+                        url = %readiness.url,
+                        "dependency never became ready; launching anyway"
+                    );
+                    managed.dependency_ready = true;
+                    managed.waiting_since = None;
+                    continue;
+                }
+            }
+
+            if managed.status.state != AppState::WaitingForDependency {
+                tracing::info!(app = %id, url = %readiness.url, "waiting for dependency");
+            }
+            set_state(
+                &mut managed.status,
+                AppState::WaitingForDependency,
+                Some(format!("waiting for {detail}")),
+            );
+        }
     }
 
     /// Record a heartbeat from an app's content. Returns false for unknown apps.
@@ -391,6 +497,12 @@ impl Supervisor {
             if managed.is_running() || managed.halted {
                 continue;
             }
+            // An app whose dependency has never answered must not be launched:
+            // a kiosk browser started too early shows an error page and stays
+            // on it, because nothing reloads the tab.
+            if managed.config.readiness.is_some() && !managed.dependency_ready {
+                continue;
+            }
             if managed.restart_at.is_some_and(|at| at > now) {
                 continue;
             }
@@ -639,6 +751,7 @@ mod tests {
             fullscreen: true,
             span_outputs: false,
             env: Default::default(),
+            readiness: None,
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),
@@ -864,6 +977,157 @@ mod tests {
 
         assert!(!sway.ran_command_containing("con_id=99"));
         supervisor.shutdown().await;
+    }
+
+    /// A server that answers `status`, for readiness tests.
+    async fn serve(status: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::AsyncWriteExt;
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .await;
+            }
+        });
+        format!("http://{address}/ready")
+    }
+
+    fn waiting_on(url: &str) -> crate::model::ReadinessConfig {
+        crate::model::ReadinessConfig {
+            url: url.to_string(),
+            expect_status: vec![],
+            interval_seconds: 1,
+            timeout_seconds: 2,
+            give_up_after_seconds: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_waits_for_a_dependency_that_is_not_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let mut config = sleeper("a");
+        // Nothing is listening on this port.
+        config.readiness = Some(waiting_on("http://127.0.0.1:1/ready"));
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+
+        let status = supervisor.status("a").await.unwrap();
+        assert!(
+            status.pid.is_none(),
+            "must not launch before the service is up"
+        );
+
+        supervisor.tick(&[]).await;
+        let status = supervisor.status("a").await.unwrap();
+        assert_eq!(status.state, AppState::WaitingForDependency);
+        assert!(status.detail.unwrap().contains("waiting for"));
+        assert!(supervisor.status("a").await.unwrap().pid.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_app_launches_once_its_dependency_answers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let url = serve("200 OK").await;
+        let mut config = sleeper("a");
+        config.readiness = Some(waiting_on(&url));
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+
+        // The first tick probes; the app starts on the same pass.
+        supervisor.tick(&[]).await;
+        let status = supervisor.status("a").await.unwrap();
+        assert!(status.pid.is_some(), "should launch: {:?}", status.detail);
+        assert_ne!(status.state, AppState::WaitingForDependency);
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_unacceptable_status_keeps_the_app_waiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        // Answering 503 means the service is up but not ready to serve.
+        let url = serve("503 Service Unavailable").await;
+        let mut config = sleeper("a");
+        config.readiness = Some(waiting_on(&url));
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+
+        supervisor.tick(&[]).await;
+        let status = supervisor.status("a").await.unwrap();
+        assert_eq!(status.state, AppState::WaitingForDependency);
+        assert!(status.detail.unwrap().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_expected_status_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let url = serve("503 Service Unavailable").await;
+        let mut config = sleeper("a");
+        let mut readiness = waiting_on(&url);
+        readiness.expect_status = vec![503];
+        config.readiness = Some(readiness);
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+
+        supervisor.tick(&[]).await;
+        assert!(supervisor.status("a").await.unwrap().pid.is_some());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn giving_up_launches_anyway() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let mut config = sleeper("a");
+        let mut readiness = waiting_on("http://127.0.0.1:1/ready");
+        // Zero means the very first failure exhausts the patience.
+        readiness.give_up_after_seconds = Some(0);
+        config.readiness = Some(readiness);
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+
+        supervisor.tick(&[]).await;
+        assert!(
+            supervisor.status("a").await.unwrap().pid.is_some(),
+            "give_up_after_seconds should let it start regardless"
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_app_without_readiness_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        supervisor
+            .reconcile(&[sleeper("a")], &[target("a", None)])
+            .await;
+        assert!(supervisor.status("a").await.unwrap().pid.is_some());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn changing_the_readiness_url_forces_a_fresh_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let url = serve("200 OK").await;
+        let mut config = sleeper("a");
+        config.readiness = Some(waiting_on(&url));
+        supervisor
+            .reconcile(&[config.clone()], &[target("a", None)])
+            .await;
+        supervisor.tick(&[]).await;
+        assert!(supervisor.status("a").await.unwrap().pid.is_some());
+
+        // Point it at something dead: the old verdict must not carry over.
+        config.readiness = Some(waiting_on("http://127.0.0.1:1/ready"));
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+        supervisor.tick(&[]).await;
+        let status = supervisor.status("a").await.unwrap();
+        assert_eq!(status.state, AppState::WaitingForDependency);
+        assert!(status.pid.is_none());
     }
 
     #[tokio::test]

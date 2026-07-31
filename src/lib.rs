@@ -11,12 +11,14 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod model;
+pub mod probe;
 pub mod reconciler;
 pub mod snapshot;
 pub mod state;
 pub mod supervisor;
 pub mod sway;
 pub mod util;
+pub mod wallpapers;
 
 /// Version of the running daemon, from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
