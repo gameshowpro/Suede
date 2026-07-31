@@ -8,6 +8,7 @@ pub mod observed;
 pub mod ui;
 pub mod wallpapers;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -213,6 +214,17 @@ async fn authenticate(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // A request that arrived from off-box is proof the port is reachable —
+    // something the reachability check cannot establish any other way, since
+    // reading the host firewall's rules needs root. Recorded before the token
+    // is examined: a rejected request crossed the network just as well.
+    if let Some(peer) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<SocketAddr>>()
+    {
+        state.checks.note_client(peer.0.ip());
+    }
+
     let Some(expected) = state.bootstrap.token.as_deref() else {
         return Ok(next.run(request).await);
     };

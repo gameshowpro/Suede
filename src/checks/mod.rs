@@ -43,6 +43,116 @@ pub mod ids {
     pub const SYSTEMD_UNIT: &str = "systemd-unit";
     pub const SWAY_CONFIG: &str = "sway-config";
     pub const STATE_DIR: &str = "state-dir";
+    pub const API_REACHABILITY: &str = "api-reachability";
+}
+
+/// A host packet filter that may be dropping traffic to the API port.
+///
+/// Only the presence of one can be established without root: `ufw status` and
+/// `nft list ruleset` both need privileges Suede deliberately does not have.
+/// That is enough to be useful — the failure this catches looks identical to a
+/// dead appliance, so naming the suspect is most of the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostFirewall {
+    Ufw,
+    Firewalld,
+    Nftables,
+    None,
+}
+
+impl HostFirewall {
+    /// The systemd unit whose being active implies this filter.
+    fn unit(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Ufw => "ufw",
+            Self::Firewalld => "firewalld",
+            Self::Nftables => "nftables",
+            Self::None => return None,
+        })
+    }
+
+    /// What the operator would run to open `port`, where there is a one-liner.
+    fn allow_command(self, port: u16) -> Option<String> {
+        Some(match self {
+            Self::Ufw => format!("sudo ufw allow {port}/tcp"),
+            Self::Firewalld => format!(
+                "sudo firewall-cmd --permanent --add-port={port}/tcp && sudo firewall-cmd --reload"
+            ),
+            // nftables has no stable one-liner: it depends on the table and
+            // chain names in use, so sending them to the docs is honest.
+            Self::Nftables | Self::None => return None,
+        })
+    }
+}
+
+/// Decide what to say about who can reach the API.
+///
+/// Pure, so every combination is table-testable: the interesting cases involve
+/// a firewall that cannot be inspected on the machine running the tests.
+///
+/// `last_remote` is the address of the most recent off-box client, if any.
+/// It outranks everything inferred: a request that crossed the network is
+/// proof the port is open, where a running firewall is only a suspicion.
+fn assess_reachability(
+    bind: std::net::SocketAddr,
+    firewall: HostFirewall,
+    authenticated: bool,
+    last_remote: Option<std::net::IpAddr>,
+) -> (CheckStatus, String) {
+    if bind.ip().is_loopback() {
+        return (
+            CheckStatus::Pass,
+            format!(
+                "bound to {bind}, so the API answers only on this machine. \
+                 Reach it from elsewhere with `ssh -L {port}:127.0.0.1:{port} <host>`, \
+                 or bind a routable address to expose it.",
+                port = bind.port()
+            ),
+        );
+    }
+
+    let exposure = if authenticated {
+        "a bearer token is required"
+    } else {
+        "no token is set, so anyone who can reach it has full control"
+    };
+
+    if let Some(peer) = last_remote {
+        return (
+            CheckStatus::Pass,
+            format!("bound to {bind} and confirmed reachable — {peer} has connected; {exposure}"),
+        );
+    }
+
+    match firewall.unit() {
+        None => (
+            CheckStatus::Pass,
+            format!(
+                "bound to {bind} with no host firewall running, though nothing off this \
+                 machine has connected yet; {exposure}"
+            ),
+        ),
+        Some(unit) => {
+            // The port cannot be tested from here: traffic from the appliance
+            // to its own address never crosses the filter, so it would pass
+            // whether or not anything else can connect. And the rules cannot
+            // be read — they are root-only — so evidence is all there is.
+            let remedy = match firewall.allow_command(bind.port()) {
+                Some(command) => format!("Open it with: {command}"),
+                None => "Open it in the ruleset for this host.".to_string(),
+            };
+            (
+                CheckStatus::Warn,
+                format!(
+                    "bound to {bind}, but {unit} is running, its rules are root-only, and \
+                     nothing off this machine has connected yet. If the appliance is \
+                     unreachable, the port is being dropped — which looks exactly like a \
+                     daemon that is not running. {remedy} This clears itself as soon as one \
+                     remote client connects. ({exposure}.)"
+                ),
+            )
+        }
+    }
 }
 
 pub struct CheckRunner {
@@ -52,6 +162,10 @@ pub struct CheckRunner {
     store: Arc<crate::state::StateStore>,
     events: EventHub,
     results: RwLock<Vec<Check>>,
+    /// Most recent client that was not on this machine. See [`note_client`].
+    ///
+    /// [`note_client`]: CheckRunner::note_client
+    last_remote_client: RwLock<Option<std::net::IpAddr>>,
 }
 
 impl CheckRunner {
@@ -69,11 +183,32 @@ impl CheckRunner {
             store,
             events,
             results: RwLock::new(Vec::new()),
+            last_remote_client: RwLock::new(None),
         }
     }
 
     pub fn results(&self) -> Vec<Check> {
         self.results.read().unwrap().clone()
+    }
+
+    /// Record that a request arrived from `peer`.
+    ///
+    /// Loopback callers are ignored: the daemon's own health probes and the
+    /// browsers posting heartbeats would otherwise "prove" a reachability the
+    /// network has never actually demonstrated.
+    pub fn note_client(&self, peer: std::net::IpAddr) {
+        if peer.is_loopback() {
+            return;
+        }
+        let mut guard = self.last_remote_client.write().unwrap();
+        if *guard != Some(peer) {
+            *guard = Some(peer);
+        }
+    }
+
+    /// The most recent off-box client, if one has ever connected.
+    pub fn last_remote_client(&self) -> Option<std::net::IpAddr> {
+        *self.last_remote_client.read().unwrap()
     }
 
     /// Run every check, publishing an event when the outcome changes.
@@ -91,6 +226,7 @@ impl CheckRunner {
             self.check_systemd_unit().await,
             self.check_sway_config(),
             self.check_state_dir(),
+            self.check_api_reachability().await,
         ];
 
         let changed = {
@@ -674,6 +810,48 @@ impl CheckRunner {
         )
     }
 
+    /// Whether anything outside this machine can actually reach the API.
+    ///
+    /// Added because a firewall silently dropping the API port is
+    /// indistinguishable, from the outside, from an appliance that is dead:
+    /// the connection times out rather than being refused, and every other
+    /// check passes because they all run from inside.
+    async fn check_api_reachability(&self) -> Check {
+        let bind = self.bootstrap.bind;
+        let mut firewall = HostFirewall::None;
+        if !bind.ip().is_loopback() {
+            for candidate in [
+                HostFirewall::Ufw,
+                HostFirewall::Firewalld,
+                HostFirewall::Nftables,
+            ] {
+                let Some(unit) = candidate.unit() else {
+                    continue;
+                };
+                if let Ok(output) = run("systemctl", &["is-active", unit]).await {
+                    if first_line(&output.stdout) == "active" {
+                        firewall = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (status, detail) = assess_reachability(
+            bind,
+            firewall,
+            self.bootstrap.auth_enabled(),
+            self.last_remote_client(),
+        );
+        self.check(
+            ids::API_REACHABILITY,
+            "API reachable from the network",
+            status,
+            detail,
+            Some("getting-started/#network-access"),
+        )
+    }
+
     fn check(
         &self,
         id: &str,
@@ -1032,7 +1210,7 @@ mod tests {
     async fn every_check_reports_something() {
         let dir = tempfile::tempdir().unwrap();
         let checks = runner(dir.path().to_path_buf()).run_all().await;
-        assert_eq!(checks.len(), 12);
+        assert_eq!(checks.len(), 13);
         for id in [
             ids::SWAY_SOCKET,
             ids::SWAY_VERSION,
@@ -1045,6 +1223,7 @@ mod tests {
             ids::REAL_DISPLAYS,
             ids::VIDEO_DECODE,
             ids::SWAYBG,
+            ids::API_REACHABILITY,
         ] {
             assert!(checks.iter().any(|check| check.id == id), "missing {id}");
         }
@@ -1317,5 +1496,124 @@ mod tests {
         let unit = unit_file("/usr/bin/suede");
         assert!(unit.contains("ExecStart=/usr/bin/suede run"));
         assert!(unit.contains("WantedBy=sway-session.target"));
+    }
+
+    // --- API reachability -------------------------------------------------
+
+    fn addr(text: &str) -> std::net::SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_loopback_bind_explains_how_to_reach_it_anyway() {
+        let (status, detail) =
+            assess_reachability(addr("127.0.0.1:7071"), HostFirewall::None, false, None);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("only on this machine"));
+        // The tunnel command is the answer to "why can I not open the page",
+        // so it belongs in the detail rather than only in the documentation.
+        assert!(detail.contains("ssh -L 7071:127.0.0.1:7071"));
+    }
+
+    #[test]
+    fn an_exposed_bind_with_no_firewall_passes() {
+        let (status, detail) =
+            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::None, true, None);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("no host firewall"));
+        assert!(detail.contains("bearer token"));
+    }
+
+    #[test]
+    fn an_exposed_bind_behind_a_firewall_warns_with_the_command_to_open_it() {
+        // The case that cost an afternoon: bound to the world, dropped by ufw,
+        // every other check green because they all run from inside.
+        let (status, detail) =
+            assess_reachability(addr("0.0.0.0:7075"), HostFirewall::Ufw, false, None);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("ufw is running"));
+        assert!(detail.contains("sudo ufw allow 7075/tcp"));
+        assert!(
+            detail.contains("looks exactly like a daemon that is not running"),
+            "the symptom matters more than the cause: {detail}"
+        );
+    }
+
+    #[test]
+    fn firewalld_gets_its_own_command() {
+        let (_, detail) =
+            assess_reachability(addr("0.0.0.0:9000"), HostFirewall::Firewalld, false, None);
+        assert!(detail.contains("firewall-cmd --permanent --add-port=9000/tcp"));
+    }
+
+    #[test]
+    fn nftables_is_sent_to_the_documentation_rather_than_given_a_wrong_command() {
+        // The rule depends on the table and chain names in use, so any
+        // one-liner Suede printed would be a guess.
+        assert_eq!(HostFirewall::Nftables.allow_command(7071), None);
+        let (status, detail) =
+            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::Nftables, false, None);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("Open it in the ruleset"));
+    }
+
+    #[test]
+    fn an_unauthenticated_exposed_bind_says_so() {
+        let (_, detail) =
+            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::None, false, None);
+        assert!(detail.contains("full control"));
+    }
+
+    #[test]
+    fn a_connection_from_off_box_clears_the_firewall_warning() {
+        // Direct evidence beats inference: the rules cannot be read, but a
+        // request that crossed the network settles the question. Without this
+        // the warning could never be cleared, and an alert that never clears
+        // is one the operator learns to scroll past.
+        let peer = Some("10.0.0.5".parse().unwrap());
+        let (status, detail) =
+            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::Ufw, false, peer);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("confirmed reachable"));
+        assert!(detail.contains("10.0.0.5"));
+    }
+
+    #[test]
+    fn the_warning_says_it_will_clear_itself() {
+        let (_, detail) = assess_reachability(addr("0.0.0.0:7071"), HostFirewall::Ufw, false, None);
+        assert!(detail.contains("clears itself"));
+    }
+
+    #[test]
+    fn loopback_clients_are_not_evidence_of_anything() {
+        let runner = runner(tempfile::tempdir().unwrap().path().to_path_buf());
+        for local in ["127.0.0.1", "::1"] {
+            runner.note_client(local.parse().unwrap());
+        }
+        assert_eq!(
+            runner.last_remote_client(),
+            None,
+            "the daemon's own probes and page heartbeats must not count"
+        );
+
+        runner.note_client("192.168.1.20".parse().unwrap());
+        assert_eq!(
+            runner.last_remote_client(),
+            Some("192.168.1.20".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn a_loopback_bind_never_reports_a_firewall_problem() {
+        // Nothing can be filtering loopback traffic in a way that matters, so
+        // a warning here would be noise the operator learns to ignore.
+        for firewall in [
+            HostFirewall::Ufw,
+            HostFirewall::Firewalld,
+            HostFirewall::Nftables,
+        ] {
+            let (status, _) = assess_reachability(addr("127.0.0.1:7071"), firewall, false, None);
+            assert_eq!(status, CheckStatus::Pass, "{firewall:?} should not warn");
+        }
     }
 }

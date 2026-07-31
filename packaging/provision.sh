@@ -3,22 +3,28 @@
 # Prepare a machine to run as a Suede display appliance.
 #
 # This does the root-level work that the daemon deliberately will not do:
-# auto-login, starting sway at boot, and getting competing desktop
-# environments out of the way. It is idempotent — safe to re-run after an
-# upgrade — and it never touches Suede's own configuration, which lives in the
-# API and survives package operations.
+# auto-login, starting sway at boot, getting competing desktop environments
+# out of the way, and opening the API port in the host firewall. It is
+# idempotent — safe to re-run after an upgrade — and it never touches Suede's
+# own configuration, which lives in the API and survives package operations.
 #
 #   sudo /usr/share/suede/provision.sh [--user NAME] [--no-reboot]
+#                                      [--port N] [--no-firewall]
 
 set -euo pipefail
 
 APPLIANCE_USER="${SUDO_USER:-}"
 ASK_REBOOT=1
+# Must match DEFAULT_BIND in src/config.rs.
+SUEDE_PORT=7071
+OPEN_FIREWALL=1
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) APPLIANCE_USER="$2"; shift 2 ;;
     --no-reboot) ASK_REBOOT=0; shift ;;
+    --port) SUEDE_PORT="$2"; shift 2 ;;
+    --no-firewall) OPEN_FIREWALL=0; shift ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
@@ -186,6 +192,29 @@ rm -f /etc/xdg/autostart/labwc.desktop 2>/dev/null || true
 rm -f "$USER_HOME/.config/autostart/labwc.desktop" 2>/dev/null || true
 
 systemctl set-default multi-user.target >/dev/null 2>&1 || true
+
+step "Opening the API port"
+# Ubuntu Server enables ufw with SSH alone allowed, and its default policy
+# drops rather than rejects — so a correctly running Suede times out from the
+# network and looks like a machine that is switched off. This is the one place
+# in provisioning with the privileges to fix that.
+if [[ "$OPEN_FIREWALL" -eq 0 ]]; then
+  echo "  skipped (--no-firewall)"
+elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q "Status: active"; then
+  if ufw status 2>/dev/null | grep -qE "^${SUEDE_PORT}(/tcp)?[[:space:]]"; then
+    echo "  ufw already allows ${SUEDE_PORT}/tcp"
+  else
+    ufw allow "${SUEDE_PORT}/tcp" >/dev/null && \
+      echo "  allowed ${SUEDE_PORT}/tcp through ufw" || \
+      echo "  could not add the ufw rule; open ${SUEDE_PORT}/tcp by hand"
+  fi
+elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  firewall-cmd --permanent --add-port="${SUEDE_PORT}/tcp" >/dev/null && \
+    firewall-cmd --reload >/dev/null && \
+    echo "  allowed ${SUEDE_PORT}/tcp through firewalld"
+else
+  echo "  no active host firewall detected; nothing to open"
+fi
 
 step "Provisioning complete"
 cat <<EOF
