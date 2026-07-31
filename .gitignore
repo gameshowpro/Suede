@@ -1,3 +1,6 @@
 /target
 /site
 *.deb
+
+# Binaries built for deployment to a test machine
+/suede-x86_64

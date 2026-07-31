@@ -940,6 +940,16 @@
           "enabled": {
             "type": "boolean"
           },
+          "env": {
+            "type": "object",
+            "description": "Extra environment variables for the launched process.\n\nApplied last, so they override anything the launcher preset sets.\nHardware acceleration usually needs this: enabling NVDEC on an Nvidia\ncard, for instance, is a matter of `LIBVA_DRIVER_NAME` and\n`NVD_BACKEND` rather than any command-line flag.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "fullscreen": {
             "type": "boolean"
           },
@@ -977,19 +987,23 @@
           },
           "restart": {
             "$ref": "#/components/schemas/RestartPolicy"
+          },
+          "spanOutputs": {
+            "type": "boolean",
+            "description": "Stretch one window across *every* output instead of filling one.\n\nThis is sway's `fullscreen enable global`, and it is how a single\nbrowser drives a video wall: the outputs are positioned to form one\ncanvas, and the window covers the whole of it. When set, `output`\nonly decides where the window first appears."
           }
         }
       },
       "AppState": {
         "type": "string",
-        "description": "Lifecycle state of a supervised application.",
+        "description": "Lifecycle state of a supervised application.\n\nValues are camelCase like the rest of the API: `lowercase` would render\n`WaitingForOutput` as the unreadable `waitingforoutput`.",
         "enum": [
           "starting",
           "running",
           "stopped",
           "crashed",
           "backoff",
-          "waitingforoutput"
+          "waitingForOutput"
         ]
       },
       "AppStatus": {
@@ -1732,11 +1746,11 @@
         "type": "string",
         "description": "Why an app was last restarted.",
         "enum": [
-          "process_exited",
-          "heartbeat_timeout",
-          "window_never_appeared",
-          "config_changed",
-          "api_request"
+          "processExited",
+          "heartbeatTimeout",
+          "windowNeverAppeared",
+          "configChanged",
+          "apiRequest"
         ]
       },
       "Settings": {

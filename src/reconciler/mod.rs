@@ -450,6 +450,7 @@ mod tests {
             events.clone(),
             LaunchContext {
                 profiles_root: dir.path().join("profiles"),
+                log_root: dir.path().join("logs"),
                 api_base: "http://127.0.0.1:7071/api/v1".into(),
             },
         ));
@@ -494,6 +495,8 @@ mod tests {
             },
             output: output.map(OutputMatch::by_name),
             fullscreen: true,
+            span_outputs: false,
+            env: Default::default(),
             audio,
             heartbeat: None,
             restart: RestartPolicy::default(),

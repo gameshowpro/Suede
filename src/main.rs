@@ -140,6 +140,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         events.clone(),
         LaunchContext {
             profiles_root: bootstrap.state_dir.join("profiles"),
+            log_root: bootstrap.state_dir.join("logs"),
             // Loopback: the browsers posting heartbeats run on this machine.
             api_base: format!("http://127.0.0.1:{}/api/v1", bootstrap.bind.port()),
         },
@@ -156,6 +157,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         bootstrap.clone(),
         sway.clone(),
         audio.clone(),
+        store.clone(),
         events.clone(),
     ));
     let (trigger, trigger_rx) = Reconciler::channel();
@@ -256,14 +258,19 @@ fn init_tracing() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("suede=info,warn"));
 
-    // Under systemd the journal is the right destination; elsewhere, stderr.
+    // Log to the journal only when systemd is actually supervising us — it
+    // sets JOURNAL_STREAM for its services. Detecting the journal's mere
+    // availability would silently swallow the output of a foreground run,
+    // which is exactly when someone is watching the terminal.
     #[cfg(target_os = "linux")]
-    if let Ok(journald) = tracing_journald::layer() {
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(journald)
-            .init();
-        return;
+    if std::env::var_os("JOURNAL_STREAM").is_some() {
+        if let Ok(journald) = tracing_journald::layer() {
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(journald)
+                .init();
+            return;
+        }
     }
 
     tracing_subscriber::registry()

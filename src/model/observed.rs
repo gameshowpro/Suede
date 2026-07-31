@@ -3,6 +3,11 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+/// How far an advertised refresh rate may sit from a requested one and still
+/// be considered the mode the client meant. Wide enough for EDID jitter
+/// (59.81–60.02 for "60"), narrow enough to never confuse 50, 60, 72 or 75.
+pub const REFRESH_TOLERANCE_HZ: f64 = 1.0;
+
 /// A display mode. Refresh is in Hz (Sway reports mHz on the wire).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -97,7 +102,30 @@ impl Output {
 
     /// Whether this output advertises a mode compatible with `mode`.
     pub fn supports(&self, mode: &Mode) -> bool {
-        self.modes.iter().any(|m| m.matches(mode))
+        self.resolve_mode(mode).is_some()
+    }
+
+    /// The advertised mode that best satisfies `wanted`, if any.
+    ///
+    /// Real EDIDs almost never carry round refresh rates: a display offering
+    /// "1440p60" actually advertises 59.951 Hz, and 4K60 is 59.997 Hz. Asking
+    /// for 60 must therefore select the nearest rate at that resolution rather
+    /// than being refused — while still keeping genuinely distinct rates (50,
+    /// 60, 72, 75) apart.
+    pub fn resolve_mode(&self, wanted: &Mode) -> Option<Mode> {
+        if let Some(exact) = self.modes.iter().find(|m| m.matches(wanted)) {
+            return Some(*exact);
+        }
+        self.modes
+            .iter()
+            .filter(|m| m.width == wanted.width && m.height == wanted.height)
+            .filter(|m| (m.refresh_hz - wanted.refresh_hz).abs() <= REFRESH_TOLERANCE_HZ)
+            .min_by(|a, b| {
+                let da = (a.refresh_hz - wanted.refresh_hz).abs();
+                let db = (b.refresh_hz - wanted.refresh_hz).abs();
+                da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
     }
 }
 
@@ -120,8 +148,11 @@ pub struct Window {
 }
 
 /// Lifecycle state of a supervised application.
+///
+/// Values are camelCase like the rest of the API: `lowercase` would render
+/// `WaitingForOutput` as the unreadable `waitingforoutput`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum AppState {
     /// Spawned; waiting for its window to appear.
     Starting,
@@ -139,7 +170,7 @@ pub enum AppState {
 
 /// Why an app was last restarted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum RestartReason {
     ProcessExited,
     HeartbeatTimeout,
@@ -363,6 +394,146 @@ mod tests {
             refresh_hz: 50.0,
         };
         assert!(!a.matches(&c));
+    }
+
+    /// Refresh rates taken verbatim from a Samsung U28E510's EDID.
+    fn real_display() -> Output {
+        Output {
+            name: "DP-3".into(),
+            active: true,
+            make: Some("Samsung Electric Company".into()),
+            model: Some("U28E510".into()),
+            serial: None,
+            current_mode: None,
+            modes: vec![
+                Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 59.939,
+                },
+                Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60.000,
+                },
+                Mode {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 59.951,
+                },
+                Mode {
+                    width: 3840,
+                    height: 2160,
+                    refresh_hz: 59.997,
+                },
+                Mode {
+                    width: 1280,
+                    height: 720,
+                    refresh_hz: 60.000,
+                },
+                Mode {
+                    width: 640,
+                    height: 480,
+                    refresh_hz: 59.940,
+                },
+                Mode {
+                    width: 640,
+                    height: 480,
+                    refresh_hz: 72.809,
+                },
+                Mode {
+                    width: 640,
+                    height: 480,
+                    refresh_hz: 75.000,
+                },
+            ],
+            rect: Rect::default(),
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        }
+    }
+
+    #[test]
+    fn enum_values_stay_readable_in_json() {
+        // `lowercase` would produce "waitingforoutput"; the docs and the UI
+        // both expect camelCase.
+        assert_eq!(
+            serde_json::to_value(AppState::WaitingForOutput).unwrap(),
+            "waitingForOutput"
+        );
+        assert_eq!(serde_json::to_value(AppState::Running).unwrap(), "running");
+        assert_eq!(
+            serde_json::to_value(RestartReason::HeartbeatTimeout).unwrap(),
+            "heartbeatTimeout"
+        );
+    }
+
+    #[test]
+    fn a_request_for_60_finds_the_real_rate_beside_it() {
+        // No real display advertises exactly 60 at 1440p; this one says 59.951.
+        let display = real_display();
+        let resolved = display
+            .resolve_mode(&Mode {
+                width: 2560,
+                height: 1440,
+                refresh_hz: 60.0,
+            })
+            .expect("2560x1440 is advertised and must resolve");
+        assert_eq!(resolved.refresh_hz, 59.951);
+        assert!(display.supports(&Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 60.0
+        }));
+    }
+
+    #[test]
+    fn an_exact_rate_is_preferred_over_a_near_one() {
+        // 1080p is advertised at both 59.939 and 60.000.
+        let resolved = real_display()
+            .resolve_mode(&Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            })
+            .unwrap();
+        assert_eq!(resolved.refresh_hz, 60.0);
+    }
+
+    #[test]
+    fn distinct_refresh_rates_are_never_conflated() {
+        let display = real_display();
+        // 640x480 offers 59.94, 72.809 and 75; each request must land on its own.
+        for (asked, expected) in [(60.0, 59.940), (72.0, 72.809), (75.0, 75.000)] {
+            let resolved = display
+                .resolve_mode(&Mode {
+                    width: 640,
+                    height: 480,
+                    refresh_hz: asked,
+                })
+                .unwrap();
+            assert_eq!(resolved.refresh_hz, expected, "asking for {asked}");
+        }
+        // 50 Hz is not on offer at all and must not borrow the 59.94 mode.
+        assert!(display
+            .resolve_mode(&Mode {
+                width: 640,
+                height: 480,
+                refresh_hz: 50.0
+            })
+            .is_none());
+    }
+
+    #[test]
+    fn an_unavailable_resolution_still_resolves_to_nothing() {
+        assert!(real_display()
+            .resolve_mode(&Mode {
+                width: 7680,
+                height: 4320,
+                refresh_hz: 60.0
+            })
+            .is_none());
     }
 
     #[test]

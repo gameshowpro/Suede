@@ -118,6 +118,11 @@ impl DesiredState {
                     ));
                 }
             }
+            for key in app.env.keys() {
+                if key.is_empty() || key.contains('=') || key.contains('\0') {
+                    errors.push(format!("{prefix}.env has an invalid variable name {key:?}"));
+                }
+            }
         }
 
         if self.settings.output_poll_interval_seconds == 0 {
@@ -451,9 +456,25 @@ pub struct AppConfig {
     pub output: Option<OutputMatch>,
     #[serde(default = "default_true")]
     pub fullscreen: bool,
+    /// Stretch one window across *every* output instead of filling one.
+    ///
+    /// This is sway's `fullscreen enable global`, and it is how a single
+    /// browser drives a video wall: the outputs are positioned to form one
+    /// canvas, and the window covers the whole of it. When set, `output`
+    /// only decides where the window first appears.
+    #[serde(default)]
+    pub span_outputs: bool,
     /// Audio routing. Absent leaves routing untouched; `{"output": null}` silences.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio: Option<AudioConfig>,
+    /// Extra environment variables for the launched process.
+    ///
+    /// Applied last, so they override anything the launcher preset sets.
+    /// Hardware acceleration usually needs this: enabling NVDEC on an Nvidia
+    /// card, for instance, is a matter of `LIBVA_DRIVER_NAME` and
+    /// `NVD_BACKEND` rather than any command-line flag.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub heartbeat: Option<HeartbeatConfig>,
     #[serde(default)]
@@ -608,6 +629,8 @@ mod tests {
             },
             output: None,
             fullscreen: true,
+            span_outputs: false,
+            env: Default::default(),
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),
@@ -622,6 +645,33 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_bad_environment_names() {
+        let mut app = AppConfig {
+            id: "a".into(),
+            enabled: true,
+            launcher: Launcher::Exec {
+                command: "true".into(),
+                args: vec![],
+            },
+            output: None,
+            fullscreen: true,
+            span_outputs: false,
+            env: Default::default(),
+            audio: None,
+            heartbeat: None,
+            restart: RestartPolicy::default(),
+            persist_profile: false,
+        };
+        app.env.insert("BAD=NAME".into(), "x".into());
+        let state = DesiredState {
+            apps: vec![app],
+            ..DesiredState::new()
+        };
+        let errors = state.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("invalid variable name")));
+    }
+
+    #[test]
     fn validation_rejects_unsafe_app_id() {
         let state = DesiredState {
             apps: vec![AppConfig {
@@ -633,6 +683,8 @@ mod tests {
                 },
                 output: None,
                 fullscreen: true,
+                span_outputs: false,
+                env: Default::default(),
                 audio: None,
                 heartbeat: None,
                 restart: RestartPolicy::default(),

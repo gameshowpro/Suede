@@ -31,6 +31,13 @@ pub struct BootstrapConfig {
     pub state_dir: PathBuf,
     /// Base URL used to build `docsUrl` links in health checks.
     pub docs_base_url: String,
+    /// Sway configuration file that health-check fixes may patch.
+    ///
+    /// Held here rather than derived at the point of use so the remediations
+    /// can be exercised against a temporary directory instead of a real home.
+    pub sway_config_path: PathBuf,
+    /// Directory for systemd *user* units that fixes may write.
+    pub systemd_user_dir: PathBuf,
 }
 
 impl Default for BootstrapConfig {
@@ -40,8 +47,25 @@ impl Default for BootstrapConfig {
             token: None,
             state_dir: crate::util::state_dir(),
             docs_base_url: DEFAULT_DOCS_BASE_URL.to_string(),
+            sway_config_path: default_sway_config_path(),
+            systemd_user_dir: default_systemd_user_dir(),
         }
     }
+}
+
+fn config_home() -> PathBuf {
+    crate::util::config_dir()
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_sway_config_path() -> PathBuf {
+    config_home().join("sway/config")
+}
+
+fn default_systemd_user_dir() -> PathBuf {
+    config_home().join("systemd/user")
 }
 
 #[derive(Debug, thiserror::Error)]

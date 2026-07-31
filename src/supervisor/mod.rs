@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 
 use crate::events::{EventHub, ServerEvent};
 use crate::model::{AppConfig, AppState, AppStatus, Divergence, RestartReason, Window};
-use crate::reconciler::plan::{placement_commands, AppTarget};
+use crate::reconciler::plan::{desired_fullscreen_mode, placement_commands, AppTarget};
 use crate::sway::SwayClient;
 
 pub use launcher::{LaunchContext, LaunchSpec};
@@ -212,7 +212,18 @@ impl Supervisor {
             let ids: Vec<i64> = matched.iter().map(|window| window.id).collect();
             managed.status.window_ids = ids.clone();
 
-            if managed.placed {
+            // A client can change its own fullscreen state after we place it —
+            // a kiosk browser asks for fullscreen on its own output — so a
+            // window that has drifted out of the mode we asked for is placed
+            // again rather than left wrong.
+            let wanted_mode =
+                desired_fullscreen_mode(managed.config.fullscreen, managed.config.span_outputs);
+            let drifted = wanted_mode > 0
+                && matched
+                    .iter()
+                    .any(|window| window.fullscreen_mode != wanted_mode);
+
+            if managed.placed && !drifted {
                 continue;
             }
 
@@ -221,23 +232,37 @@ impl Supervisor {
                 self.publish(managed);
             }
 
-            let Some(workspace) = managed.target.as_ref().and_then(|target| target.workspace)
-            else {
+            // No workspace means no output was pinned, which is normal for a
+            // spanning app; it still needs its fullscreen mode applied.
+            let workspace = managed.target.as_ref().and_then(|target| target.workspace);
+            let commands: Vec<String> = ids
+                .iter()
+                .flat_map(|window_id| {
+                    placement_commands(
+                        *window_id,
+                        workspace,
+                        managed.config.fullscreen,
+                        managed.config.span_outputs,
+                    )
+                })
+                .collect();
+
+            if commands.is_empty() {
                 managed.placed = true;
                 continue;
-            };
+            }
 
-            for window_id in ids {
-                for command in placement_commands(window_id, workspace, managed.config.fullscreen) {
-                    if let Err(error) = self.sway.run_command(&command).await {
-                        tracing::warn!(app = %managed.config.id, %error, "window placement failed");
-                    }
+            for command in &commands {
+                if let Err(error) = self.sway.run_command(command).await {
+                    tracing::warn!(app = %managed.config.id, %error, "window placement failed");
                 }
             }
             managed.placed = true;
             tracing::info!(
                 app = %managed.config.id,
-                workspace,
+                ?workspace,
+                span = managed.config.span_outputs,
+                replaced = drifted,
                 "placed window"
             );
         }
@@ -252,14 +277,26 @@ impl Supervisor {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let code = status.code();
-                    tracing::warn!(app = %managed.config.id, ?code, "app exited");
+                    // Whatever the program said on the way out is the most
+                    // useful thing we can show an operator.
+                    let reason = last_stderr_line(&self.context.log_path(&managed.config.id));
+                    match &reason {
+                        Some(text) => {
+                            tracing::warn!(app = %managed.config.id, ?code, error = %text, "app exited")
+                        }
+                        None => tracing::warn!(app = %managed.config.id, ?code, "app exited"),
+                    }
                     managed.child = None;
                     managed.placed = false;
                     managed.status.pid = None;
                     managed.status.window_ids.clear();
                     managed.status.last_exit_code = code;
                     managed.status.last_restart_reason = Some(RestartReason::ProcessExited);
-                    schedule_restart_or_halt(managed, code, "exited");
+                    let detail = match reason {
+                        Some(text) => format!("exited ({}): {text}", describe(code)),
+                        None => format!("exited ({})", describe(code)),
+                    };
+                    schedule_restart_or_halt(managed, code, &detail);
                     self.publish(managed);
                 }
                 Ok(None) => {}
@@ -382,12 +419,33 @@ impl Supervisor {
             tokio::fs::create_dir_all(profile).await?;
         }
 
-        let mut command = tokio::process::Command::new(&spec.program);
+        // Capture stderr to a file. Without it, a crash-looping app tells the
+        // operator nothing at all — which is precisely when they need to know
+        // why, and the reason is usually in the first line the program prints.
+        let log_path = self.context.log_path(&managed.config.id);
+        if let Some(parent) = log_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let log = std::fs::File::create(&log_path)?;
+
+        // Chromium goes by a different name on almost every distribution, so
+        // the preset carries candidates rather than one hardcoded binary.
+        let program = launcher::resolve_program(&spec.programs).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "none of these programs is installed: {}",
+                    spec.programs.join(", ")
+                ),
+            )
+        })?;
+
+        let mut command = tokio::process::Command::new(&program);
         command
             .args(&spec.args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::from(log))
             .kill_on_drop(true);
         for (key, value) in &spec.env {
             command.env(key, value);
@@ -401,7 +459,7 @@ impl Supervisor {
 
         tracing::info!(
             app = %managed.config.id,
-            program = %spec.program,
+            program = %program.display(),
             ?pid,
             "launched app"
         );
@@ -440,6 +498,30 @@ impl Supervisor {
 fn set_state(status: &mut AppStatus, state: AppState, detail: Option<String>) {
     status.state = state;
     status.detail = detail;
+}
+
+fn describe(code: Option<i32>) -> String {
+    match code {
+        Some(0) => "cleanly".to_string(),
+        Some(code) => format!("status {code}"),
+        None => "killed by a signal".to_string(),
+    }
+}
+
+/// The last meaningful line a failing program wrote to stderr.
+fn last_stderr_line(path: &std::path::Path) -> Option<String> {
+    const TAIL: usize = 4096;
+    let text = std::fs::read(path).ok()?;
+    let tail = &text[text.len().saturating_sub(TAIL)..];
+    let text = String::from_utf8_lossy(tail);
+    let line = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    // Keep it short enough to sit in a status field and an SSE payload.
+    let line: String = line.chars().take(300).collect();
+    Some(line)
 }
 
 /// Queue a restart, or halt the app when its policy declines one.
@@ -533,6 +615,7 @@ mod tests {
     fn context(root: &std::path::Path) -> LaunchContext {
         LaunchContext {
             profiles_root: root.join("profiles"),
+            log_root: root.join("logs"),
             api_base: "http://127.0.0.1:7071/api/v1".into(),
         }
     }
@@ -554,6 +637,8 @@ mod tests {
             },
             output: None,
             fullscreen: true,
+            span_outputs: false,
+            env: Default::default(),
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),

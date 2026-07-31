@@ -76,6 +76,8 @@ pub fn plan_outputs(
             continue;
         }
 
+        let applied = previously_applied.get(name);
+
         // Enabling an output resets everything Sway knows about it, so once we
         // issue `enable` every other setting must be re-applied unconditionally.
         let just_enabled = !output.active;
@@ -84,26 +86,55 @@ pub fn plan_outputs(
             plan.topology_changed = true;
         }
 
+        // The first time Suede manages an output, apply every setting even if
+        // the observed value already matches. An observed value that Suede did
+        // not set is not necessarily pinned: sway auto-arranges outputs it has
+        // no explicit position for, and will silently recompute that position
+        // when a neighbouring output changes size. Applying once makes it
+        // explicit; later passes go back to minimal diffs.
+        let unmanaged = applied.is_none();
+        let force = just_enabled || unmanaged;
+
         if let Some(mode) = config.mode {
-            let advertises_modes = !output.modes.is_empty();
-            if output.active && advertises_modes && !output.supports(&mode) {
-                plan.divergences.push(Divergence::new(
+            // An inactive output reports no modes, so the request is passed
+            // through and sway validates it once the output comes up.
+            let target = if output.modes.is_empty() {
+                Some(mode)
+            } else {
+                output.resolve_mode(&mode)
+            };
+
+            match target {
+                None => plan.divergences.push(Divergence::new(
                     "mode_unsupported",
                     name,
                     format!("{name} does not advertise mode {}", mode.to_sway()),
-                ));
-            } else if just_enabled
-                || output
-                    .current_mode
-                    .is_none_or(|current| !current.matches(&mode))
-            {
-                plan.commands
-                    .push(format!("output {name} mode {}", mode.to_sway()));
+                )),
+                Some(target) => {
+                    if !target.matches(&mode) {
+                        tracing::info!(
+                            output = name,
+                            requested = %mode.to_sway(),
+                            using = %target.to_sway(),
+                            "using the nearest advertised refresh rate"
+                        );
+                    }
+                    // Issue the advertised mode rather than the requested one,
+                    // so the next pass sees it as already satisfied.
+                    if force
+                        || output
+                            .current_mode
+                            .is_none_or(|current| !current.matches(&target))
+                    {
+                        plan.commands
+                            .push(format!("output {name} mode {}", target.to_sway()));
+                    }
+                }
             }
         }
 
         if let Some(position) = config.position {
-            if just_enabled || output.rect.x != position.x || output.rect.y != position.y {
+            if force || output.rect.x != position.x || output.rect.y != position.y {
                 plan.commands
                     .push(format!("output {name} pos {} {}", position.x, position.y));
             }
@@ -113,7 +144,7 @@ pub fn plan_outputs(
             let differs = output
                 .scale
                 .is_none_or(|current| (current - scale).abs() > 1e-6);
-            if just_enabled || differs {
+            if force || differs {
                 plan.commands
                     .push(format!("output {name} scale {}", format_number(scale)));
             }
@@ -121,7 +152,7 @@ pub fn plan_outputs(
 
         if let Some(transform) = config.transform {
             let wanted = transform.as_sway();
-            if just_enabled || output.transform.as_deref() != Some(wanted) {
+            if force || output.transform.as_deref() != Some(wanted) {
                 plan.commands
                     .push(format!("output {name} transform {wanted}"));
             }
@@ -131,20 +162,20 @@ pub fn plan_outputs(
             .adaptive_sync_status
             .as_deref()
             .map(|status| status == "enabled");
-        if just_enabled || adaptive_sync_active != Some(config.adaptive_sync) {
+        if force || adaptive_sync_active != Some(config.adaptive_sync) {
             plan.commands.push(format!(
                 "output {name} adaptive_sync {}",
                 if config.adaptive_sync { "on" } else { "off" }
             ));
         }
 
-        let applied = previously_applied.get(name);
-
         if capabilities.supports_tearing {
             let changed = applied.is_none_or(|a| a.config.allow_tearing != config.allow_tearing);
-            if just_enabled || changed {
+            if force || changed {
+                // `allow_tearing` is the subcommand sway accepts; a plain
+                // `tearing` is rejected as an invalid output subcommand.
                 plan.commands.push(format!(
-                    "output {name} tearing {}",
+                    "output {name} allow_tearing {}",
                     if config.allow_tearing { "yes" } else { "no" }
                 ));
             }
@@ -158,7 +189,7 @@ pub fn plan_outputs(
 
         let render_time_changed =
             applied.is_none_or(|a| a.config.max_render_time_ms != config.max_render_time_ms);
-        if just_enabled || render_time_changed {
+        if force || render_time_changed {
             let value = config
                 .max_render_time_ms
                 .map(|ms| ms.to_string())
@@ -168,7 +199,7 @@ pub fn plan_outputs(
         }
 
         // Pinning a workspace to the output makes app placement deterministic.
-        if just_enabled || applied.is_none_or(|a| a.workspace != workspace) {
+        if force || applied.is_none_or(|a| a.workspace != workspace) {
             plan.commands
                 .push(format!("workspace {workspace} output {name}"));
         }
@@ -259,16 +290,47 @@ pub fn resolve_app_targets(
         .collect()
 }
 
-/// Commands that place a window and make it fill its output.
-pub fn placement_commands(window_id: i64, workspace: u32, fullscreen: bool) -> Vec<String> {
-    let mut commands = vec![format!(
-        "[con_id={window_id}] move container to workspace number {workspace}"
-    )];
-    if fullscreen {
-        // Not `global`: each app fills its own output, not the whole layout.
+/// Commands that place a window and make it fill its output — or every output.
+///
+/// `workspace` is optional: an app that spans every output pins no single one,
+/// but it still needs its fullscreen mode set. Skipping placement whenever no
+/// workspace was resolved would leave such a window with whatever fullscreen
+/// state the client asked for — which for a kiosk browser is one output.
+pub fn placement_commands(
+    window_id: i64,
+    workspace: Option<u32>,
+    fullscreen: bool,
+    span_outputs: bool,
+) -> Vec<String> {
+    let mut commands = Vec::new();
+    if let Some(workspace) = workspace {
+        commands.push(format!(
+            "[con_id={window_id}] move container to workspace number {workspace}"
+        ));
+    }
+    if span_outputs {
+        // `global` stretches the window across the whole layout, which is what
+        // drives a video wall from a single browser. Sway upgrades straight
+        // from per-output fullscreen, so no need to clear it first.
+        commands.push(format!("[con_id={window_id}] fullscreen enable global"));
+    } else if fullscreen {
+        // Without `global`, the window fills only its own output.
         commands.push(format!("[con_id={window_id}] fullscreen enable"));
     }
     commands
+}
+
+/// The `fullscreen_mode` sway should report once placement has taken effect.
+///
+/// 0 = windowed, 1 = fills its output, 2 = spans the whole layout.
+pub fn desired_fullscreen_mode(fullscreen: bool, span_outputs: bool) -> i32 {
+    if span_outputs {
+        2
+    } else if fullscreen {
+        1
+    } else {
+        0
+    }
 }
 
 /// Hide the pointer and park it below the layout, out of every output.
@@ -365,6 +427,8 @@ mod tests {
             },
             output: output.map(OutputMatch::by_name),
             fullscreen: true,
+            span_outputs: false,
+            env: Default::default(),
             audio: None,
             heartbeat: None,
             restart: RestartPolicy::default(),
@@ -424,7 +488,7 @@ mod tests {
                 "output HDMI-A-1 mode 1920x1080@60Hz",
                 "output HDMI-A-1 pos 0 0",
                 "output HDMI-A-1 adaptive_sync off",
-                "output HDMI-A-1 tearing no",
+                "output HDMI-A-1 allow_tearing no",
                 "output HDMI-A-1 max_render_time off",
                 "workspace 1 output HDMI-A-1",
             ]
@@ -469,6 +533,51 @@ mod tests {
         assert_eq!(plan.divergences.len(), 1);
         assert_eq!(plan.divergences[0].kind, "output_not_connected");
         assert_eq!(plan.divergences[0].subject, "HDMI-A-2");
+    }
+
+    #[test]
+    fn a_near_refresh_rate_is_applied_as_advertised() {
+        // The planner must issue the rate the display actually offers, so the
+        // next pass recognises the result as already satisfied.
+        let mut display = output("HDMI-A-1", true);
+        display.modes = vec![Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 59.951,
+        }];
+        let mut desired = config("HDMI-A-1");
+        desired.mode = Some(Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 60.0,
+        });
+
+        let plan = plan_outputs(
+            std::slice::from_ref(&display),
+            std::slice::from_ref(&desired),
+            &HashMap::new(),
+            tearing_capable(),
+        );
+        assert!(
+            plan.commands
+                .contains(&"output HDMI-A-1 mode 2560x1440@59.951Hz".to_string()),
+            "expected the advertised rate, got {:?}",
+            plan.commands
+        );
+        assert!(plan.divergences.is_empty());
+
+        // Once applied, the pass must settle rather than re-issuing forever.
+        display.current_mode = Some(Mode {
+            width: 2560,
+            height: 1440,
+            refresh_hz: 59.951,
+        });
+        let second = plan_outputs(&[display], &[desired], &plan.applied, tearing_capable());
+        assert!(
+            !second.commands.iter().any(|c| c.contains("mode")),
+            "second pass re-issued the mode: {:?}",
+            second.commands
+        );
     }
 
     #[test]
@@ -520,6 +629,77 @@ mod tests {
         );
         assert!(!plan.commands.iter().any(|c| c.contains("HDMI-A-2")));
         assert!(plan.divergences.is_empty());
+    }
+
+    #[test]
+    fn tearing_uses_the_subcommand_sway_accepts() {
+        // sway rejects a plain `tearing` with "Invalid output subcommand".
+        let observed = vec![output("HDMI-A-1", true)];
+        let mut desired = config("HDMI-A-1");
+        desired.allow_tearing = true;
+
+        let plan = plan_outputs(&observed, &[desired], &HashMap::new(), tearing_capable());
+        assert!(plan
+            .commands
+            .contains(&"output HDMI-A-1 allow_tearing yes".to_string()));
+        assert!(
+            !plan.commands.iter().any(|c| c.contains(" tearing ")),
+            "must not emit the rejected spelling: {:?}",
+            plan.commands
+        );
+    }
+
+    #[test]
+    fn an_unmanaged_output_has_every_setting_applied_once() {
+        // An observed position Suede did not set is not pinned: sway
+        // auto-arranges such outputs and silently recomputes their position
+        // when a neighbour changes size. So the first pass must be explicit
+        // even where observed already equals desired.
+        let observed = vec![output("HDMI-A-1", true)];
+        let mut desired = config("HDMI-A-1");
+        desired.mode = Some(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        });
+        // Exactly what the output already reports.
+        desired.position = Some(Position { x: 0, y: 0 });
+        desired.scale = Some(1.0);
+        desired.transform = Some(Transform::Normal);
+
+        let plan = plan_outputs(&observed, &[desired], &HashMap::new(), tearing_capable());
+        assert!(
+            plan.commands
+                .contains(&"output HDMI-A-1 pos 0 0".to_string()),
+            "position must be pinned on the first pass: {:?}",
+            plan.commands
+        );
+        assert!(plan.commands.iter().any(|c| c.contains("mode")));
+        assert!(plan.commands.iter().any(|c| c.contains("scale")));
+        assert!(plan.commands.iter().any(|c| c.contains("transform")));
+    }
+
+    #[test]
+    fn a_managed_output_returns_to_minimal_diffs() {
+        // Having pinned everything once, the next pass must be quiet again.
+        let observed = vec![output("HDMI-A-1", true)];
+        let mut desired = config("HDMI-A-1");
+        desired.position = Some(Position { x: 0, y: 0 });
+
+        let first = plan_outputs(
+            &observed,
+            std::slice::from_ref(&desired),
+            &HashMap::new(),
+            tearing_capable(),
+        );
+        assert!(!first.commands.is_empty());
+
+        let second = plan_outputs(&observed, &[desired], &first.applied, tearing_capable());
+        assert!(
+            second.commands.is_empty(),
+            "second pass should be a no-op, got {:?}",
+            second.commands
+        );
     }
 
     #[test]
@@ -644,7 +824,7 @@ mod tests {
 
     #[test]
     fn placement_uses_per_output_fullscreen() {
-        let commands = placement_commands(42, 3, true);
+        let commands = placement_commands(42, Some(3), true, false);
         assert_eq!(
             commands,
             vec![
@@ -658,7 +838,60 @@ mod tests {
 
     #[test]
     fn placement_can_skip_fullscreen() {
-        assert_eq!(placement_commands(42, 3, false).len(), 1);
+        assert_eq!(placement_commands(42, Some(3), false, false).len(), 1);
+    }
+
+    #[test]
+    fn spanning_uses_global_fullscreen() {
+        // One browser across every output: the video-wall case.
+        let commands = placement_commands(42, Some(1), true, true);
+        assert_eq!(
+            commands,
+            vec![
+                "[con_id=42] move container to workspace number 1",
+                "[con_id=42] fullscreen enable global",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_spanning_app_is_placed_even_with_no_pinned_output() {
+        // The regression that made spanning silently fill one monitor: with no
+        // workspace resolved, placement produced nothing at all and the kiosk
+        // browser kept its own per-output fullscreen.
+        let commands = placement_commands(9, None, true, true);
+        assert_eq!(commands, vec!["[con_id=9] fullscreen enable global"]);
+        assert!(!commands.is_empty(), "spanning must still be applied");
+    }
+
+    #[test]
+    fn without_a_workspace_nothing_is_moved() {
+        let commands = placement_commands(9, None, true, false);
+        assert!(!commands.iter().any(|c| c.contains("move container")));
+        assert_eq!(commands, vec!["[con_id=9] fullscreen enable"]);
+    }
+
+    #[test]
+    fn desired_modes_match_sways_numbering() {
+        assert_eq!(desired_fullscreen_mode(true, true), 2);
+        assert_eq!(desired_fullscreen_mode(true, false), 1);
+        assert_eq!(desired_fullscreen_mode(false, false), 0);
+        // Spanning implies filling the screen even if fullscreen is unset.
+        assert_eq!(desired_fullscreen_mode(false, true), 2);
+    }
+
+    #[test]
+    fn spanning_wins_over_per_output_fullscreen() {
+        // `global` already implies filling the screen; issuing both would
+        // leave the window merely filling one output.
+        let commands = placement_commands(7, Some(2), false, true);
+        assert!(commands
+            .iter()
+            .any(|c| c.ends_with("fullscreen enable global")));
+        assert_eq!(
+            commands.iter().filter(|c| c.contains("fullscreen")).count(),
+            1
+        );
     }
 
     #[test]
