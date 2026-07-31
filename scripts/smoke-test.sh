@@ -64,7 +64,7 @@ check "windows are visible" "2" \
   "$(json_of "${BASE}/api/v1/windows" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
 check "audio sinks are visible" "2" \
   "$(json_of "${BASE}/api/v1/audio/outputs" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
-check "health checks run" "7" \
+check "health checks run" "11" \
   "$(json_of "${BASE}/api/v1/system/checks" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
 check "system reports its version" "true" \
   "$(json_of "${BASE}/api/v1/system" | python3 -c 'import sys,json;print(str(len(json.load(sys.stdin)["suedeVersion"])>0).lower())')"

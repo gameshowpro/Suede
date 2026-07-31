@@ -71,6 +71,35 @@ chromium --ozone-platform=wayland --kiosk http://example.com
 !!! tip "Two Chromium instances, one profile"
     Chromium refuses to start a second instance sharing a profile. Suede gives every app its own `--user-data-dir` automatically, so this only bites if you have passed a conflicting `--user-data-dir` in `extraArgs`.
 
+## A spanned window mirrors instead of spanning
+
+Every display shows the *same* part of the page rather than its own slice, even
+though `GET /windows` reports the window at the full width of the layout and
+sway agrees.
+
+This is not a layout problem. When wlroots can hand a fullscreen client buffer
+straight to the display controller, each output scans that buffer out from its
+own origin — so a 3840-wide window on two 1920-wide displays shows pixels
+0–1920 on both. Everything reports as correct, which makes it very hard to spot
+from the API alone.
+
+Start sway with direct scanout disabled:
+
+```bash
+WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 sway
+```
+
+`provision.sh` sets this for you. The `direct-scanout` health check warns
+whenever an app has `spanOutputs: true` while the running compositor was
+started without it:
+
+```bash
+curl -s http://appliance:7071/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="direct-scanout"])'
+```
+
+Observed with the Nvidia proprietary driver. Per-output kiosks are unaffected —
+each window covers one display, so the buffer and the output match.
+
 ## A page freezes but the browser keeps running
 
 That is exactly what the content watchdog is for. Enable it on the app, and have the page post to `{heartbeatUrl}` every 10 seconds. Suede then kills and relaunches the browser after 25 seconds of silence.

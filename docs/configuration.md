@@ -77,10 +77,50 @@ An application is a *launch specification*, not a window. That is what makes it 
 | `launcher` | object | required | See below |
 | `output` | object \| null | null | Output to place the window on |
 | `fullscreen` | bool | `true` | Fill the target output |
+| `spanOutputs` | bool | `false` | Stretch one window across **every** output |
+| `env` | object | `{}` | Extra environment variables for the process |
 | `audio` | object \| null | null | Absent leaves routing alone; see below |
 | `heartbeat` | object \| null | null | Content watchdog |
 | `restart` | object | always/1s/30s | Restart policy and backoff |
 | `persistProfile` | bool | `false` | Keep the browser profile between launches |
+
+#### Driving a video wall
+
+Setting `spanOutputs: true` stretches a single window across the whole layout
+rather than filling one output — sway's `fullscreen enable global`. This is how
+one browser drives several displays as a single canvas:
+
+```json
+{
+  "outputs": [
+    {"match":{"name":"HDMI-A-1"},"enable":true,"mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":0,"y":0}},
+    {"match":{"name":"HDMI-A-2"},"enable":true,"mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":1920,"y":0}},
+    {"match":{"name":"HDMI-A-3"},"enable":true,"mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":3840,"y":0}},
+    {"match":{"name":"HDMI-A-4"},"enable":true,"mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":5760,"y":0}}
+  ],
+  "apps": [
+    {"id":"wall","enabled":true,"spanOutputs":true,
+     "launcher":{"kind":"chromium-kiosk","uri":"http://control.local/wall"}}
+  ]
+}
+```
+
+The page then sees one 7680x1080 viewport. Position the outputs to form the
+canvas you want; Suede performs no layout arithmetic, so the geometry is
+entirely yours.
+
+!!! warning "Start sway with direct scanout disabled"
+    Spanning needs `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` on the compositor.
+    Without it, some drivers show the same part of the window on every display
+    instead of spanning — see
+    [troubleshooting](troubleshooting.md#a-spanned-window-mirrors-instead-of-spanning).
+    `provision.sh` sets it, and the `direct-scanout` health check warns if it is
+    missing.
+
+!!! tip "Give the outputs matching heights"
+    A spanned window covers the *bounding box* of every output. Where an output
+    is shorter than its neighbours, the content below it falls outside any
+    display and is simply not visible.
 
 #### Launchers
 
@@ -120,6 +160,39 @@ An application is a *launch specification*, not a window. That is what makes it 
     ```
 
     Launched verbatim. A bare `exec` app is only expected to map a window if it pins an output.
+
+#### Environment and hardware acceleration
+
+`env` sets environment variables on the launched process. They are applied
+last, so they override anything the launcher preset chose.
+
+This is usually how graphics acceleration is configured, because the knobs are
+environment variables rather than command-line flags:
+
+```json
+{
+  "id": "wall",
+  "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/wall" },
+  "env": {
+    "LIBVA_DRIVER_NAME": "nvidia",
+    "NVD_BACKEND": "direct"
+  }
+}
+```
+
+!!! warning "Check that hardware video decode is really happening"
+    The `chromium-kiosk` preset asks for `VaapiVideoDecoder`, but that only
+    takes effect if a VA-API driver for your GPU is installed. Without one,
+    Chromium falls back to software decode *silently* — nothing fails, it just
+    uses the CPU. Nvidia cards need `nvidia-vaapi-driver`; Intel needs
+    `intel-media-va-driver`. Confirm from inside the browser with
+    `navigator.mediaCapabilities.decodingInfo(...)`, whose `powerEfficient`
+    flag is the honest answer, or watch `nvidia-smi dmon -s u` and look at the
+    `dec` column while a video plays.
+
+    Rasterisation, compositing, WebGL and CSS animation are a separate path and
+    generally work without any of this — check the WebGL renderer string is
+    your GPU rather than `llvmpipe` or `SwiftShader`.
 
 #### URI placeholders
 

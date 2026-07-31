@@ -237,7 +237,7 @@ Process liveness alone cannot detect a hung page (Chromium happily keeps running
 - The app config carries `heartbeat: { enabled, timeoutSeconds, startupGraceSeconds }` (defaults: 25 s timeout, 60 s startup grace).
 - The rendered content is expected to `POST /api/v1/apps/{id}/heartbeat` (empty body) every ~10 seconds, using the `{heartbeatUrl}` URI placeholder to learn the address. The endpoint is deliberately unauthenticated but accepted **only from loopback connections** — the kiosk browsers posting heartbeats always run on the same machine as Suede, and the endpoint is low-risk (worst case, a local process delays a watchdog restart).
 - Arming: the watchdog arms on the *first* heartbeat received after launch. Until then only the startup grace period applies (covering page load); if no heartbeat arrives within `startupGraceSeconds`, or an armed app goes silent for `timeoutSeconds`, the process is killed and relaunched with its stored parameters, subject to the app's restart backoff policy.
-- Watchdog trips are surfaced as `app_status_changed` events (status `crashed`, reason `heartbeat_timeout`) and counted in `/apps/{id}/status`.
+- Watchdog trips are surfaced as `app_status_changed` events (status `crashed`, reason `heartbeatTimeout`) and counted in `/apps/{id}/status`.
 
 ## Environment preparation and health checks
 
@@ -416,7 +416,7 @@ The build is split into phases designed to be implemented **strictly in order**;
 
 ### Phase 5 — Content watchdog
 
-**Scope:** `heartbeat` app-config section; loopback-only unauthenticated `POST /apps/{id}/heartbeat`; `{heartbeatUrl}` placeholder; arming on first heartbeat, `startupGraceSeconds` before it, `timeoutSeconds` after it; kill/relaunch through the existing restart machinery with status reason `heartbeat_timeout`.
+**Scope:** `heartbeat` app-config section; loopback-only unauthenticated `POST /apps/{id}/heartbeat`; `{heartbeatUrl}` placeholder; arming on first heartbeat, `startupGraceSeconds` before it, `timeoutSeconds` after it; kill/relaunch through the existing restart machinery with status reason `heartbeatTimeout`.
 **Acceptance:** a test page that stops posting is relaunched within `timeoutSeconds` + restart delay; a page that never posts is relaunched after the startup grace; a non-loopback POST is rejected 403; heartbeats from one app never feed another's watchdog.
 
 ### Phase 6 — Environment checks and fixes

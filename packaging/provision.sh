@@ -95,6 +95,10 @@ if [ "\$(tty)" = "/dev/tty1" ] && [ -z "\${WAYLAND_DISPLAY:-}" ]; then
   export XDG_SESSION_TYPE=wayland
   export XDG_CURRENT_DESKTOP=sway
   export XDG_SESSION_DESKTOP=sway
+  # Without this, a window spanning several outputs is handed straight to each
+  # display controller, so every screen shows the same part of it instead of
+  # its own. Verified on the Nvidia proprietary driver.
+  export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1
   clear
   exec sway > "\$HOME/.sway.log" 2>&1
 fi
