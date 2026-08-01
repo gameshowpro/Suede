@@ -489,7 +489,7 @@ mod tests {
             LaunchContext {
                 profiles_root: dir.path().join("profiles"),
                 log_root: dir.path().join("logs"),
-                api_base: "http://127.0.0.1:7071/api/v1".into(),
+                api_base: "http://127.0.0.1:9088/api/v1".into(),
             },
         ));
         let reconciler = Arc::new(Reconciler::new(ReconcilerDeps {

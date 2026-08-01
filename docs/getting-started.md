@@ -53,7 +53,7 @@ It is idempotent, so re-running it after an upgrade is safe. It will:
 4. Create a minimal Sway config, including the block Suede manages.
 5. Install `sway-session.target` and enable `suede.service`.
 6. Disable and mask competing display managers and compositors.
-7. Open port 7071 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
+7. Open port 9088 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
 
 !!! note "Raspberry Pi OS"
     Pi OS ships `labwc`, which will fight Sway for the displays. The provisioning script disables it, including its autostart entry.
@@ -62,7 +62,7 @@ Reboot when it finishes. The machine will log in, start Sway, and start Suede.
 
 ## First run
 
-Open `http://<machine>:7071/` from another computer on the network. If it times out rather than refusing, a host firewall is dropping the port — see [Network access](#network-access); on Ubuntu Server it usually is.
+Open `http://<machine>:9088/` from another computer on the network. If it times out rather than refusing, a host firewall is dropping the port — see [Network access](#network-access); on Ubuntu Server it usually is.
 
 The web UI shows a banner for any health check that is not passing, with a **Fix this** button where Suede can safely remediate the problem itself. Work through those first — they cover the handful of things provisioning cannot do, such as enabling the user service before the first login has happened.
 
@@ -107,20 +107,20 @@ Check that `pipewire-pulse` is actually running — the `pipewire` health check 
 
 ## Network access {: #network-access }
 
-Suede binds `0.0.0.0:7071` by default, so a freshly provisioned appliance is reachable from the network it is on. Read [Security posture](#security-posture) — that default is also unauthenticated.
+Suede binds `0.0.0.0:9088` by default, so a freshly provisioned appliance is reachable from the network it is on. Read [Security posture](#security-posture) — that default is also unauthenticated.
 
 To restrict it to the machine itself:
 
 ```toml
 # ~/.config/suede/suede.toml
-bind = "127.0.0.1:7071"
+bind = "127.0.0.1:9088"
 ```
 
-or pass `--bind 127.0.0.1:7071`. You can then still reach the UI by forwarding the port:
+or pass `--bind 127.0.0.1:9088`. You can then still reach the UI by forwarding the port:
 
 ```bash
-ssh -L 7071:127.0.0.1:7071 appliance
-# then open http://localhost:7071/
+ssh -L 9088:127.0.0.1:9088 appliance
+# then open http://localhost:9088/
 ```
 
 ### When it will not connect
@@ -130,15 +130,15 @@ A host firewall is the usual culprit, and its signature is distinctive: the conn
 Ubuntu Server enables `ufw` with only SSH allowed, so a default install blocks Suede even though Suede is listening correctly. This is the common case:
 
 ```bash
-sudo ufw allow 7071/tcp
+sudo ufw allow 9088/tcp
 # or, scoped to the network the appliance serves:
-sudo ufw allow from 192.168.1.0/24 to any port 7071 proto tcp
+sudo ufw allow from 192.168.1.0/24 to any port 9088 proto tcp
 ```
 
 On a `firewalld` host:
 
 ```bash
-sudo firewall-cmd --permanent --add-port=7071/tcp && sudo firewall-cmd --reload
+sudo firewall-cmd --permanent --add-port=9088/tcp && sudo firewall-cmd --reload
 ```
 
 The `api-reachability` check reports which of these applies. Suede can detect that a filter is *running* but not read its rules — `/etc/ufw/user.rules` is root-only, and the session user is deliberately not root — so it warns and names the command rather than claiming to know whether the port is open. It cannot test the port itself either: traffic from the appliance to its own address never crosses the filter, so a self-test would succeed no matter what.

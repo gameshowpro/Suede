@@ -16,7 +16,7 @@ set -euo pipefail
 APPLIANCE_USER="${SUDO_USER:-}"
 ASK_REBOOT=1
 # Must match DEFAULT_BIND in src/config.rs.
-SUEDE_PORT=7071
+SUEDE_PORT=9088
 OPEN_FIREWALL=1
 
 while [[ $# -gt 0 ]]; do
@@ -224,7 +224,7 @@ cat <<EOF
   Service:      suede.service (systemd user unit)
 
   After a reboot the machine will log in, start sway, and start Suede.
-  Open http://\$(hostname):7071/ from another computer to configure it.
+  Open http://\$(hostname):9088/ from another computer to configure it.
 EOF
 
 if [[ "$ASK_REBOOT" -eq 1 ]]; then

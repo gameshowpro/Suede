@@ -55,7 +55,7 @@ sudo /usr/share/suede/provision.sh     # one-time: auto-login, Sway autostart, k
 sudo reboot
 ```
 
-After the reboot the machine logs in, starts Sway, and starts Suede. Open `http://<machine>:7071/` from another computer; the reference UI will walk you through any remaining setup via its health-check prompts.
+After the reboot the machine logs in, starts Sway, and starts Suede. Open `http://<machine>:9088/` from another computer; the reference UI will walk you through any remaining setup via its health-check prompts.
 
 ### Option 2 - Build from source
 
@@ -74,7 +74,7 @@ Suede has no native library dependencies, so a Rust toolchain is all you need.
 ### Develop without hardware
 
 ```bash
-cargo run -- run --mock        # in-memory compositor and audio, UI on :7071
+cargo run -- run --mock        # in-memory compositor and audio, UI on :9088
 scripts/dev-check.sh           # fmt, clippy, tests, end-to-end smoke test
 ```
 
@@ -85,7 +85,7 @@ scripts/dev-check.sh           # fmt, clippy, tests, end-to-end smoke test
 Drive four HDMI outputs, each showing its own kiosk Chromium, with all audio following output 1 - the entire appliance in one API call:
 
 ```bash
-curl -X PUT http://media-server:7071/api/v1/config -H "Content-Type: application/json" -d '{
+curl -X PUT http://media-server:9088/api/v1/config -H "Content-Type: application/json" -d '{
   "outputs": [
     { "match": { "name": "HDMI-A-1" }, "enable": true, "mode": { "width": 1920, "height": 1080, "refreshHz": 60 }, "position": { "x": 0, "y": 0 } },
     { "match": { "name": "HDMI-A-2" }, "enable": true, "mode": { "width": 1920, "height": 1080, "refreshHz": 60 }, "position": { "x": 1920, "y": 0 } },
@@ -104,7 +104,7 @@ curl -X PUT http://media-server:7071/api/v1/config -H "Content-Type: application
 The configuration is persisted immediately: reboot the machine and it comes back exactly like this, no operator required. Watch it happen live:
 
 ```bash
-curl -N http://media-server:7071/api/v1/events
+curl -N http://media-server:9088/api/v1/events
 ```
 
 ## Documentation

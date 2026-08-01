@@ -728,7 +728,7 @@ mod tests {
         LaunchContext {
             profiles_root: root.join("profiles"),
             log_root: root.join("logs"),
-            api_base: "http://127.0.0.1:7071/api/v1".into(),
+            api_base: "http://127.0.0.1:9088/api/v1".into(),
         }
     }
 

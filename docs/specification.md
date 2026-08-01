@@ -192,7 +192,7 @@ Two kinds of configuration exist, and the split is a hard rule: anything that mu
 
 ```toml
 # $XDG_CONFIG_HOME/suede/suede.toml — bootstrap settings, read once at startup
-bind = "0.0.0.0:7071"        # SUEDE_BIND
+bind = "0.0.0.0:9088"        # SUEDE_BIND
 # token = "…"                # SUEDE_TOKEN — enables bearer auth and disables the web UI
 # state_dir = "…"            # SUEDE_STATE_DIR — default $XDG_STATE_HOME/suede
 docs_base_url = "https://suede.gameshow.pro/"   # base for health-check docsUrl links
@@ -258,7 +258,7 @@ Suede depends on an environment it does not own (Sway session, browsers, PipeWir
 
 ## Security
 
-- Bind address is configurable; default `0.0.0.0:7071` (remote management is the primary use case).
+- Bind address is configurable; default `0.0.0.0:9088` (remote management is the primary use case).
 - **Unauthenticated by default.** The expected deployment is a trusted production LAN, and any same-machine web UI would necessarily expose a shared credential to its users anyway (visible in request headers), so a token is not the default posture.
 - **Optional static bearer token** (`Authorization: Bearer …`), set via config file or environment variable, for deployments on less-trusted networks. When a token is configured: it is required on every endpoint except `/healthz` and `/apps/{id}/heartbeat`, and **the reference web UI is disabled** — serving a UI that embeds the token would defeat it. Token mode is for machine-to-machine API clients that hold the credential properly.
 - `/apps/{id}/heartbeat` is always loopback-only and never requires the token (see [App watchdog](#app-watchdog-heartbeats)).

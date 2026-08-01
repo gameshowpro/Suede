@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-pub const DEFAULT_BIND: &str = "0.0.0.0:7071";
+pub const DEFAULT_BIND: &str = "0.0.0.0:9088";
 pub const DEFAULT_DOCS_BASE_URL: &str = "https://suede.gameshow.pro/";
 
 #[derive(Debug, Clone, Deserialize, Default)]

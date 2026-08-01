@@ -3,7 +3,7 @@
 Start with the health checks. `GET /api/v1/system/checks`, or the banner at the top of the web UI, covers most of what goes wrong and tells you which of it Suede can fix itself.
 
 ```bash
-curl -s http://appliance:7071/api/v1/system/checks | python3 -m json.tool
+curl -s http://appliance:9088/api/v1/system/checks | python3 -m json.tool
 ```
 
 Then look at `GET /api/v1/status`, which lists every piece of desired state that could not be realized.
@@ -27,7 +27,7 @@ A **divergence** is a fact about your configuration — something you asked for 
 The web UI collects both into a banner above every tab, failures first, and shows the fix description with a confirmation step before anything is applied — a fix writes to the machine, so it should never happen on a stray click. Applying one calls:
 
 ```bash
-curl -X POST http://appliance:7071/api/v1/system/checks/direct-scanout/fix
+curl -X POST http://appliance:9088/api/v1/system/checks/direct-scanout/fix
 ```
 
 which returns what it did. Only four checks offer this: `direct-scanout`, `sway-config`, `systemd-unit` and `pipewire`. Everything else needs a package installed or a cable moved, and says so.
@@ -61,7 +61,7 @@ If Sway itself is not starting, check `~/.sway.log` and confirm auto-login is la
 Check what Sway actually sees:
 
 ```bash
-curl -s http://appliance:7071/api/v1/outputs | python3 -m json.tool
+curl -s http://appliance:9088/api/v1/outputs | python3 -m json.tool
 ```
 
 | Symptom | Cause |
@@ -76,7 +76,7 @@ A configured output that is not connected is deliberately **not** an error. Sued
 ## A browser will not start
 
 ```bash
-curl -s http://appliance:7071/api/v1/apps | python3 -m json.tool
+curl -s http://appliance:9088/api/v1/apps | python3 -m json.tool
 ```
 
 | State | Meaning |
@@ -118,7 +118,7 @@ whenever an app has `spanOutputs: true` while the running compositor was
 started without it:
 
 ```bash
-curl -s http://appliance:7071/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="direct-scanout"])'
+curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="direct-scanout"])'
 ```
 
 Observed with the Nvidia proprietary driver. Per-output kiosks are unaffected —
@@ -135,7 +135,7 @@ If the watchdog is firing when it should not, check that the page is actually po
 ## Audio goes to the wrong place, or nowhere
 
 ```bash
-curl -s http://appliance:7071/api/v1/audio/outputs | python3 -m json.tool
+curl -s http://appliance:9088/api/v1/audio/outputs | python3 -m json.tool
 wpctl status    # what PipeWire itself thinks
 ```
 
@@ -172,8 +172,8 @@ A pass that never converges usually means a command silently fails to take effec
 
 ```bash
 # Everything Suede is doing, live
-curl -N http://appliance:7071/api/v1/events
+curl -N http://appliance:9088/api/v1/events
 
 # Force a pass and see the result
-curl -X POST http://appliance:7071/api/v1/reconcile | python3 -m json.tool
+curl -X POST http://appliance:9088/api/v1/reconcile | python3 -m json.tool
 ```

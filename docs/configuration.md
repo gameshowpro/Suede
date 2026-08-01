@@ -15,7 +15,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
-| `bind` | `SUEDE_BIND` | `0.0.0.0:7071` | Address the HTTP server binds to |
+| `bind` | `SUEDE_BIND` | `0.0.0.0:9088` | Address the HTTP server binds to |
 | `token` | `SUEDE_TOKEN` | unset | Bearer token; setting it disables the web UI |
 | `state_dir` | `SUEDE_STATE_DIR` | `$XDG_STATE_HOME/suede` | Where desired state is persisted |
 | `docs_base_url` | `SUEDE_DOCS_BASE_URL` | `https://suede.gameshow.pro/` | Base for health-check documentation links |
@@ -90,9 +90,9 @@ covers it — during a relaunch, or before the first app starts.
 Upload images first, then refer to them by id:
 
 ```bash
-curl -X PUT --data-binary @lobby.png http://appliance:7071/api/v1/wallpapers/lobby
-curl http://appliance:7071/api/v1/wallpapers          # list
-curl -X DELETE http://appliance:7071/api/v1/wallpapers/lobby
+curl -X PUT --data-binary @lobby.png http://appliance:9088/api/v1/wallpapers/lobby
+curl http://appliance:9088/api/v1/wallpapers          # list
+curl -X DELETE http://appliance:9088/api/v1/wallpapers/lobby
 ```
 
 PNG and JPEG are accepted, up to 32 MB. The format is detected from the file's

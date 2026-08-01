@@ -9,7 +9,7 @@
 # written through the API and persisted separately.
 
 # Address the HTTP server binds to.  Env: SUEDE_BIND
-bind = "0.0.0.0:7071"
+bind = "0.0.0.0:9088"
 
 # Optional bearer token.  Env: SUEDE_TOKEN
 #

@@ -61,7 +61,7 @@ sudo /usr/share/suede/provision.sh
 sudo reboot
 ```
 
-Then open `http://<machine>:7071/` from another computer. The bundled web UI walks you through anything still missing.
+Then open `http://<machine>:9088/` from another computer. The bundled web UI walks you through anything still missing.
 
 [Full installation guide :material-arrow-right:](getting-started.md){ .md-button .md-button--primary }
 [Configuration reference :material-arrow-right:](configuration.md){ .md-button }

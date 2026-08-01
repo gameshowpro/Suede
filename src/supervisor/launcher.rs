@@ -72,7 +72,7 @@ pub struct LaunchContext {
     pub profiles_root: PathBuf,
     /// Root under which per-app stderr logs are written.
     pub log_root: PathBuf,
-    /// Loopback base for the API, e.g. `http://127.0.0.1:7071/api/v1`.
+    /// Loopback base for the API, e.g. `http://127.0.0.1:9088/api/v1`.
     pub api_base: String,
 }
 
@@ -219,7 +219,7 @@ mod tests {
         LaunchContext {
             profiles_root: PathBuf::from("/state/profiles"),
             log_root: PathBuf::from("/state/logs"),
-            api_base: "http://127.0.0.1:7071/api/v1".into(),
+            api_base: "http://127.0.0.1:9088/api/v1".into(),
         }
     }
 
@@ -432,7 +432,7 @@ mod tests {
         );
         let uri = spec.args.last().unwrap();
         assert!(uri.contains("id=renderer-3"));
-        assert!(uri.contains("hb=http://127.0.0.1:7071/api/v1/apps/renderer-3/heartbeat"));
+        assert!(uri.contains("hb=http://127.0.0.1:9088/api/v1/apps/renderer-3/heartbeat"));
         assert!(!uri.contains('{'));
     }
 

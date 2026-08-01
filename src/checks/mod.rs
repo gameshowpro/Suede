@@ -1507,18 +1507,18 @@ mod tests {
     #[test]
     fn a_loopback_bind_explains_how_to_reach_it_anyway() {
         let (status, detail) =
-            assess_reachability(addr("127.0.0.1:7071"), HostFirewall::None, false, None);
+            assess_reachability(addr("127.0.0.1:9088"), HostFirewall::None, false, None);
         assert_eq!(status, CheckStatus::Pass);
         assert!(detail.contains("only on this machine"));
         // The tunnel command is the answer to "why can I not open the page",
         // so it belongs in the detail rather than only in the documentation.
-        assert!(detail.contains("ssh -L 7071:127.0.0.1:7071"));
+        assert!(detail.contains("ssh -L 9088:127.0.0.1:9088"));
     }
 
     #[test]
     fn an_exposed_bind_with_no_firewall_passes() {
         let (status, detail) =
-            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::None, true, None);
+            assess_reachability(addr("0.0.0.0:9088"), HostFirewall::None, true, None);
         assert_eq!(status, CheckStatus::Pass);
         assert!(detail.contains("no host firewall"));
         assert!(detail.contains("bearer token"));
@@ -1550,9 +1550,9 @@ mod tests {
     fn nftables_is_sent_to_the_documentation_rather_than_given_a_wrong_command() {
         // The rule depends on the table and chain names in use, so any
         // one-liner Suede printed would be a guess.
-        assert_eq!(HostFirewall::Nftables.allow_command(7071), None);
+        assert_eq!(HostFirewall::Nftables.allow_command(9088), None);
         let (status, detail) =
-            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::Nftables, false, None);
+            assess_reachability(addr("0.0.0.0:9088"), HostFirewall::Nftables, false, None);
         assert_eq!(status, CheckStatus::Warn);
         assert!(detail.contains("Open it in the ruleset"));
     }
@@ -1560,7 +1560,7 @@ mod tests {
     #[test]
     fn an_unauthenticated_exposed_bind_says_so() {
         let (_, detail) =
-            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::None, false, None);
+            assess_reachability(addr("0.0.0.0:9088"), HostFirewall::None, false, None);
         assert!(detail.contains("full control"));
     }
 
@@ -1572,7 +1572,7 @@ mod tests {
         // is one the operator learns to scroll past.
         let peer = Some("10.0.0.5".parse().unwrap());
         let (status, detail) =
-            assess_reachability(addr("0.0.0.0:7071"), HostFirewall::Ufw, false, peer);
+            assess_reachability(addr("0.0.0.0:9088"), HostFirewall::Ufw, false, peer);
         assert_eq!(status, CheckStatus::Pass);
         assert!(detail.contains("confirmed reachable"));
         assert!(detail.contains("10.0.0.5"));
@@ -1580,7 +1580,7 @@ mod tests {
 
     #[test]
     fn the_warning_says_it_will_clear_itself() {
-        let (_, detail) = assess_reachability(addr("0.0.0.0:7071"), HostFirewall::Ufw, false, None);
+        let (_, detail) = assess_reachability(addr("0.0.0.0:9088"), HostFirewall::Ufw, false, None);
         assert!(detail.contains("clears itself"));
     }
 
@@ -1612,7 +1612,7 @@ mod tests {
             HostFirewall::Firewalld,
             HostFirewall::Nftables,
         ] {
-            let (status, _) = assess_reachability(addr("127.0.0.1:7071"), firewall, false, None);
+            let (status, _) = assess_reachability(addr("127.0.0.1:9088"), firewall, false, None);
             assert_eq!(status, CheckStatus::Pass, "{firewall:?} should not warn");
         }
     }
