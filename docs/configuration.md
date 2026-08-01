@@ -73,19 +73,69 @@ A blank screen looks broken even when it is only a browser restarting. A
 background gives an output something deliberate to show whenever no window
 covers it — during a relaunch, or before the first app starts.
 
-```json
-{
-  "match": { "name": "HDMI-A-1" },
-  "enable": true,
-  "background": { "wallpaper": "lobby", "mode": "fill", "color": "#101820" }
-}
-```
+A background has three properties, all optional:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `wallpaper` | string \| null | null | Id of an uploaded image |
-| `color` | string \| null | null | `#rrggbb`, used alone or where the image does not reach |
+| `wallpaper` | string \| null | null | Id of an uploaded image. Absent means the colour alone |
+| `color` | string \| null | `#000000` | `#rrggbb`, used alone or wherever the image does not reach |
 | `mode` | string | `fill` | `fill`, `fit`, `stretch`, `center`, `tile` |
+
+The colour is never left unstated. Every mode except `fill` and `stretch`
+leaves part of the screen uncovered, and an unpainted region shows whatever the
+compositor last left there — usually a stale frame of the previous app.
+
+#### Named backgrounds {: #named-backgrounds }
+
+Define a background once and let any number of outputs name it. A video wall
+normally wants one look across every screen, and repeating the same three
+properties per output guarantees they drift apart the first time somebody edits
+only three of four.
+
+```json
+{
+  "backgrounds": [
+    { "id": "lobby", "wallpaper": "lobby-art", "mode": "fill", "color": "#101820" },
+    { "id": "curtain", "color": "#000000" }
+  ],
+  "outputs": [
+    { "match": { "name": "HDMI-A-1" }, "background": "lobby" },
+    { "match": { "name": "HDMI-A-2" }, "background": "lobby" }
+  ]
+}
+```
+
+Editing the preset repaints every output using it — the reference has not
+changed, but Suede diffs the *resolved* properties, so the new picture reaches
+the wall on the next pass.
+
+An output's `background` accepts either form:
+
+```json
+"background": "lobby"
+"background": { "wallpaper": "lobby-art", "mode": "fill", "color": "#101820" }
+```
+
+A bare string names a preset; an object spells the properties out. Both exist
+because they serve different callers: the web UI wants one dropdown across every
+screen, while a script driving the API directly should not have to create a
+preset to paint a single output.
+
+Naming a preset that does not exist is rejected at the write, not at reconcile
+time — a typo is a mistake in the request, and the writer is the only one who
+can still fix it cheaply. Deleting a preset an output still names is refused
+with `409`, because cascading would blank those screens.
+
+```bash
+curl -X PUT -H 'content-type: application/json' \
+  -d '{"id":"lobby","wallpaper":"lobby-art","mode":"fill","color":"#101820"}' \
+  http://appliance:9088/api/v1/config/backgrounds/lobby
+
+curl http://appliance:9088/api/v1/config/backgrounds
+curl -X DELETE http://appliance:9088/api/v1/config/backgrounds/lobby
+```
+
+#### Images
 
 Upload images first, then refer to them by id:
 
@@ -97,8 +147,12 @@ curl -X DELETE http://appliance:9088/api/v1/wallpapers/lobby
 
 PNG and JPEG are accepted, up to 32 MB. The format is detected from the file's
 own bytes rather than the request, so a mislabelled upload is refused outright
-instead of leaving a background that silently fails to draw. A wallpaper still
-referenced by an output cannot be deleted.
+instead of leaving a background that silently fails to draw. An image still
+referenced — by an output *or* by a named background — cannot be deleted.
+
+In the web UI these live on the **Backgrounds** tab: upload images at the
+bottom, define named backgrounds at the top with a live preview, then pick one
+per display from the dropdown on the **Displays** tab.
 
 !!! warning "Backgrounds need swaybg"
     Sway draws them by running `swaybg`. Without it the command *succeeds* and

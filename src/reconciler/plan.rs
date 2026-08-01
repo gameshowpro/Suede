@@ -23,6 +23,11 @@ pub struct Capabilities {
 pub struct AppliedOutput {
     pub config: OutputConfig,
     pub workspace: u32,
+    /// The background as *resolved*, not as referenced.
+    ///
+    /// Diffing the reference would miss an edit to a preset the output points
+    /// at: the name is unchanged while the picture behind it is not.
+    pub background: Option<Background>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -49,18 +54,26 @@ pub fn plan_outputs(
     previously_applied: &HashMap<String, AppliedOutput>,
     capabilities: Capabilities,
 ) -> OutputPlan {
-    plan_outputs_with(observed, desired, previously_applied, capabilities, |_| {
-        None
-    })
+    plan_outputs_with(
+        observed,
+        desired,
+        &[],
+        previously_applied,
+        capabilities,
+        |_| None,
+    )
 }
 
-/// As [`plan_outputs`], with a resolver from wallpaper id to file path.
+/// As [`plan_outputs`], with background presets and a resolver from wallpaper
+/// id to file path.
 ///
-/// Injected rather than read from disk here, so the planner stays pure and the
-/// background rules remain testable without any files existing.
+/// The resolver is injected rather than reading from disk here, so the planner
+/// stays pure and the background rules remain testable without any files
+/// existing.
 pub fn plan_outputs_with<F>(
     observed: &[Output],
     desired: &[OutputConfig],
+    presets: &[crate::model::BackgroundPreset],
     previously_applied: &HashMap<String, AppliedOutput>,
     capabilities: Capabilities,
     resolve_wallpaper: F,
@@ -218,15 +231,31 @@ where
         }
 
         // Sway does not report the background in `get_outputs`, so like tearing
-        // it is diffed against what Suede last applied.
-        if let Some(background) = &config.background {
-            let changed = applied.is_none_or(|a| a.config.background.as_ref() != Some(background));
-            if force || changed {
-                match background_command(name, background, &resolve_wallpaper) {
-                    Ok(Some(command)) => plan.commands.push(command),
-                    Ok(None) => {}
-                    Err(divergence) => plan.divergences.push(divergence),
+        // it is diffed against what Suede last applied — and against the
+        // resolved properties, so editing a preset repaints every output using
+        // it even though none of their references changed.
+        let mut resolved_background = None;
+        if let Some(reference) = &config.background {
+            match reference.resolve(presets) {
+                Some(background) => {
+                    resolved_background = Some(background.clone());
+                    let changed = applied.is_none_or(|a| a.background.as_ref() != Some(background));
+                    if force || changed {
+                        match background_command(name, background, &resolve_wallpaper) {
+                            Ok(Some(command)) => plan.commands.push(command),
+                            Ok(None) => {}
+                            Err(divergence) => plan.divergences.push(divergence),
+                        }
+                    }
                 }
+                None => plan.divergences.push(Divergence::new(
+                    "background_preset_not_found",
+                    name,
+                    format!(
+                        "{name} refers to background preset {:?}, which is not defined",
+                        reference.preset_id().unwrap_or_default()
+                    ),
+                )),
             }
         }
 
@@ -241,6 +270,7 @@ where
             name.to_string(),
             AppliedOutput {
                 config: config.clone(),
+                background: resolved_background,
                 workspace,
             },
         );
@@ -365,10 +395,6 @@ fn background_command<F>(
 where
     F: Fn(&str) -> Option<String>,
 {
-    if background.is_empty() {
-        return Ok(None);
-    }
-
     if let Some(id) = &background.wallpaper {
         let Some(path) = resolve_wallpaper(id) else {
             return Err(Divergence::new(
@@ -377,17 +403,19 @@ where
                 format!("{name} refers to wallpaper {id:?}, which is not stored"),
             ));
         };
-        let mut command = format!("output {name} bg {path} {}", background.mode.as_sway());
-        // Sway paints this wherever the image does not reach.
-        if let Some(color) = background.sway_color() {
-            command.push_str(&format!(" #{color}"));
-        }
-        return Ok(Some(command));
+        // Sway paints the colour wherever the image does not reach — which is
+        // every mode except `fill` and `stretch`, so it is always supplied.
+        return Ok(Some(format!(
+            "output {name} bg {path} {} #{}",
+            background.mode.as_sway(),
+            background.sway_color()
+        )));
     }
 
-    Ok(background
-        .sway_color()
-        .map(|color| format!("output {name} bg #{color} solid_color")))
+    Ok(Some(format!(
+        "output {name} bg #{} solid_color",
+        background.sway_color()
+    )))
 }
 
 /// The `fullscreen_mode` sway should report once placement has taken effect.
@@ -527,6 +555,7 @@ mod tests {
         applied.insert(
             "HDMI-A-1".to_string(),
             AppliedOutput {
+                background: None,
                 config: desired.clone(),
                 workspace: 1,
             },
@@ -583,6 +612,7 @@ mod tests {
         applied.insert(
             "HDMI-A-1".to_string(),
             AppliedOutput {
+                background: None,
                 config: desired.clone(),
                 workspace: 1,
             },
@@ -812,6 +842,7 @@ mod tests {
         applied.insert(
             "HDMI-A-1".to_string(),
             AppliedOutput {
+                background: None,
                 config: desired.clone(),
                 workspace: 1,
             },
@@ -967,9 +998,11 @@ mod tests {
         );
     }
 
+    use crate::model::BackgroundRef;
+
     fn with_background(name: &str, background: Background) -> OutputConfig {
         let mut config = config(name);
-        config.background = Some(background);
+        config.background = Some(BackgroundRef::Inline(background));
         config
     }
 
@@ -1005,13 +1038,204 @@ mod tests {
         let plan = plan_outputs_with(
             &observed,
             &[desired],
+            &[],
             &HashMap::new(),
             tearing_capable(),
             |id| Some(format!("/state/wallpapers/{id}.png")),
         );
+        // The colour is always supplied: `fit` letterboxes, and an unstated
+        // colour would leave swaybg to choose what the bars look like.
         assert!(plan
             .commands
-            .contains(&"output HDMI-A-1 bg /state/wallpapers/lobby.png fit".to_string()));
+            .contains(&"output HDMI-A-1 bg /state/wallpapers/lobby.png fit #000000".to_string()));
+    }
+
+    #[test]
+    fn an_unstated_colour_is_black_rather_than_nothing() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = with_background("HDMI-A-1", Background::default());
+        let plan = plan_outputs(&observed, &[desired], &HashMap::new(), tearing_capable());
+        assert!(
+            plan.commands
+                .contains(&"output HDMI-A-1 bg #000000 solid_color".to_string()),
+            "an empty background should still paint the screen: {:?}",
+            plan.commands
+        );
+    }
+
+    // --- presets ---------------------------------------------------------
+
+    fn preset(id: &str, background: Background) -> crate::model::BackgroundPreset {
+        crate::model::BackgroundPreset {
+            id: id.to_string(),
+            background,
+        }
+    }
+
+    fn referencing(name: &str, preset_id: &str) -> OutputConfig {
+        let mut config = config(name);
+        config.background = Some(BackgroundRef::Preset(preset_id.to_string()));
+        config
+    }
+
+    #[test]
+    fn an_output_can_name_a_preset_instead_of_repeating_it() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let presets = vec![preset(
+            "lobby",
+            Background {
+                wallpaper: Some("art".into()),
+                color: Some("#101820".into()),
+                mode: BackgroundMode::Fit,
+            },
+        )];
+        let plan = plan_outputs_with(
+            &observed,
+            &[referencing("HDMI-A-1", "lobby")],
+            &presets,
+            &HashMap::new(),
+            tearing_capable(),
+            |id| Some(format!("/w/{id}.png")),
+        );
+        assert!(plan
+            .commands
+            .contains(&"output HDMI-A-1 bg /w/art.png fit #101820".to_string()));
+        assert!(plan.divergences.is_empty());
+    }
+
+    #[test]
+    fn one_preset_paints_every_output_that_names_it() {
+        // The whole point: a video wall is configured once, not once per screen.
+        let observed = vec![output("HDMI-A-1", true), output("HDMI-A-2", true)];
+        let presets = vec![preset(
+            "wall",
+            Background {
+                wallpaper: None,
+                color: Some("#223344".into()),
+                mode: BackgroundMode::Fill,
+            },
+        )];
+        let plan = plan_outputs_with(
+            &observed,
+            &[
+                referencing("HDMI-A-1", "wall"),
+                referencing("HDMI-A-2", "wall"),
+            ],
+            &presets,
+            &HashMap::new(),
+            tearing_capable(),
+            |_| None,
+        );
+        for name in ["HDMI-A-1", "HDMI-A-2"] {
+            assert!(
+                plan.commands
+                    .contains(&format!("output {name} bg #223344 solid_color")),
+                "{name} was not painted: {:?}",
+                plan.commands
+            );
+        }
+    }
+
+    #[test]
+    fn editing_a_preset_repaints_the_outputs_using_it() {
+        // The reference is unchanged, so diffing it would conclude nothing has
+        // happened and leave the old picture on the wall.
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = vec![referencing("HDMI-A-1", "lobby")];
+        let before = vec![preset(
+            "lobby",
+            Background {
+                wallpaper: None,
+                color: Some("#111111".into()),
+                mode: BackgroundMode::Fill,
+            },
+        )];
+        let first = plan_outputs_with(
+            &observed,
+            &desired,
+            &before,
+            &HashMap::new(),
+            tearing_capable(),
+            |_| None,
+        );
+
+        let after = vec![preset(
+            "lobby",
+            Background {
+                wallpaper: None,
+                color: Some("#999999".into()),
+                mode: BackgroundMode::Fill,
+            },
+        )];
+        let second = plan_outputs_with(
+            &observed,
+            &desired,
+            &after,
+            &HashMap::new(),
+            tearing_capable(),
+            |_| None,
+        );
+        assert!(first
+            .commands
+            .contains(&"output HDMI-A-1 bg #111111 solid_color".to_string()));
+        assert!(
+            second
+                .commands
+                .contains(&"output HDMI-A-1 bg #999999 solid_color".to_string()),
+            "editing the preset must reach the screen: {:?}",
+            second.commands
+        );
+    }
+
+    #[test]
+    fn an_unchanged_preset_is_not_repainted_every_pass() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let desired = vec![referencing("HDMI-A-1", "lobby")];
+        let presets = vec![preset(
+            "lobby",
+            Background {
+                wallpaper: None,
+                color: Some("#111111".into()),
+                mode: BackgroundMode::Fill,
+            },
+        )];
+        let first = plan_outputs_with(
+            &observed,
+            &desired,
+            &presets,
+            &HashMap::new(),
+            tearing_capable(),
+            |_| None,
+        );
+        let second = plan_outputs_with(
+            &observed,
+            &desired,
+            &presets,
+            &first.applied,
+            tearing_capable(),
+            |_| None,
+        );
+        assert!(!second.commands.iter().any(|c| c.contains(" bg ")));
+    }
+
+    #[test]
+    fn a_preset_that_does_not_exist_is_a_divergence() {
+        let observed = vec![output("HDMI-A-1", true)];
+        let plan = plan_outputs_with(
+            &observed,
+            &[referencing("HDMI-A-1", "typo")],
+            &[],
+            &HashMap::new(),
+            tearing_capable(),
+            |_| None,
+        );
+        assert!(!plan.commands.iter().any(|c| c.contains(" bg ")));
+        let divergence = plan
+            .divergences
+            .iter()
+            .find(|d| d.kind == "background_preset_not_found")
+            .expect("the operator must be told which name is wrong");
+        assert!(divergence.detail.contains("typo"));
     }
 
     #[test]
@@ -1029,6 +1253,7 @@ mod tests {
         let plan = plan_outputs_with(
             &observed,
             &[desired],
+            &[],
             &HashMap::new(),
             tearing_capable(),
             |_| Some("/w/lobby.png".to_string()),
@@ -1052,6 +1277,7 @@ mod tests {
         let plan = plan_outputs_with(
             &observed,
             &[desired],
+            &[],
             &HashMap::new(),
             tearing_capable(),
             |_| None,

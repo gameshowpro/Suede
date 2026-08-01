@@ -202,6 +202,7 @@ impl Reconciler {
             crate::reconciler::plan::plan_outputs_with(
                 &self.snapshot.outputs(),
                 &desired.outputs,
+                &desired.backgrounds,
                 &applied,
                 capabilities,
                 |id| {

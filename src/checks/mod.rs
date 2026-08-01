@@ -571,12 +571,17 @@ impl CheckRunner {
     /// `bg` command succeeds and nothing appears, which is the worst
     /// combination: a screen that stays black with no error anywhere.
     async fn check_swaybg(&self) -> Check {
-        let wanted = self
-            .store
-            .get()
+        let desired = self.store.get();
+        let wanted = desired
             .outputs
             .iter()
-            .filter(|output| output.background.as_ref().is_some_and(|b| !b.is_empty()))
+            .filter(|output| {
+                output
+                    .background
+                    .as_ref()
+                    .and_then(|reference| reference.resolve(&desired.backgrounds))
+                    .is_some()
+            })
             .count();
         let installed = crate::supervisor::launcher::resolve_program(&["swaybg".to_string()]);
 

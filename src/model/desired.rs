@@ -18,6 +18,13 @@ pub struct DesiredState {
     pub revision: u64,
     pub outputs: Vec<OutputConfig>,
     pub apps: Vec<AppConfig>,
+    /// Named background definitions outputs can refer to.
+    ///
+    /// A video wall usually wants one look across every screen, so the
+    /// alternative — repeating a wallpaper, scaling mode and colour on each
+    /// output — makes the common case the laborious one and guarantees the
+    /// screens drift apart the first time somebody edits only three of four.
+    pub backgrounds: Vec<BackgroundPreset>,
     pub settings: Settings,
 }
 
@@ -60,25 +67,35 @@ impl DesiredState {
                     errors.push(format!("{prefix}.scale must be a positive number"));
                 }
             }
-            if let Some(background) = &output.background {
-                if let Some(color) = &background.color {
-                    let digits = color.trim_start_matches('#');
-                    let valid = matches!(digits.len(), 6 | 8)
-                        && digits.chars().all(|c| c.is_ascii_hexdigit());
-                    if !valid {
-                        errors.push(format!(
-                            "{prefix}.background.color {color:?} must be #rrggbb or #rrggbbaa"
-                        ));
-                    }
+            match &output.background {
+                Some(BackgroundRef::Inline(background)) => {
+                    errors.extend(background.problems(&format!("{prefix}.background")));
                 }
-                if let Some(id) = &background.wallpaper {
-                    if id.is_empty() || id.contains("..") || id.contains('/') {
-                        errors.push(format!(
-                            "{prefix}.background.wallpaper {id:?} is not a valid wallpaper id"
-                        ));
-                    }
+                // Caught here rather than at reconcile time: a typo in a preset
+                // name is a mistake in the write, and the writer is the only
+                // one who can still fix it cheaply.
+                Some(BackgroundRef::Preset(id))
+                    if !self.backgrounds.iter().any(|preset| &preset.id == id) =>
+                {
+                    errors.push(format!(
+                        "{prefix}.background {id:?} is not a defined background preset"
+                    ));
                 }
+                Some(BackgroundRef::Preset(_)) => {}
+                None => {}
             }
+        }
+
+        let mut seen_backgrounds = std::collections::HashSet::new();
+        for (index, preset) in self.backgrounds.iter().enumerate() {
+            let prefix = format!("backgrounds[{index}]");
+            if preset.id.trim().is_empty() {
+                errors.push(format!("{prefix}.id must not be empty"));
+            }
+            if !seen_backgrounds.insert(preset.id.clone()) {
+                errors.push(format!("{prefix}.id {:?} is not unique", preset.id));
+            }
+            errors.extend(preset.background.problems(&prefix));
         }
 
         let mut seen_apps = std::collections::HashSet::new();
@@ -325,9 +342,10 @@ pub struct OutputConfig {
     /// Maximum milliseconds allowed to render a frame; `null` means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_render_time_ms: Option<u32>,
-    /// What this output shows when no window covers it.
+    /// What this output shows when no window covers it: a preset name, or the
+    /// properties spelled out. See [`BackgroundRef`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub background: Option<Background>,
+    pub background: Option<BackgroundRef>,
 }
 
 /// How a wallpaper is scaled onto an output, matching `sway-output(5)`.
@@ -359,6 +377,13 @@ impl BackgroundMode {
     }
 }
 
+/// Colour shown where no wallpaper reaches.
+///
+/// Black rather than "nothing": an unpainted output is whatever the compositor
+/// last left there, which on a video wall is usually a stale frame of the
+/// previous app. Something deliberate is always better than something leftover.
+pub const DEFAULT_BACKGROUND_COLOR: &str = "#000000";
+
 /// What an output shows behind, or instead of, any window.
 ///
 /// An appliance with a blank screen looks broken even when it is merely
@@ -371,6 +396,7 @@ pub struct Background {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wallpaper: Option<String>,
     /// `#rrggbb`, shown where the wallpaper does not reach, or on its own.
+    /// Absent means [`DEFAULT_BACKGROUND_COLOR`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
     #[serde(default)]
@@ -378,16 +404,94 @@ pub struct Background {
 }
 
 impl Background {
-    /// Whether this asks for anything at all.
-    pub fn is_empty(&self) -> bool {
-        self.wallpaper.is_none() && self.color.is_none()
+    /// Everything wrong with this background, prefixed for the caller's path.
+    ///
+    /// Shared so an inline background and a preset are held to identical
+    /// rules — they end up in the same swaybg command either way.
+    pub fn problems(&self, prefix: &str) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some(color) = &self.color {
+            let digits = color.trim_start_matches('#');
+            let valid =
+                matches!(digits.len(), 6 | 8) && digits.chars().all(|c| c.is_ascii_hexdigit());
+            if !valid {
+                errors.push(format!(
+                    "{prefix}.color {color:?} must be #rrggbb or #rrggbbaa"
+                ));
+            }
+        }
+        if let Some(id) = &self.wallpaper {
+            if id.is_empty() || id.contains("..") || id.contains('/') {
+                errors.push(format!(
+                    "{prefix}.wallpaper {id:?} is not a valid wallpaper id"
+                ));
+            }
+        }
+        errors
     }
 
-    /// Sway wants `#rrggbb` without the hash.
-    pub fn sway_color(&self) -> Option<String> {
+    /// Sway wants `#rrggbb` without the hash. Never empty: an unset colour
+    /// falls back to black rather than leaving swaybg to invent one.
+    pub fn sway_color(&self) -> String {
         self.color
-            .as_ref()
-            .map(|value| value.trim_start_matches('#').to_string())
+            .as_deref()
+            .unwrap_or(DEFAULT_BACKGROUND_COLOR)
+            .trim_start_matches('#')
+            .to_string()
+    }
+}
+
+/// A named background, defined once and used by any number of outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BackgroundPreset {
+    /// Client-chosen name, referenced from an output's `background`.
+    pub id: String,
+    #[serde(flatten)]
+    pub background: Background,
+}
+
+/// What an output's `background` may be.
+///
+/// A bare string names a preset; an object spells the properties out. Both are
+/// accepted because they serve different callers: the UI wants one dropdown
+/// across every screen, while a script driving the API directly should not
+/// have to create a preset to paint one output.
+///
+/// ```json
+/// "background": "lobby"
+/// "background": { "wallpaper": "teal", "mode": "fill", "color": "#101820" }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum BackgroundRef {
+    /// Id of an entry in [`DesiredState::backgrounds`].
+    Preset(String),
+    /// Properties given directly.
+    Inline(Background),
+}
+
+impl BackgroundRef {
+    /// The preset this refers to, if it is a reference rather than inline.
+    pub fn preset_id(&self) -> Option<&str> {
+        match self {
+            Self::Preset(id) => Some(id),
+            Self::Inline(_) => None,
+        }
+    }
+
+    /// Resolve to concrete properties against `presets`.
+    ///
+    /// `None` means the reference names a preset that does not exist — the
+    /// caller raises a divergence rather than silently painting the screen.
+    pub fn resolve<'a>(&'a self, presets: &'a [BackgroundPreset]) -> Option<&'a Background> {
+        match self {
+            Self::Inline(background) => Some(background),
+            Self::Preset(id) => presets
+                .iter()
+                .find(|preset| &preset.id == id)
+                .map(|preset| &preset.background),
+        }
     }
 }
 
@@ -872,5 +976,109 @@ mod tests {
         )
         .unwrap();
         assert_eq!(silent.audio, Some(AudioConfig { output: None }));
+    }
+
+    // --- background presets ----------------------------------------------
+
+    #[test]
+    fn a_bare_string_background_is_a_preset_reference() {
+        // The shorthand is what the UI writes, so it has to survive a round
+        // trip exactly; an object must still parse as inline properties.
+        let reference: BackgroundRef = serde_json::from_str(r#""lobby""#).unwrap();
+        assert_eq!(reference, BackgroundRef::Preset("lobby".into()));
+        assert_eq!(serde_json::to_string(&reference).unwrap(), r#""lobby""#);
+
+        let inline: BackgroundRef =
+            serde_json::from_str(r#"{"wallpaper":"art","mode":"fit"}"#).unwrap();
+        assert!(matches!(inline, BackgroundRef::Inline(_)));
+        assert_eq!(inline.preset_id(), None);
+    }
+
+    #[test]
+    fn a_preset_flattens_its_properties() {
+        // `{"id":..,"wallpaper":..}`, not `{"id":..,"background":{..}}` — the
+        // nesting would be visible in every hand-written config file.
+        let preset: BackgroundPreset =
+            serde_json::from_str(r##"{"id":"lobby","wallpaper":"art","color":"#101820"}"##)
+                .unwrap();
+        assert_eq!(preset.id, "lobby");
+        assert_eq!(preset.background.wallpaper.as_deref(), Some("art"));
+        let text = serde_json::to_string(&preset).unwrap();
+        assert!(text.contains(r#""id":"lobby""#), "{text}");
+        assert!(!text.contains("background"), "{text}");
+    }
+
+    #[test]
+    fn an_output_naming_an_undefined_preset_is_rejected() {
+        let mut state = DesiredState::new();
+        let mut output = OutputConfig::new(OutputMatch {
+            name: Some("HDMI-A-1".into()),
+            ..Default::default()
+        });
+        output.background = Some(BackgroundRef::Preset("nope".into()));
+        state.outputs.push(output);
+
+        let errors = state.validate().unwrap_err();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("not a defined background preset")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn preset_ids_must_be_unique_and_their_colours_valid() {
+        let mut state = DesiredState::new();
+        state.backgrounds.push(BackgroundPreset {
+            id: "one".into(),
+            background: Background {
+                color: Some("not-a-colour".into()),
+                ..Default::default()
+            },
+        });
+        state.backgrounds.push(BackgroundPreset {
+            id: "one".into(),
+            ..Default::default()
+        });
+
+        let errors = state.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("is not unique")),
+            "{errors:?}"
+        );
+        assert!(errors.iter().any(|e| e.contains("#rrggbb")), "{errors:?}");
+    }
+
+    #[test]
+    fn an_unset_colour_resolves_to_black() {
+        assert_eq!(Background::default().sway_color(), "000000");
+        assert_eq!(
+            Background {
+                color: Some("#ABCDEF".into()),
+                ..Default::default()
+            }
+            .sway_color(),
+            "ABCDEF"
+        );
+    }
+
+    #[test]
+    fn a_reference_resolves_through_the_preset_table() {
+        let presets = vec![BackgroundPreset {
+            id: "lobby".into(),
+            background: Background {
+                wallpaper: Some("art".into()),
+                ..Default::default()
+            },
+        }];
+        let found = BackgroundRef::Preset("lobby".into());
+        assert_eq!(
+            found.resolve(&presets).unwrap().wallpaper.as_deref(),
+            Some("art")
+        );
+        assert!(BackgroundRef::Preset("gone".into())
+            .resolve(&presets)
+            .is_none());
     }
 }

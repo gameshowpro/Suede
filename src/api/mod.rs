@@ -143,6 +143,14 @@ pub fn router(state: ApiState) -> Router {
             delete(config_routes::delete_output),
         )
         .route(
+            "/config/backgrounds",
+            get(config_routes::get_backgrounds).put(config_routes::put_backgrounds),
+        )
+        .route(
+            "/config/backgrounds/{id}",
+            put(config_routes::put_background).delete(config_routes::delete_background),
+        )
+        .route(
             "/config/apps",
             get(config_routes::get_apps).put(config_routes::put_apps),
         )

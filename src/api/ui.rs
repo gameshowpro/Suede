@@ -115,6 +115,24 @@ mod tests {
     }
 
     #[test]
+    fn an_uploaded_image_can_be_put_on_a_display() {
+        // The first version of this tab could upload wallpapers and nothing
+        // else, leaving no way to reach a screen with one.
+        assert!(
+            INDEX.contains("/config/backgrounds"),
+            "backgrounds cannot be defined"
+        );
+        assert!(
+            INDEX.contains("renderOutputBackgroundChoices"),
+            "the Displays tab offers no way to choose one"
+        );
+        assert!(
+            INDEX.contains("display-buttons"),
+            "the output editor is reachable only by clicking the diagram"
+        );
+    }
+
+    #[test]
     fn warnings_offer_a_way_forward() {
         // Every alert should end in either a fix or a documentation link, and
         // a fix writes to the operator's machine, so it must be confirmed

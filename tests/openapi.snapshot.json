@@ -418,6 +418,174 @@
         }
       }
     },
+    "/api/v1/config/backgrounds": {
+      "get": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "get_backgrounds",
+        "responses": {
+          "200": {
+            "description": "Defined background presets",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BackgroundPreset"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_backgrounds",
+        "parameters": [
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/BackgroundPreset"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A preset is invalid, or an output refers to one that is gone"
+          }
+        }
+      }
+    },
+    "/api/v1/config/backgrounds/{id}": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_background",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Preset id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackgroundPreset"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "delete_background",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Preset id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "wait",
+            "in": "query",
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such preset"
+          },
+          "409": {
+            "description": "An output still uses this preset"
+          }
+        }
+      }
+    },
     "/api/v1/config/outputs": {
       "get": {
         "tags": [
@@ -1287,7 +1455,7 @@
               "string",
               "null"
             ],
-            "description": "`#rrggbb`, shown where the wallpaper does not reach, or on its own."
+            "description": "`#rrggbb`, shown where the wallpaper does not reach, or on its own.\nAbsent means [`DEFAULT_BACKGROUND_COLOR`]."
           },
           "mode": {
             "$ref": "#/components/schemas/BackgroundMode"
@@ -1311,6 +1479,39 @@
           "center",
           "tile"
         ]
+      },
+      "BackgroundPreset": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Background"
+          },
+          {
+            "type": "object",
+            "required": [
+              "id"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Client-chosen name, referenced from an output's `background`."
+              }
+            }
+          }
+        ],
+        "description": "A named background, defined once and used by any number of outputs."
+      },
+      "BackgroundRef": {
+        "oneOf": [
+          {
+            "type": "string",
+            "description": "Id of an entry in [`DesiredState::backgrounds`]."
+          },
+          {
+            "$ref": "#/components/schemas/Background",
+            "description": "Properties given directly."
+          }
+        ],
+        "description": "What an output's `background` may be.\n\nA bare string names a preset; an object spells the properties out. Both are\naccepted because they serve different callers: the UI wants one dropdown\nacross every screen, while a script driving the API directly should not\nhave to create a preset to paint one output.\n\n```json\n\"background\": \"lobby\"\n\"background\": { \"wallpaper\": \"teal\", \"mode\": \"fill\", \"color\": \"#101820\" }\n```"
       },
       "Check": {
         "type": "object",
@@ -1395,6 +1596,14 @@
             "items": {
               "$ref": "#/components/schemas/AppConfig"
             },
+            "default": []
+          },
+          "backgrounds": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BackgroundPreset"
+            },
+            "description": "Named background definitions outputs can refer to.\n\nA video wall usually wants one look across every screen, so the\nalternative — repeating a wallpaper, scaling mode and colour on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
             "default": []
           },
           "outputs": {
@@ -1712,8 +1921,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/Background",
-                "description": "What this output shows when no window covers it."
+                "$ref": "#/components/schemas/BackgroundRef",
+                "description": "What this output shows when no window covers it: a preset name, or the\nproperties spelled out. See [`BackgroundRef`]."
               }
             ]
           },

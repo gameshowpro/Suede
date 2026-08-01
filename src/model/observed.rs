@@ -288,6 +288,7 @@ impl Divergence {
         "audio_sink_not_present",
         "null_sink_unavailable",
         "wallpaper_not_found",
+        "background_preset_not_found",
         "tearing_unsupported",
     ];
 
@@ -303,7 +304,9 @@ impl Divergence {
             "audio_sink_not_present" | "null_sink_unavailable" => {
                 "troubleshooting/#audio-goes-to-the-wrong-place-or-nowhere"
             }
-            "wallpaper_not_found" => "configuration/#backgrounds-and-wallpapers",
+            "wallpaper_not_found" | "background_preset_not_found" => {
+                "configuration/#backgrounds-and-wallpapers"
+            }
             "tearing_unsupported" => "configuration/#outputs",
             _ => return None,
         })

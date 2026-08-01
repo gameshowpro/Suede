@@ -81,22 +81,31 @@ pub async fn delete(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    // Removing an image an output still points at would leave that output
-    // permanently diverged, so say no rather than break it.
-    let referenced: Vec<String> = state
-        .store
-        .get()
+    // Removing an image something still points at would leave that output
+    // permanently diverged, so say no rather than break it. Presets count as
+    // users too: a wallpaper reached only through one is no less in use.
+    let desired = state.store.get();
+    let mut referenced: Vec<String> = desired
         .outputs
         .iter()
         .filter(|output| {
             output
                 .background
                 .as_ref()
-                .and_then(|b| b.wallpaper.as_deref())
+                .and_then(|reference| reference.resolve(&desired.backgrounds))
+                .and_then(|background| background.wallpaper.as_deref())
                 == Some(id.as_str())
         })
         .map(|output| output.r#match.key())
         .collect();
+    referenced.extend(
+        desired
+            .backgrounds
+            .iter()
+            .filter(|preset| preset.background.wallpaper.as_deref() == Some(id.as_str()))
+            .map(|preset| format!("preset {:?}", preset.id)),
+    );
+    referenced.dedup();
     if !referenced.is_empty() {
         return Err(ApiError::Conflict(format!(
             "wallpaper {id} is still used by {}; change those outputs first",
@@ -208,11 +217,13 @@ mod tests {
             .update(|state| {
                 let mut output =
                     crate::model::OutputConfig::new(crate::model::OutputMatch::by_name("HDMI-A-1"));
-                output.background = Some(crate::model::Background {
-                    wallpaper: Some("lobby".into()),
-                    color: None,
-                    mode: Default::default(),
-                });
+                output.background = Some(crate::model::BackgroundRef::Inline(
+                    crate::model::Background {
+                        wallpaper: Some("lobby".into()),
+                        color: None,
+                        mode: Default::default(),
+                    },
+                ));
                 state.outputs.push(output);
             })
             .unwrap();

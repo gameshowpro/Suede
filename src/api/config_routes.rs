@@ -12,7 +12,9 @@ use utoipa::IntoParams;
 
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
-use crate::model::{AppConfig, DesiredState, OutputConfig, OutputMatch, Settings};
+use crate::model::{
+    AppConfig, BackgroundPreset, DesiredState, OutputConfig, OutputMatch, Settings,
+};
 
 /// Optional blocking behaviour for writes.
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -157,6 +159,116 @@ pub async fn delete_output(
         )));
     }
     state.commit(next, "outputs", query.wait).await.map(Json)
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/config/backgrounds", tag = "config",
+    responses((status = 200, description = "Defined background presets", body = Vec<BackgroundPreset>))
+)]
+pub async fn get_backgrounds(State(state): State<ApiState>) -> Json<Vec<BackgroundPreset>> {
+    Json(state.store.get().backgrounds)
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/config/backgrounds", tag = "config",
+    params(WaitQuery), request_body = Vec<BackgroundPreset>,
+    responses(
+        (status = 200, description = "The persisted document", body = DesiredState),
+        (status = 422, description = "A preset is invalid, or an output refers to one that is gone"),
+    )
+)]
+pub async fn put_backgrounds(
+    State(state): State<ApiState>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+    Json(body): Json<Vec<BackgroundPreset>>,
+) -> ApiResult<Json<DesiredState>> {
+    state.check_precondition(if_match(&headers))?;
+    let mut next = state.store.get();
+    next.backgrounds = body;
+    // Validation rejects the write if this removed a preset an output still
+    // refers to, so the two collections cannot drift out of agreement.
+    state
+        .commit(next, "backgrounds", query.wait)
+        .await
+        .map(Json)
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/config/backgrounds/{id}", tag = "config",
+    params(("id" = String, Path, description = "Preset id"), WaitQuery),
+    request_body = BackgroundPreset,
+    responses((status = 200, description = "The persisted document", body = DesiredState))
+)]
+pub async fn put_background(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+    Json(mut body): Json<BackgroundPreset>,
+) -> ApiResult<Json<DesiredState>> {
+    state.check_precondition(if_match(&headers))?;
+    // The path wins, so a mismatched body cannot silently create a second one.
+    body.id = id;
+    let mut next = state.store.get();
+    match next.backgrounds.iter_mut().find(|p| p.id == body.id) {
+        Some(existing) => *existing = body,
+        None => next.backgrounds.push(body),
+    }
+    state
+        .commit(next, "backgrounds", query.wait)
+        .await
+        .map(Json)
+}
+
+#[utoipa::path(
+    delete, path = "/api/v1/config/backgrounds/{id}", tag = "config",
+    params(("id" = String, Path, description = "Preset id"), WaitQuery),
+    responses(
+        (status = 200, description = "The persisted document", body = DesiredState),
+        (status = 404, description = "No such preset"),
+        (status = 409, description = "An output still uses this preset"),
+    )
+)]
+pub async fn delete_background(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<DesiredState>> {
+    state.check_precondition(if_match(&headers))?;
+    let mut next = state.store.get();
+
+    // Refused rather than cascaded: deleting a preset would otherwise blank
+    // every screen using it, which is a lot of damage for one click.
+    let users: Vec<String> = next
+        .outputs
+        .iter()
+        .filter(|output| {
+            output
+                .background
+                .as_ref()
+                .and_then(|background| background.preset_id())
+                == Some(id.as_str())
+        })
+        .map(|output| output.r#match.key())
+        .collect();
+    if !users.is_empty() {
+        return Err(ApiError::Conflict(format!(
+            "background preset {id:?} is still used by {}",
+            users.join(", ")
+        )));
+    }
+
+    let before = next.backgrounds.len();
+    next.backgrounds.retain(|preset| preset.id != id);
+    if next.backgrounds.len() == before {
+        return Err(ApiError::NotFound(format!("no background preset {id}")));
+    }
+    state
+        .commit(next, "backgrounds", query.wait)
+        .await
+        .map(Json)
 }
 
 #[utoipa::path(
@@ -576,5 +688,155 @@ mod tests {
         assert_eq!(event.name(), "config_changed");
         assert_eq!(event.data()["section"], "apps");
         assert_eq!(event.data()["revision"], 1);
+    }
+
+    // --- background presets ----------------------------------------------
+
+    const PRESET: &str = r##"{"id":"lobby","color":"#101820","mode":"fit"}"##;
+    const USES_PRESET: &str = r#"{"match":{"name":"HDMI-A-1"},"background":"lobby"}"#;
+
+    #[tokio::test]
+    async fn a_preset_can_be_defined_and_then_named_by_an_output() {
+        let harness = harness(None);
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/backgrounds/lobby",
+            Some(PRESET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(USES_PRESET),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The shorthand survives the round trip rather than being expanded.
+        assert_eq!(body["outputs"][0]["background"], "lobby");
+        assert_eq!(body["backgrounds"][0]["color"], "#101820");
+    }
+
+    #[tokio::test]
+    async fn naming_a_preset_that_does_not_exist_is_refused() {
+        // Rejected at the write, where the author can still see their typo.
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(r#"{"match":{"name":"HDMI-A-1"},"background":"typo"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("not a defined background preset"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preset_in_use_cannot_be_deleted() {
+        // Deleting it would blank every screen using it, which is a lot of
+        // damage for one click.
+        let harness = harness(None);
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config/backgrounds/lobby",
+            Some(PRESET),
+        )
+        .await;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(USES_PRESET),
+        )
+        .await;
+
+        let (status, body) =
+            call(&harness, "DELETE", "/api/v1/config/backgrounds/lobby", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["detail"].as_str().unwrap().contains("HDMI-A-1"),
+            "the operator needs to know which display is holding it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unused_preset_deletes_cleanly() {
+        let harness = harness(None);
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config/backgrounds/spare",
+            Some(r##"{"id":"spare","color":"#000000"}"##),
+        )
+        .await;
+        let (status, body) =
+            call(&harness, "DELETE", "/api/v1/config/backgrounds/spare", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["backgrounds"].as_array().unwrap().len(), 0);
+
+        let (status, _) = call(&harness, "DELETE", "/api/v1/config/backgrounds/spare", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn replacing_the_whole_set_cannot_orphan_an_output() {
+        let harness = harness(None);
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config/backgrounds/lobby",
+            Some(PRESET),
+        )
+        .await;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(USES_PRESET),
+        )
+        .await;
+
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/backgrounds",
+            Some(r##"[{"id":"other","color":"#000000"}]"##),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "dropping a preset an output still names must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_output_may_still_carry_its_properties_directly() {
+        // A script driving the API should not have to create a preset to
+        // paint one screen.
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(
+                r##"{"match":{"name":"HDMI-A-1"},
+                     "background":{"color":"#223344","mode":"fill"}}"##,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["outputs"][0]["background"]["color"], "#223344");
     }
 }
