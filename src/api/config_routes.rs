@@ -887,12 +887,13 @@ mod tests {
             &harness,
             "PUT",
             "/api/v1/config/projection",
-            Some(r#"{"blend":true,"gamma":2.4,"blackLift":0.04}"#),
+            Some(r#"{"blend":true,"gamma":2.4,"overlap":160,"blackLift":0.04}"#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["projection"]["gamma"], 2.4);
         assert_eq!(body["projection"]["blackLift"], 0.04);
+        assert_eq!(body["projection"]["overlap"], 160);
 
         let (status, body) = call(&harness, "PUT", "/api/v1/config/projection", Some("null")).await;
         assert_eq!(status, StatusCode::OK);
@@ -912,6 +913,25 @@ mod tests {
         assert_eq!(body["projection"]["blend"], true);
         assert_eq!(body["projection"]["gamma"], 2.2);
         assert_eq!(body["projection"]["blackLift"], 0.0);
+        // Zero overlap: a wall is not blended until its seam is measured.
+        assert_eq!(body["projection"]["overlap"], 0);
+    }
+
+    #[tokio::test]
+    async fn projection_overlap_is_range_checked() {
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"overlap":9000}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body["detail"].as_str().unwrap().contains("0 and 4096"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

@@ -112,6 +112,7 @@ mod tests {
             "env",
             "gamma",
             "testPattern",
+            "overlap",
         ] {
             assert!(INDEX.contains(field), "the UI never sets {field}");
         }

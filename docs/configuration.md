@@ -377,74 +377,92 @@ The endpoint is unauthenticated but accepted only from loopback, so the key-free
 ### Projection and edge blending {: #projection-edge-blending }
 
 For a wall of projectors whose images physically overlap, Suede can fade each
-side of every seam so the doubled light adds up to one seamless picture. This
-is phase one of projection support: it assumes the projectors handle their own
-geometry (corner pinning), which most installation-class projectors do.
+side of every seam so the doubled light adds up to one seamless picture, and
+can compensate for the projectors' non-zero black.
 
-The pieces:
+!!! danger "Blending needs the outputs laid edge to edge, not overlapping"
+    Sway keeps every surface in **one global coordinate space**, and each
+    output renders whatever intersects its box — layer surfaces *and*
+    windows alike. Two outputs positioned to overlap therefore show
+    identical pixels in the shared region, by construction. An edge blend
+    needs the opposite: the left projector fading out across the seam while
+    the right one fades in.
 
-1. **Overlap comes from the layout.** Position the outputs so their
-   rectangles intersect — a 160&nbsp;px seam between two 1920-wide projectors
-   means positions `0` and `1760`. A spanned app
-   ([`spanOutputs`](#driving-a-video-wall)) then renders the shared strip on
-   both outputs. There is no separate overlap setting, and no list of
-   projectors either: the blend regions *are* the intersections. A monitor
-   beside the wall overlaps nothing and is untouched; an output that
-   *mirrors* another (near-total overlap) is recognised as a mirror, not a
-   seam.
-2. **Blending is a ramp in light, not in signal.** A display raises its input
-   signal to a power (its gamma, typically 2.2), so a gradient that is linear
-   in signal is far from linear in light and produces a visible bright band
-   at every seam. Suede shapes each ramp as `ramp^(1/gamma)`, which makes the
-   summed luminance across a seam constant.
-3. **Black-level compensation.** Projector black is not zero light, so seams
-   glow on dark scenes — they receive two projectors' worth of leaked black.
-   The seam cannot be made darker, so `blackLift` brightens everything *else*
-   to match: `out = lift + (1 − lift) · in` outside the seams. Show a black
-   scene and raise it until the picture is even.
-4. **The overlays are tiny and passive.** Each projector gets one
-   `suede blend` process: an input-transparent layer surface carrying the
-   ramps and the lift. It is drawn once, costs nothing per frame, and clicks
-   pass straight through. The reconciler starts, restarts, and retires them
-   as the layout or configuration changes.
+    So the intuitive arrangement — overlap the outputs, span one browser
+    across them — **cannot be blended**, and Suede refuses rather than
+    painting ramps that make the seam worse. It reports
+    `blend_needs_distinct_outputs` naming the offending pair.
+
+    Measured on hardware: with one projector's overlay running, its ramp
+    appeared on *both* screens; and two per-output kiosks in an overlapping
+    layout showed the right-hand kiosk's colour on the left-hand display.
+
+The working arrangement gives each projector its own region of the layout
+and its own view of the content:
+
+1. **Lay the outputs edge to edge** — `0` and `1920` for two 1920-wide
+   projectors. No intersection, so nothing bleeds.
+2. **Give each projector its own app**, pointed at the same content with a
+   source offset, so that the right-hand projector's first *O* pixels repeat
+   the left-hand projector's last *O* pixels. For *n* projectors of width
+   *W* with per-seam overlap *O*, projector *i* shows canvas columns
+   `i·(W−O)` to `i·(W−O)+W`, and the canvas is `n·W − (n−1)·O` wide. The
+   Displays tab reports the layout's size directly beneath the diagram.
+3. **Set `overlap` and turn on blending.** Each projector then gets a ramp
+   of that width on its seam-facing edge, and the two ramps sum to constant
+   luminance. The seam is *inside* each output, which is exactly why the two
+   projectors can be given opposite fades.
+
+Content that cannot take a source offset needs the capture-and-warp client
+(the planned phase two), which renders the canvas once to a headless output
+and gives each projector a warped crop of it.
 
 ```json
-"projection": { "blend": true, "gamma": 2.2, "blackLift": 0.04 }
+"projection": { "blend": true, "overlap": 160, "gamma": 2.2, "blackLift": 0.04 }
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `blend` | bool | `true` | `false` skips the entire chain: overlays are torn down, nothing runs |
+| `overlap` | number | `0` | Pixels each pair of neighbouring beams shares on the wall, 0–4096. `0` means no seams and no ramps |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0–4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0–0.5 |
 | `testPattern` | string \| null | null | `grid`, `white`, `black`, `gamma` — or null for content |
 
-One gamma for the whole wall: a wall is near-universally identical
-projectors, and a single measured value covers it. (Per-output overrides can
-be added later without breaking this shape, should mixed models ever
-matter.) Setting `blend: false` — or removing the section with
-`PUT /api/v1/config/projection` and a `null` body — stops every overlay and
-skips all projection work; nothing is spawned and nothing is checked.
+**Blending is a ramp in light, not in signal.** A display raises its input
+signal to a power (its gamma, typically 2.2), so a gradient that is linear in
+signal is far from linear in light and leaves a bright band at every seam.
+Suede shapes each ramp as `ramp^(1/gamma)`, making the summed luminance
+across a seam constant.
 
-Rows, columns, and grids all work: seams are derived pairwise from wherever
-outputs intersect, and in a 2×2 grid the corner region multiplies its
-horizontal and vertical ramps, which sums correctly by construction.
+**Black-level compensation.** Projector black is not zero light, so seams
+glow on dark scenes — they receive two projectors' worth of leaked black. The
+seam cannot be darkened, so `blackLift` brightens everything *else* to match:
+`out = lift + (1 − lift) · in` outside the seams. Show the `black` test
+pattern and raise it until the picture is even.
+
+One gamma covers the whole wall: a wall is near-universally identical
+projectors. Setting `blend: false` — or removing the section with
+`PUT /api/v1/config/projection` and a `null` body — stops every overlay and
+skips all projection work.
 
 #### Test patterns {: #projection-test-patterns }
 
 Built into the blending component, sized automatically to each output, and
 drawn in **global** coordinates so features continue exactly across a seam:
-two aligned projectors superimpose the pattern pixel for pixel. The blend
-ramps and black lift apply to the pattern exactly as they would to content,
-so what you align with is what content will experience. Set
-`testPattern` (or use the Displays tab's Projection panel):
+two aligned projectors superimpose the pattern pixel for pixel. Ramps and
+black lift apply to the pattern exactly as they would to content, so what you
+align with is what content will experience. Patterns work regardless of
+`blend`, because alignment comes first — and, being drawn globally, they are
+unaffected by the overlapping-output limitation above, which makes them the
+right tool for checking a rig before committing to a layout.
 
 | Pattern | For |
 |---|---|
 | `grid` | Geometry, focus, and seam alignment: 100 px colour tiles with crosses, each labelled with its global pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
-| `white` | The blend ramps in isolation, and brightness mismatch between projectors. On the bench, this is the clearest view of the ramp shape. |
+| `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the wall matches them. |
-| `gamma` | Measuring the `gamma` value: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the currently configured value is underlined. |
+| `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |
 
 The gamma chart assumes the output runs at scale 1 (its stripes are
 single-pixel rows); the other patterns have no such constraint.
@@ -460,12 +478,6 @@ single-pixel rows); the other patterns have no such constraint.
 Suede must be built with the `projection` cargo feature (on by default). A
 build without it still accepts and stores this configuration, and reports a
 `projection_unavailable` divergence if asked to blend.
-
-!!! note "Phase two"
-    Corner pinning and per-output source rectangles (for projectors without
-    built-in geometry) are designed but not yet built; this configuration
-    shape is forward-compatible with them. Measure each projector's gamma
-    with a test pattern for best results — per-channel gamma is also planned.
 
 ### Settings
 

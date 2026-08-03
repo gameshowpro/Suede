@@ -2174,7 +2174,7 @@
       },
       "ProjectionConfig": {
         "type": "object",
-        "description": "Multi-projector configuration: edge blending today, warping later.\n\nPhase one covers a soft-edge wall where the projectors handle their own\ngeometry: outputs are *positioned to overlap* in the ordinary layout, a\nspanned window renders the shared strip on both, and a gamma-correct ramp\nfades each side so the overlapping light sums to constant luminance.\n\nThere is no list of projectors and no overlap setting: blend regions are\nderived from wherever the layout's outputs intersect, so they cannot fall\nout of step with it. An operator monitor beside the wall overlaps nothing\nand is untouched; a mirrored output overlaps *entirely* and is recognised\nas a mirror rather than a seam. Corner pinning and source-rectangle\nwarping are a later phase; this shape grows those fields without breaking.",
+        "description": "Multi-projector configuration: edge blending today, warping later.\n\nPhase one covers a soft-edge wall where the projectors handle their own\ngeometry. The outputs must sit **edge to edge** in the layout, each\nprojector showing its own region: sway keeps every surface in one global\ncoordinate space and each output renders whatever intersects its box, so\noutputs positioned to *overlap* necessarily show identical pixels there —\nthe exact opposite of what a blend needs. [`overlapping_pairs`] detects\nthat arrangement and the reconciler refuses it.\n\n[`Self::overlap`] therefore states how wide the shared strip is on the\nwall, and the content handed to each projector must repeat it. There is no\nlist of projectors: a seam exists wherever two outputs abut, so an operator\nmonitor that touches nothing is untouched.\n\nCorner pinning and source-rectangle warping are a later phase; this shape\ngrows those fields without breaking.\n\n[`overlapping_pairs`]: crate::projection::blend::overlapping_pairs",
         "properties": {
           "blackLift": {
             "type": "number",
@@ -2192,6 +2192,12 @@
             "format": "double",
             "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\nwall — walls are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
             "default": 2.2
+          },
+          "overlap": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Width in pixels of the region each pair of neighbouring projectors\nshows twice — the physical overlap of their beams, measured on the\nwall and converted to pixels.\n\nThis cannot be derived from the layout: the outputs must sit edge to\nedge (see [`ProjectionConfig`]), so the shared strip exists on the\n*wall*, not in the coordinate space. `0` means no seams and no ramps.\n\nThe content each projector is given must repeat that strip: for\nprojectors of width `W`, projector `i` shows canvas columns\n`i·(W−overlap)` to `i·(W−overlap)+W`, and the canvas is\n`n·W − (n−1)·overlap` wide.",
+            "default": 0
           },
           "testPattern": {
             "oneOf": [

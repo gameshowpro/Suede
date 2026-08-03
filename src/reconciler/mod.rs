@@ -321,6 +321,7 @@ impl Reconciler {
     async fn sync_projection(&self, desired: &crate::model::DesiredState) -> Vec<Divergence> {
         use crate::projection::{overlay_specs, Participant};
 
+        let mut divergences = Vec::new();
         let mut specs = Vec::new();
         if let Some(projection) = desired
             .projection
@@ -341,10 +342,36 @@ impl Reconciler {
                     rect: output.rect,
                 })
                 .collect();
-            specs = overlay_specs(&participants, projection);
+            // Blending overlapping outputs is not merely unimplemented, it is
+            // impossible in sway: the shared region is one set of global
+            // pixels, so both projectors necessarily show it identically,
+            // while a blend needs each to fade the opposite way. Say so
+            // rather than paint ramps that make the seam worse.
+            let overlapping = crate::projection::blend::overlapping_pairs(&participants);
+            let mut effective = projection.clone();
+            if projection.blend && !overlapping.is_empty() {
+                let pairs = overlapping
+                    .iter()
+                    .map(|(a, b)| format!("{a} and {b}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                divergences.push(Divergence::new(
+                    "blend_needs_distinct_outputs",
+                    "projection",
+                    format!(
+                        "{pairs} overlap in the layout, so sway gives both projectors \
+                         the same pixels there and no ramp can fade them apart. Lay the \
+                         outputs edge to edge and give each projector its own view of \
+                         the content; test patterns still work for alignment."
+                    ),
+                ));
+                effective.blend = false;
+            }
+            specs = overlay_specs(&participants, &effective);
         }
 
-        self.blend.lock().await.sync(&specs)
+        divergences.extend(self.blend.lock().await.sync(&specs));
+        divergences
     }
 
     /// Without the `projection` feature there is nothing to run — but asking

@@ -76,86 +76,136 @@ fn area(rect: &Rect) -> i64 {
     rect.width as i64 * rect.height as i64
 }
 
-/// Derive one overlay spec per output that has any seam.
+/// Pairs of outputs whose rectangles intersect in the layout.
 ///
-/// A seam is a pairwise intersection of two participants' rectangles, with
-/// two structural exclusions:
-///
-/// - **Mirrors.** An intersection covering most of either output is a
-///   mirrored display (the sway same-position trick — a confidence monitor
-///   showing a projector's picture), not a projection seam; fading it would
-///   black out both screens.
-/// - **Diagonals.** In a 2×2 grid the corner region already receives the
-///   product of each output's horizontal and vertical ramps, which sums to
-///   constant luminance by construction — a third ramp from the diagonal
-///   pair would darken it twice.
-pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) -> Vec<OverlaySpec> {
-    let mut ramps: Vec<(usize, RampSpec)> = Vec::new();
-
+/// Sway keeps every surface in one global coordinate space and each output
+/// renders whatever intersects its box — layer surfaces and windows alike.
+/// Two outputs that overlap therefore *necessarily* show identical pixels in
+/// the shared region, and an edge blend needs the opposite: each projector
+/// fading the other way. Measured on hardware, not inferred.
+pub fn overlapping_pairs(participants: &[Participant]) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
     for i in 0..participants.len() {
         for j in (i + 1)..participants.len() {
             let (a, b) = (&participants[i], &participants[j]);
-            let Some(seam) = intersect(&a.rect, &b.rect) else {
-                continue;
-            };
-
-            // A mirror, not a seam.
-            if area(&seam) * 5 >= area(&a.rect).min(area(&b.rect)) * 4 {
-                continue;
-            }
-
-            // Edge adjacency: the seam spans (most of) the shorter output
-            // along the axis perpendicular to the fade.
-            let horizontal = seam.height * 2 >= a.rect.height.min(b.rect.height);
-            let vertical = seam.width * 2 >= a.rect.width.min(b.rect.width);
-            let center_dx = (a.rect.x * 2 + a.rect.width) - (b.rect.x * 2 + b.rect.width);
-            let center_dy = (a.rect.y * 2 + a.rect.height) - (b.rect.y * 2 + b.rect.height);
-
-            let axis = match (horizontal, vertical) {
-                (true, false) => Axis::X,
-                (false, true) => Axis::Y,
-                // Both qualify (heavily overlapped): the larger centre offset
-                // decides. Neither: a diagonal neighbour — no ramp.
-                (true, true) => {
-                    if center_dx.abs() >= center_dy.abs() {
-                        Axis::X
-                    } else {
-                        Axis::Y
-                    }
+            if let Some(seam) = intersect(&a.rect, &b.rect) {
+                // A mirror is a deliberate arrangement, not a wall seam.
+                if area(&seam) * 5 < area(&a.rect).min(area(&b.rect)) * 4 {
+                    pairs.push((a.name.clone(), b.name.clone()));
                 }
-                (false, false) => continue,
-            };
-
-            let (fade_a, fade_b) = match axis {
-                Axis::X if center_dx <= 0 => (FadeTo::Right, FadeTo::Left),
-                Axis::X => (FadeTo::Left, FadeTo::Right),
-                Axis::Y if center_dy <= 0 => (FadeTo::Bottom, FadeTo::Top),
-                Axis::Y => (FadeTo::Top, FadeTo::Bottom),
-            };
-
-            for (index, fade_to) in [(i, fade_a), (j, fade_b)] {
-                let origin = &participants[index].rect;
-                ramps.push((
-                    index,
-                    RampSpec {
-                        rect: Rect {
-                            x: seam.x - origin.x,
-                            y: seam.y - origin.y,
-                            width: seam.width,
-                            height: seam.height,
-                        },
-                        fade_to,
-                    },
-                ));
             }
         }
     }
+    pairs
+}
 
-    // Blending off leaves the seams unfaded; a test pattern is still shown
-    // if one is requested, which is how alignment is done before enabling
-    // the blend.
-    if !config.blend {
-        ramps.clear();
+/// Derive one overlay spec per output that has a seam.
+///
+/// Seams come from *adjacency*, not intersection: neighbouring outputs must
+/// abut in the layout, and [`ProjectionConfig::overlap`] says how many pixels
+/// of each one's edge its neighbour also projects onto the wall. That ramp
+/// region lies inside each output, so the two projectors can be given
+/// opposite fades — which is the whole point, and which overlapping outputs
+/// cannot deliver (see [`overlapping_pairs`]).
+///
+/// In a grid, the corner region receives the product of an output's
+/// horizontal and vertical ramps, which sums to constant luminance by
+/// construction; no diagonal seam is needed or wanted.
+pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) -> Vec<OverlaySpec> {
+    let mut ramps: Vec<(usize, RampSpec)> = Vec::new();
+    let overlap = config.overlap;
+
+    if config.blend && overlap > 0 {
+        for i in 0..participants.len() {
+            for j in (i + 1)..participants.len() {
+                let (a, b) = (&participants[i].rect, &participants[j].rect);
+
+                // Shared extent along each axis, for the seam's other dimension.
+                let y0 = a.y.max(b.y);
+                let y1 = (a.y + a.height).min(b.y + b.height);
+                let x0 = a.x.max(b.x);
+                let x1 = (a.x + a.width).min(b.x + b.width);
+
+                // Left/right neighbours: one's right edge meets the other's left.
+                if y1 > y0 {
+                    let horizontal = if a.x + a.width == b.x {
+                        Some((i, j, a.x + a.width))
+                    } else if b.x + b.width == a.x {
+                        Some((j, i, b.x + b.width))
+                    } else {
+                        None
+                    };
+                    if let Some((left, right, edge)) = horizontal {
+                        let origin = &participants[left].rect;
+                        ramps.push((
+                            left,
+                            RampSpec {
+                                rect: Rect {
+                                    x: edge - overlap - origin.x,
+                                    y: y0 - origin.y,
+                                    width: overlap,
+                                    height: y1 - y0,
+                                },
+                                fade_to: FadeTo::Right,
+                            },
+                        ));
+                        let origin = &participants[right].rect;
+                        ramps.push((
+                            right,
+                            RampSpec {
+                                rect: Rect {
+                                    x: edge - origin.x,
+                                    y: y0 - origin.y,
+                                    width: overlap,
+                                    height: y1 - y0,
+                                },
+                                fade_to: FadeTo::Left,
+                            },
+                        ));
+                        continue;
+                    }
+                }
+
+                // Above/below neighbours.
+                if x1 > x0 {
+                    let vertical = if a.y + a.height == b.y {
+                        Some((i, j, a.y + a.height))
+                    } else if b.y + b.height == a.y {
+                        Some((j, i, b.y + b.height))
+                    } else {
+                        None
+                    };
+                    if let Some((top, bottom, edge)) = vertical {
+                        let origin = &participants[top].rect;
+                        ramps.push((
+                            top,
+                            RampSpec {
+                                rect: Rect {
+                                    x: x0 - origin.x,
+                                    y: edge - overlap - origin.y,
+                                    width: x1 - x0,
+                                    height: overlap,
+                                },
+                                fade_to: FadeTo::Bottom,
+                            },
+                        ));
+                        let origin = &participants[bottom].rect;
+                        ramps.push((
+                            bottom,
+                            RampSpec {
+                                rect: Rect {
+                                    x: x0 - origin.x,
+                                    y: edge - origin.y,
+                                    width: x1 - x0,
+                                    height: overlap,
+                                },
+                                fade_to: FadeTo::Top,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     let mut specs: Vec<OverlaySpec> = Vec::new();
@@ -180,11 +230,6 @@ pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) ->
     }
     specs.sort_by(|a, b| a.output.cmp(&b.output));
     specs
-}
-
-enum Axis {
-    X,
-    Y,
 }
 
 /// Combined light attenuation of every ramp covering the pixel centre
@@ -328,7 +373,11 @@ mod tests {
     }
 
     fn config() -> ProjectionConfig {
-        ProjectionConfig::default()
+        // 160 px of beam overlap, the classic two-projector soft edge.
+        ProjectionConfig {
+            overlap: 160,
+            ..ProjectionConfig::default()
+        }
     }
 
     fn specs_for(participants: &[Participant]) -> Vec<OverlaySpec> {
@@ -336,11 +385,11 @@ mod tests {
     }
 
     #[test]
-    fn two_overlapping_outputs_get_mirrored_ramps() {
-        // 160 px of shared strip: the classic two-projector soft edge.
+    fn two_abutting_outputs_get_mirrored_ramps() {
+        // Edge to edge in the layout; the overlap lives on the wall.
         let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1760, 0, 1920, 1080),
+            participant("DP-2", 1920, 0, 1920, 1080),
         ]);
         assert_eq!(specs.len(), 2);
 
@@ -355,7 +404,8 @@ mod tests {
                 y: 0,
                 width: 160,
                 height: 1080
-            }
+            },
+            "the left projector fades across its own last 160 px"
         );
         assert_eq!(left.ramps[0].fade_to, FadeTo::Right);
 
@@ -376,9 +426,9 @@ mod tests {
     fn a_row_of_four_has_three_seams() {
         let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1200),
-            participant("DP-2", 1760, 0, 1920, 1200),
-            participant("DP-3", 3520, 0, 1920, 1200),
-            participant("DP-4", 5280, 0, 1920, 1200),
+            participant("DP-2", 1920, 0, 1920, 1200),
+            participant("DP-3", 3840, 0, 1920, 1200),
+            participant("DP-4", 5760, 0, 1920, 1200),
         ]);
         assert_eq!(specs.len(), 4);
         // The middle projectors blend on both sides; the ends on one.
@@ -390,38 +440,45 @@ mod tests {
 
     #[test]
     fn separated_outputs_produce_nothing() {
+        // A gap in the layout is not a wall: nothing abuts, nothing blends.
         let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1920, 0, 1920, 1080),
+            participant("DP-2", 2400, 0, 1920, 1080),
         ]);
-        assert!(specs.is_empty(), "adjacent-but-not-overlapping has no seam");
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn a_zero_overlap_means_no_ramps() {
+        // The default: a wall is not blended until its overlap is measured.
+        let specs = overlay_specs(
+            &[
+                participant("DP-1", 0, 0, 1920, 1080),
+                participant("DP-2", 1920, 0, 1920, 1080),
+            ],
+            &ProjectionConfig::default(),
+        );
+        assert!(specs.is_empty());
     }
 
     #[test]
     fn a_mirrored_output_is_not_a_seam() {
         // The sway same-position trick: a confidence monitor showing the
-        // projector's picture. Fading "the overlap" would black out both.
+        // projector's picture. It does not abut anything, so no ramps.
         let specs = specs_for(&[
             participant("PROJECTOR", 0, 0, 1920, 1080),
             participant("MONITOR", 0, 0, 1920, 1080),
         ]);
         assert!(specs.is_empty(), "a full mirror must produce no ramps");
-
-        // Still a mirror when the monitor is a different, contained size.
-        let specs = specs_for(&[
-            participant("PROJECTOR", 0, 0, 1920, 1080),
-            participant("MONITOR", 0, 0, 1280, 1024),
-        ]);
-        assert!(specs.is_empty(), "a contained mirror must produce no ramps");
     }
 
     #[test]
-    fn an_operator_monitor_beside_the_wall_is_untouched() {
-        // Two projectors overlap; the monitor sits beyond them, no overlap.
+    fn an_operator_monitor_set_apart_is_untouched() {
+        // Two projectors abut; the monitor sits away from them with a gap.
         let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1760, 0, 1920, 1080),
-            participant("HDMI-A-1", 3680, 0, 1920, 1080),
+            participant("DP-2", 1920, 0, 1920, 1080),
+            participant("HDMI-A-1", 4400, 0, 1920, 1080),
         ]);
         assert_eq!(specs.len(), 2);
         assert!(specs.iter().all(|spec| spec.output != "HDMI-A-1"));
@@ -431,13 +488,20 @@ mod tests {
     fn vertical_stacks_fade_up_and_down() {
         let specs = specs_for(&[
             participant("TOP", 0, 0, 1920, 1080),
-            participant("BOT", 0, 960, 1920, 1080),
+            participant("BOT", 0, 1080, 1920, 1080),
         ]);
         // Sorted by name: specs[0] is BOT, specs[1] is TOP. The upper
         // projector hands over toward its bottom edge, and vice versa.
         assert_eq!(specs[1].ramps[0].fade_to, FadeTo::Bottom);
         assert_eq!(specs[0].ramps[0].fade_to, FadeTo::Top);
-        assert_eq!(specs[0].ramps[0].rect.height, 120);
+        assert_eq!(specs[0].ramps[0].rect.height, 160);
+        // Each ramp sits inside its own output, which is what lets the two
+        // projectors be given opposite fades at all.
+        assert_eq!(specs[0].ramps[0].rect.y, 0, "BOT fades from its top edge");
+        assert_eq!(
+            specs[1].ramps[0].rect.y, 920,
+            "TOP fades into its bottom edge"
+        );
     }
 
     #[test]
@@ -447,9 +511,9 @@ mod tests {
         // third ramp: the corner is already the product of the other two.
         let specs = specs_for(&[
             participant("A", 0, 0, 1920, 1080),
-            participant("B", 1760, 0, 1920, 1080),
-            participant("C", 0, 960, 1920, 1080),
-            participant("D", 1760, 960, 1920, 1080),
+            participant("B", 1920, 0, 1920, 1080),
+            participant("C", 0, 1080, 1920, 1080),
+            participant("D", 1920, 1080, 1920, 1080),
         ]);
         assert_eq!(specs.len(), 4);
         for spec in &specs {
@@ -467,7 +531,7 @@ mod tests {
         let specs = overlay_specs(
             &[
                 participant("DP-1", 0, 0, 1920, 1080),
-                participant("DP-2", 1760, 0, 1920, 1080),
+                participant("DP-2", 1920, 0, 1920, 1080),
             ],
             &ProjectionConfig {
                 gamma: 2.4,
@@ -534,7 +598,7 @@ mod tests {
         let specs = overlay_specs(
             &[
                 participant("L", 0, 0, 1920, 1080),
-                participant("R", 1760, 0, 1920, 1080),
+                participant("R", 1920, 0, 1920, 1080),
             ],
             &config(),
         );
@@ -687,7 +751,7 @@ mod tests {
         // not depend on it.
         let wall = [
             participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1760, 0, 1920, 1080),
+            participant("DP-2", 1920, 0, 1920, 1080),
         ];
         let specs = overlay_specs(
             &wall,
@@ -763,5 +827,49 @@ mod tests {
         assert_eq!(pixels[2 * 4], 0);
         // Outside: the lift, verbatim.
         assert_eq!(pixels[6 * 4], (0.1f64 * 255.0).round() as u8);
+    }
+
+    // --- the overlapping-output limitation --------------------------------
+
+    #[test]
+    fn overlapping_outputs_are_reported_as_unblendable() {
+        // Measured on hardware, not assumed: sway renders every surface that
+        // intersects an output's box, so two overlapping outputs show the
+        // same pixels there and no ramp can fade them apart.
+        let pairs = overlapping_pairs(&[
+            participant("DP-1", 0, 0, 1920, 1080),
+            participant("DP-2", 1760, 0, 1920, 1080),
+        ]);
+        assert_eq!(pairs, vec![("DP-1".to_string(), "DP-2".to_string())]);
+    }
+
+    #[test]
+    fn outputs_laid_edge_to_edge_are_blendable() {
+        // The arrangement that does work: no intersection, nothing bleeds.
+        let pairs = overlapping_pairs(&[
+            participant("DP-1", 0, 0, 1920, 1080),
+            participant("DP-2", 1920, 0, 1920, 1080),
+        ]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn a_mirror_is_not_reported_as_an_unblendable_overlap() {
+        // A confidence monitor duplicating a projector is deliberate, and
+        // produces no seam, so it must not raise the divergence either.
+        let pairs = overlapping_pairs(&[
+            participant("PROJECTOR", 0, 0, 1920, 1080),
+            participant("MONITOR", 0, 0, 1920, 1080),
+        ]);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn an_operator_monitor_beside_the_wall_is_not_an_overlap() {
+        let pairs = overlapping_pairs(&[
+            participant("DP-1", 0, 0, 1920, 1080),
+            participant("HDMI-A-1", 1920, 0, 1920, 1080),
+        ]);
+        assert!(pairs.is_empty());
     }
 }

@@ -162,6 +162,7 @@ window.addEventListener("error", (event) => {
       <h2>Layout</h2>
       <div id="layout"></div>
       <p class="hint" id="layout-hint">Click a display to configure it.</p>
+      <p class="hint" id="layout-size"></p>
       <!-- The diagram alone left the editor undiscoverable, so every display
            also gets a plain button that opens it. -->
       <div class="row" id="display-buttons" style="margin-top:10px"></div>
@@ -212,14 +213,19 @@ window.addEventListener("error", (event) => {
 
     <div class="panel" id="projection-panel">
       <h2>Projection</h2>
-      <p class="hint">For a wall of projectors: position the outputs so they
-        overlap in the layout above, then turn on edge blending. Every seam —
-        wherever two outputs overlap — is faded on both sides so the doubled
-        light adds up to one seamless picture. A display that overlaps
-        nothing, or mirrors another, is untouched.</p>
+      <p class="hint">For a wall of projectors: lay the outputs <b>edge to
+        edge</b> above, give each projector its own app showing its slice of
+        the content, and set how many pixels the beams overlap on the wall.
+        Each seam is then faded from both sides so the doubled light adds up
+        to one seamless picture. Displays that touch nothing are untouched.</p>
+      <p class="hint">Outputs positioned to <i>overlap</i> cannot be blended:
+        sway gives both projectors the same pixels there, so no ramp can fade
+        them apart. Suede reports that instead of making the seam worse.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <select id="pj-blend"><option value="off">Off</option><option value="on">On</option></select></div>
+        <div><label for="pj-overlap">Beam overlap (px)</label>
+          <input id="pj-overlap" type="number" step="10" min="0" max="4096" value="0"></div>
         <div><label for="pj-gamma">Projector gamma</label>
           <input id="pj-gamma" type="number" step="0.05" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
@@ -633,6 +639,8 @@ function renderLayout() {
     container.appendChild(el);
   });
 
+  renderLayoutSize();
+
   const buttons = $("display-buttons");
   buttons.innerHTML = "";
   for (const output of outputs) {
@@ -642,6 +650,66 @@ function renderLayout() {
     button.onclick = () => selectOutput(output.name);
     buttons.appendChild(button);
   }
+}
+
+// What a spanned app is actually handed: the bounding box of the layout.
+// Overlaps make that smaller than the sum of the panels, and the difference
+// is exactly the pixels each seam shows twice — the number an operator needs
+// when authoring content for the wall.
+function renderLayoutSize() {
+  const active = outputs.filter((o) => o.active && o.rect.width > 0);
+  const el = $("layout-size");
+  if (active.length === 0) { el.textContent = ""; return; }
+
+  const left = Math.min(...active.map((o) => o.rect.x));
+  const top = Math.min(...active.map((o) => o.rect.y));
+  const right = Math.max(...active.map((o) => o.rect.x + o.rect.width));
+  const bottom = Math.max(...active.map((o) => o.rect.y + o.rect.height));
+  const width = right - left;
+  const height = bottom - top;
+
+  const panelWidth = active.reduce((sum, o) => sum + o.rect.width, 0);
+  const sharedX = active.length > 1 ? panelWidth - width : 0;
+
+  let text = `Layout: ${width} × ${height}`;
+  text += ` — ${active.length} display${active.length === 1 ? "" : "s"}`;
+  if (sharedX > 0) {
+    text += `, overlapping by ${sharedX} px (which cannot be blended — lay` +
+      ` them edge to edge)`;
+  }
+  if (left !== 0 || top !== 0) {
+    text += `. Origin is ${left},${top} — a spanned window anchors at 0,0,` +
+      ` so keep one display there`;
+  }
+  text += ".";
+
+  // With the beams overlapping on the wall, the content each projector is
+  // handed is narrower than the panels: every seam is authored once and
+  // shown twice. This is the number to author against.
+  const overlap = config?.projection?.overlap ?? 0;
+  const seams = countSeams(active);
+  if (overlap > 0 && seams > 0) {
+    text += ` Content canvas: ${width - seams * overlap} × ${height}` +
+      ` (${seams} seam${seams === 1 ? "" : "s"} × ${overlap} px shared).`;
+  }
+  el.textContent = text;
+}
+
+// Pairs of displays that abut, which is where a seam can exist.
+function countSeams(active) {
+  let seams = 0;
+  for (let i = 0; i < active.length; i++) {
+    for (let j = i + 1; j < active.length; j++) {
+      const a = active[i].rect, b = active[j].rect;
+      const sharesRows = Math.min(a.y + a.height, b.y + b.height) > Math.max(a.y, b.y);
+      const sharesCols = Math.min(a.x + a.width, b.x + b.width) > Math.max(a.x, b.x);
+      if ((sharesRows && (a.x + a.width === b.x || b.x + b.width === a.x)) ||
+          (sharesCols && (a.y + a.height === b.y || b.y + b.height === a.y))) {
+        seams++;
+      }
+    }
+  }
+  return seams;
 }
 
 function selectOutput(name) {
@@ -833,6 +901,7 @@ function renderProjection() {
   const projection = config?.projection;
   $("pj-blend").value = projection?.blend === false ? "off" : (projection ? "on" : "off");
   $("pj-gamma").value = projection?.gamma ?? 2.2;
+  $("pj-overlap").value = projection?.overlap ?? 0;
   $("pj-lift").value = projection?.blackLift ?? 0;
   $("pj-pattern").value = projection?.testPattern ?? "";
 }
@@ -840,11 +909,12 @@ function renderProjection() {
 $("pj-save").onclick = () => run(async () => {
   const blend = $("pj-blend").value === "on";
   const gamma = Number($("pj-gamma").value) || 2.2;
+  const overlap = Number($("pj-overlap").value) || 0;
   const blackLift = Number($("pj-lift").value) || 0;
   const testPattern = $("pj-pattern").value || null;
   // Off with default values: remove the section entirely.
-  const bodyValue = (!blend && gamma === 2.2 && blackLift === 0 && !testPattern)
-    ? null : { blend, gamma, blackLift, testPattern };
+  const bodyValue = (!blend && gamma === 2.2 && overlap === 0 && blackLift === 0 && !testPattern)
+    ? null : { blend, gamma, overlap, blackLift, testPattern };
   document.activeElement?.blur();
   await save("/config/projection", bodyValue);
 }, "saved projection");

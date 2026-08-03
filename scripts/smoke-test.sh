@@ -100,7 +100,7 @@ check "stale If-Match is 409" "409" \
 check "projection config accepted" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' \
-     -d '{"blend":false,"gamma":2.4,"blackLift":0.05}')"
+     -d '{"blend":false,"gamma":2.4,"overlap":160,"blackLift":0.05}')"
 check "projection round trips" "2.4" \
   "$(curl -s "${BASE}/api/v1/config/projection" \
      | python3 -c 'import sys,json;print(json.load(sys.stdin)["gamma"])')"

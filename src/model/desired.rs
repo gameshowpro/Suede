@@ -34,16 +34,22 @@ pub struct DesiredState {
 /// Multi-projector configuration: edge blending today, warping later.
 ///
 /// Phase one covers a soft-edge wall where the projectors handle their own
-/// geometry: outputs are *positioned to overlap* in the ordinary layout, a
-/// spanned window renders the shared strip on both, and a gamma-correct ramp
-/// fades each side so the overlapping light sums to constant luminance.
+/// geometry. The outputs must sit **edge to edge** in the layout, each
+/// projector showing its own region: sway keeps every surface in one global
+/// coordinate space and each output renders whatever intersects its box, so
+/// outputs positioned to *overlap* necessarily show identical pixels there —
+/// the exact opposite of what a blend needs. [`overlapping_pairs`] detects
+/// that arrangement and the reconciler refuses it.
 ///
-/// There is no list of projectors and no overlap setting: blend regions are
-/// derived from wherever the layout's outputs intersect, so they cannot fall
-/// out of step with it. An operator monitor beside the wall overlaps nothing
-/// and is untouched; a mirrored output overlaps *entirely* and is recognised
-/// as a mirror rather than a seam. Corner pinning and source-rectangle
-/// warping are a later phase; this shape grows those fields without breaking.
+/// [`Self::overlap`] therefore states how wide the shared strip is on the
+/// wall, and the content handed to each projector must repeat it. There is no
+/// list of projectors: a seam exists wherever two outputs abut, so an operator
+/// monitor that touches nothing is untouched.
+///
+/// Corner pinning and source-rectangle warping are a later phase; this shape
+/// grows those fields without breaking.
+///
+/// [`overlapping_pairs`]: crate::projection::blend::overlapping_pairs
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProjectionConfig {
@@ -59,6 +65,19 @@ pub struct ProjectionConfig {
     /// wall — walls are near-universally identical projectors; per-output
     /// overrides can be added later if mixed models ever matter.
     pub gamma: f64,
+    /// Width in pixels of the region each pair of neighbouring projectors
+    /// shows twice — the physical overlap of their beams, measured on the
+    /// wall and converted to pixels.
+    ///
+    /// This cannot be derived from the layout: the outputs must sit edge to
+    /// edge (see [`ProjectionConfig`]), so the shared strip exists on the
+    /// *wall*, not in the coordinate space. `0` means no seams and no ramps.
+    ///
+    /// The content each projector is given must repeat that strip: for
+    /// projectors of width `W`, projector `i` shows canvas columns
+    /// `i·(W−overlap)` to `i·(W−overlap)+W`, and the canvas is
+    /// `n·W − (n−1)·overlap` wide.
+    pub overlap: i32,
     /// Black-level compensation, `0.0` (off) to `0.5`.
     ///
     /// Projector black is not zero light, so seams glow in dark scenes: they
@@ -83,6 +102,7 @@ impl Default for ProjectionConfig {
         Self {
             blend: true,
             gamma: 2.2,
+            overlap: 0,
             black_lift: 0.0,
             test_pattern: None,
         }
@@ -185,6 +205,13 @@ impl DesiredState {
                 errors.push(format!(
                     "projection.gamma must be between 1.0 and 4.0, not {}",
                     projection.gamma
+                ));
+            }
+            // A seam wider than a projector is a typo, not a rig.
+            if projection.overlap < 0 || projection.overlap > 4096 {
+                errors.push(format!(
+                    "projection.overlap must be between 0 and 4096 pixels, not {}",
+                    projection.overlap
                 ));
             }
             // Above 0.5 the "compensation" is brighter than mid-grey, which
