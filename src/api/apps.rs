@@ -63,6 +63,60 @@ pub async fn restart_app(
 }
 
 #[utoipa::path(
+    post, path = "/api/v1/apps/{id}/activate", tag = "apps",
+    params(("id" = String, Path, description = "App identifier")),
+    responses(
+        (status = 200, description = "The persisted document", body = crate::model::DesiredState),
+        (status = 404, description = "No such app"),
+    )
+)]
+pub async fn activate_app(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::model::DesiredState>> {
+    let mut next = state.store.get();
+    if !next.apps.iter().any(|app| app.id == id) {
+        return Err(ApiError::NotFound(format!("no app named {id}")));
+    }
+    // One pointer, one active app: activating B deactivates A atomically.
+    next.active_app = Some(id.clone());
+    tracing::info!(app = %id, "activated");
+    state.commit(next, "apps", None).await.map(Json)
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/apps/{id}/deactivate", tag = "apps",
+    params(("id" = String, Path, description = "App identifier")),
+    responses(
+        (status = 200, description = "The persisted document", body = crate::model::DesiredState),
+        (status = 404, description = "No such app"),
+        (status = 409, description = "A different app is active"),
+    )
+)]
+pub async fn deactivate_app(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<crate::model::DesiredState>> {
+    let mut next = state.store.get();
+    if !next.apps.iter().any(|app| app.id == id) {
+        return Err(ApiError::NotFound(format!("no app named {id}")));
+    }
+    // Deactivating an app someone else already replaced would silently kill
+    // *their* app; say so instead.
+    match next.active_app.as_deref() {
+        Some(active) if active == id => next.active_app = None,
+        Some(active) => {
+            return Err(ApiError::Conflict(format!(
+                "{active} is the active app, not {id}"
+            )))
+        }
+        None => {}
+    }
+    tracing::info!(app = %id, "deactivated");
+    state.commit(next, "apps", None).await.map(Json)
+}
+
+#[utoipa::path(
     post, path = "/api/v1/apps/{id}/heartbeat", tag = "apps",
     params(("id" = String, Path, description = "App identifier")),
     responses(
@@ -128,7 +182,11 @@ mod tests {
         harness
             .state
             .store
-            .update(|state| state.apps.push(sleeper(id)))
+            .update(|state| {
+                state.apps.push(sleeper(id));
+                // Only the active app runs; there is no per-app enable.
+                state.active_app = Some(id.to_string());
+            })
             .unwrap();
         harness.state.reconciler.reconcile().await;
         harness

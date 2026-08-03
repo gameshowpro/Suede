@@ -40,6 +40,7 @@ tempfile = { version = "3", optional = true }
 # settings, and reports a divergence if asked to blend.
 default = ["projection"]
 projection = [
+    "dep:memmap2",
     "dep:tempfile",
     "dep:wayland-client",
     "dep:wayland-protocols",
@@ -52,6 +53,7 @@ libc = "0.2"
 # no libwayland is linked. The overlay client only exists on Unix — on other
 # hosts the `projection` feature still compiles the math and the manager, so
 # the cross-platform test suite covers them.
+memmap2 = { version = "0.9", optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }

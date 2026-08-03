@@ -164,6 +164,13 @@ per display from the dropdown on the **Displays** tab.
 
 An application is a *launch specification*, not a window. That is what makes it restorable after a reboot.
 
+**One application is active at a time — `activeApp` — and it always covers
+the whole canvas.** The rest of the list is a library to switch between:
+`POST /api/v1/apps/{id}/activate` swaps the wall to another app atomically,
+killing the previous one and launching the new. There is no per-app output
+targeting and no per-app enable flag; the appliance is a single canvas, not a
+window manager.
+
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `id` | string | required | Unique, stable; also used as a profile directory name |
@@ -376,46 +383,35 @@ The endpoint is unauthenticated but accepted only from loopback, so the key-free
 
 ### Projection and edge blending {: #projection-edge-blending }
 
-For a wall of projectors whose images physically overlap, Suede can fade each
-side of every seam so the doubled light adds up to one seamless picture, and
-can compensate for the projectors' non-zero black.
+For a wall of two to four projectors whose beams physically overlap, Suede
+manages the overlap itself — sway cannot. (Sway keeps every surface in one
+global coordinate space and each output renders whatever intersects its box,
+so outputs positioned to overlap necessarily show *identical* pixels in the
+shared region: the exact opposite of a blend, which needs each side fading
+the other way. Measured on hardware, twice.)
 
-!!! danger "Blending needs the outputs laid edge to edge, not overlapping"
-    Sway keeps every surface in **one global coordinate space**, and each
-    output renders whatever intersects its box — layer surfaces *and*
-    windows alike. Two outputs positioned to overlap therefore show
-    identical pixels in the shared region, by construction. An edge blend
-    needs the opposite: the left projector fading out across the seam while
-    the right one fades in.
+The architecture, end to end:
 
-    So the intuitive arrangement — overlap the outputs, span one browser
-    across them — **cannot be blended**, and Suede refuses rather than
-    painting ramps that make the seam worse. It reports
-    `blend_needs_distinct_outputs` naming the offending pair.
+1. **The outputs sit edge to edge** in sway's layout — `0` and `1920` for two
+   1920-wide projectors. Nothing overlaps in sway, so nothing bleeds.
+2. **`projection.overlap` states the physical overlap**: how many pixels each
+   pair of neighbouring beams shares on the wall. This is rig knowledge, not
+   layout — it lives in configuration.
+3. **The active app renders into a headless canvas** that Suede creates and
+   sizes to `Σwidths − (n−1)·overlap` (7200 × 1200 for four 1920-wide
+   projectors with 160 px seams). The app never knows about projectors; it
+   sees one ordinary output. The Displays tab shows this canvas size.
+4. **The slicer** — `suede slice`, one process for the whole wall — captures
+   the canvas each frame, cuts it into per-projector slices whose neighbours
+   *repeat* the seam columns, applies the gamma-shaped blend ramps and the
+   black-level lift, and presents each slice fullscreen on its own physical
+   output. Each projector has its own buffer, which is what makes opposite
+   fades possible at all. The loop is damage-driven: a static page costs
+   nothing.
 
-    Measured on hardware: with one projector's overlay running, its ramp
-    appeared on *both* screens; and two per-output kiosks in an overlapping
-    layout showed the right-hand kiosk's colour on the left-hand display.
-
-The working arrangement gives each projector its own region of the layout
-and its own view of the content:
-
-1. **Lay the outputs edge to edge** — `0` and `1920` for two 1920-wide
-   projectors. No intersection, so nothing bleeds.
-2. **Give each projector its own app**, pointed at the same content with a
-   source offset, so that the right-hand projector's first *O* pixels repeat
-   the left-hand projector's last *O* pixels. For *n* projectors of width
-   *W* with per-seam overlap *O*, projector *i* shows canvas columns
-   `i·(W−O)` to `i·(W−O)+W`, and the canvas is `n·W − (n−1)·O` wide. The
-   Displays tab reports the layout's size directly beneath the diagram.
-3. **Set `overlap` and turn on blending.** Each projector then gets a ramp
-   of that width on its seam-facing edge, and the two ramps sum to constant
-   luminance. The seam is *inside* each output, which is exactly why the two
-   projectors can be given opposite fades.
-
-Content that cannot take a source offset needs the capture-and-warp client
-(the planned phase two), which renders the canvas once to a headless output
-and gives each projector a warped crop of it.
+Superimposed on the wall, the two copies of every seam sum to constant
+luminance. The cost is one frame of latency and one GPU→CPU readback per
+frame, which is the price of taking the overlap away from the compositor.
 
 ```json
 "projection": { "blend": true, "overlap": 160, "gamma": 2.2, "blackLift": 0.04 }
@@ -423,28 +419,26 @@ and gives each projector a warped crop of it.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `blend` | bool | `true` | `false` skips the entire chain: overlays are torn down, nothing runs |
-| `overlap` | number | `0` | Pixels each pair of neighbouring beams shares on the wall, 0–4096. `0` means no seams and no ramps |
+| `blend` | bool | `true` | `false` presents the slices without ramps — duplication still happens, which is what physically overlapping beams need even unblended |
+| `overlap` | number | `0` | Pixels each pair of neighbouring beams shares on the wall, 0–4096. `0` disables canvas mode entirely: the app spans the physical outputs directly |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0–4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0–0.5 |
 | `testPattern` | string \| null | null | `grid`, `white`, `black`, `gamma` — or null for content |
 
 **Blending is a ramp in light, not in signal.** A display raises its input
-signal to a power (its gamma, typically 2.2), so a gradient that is linear in
-signal is far from linear in light and leaves a bright band at every seam.
-Suede shapes each ramp as `ramp^(1/gamma)`, making the summed luminance
-across a seam constant.
+signal to a power (its gamma, typically 2.2), so a gradient linear in signal
+leaves a bright band at every seam. The ramps are shaped as `ramp^(1/gamma)`,
+making the summed luminance across a seam constant. Verified by pixel
+measurement: worst deviation from uniform across a 160 px seam, 0.005.
 
 **Black-level compensation.** Projector black is not zero light, so seams
-glow on dark scenes — they receive two projectors' worth of leaked black. The
-seam cannot be darkened, so `blackLift` brightens everything *else* to match:
-`out = lift + (1 − lift) · in` outside the seams. Show the `black` test
-pattern and raise it until the picture is even.
+glow on dark scenes. The seam cannot be darkened, so `blackLift` brightens
+everything else to match: `out = lift + (1 − lift) · in` outside the seams.
+Show the `black` test pattern and raise it until the wall is even.
 
-One gamma covers the whole wall: a wall is near-universally identical
-projectors. Setting `blend: false` — or removing the section with
-`PUT /api/v1/config/projection` and a `null` body — stops every overlay and
-skips all projection work.
+Canvas mode requires sway's headless backend (`WLR_BACKENDS=drm,libinput,headless`,
+set by provisioning). Without it Suede reports `headless_unavailable` and the
+active app spans the physical outputs unsliced until the backend is available.
 
 #### Test patterns {: #projection-test-patterns }
 

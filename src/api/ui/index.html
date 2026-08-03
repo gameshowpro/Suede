@@ -254,6 +254,9 @@ window.addEventListener("error", (event) => {
   <section id="tab-apps" class="hidden">
     <div class="panel">
       <h2>Managed applications</h2>
+      <p class="hint">One application is active at a time, and it always
+        covers the whole canvas — every display, with the overlaps handled by
+        Suede. The rest of the list is a library to switch between.</p>
       <table id="apps"><thead><tr>
         <th>Id</th><th>State</th><th>PID</th><th>Restarts</th><th>Detail</th><th></th>
       </tr></thead><tbody></tbody></table>
@@ -270,10 +273,6 @@ window.addEventListener("error", (event) => {
           <option value="exec">Command</option></select></div>
         <div class="span2"><label for="a-uri">URI or command</label>
           <input id="a-uri" placeholder="http://media-server.local/render/1"></div>
-        <div><label for="a-output">Output</label><select id="a-output"></select></div>
-        <div><label for="a-span">Span all outputs</label>
-          <select id="a-span"><option value="false">No — fill one output</option>
-            <option value="true">Yes — one window across every output</option></select></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div><label for="a-heartbeat">Content watchdog</label>
           <select id="a-heartbeat"><option value="false">Off</option><option value="true">On</option></select></div>
@@ -606,18 +605,20 @@ function renderAlerts() {
 function renderLayout() {
   const container = $("layout");
   container.innerHTML = "";
-  const active = outputs.filter((o) => o.active && o.rect.width > 0);
+  // The canvas output is Suede's own machinery, not a display to arrange.
+  const physical = outputs.filter((o) => !/^(HEADLESS|WL|X11)-/.test(o.name));
+  const active = physical.filter((o) => o.active && o.rect.width > 0);
   $("layout-hint").textContent = active.length
     ? "Click a display to configure it."
-    : (outputs.length ? "No outputs are enabled. Click one below to enable it."
-                      : "No outputs detected.");
+    : (physical.length ? "No outputs are enabled. Click one below to enable it."
+                       : "No outputs detected.");
 
   const spanX = Math.max(...active.map((o) => o.rect.x + o.rect.width), 1920);
   const spanY = Math.max(...active.map((o) => o.rect.y + o.rect.height), 1080);
   const box = container.getBoundingClientRect();
   const scale = Math.min((box.width - 20) / spanX, (box.height - 62) / spanY);
 
-  outputs.forEach((output, index) => {
+  physical.forEach((output, index) => {
     const el = document.createElement("div");
     el.className = "screen" + (output.active ? "" : " inactive")
                  + (selected === output.name ? " selected" : "");
@@ -643,7 +644,7 @@ function renderLayout() {
 
   const buttons = $("display-buttons");
   buttons.innerHTML = "";
-  for (const output of outputs) {
+  for (const output of physical) {
     const button = document.createElement("button");
     button.className = "action" + (selected === output.name ? "" : " ghost");
     button.textContent = "Configure " + output.name;
@@ -657,7 +658,8 @@ function renderLayout() {
 // is exactly the pixels each seam shows twice — the number an operator needs
 // when authoring content for the wall.
 function renderLayoutSize() {
-  const active = outputs.filter((o) => o.active && o.rect.width > 0);
+  const active = outputs.filter((o) => o.active && o.rect.width > 0 &&
+    !/^(HEADLESS|WL|X11)-/.test(o.name));
   const el = $("layout-size");
   if (active.length === 0) { el.textContent = ""; return; }
 
@@ -671,45 +673,31 @@ function renderLayoutSize() {
   const panelWidth = active.reduce((sum, o) => sum + o.rect.width, 0);
   const sharedX = active.length > 1 ? panelWidth - width : 0;
 
-  let text = `Layout: ${width} × ${height}`;
-  text += ` — ${active.length} display${active.length === 1 ? "" : "s"}`;
+  let text = `Displays: ${active.length}, ${width} × ${height} laid out`;
   if (sharedX > 0) {
-    text += `, overlapping by ${sharedX} px (which cannot be blended — lay` +
-      ` them edge to edge)`;
+    text += ` — overlapping by ${sharedX} px, which cannot work: lay them` +
+      ` edge to edge and put the beam overlap in the Projection panel`;
   }
   if (left !== 0 || top !== 0) {
-    text += `. Origin is ${left},${top} — a spanned window anchors at 0,0,` +
-      ` so keep one display there`;
+    text += `. Origin is ${left},${top} — keep one display at 0,0`;
   }
   text += ".";
 
-  // With the beams overlapping on the wall, the content each projector is
-  // handed is narrower than the panels: every seam is authored once and
-  // shown twice. This is the number to author against.
+  // The number that matters: the canvas the active app renders into. With a
+  // beam overlap configured, every seam is authored once and projected
+  // twice, so the canvas is narrower than the sum of the panels.
   const overlap = config?.projection?.overlap ?? 0;
-  const seams = countSeams(active);
+  const seams = active.length > 1 ? active.length - 1 : 0;
+  const panelWidthSum = active.reduce((sum, o) => sum + o.rect.width, 0);
+  const canvasWidth = overlap > 0 && seams > 0
+    ? panelWidthSum - seams * overlap : width;
+  text += ` App canvas: ${canvasWidth} × ${height}`;
   if (overlap > 0 && seams > 0) {
-    text += ` Content canvas: ${width - seams * overlap} × ${height}` +
-      ` (${seams} seam${seams === 1 ? "" : "s"} × ${overlap} px shared).`;
+    text += ` (${panelWidthSum} px of panel − ${seams} seam` +
+      `${seams === 1 ? "" : "s"} × ${overlap} px overlap)`;
   }
+  text += ` — author content to this size.`;
   el.textContent = text;
-}
-
-// Pairs of displays that abut, which is where a seam can exist.
-function countSeams(active) {
-  let seams = 0;
-  for (let i = 0; i < active.length; i++) {
-    for (let j = i + 1; j < active.length; j++) {
-      const a = active[i].rect, b = active[j].rect;
-      const sharesRows = Math.min(a.y + a.height, b.y + b.height) > Math.max(a.y, b.y);
-      const sharesCols = Math.min(a.x + a.width, b.x + b.width) > Math.max(a.x, b.x);
-      if ((sharesRows && (a.x + a.width === b.x || b.x + b.width === a.x)) ||
-          (sharesCols && (a.y + a.height === b.y || b.y + b.height === a.y))) {
-        seams++;
-      }
-    }
-  }
-  return seams;
 }
 
 function selectOutput(name) {
@@ -778,14 +766,16 @@ function renderApps() {
   const configured = config?.apps ?? [];
   $("apps-empty").classList.toggle("hidden", configured.length > 0);
 
+  const active = config?.activeApp ?? null;
   for (const app of configured) {
     const live = apps.find((a) => a.id === app.id);
     const state = live?.state ?? "stopped";
     const tone = { running: "ok", starting: "warn", backoff: "warn", waitingforoutput: "warn",
                    waitingfordependency: "warn", crashed: "bad" }[state.toLowerCase()] ?? "muted";
+    const isActive = app.id === active;
     const row = document.createElement("tr");
     row.innerHTML =
-      `<td class="mono">${escape(app.id)}${app.spanOutputs ? ' <span class="pill muted">spans</span>' : ""}</td>` +
+      `<td class="mono">${escape(app.id)}${isActive ? ' <span class="pill ok">active</span>' : ""}</td>` +
       `<td><span class="pill ${tone}">${escape(state)}</span></td>` +
       `<td class="mono">${live?.pid ?? "—"}</td>` +
       `<td>${live?.restartCount ?? 0}</td>` +
@@ -798,18 +788,23 @@ function renderApps() {
 
     const restart = document.createElement("button");
     restart.className = "action ghost"; restart.textContent = "Restart";
+    restart.disabled = !isActive;
     restart.onclick = () => run(() =>
       api(`/apps/${encodeURIComponent(app.id)}/restart`, { method: "POST" }), `restarted ${app.id}`);
 
+    // The one switch that matters: which app owns the wall right now.
     const toggle = document.createElement("button");
-    toggle.className = "action ghost";
-    toggle.textContent = app.enabled === false ? "Enable" : "Disable";
+    toggle.className = isActive ? "action ghost" : "action";
+    toggle.textContent = isActive ? "Deactivate" : "Activate";
     toggle.onclick = () => run(() =>
-      save(`/config/apps/${encodeURIComponent(app.id)}`, { ...app, enabled: app.enabled === false }),
-      `${app.enabled === false ? "enabled" : "disabled"} ${app.id}`);
+      api(`/apps/${encodeURIComponent(app.id)}/${isActive ? "deactivate" : "activate"}`,
+        { method: "POST" }),
+      `${isActive ? "deactivated" : "activated"} ${app.id}`);
 
     const remove = document.createElement("button");
     remove.className = "action danger"; remove.textContent = "Delete";
+    remove.disabled = isActive;
+    remove.title = isActive ? "Deactivate it first" : "";
     remove.onclick = () => run(() =>
       api(`/config/apps/${encodeURIComponent(app.id)}`, { method: "DELETE" }), `deleted ${app.id}`);
 
@@ -827,8 +822,6 @@ function editApp(app) {
   $("a-uri").value = app.launcher.kind === "exec"
     ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
     : app.launcher.uri;
-  $("a-output").value = app.output?.name ?? "";
-  $("a-span").value = String(!!app.spanOutputs);
   $("a-audio").value = app.audio ? (app.audio.output === null ? "__null__" : app.audio.output) : "";
   $("a-heartbeat").value = String(!!app.heartbeat?.enabled);
   $("a-ready-url").value = app.readiness?.url ?? "";
@@ -844,7 +837,7 @@ function clearAppForm() {
   $("a-heading").textContent = "Add an application";
   $("a-clear").classList.add("hidden");
   for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env"]) $(id).value = "";
-  $("a-span").value = "false"; $("a-heartbeat").value = "false";
+  $("a-heartbeat").value = "false";
   $("a-ready-interval").value = 2; $("a-ready-timeout").value = 5;
 }
 $("a-clear").onclick = clearAppForm;
@@ -870,13 +863,9 @@ $("a-save").onclick = () => run(async () => {
   const readinessUrl = $("a-ready-url").value.trim();
   const giveUp = $("a-ready-giveup").value.trim();
   const audio = $("a-audio").value;
-  const output = $("a-output").value;
 
   await save(`/config/apps/${encodeURIComponent(id)}`, {
-    id, enabled: true, launcher,
-    output: output ? { name: output } : null,
-    fullscreen: true,
-    spanOutputs: $("a-span").value === "true",
+    id, launcher,
     env,
     audio: audio === "" ? null : { output: audio === "__null__" ? null : audio },
     readiness: readinessUrl ? {
@@ -1171,8 +1160,7 @@ function renderSinks() {
 }
 
 function renderOutputChoices() {
-  $("a-output").innerHTML = `<option value="">Any output</option>` +
-    outputs.map((o) => `<option value="${escape(o.name)}">${escape(o.name)}</option>`).join("");
+// (apps no longer target an output; the active app covers the canvas)
 }
 
 function renderStatus() {

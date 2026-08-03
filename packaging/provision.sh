@@ -105,6 +105,9 @@ if [ "\$(tty)" = "/dev/tty1" ] && [ -z "\${WAYLAND_DISPLAY:-}" ]; then
   # display controller, so every screen shows the same part of it instead of
   # its own. Verified on the Nvidia proprietary driver.
   export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1
+  # The headless backend provides the projection canvas: an off-screen
+  # output the app renders into, which the slicer cuts up per projector.
+  export WLR_BACKENDS=drm,libinput,headless
   clear
   exec sway > "\$HOME/.sway.log" 2>&1
 fi

@@ -16,6 +16,8 @@ pub mod manager;
 #[cfg(unix)]
 pub mod overlay;
 pub mod pattern;
+#[cfg(unix)]
+pub mod slicer;
 
-pub use blend::{overlay_specs, OverlaySpec, Participant};
+pub use blend::{overlay_specs, slicer_spec, OverlaySpec, Participant, SlicerSpec};
 pub use manager::BlendManager;

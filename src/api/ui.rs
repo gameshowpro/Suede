@@ -102,7 +102,7 @@ mod tests {
         // The UI is the reference client; a field it cannot reach is a field
         // an operator can only set by hand-editing the raw document.
         for field in [
-            "spanOutputs",
+            "activeApp",
             "readiness",
             "background",
             "allowTearing",

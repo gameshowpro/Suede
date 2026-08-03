@@ -1,83 +1,139 @@
 {
   "outputs": [
     {
-      "match": { "name": "HDMI-A-1" },
+      "match": {
+        "name": "HDMI-A-1"
+      },
       "enable": true,
-      "mode": { "width": 1920, "height": 1080, "refreshHz": 60 },
-      "position": { "x": 0, "y": 0 },
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 0,
+        "y": 0
+      },
       "adaptiveSync": false,
       "maxRenderTimeMs": null
     },
     {
-      "match": { "name": "HDMI-A-2" },
+      "match": {
+        "name": "HDMI-A-2"
+      },
       "enable": true,
-      "mode": { "width": 1920, "height": 1080, "refreshHz": 60 },
-      "position": { "x": 1920, "y": 0 }
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 1920,
+        "y": 0
+      }
     },
     {
-      "match": { "name": "HDMI-A-3" },
+      "match": {
+        "name": "HDMI-A-3"
+      },
       "enable": true,
-      "mode": { "width": 1920, "height": 1080, "refreshHz": 60 },
-      "position": { "x": 3840, "y": 0 }
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 3840,
+        "y": 0
+      }
     },
     {
-      "match": { "name": "HDMI-A-4" },
+      "match": {
+        "name": "HDMI-A-4"
+      },
       "enable": true,
-      "mode": { "width": 1920, "height": 1080, "refreshHz": 60 },
-      "position": { "x": 5760, "y": 0 }
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 5760,
+        "y": 0
+      }
     }
   ],
   "apps": [
     {
       "id": "renderer-1",
-      "enabled": true,
       "launcher": {
         "kind": "chromium-kiosk",
         "uri": "http://control.local/render/1?hb={heartbeatUrl}"
       },
-      "output": { "name": "HDMI-A-1" },
-      "fullscreen": true,
-      "audio": { "output": "alsa_output.pci-0000_01_00.1.hdmi-stereo" },
-      "heartbeat": { "enabled": true, "timeoutSeconds": 25, "startupGraceSeconds": 60 },
-      "restart": { "policy": "always", "delayMs": 1000, "maxDelayMs": 30000 }
+      "audio": {
+        "output": "alsa_output.pci-0000_01_00.1.hdmi-stereo"
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      }
     },
     {
       "id": "renderer-2",
-      "enabled": true,
       "launcher": {
         "kind": "chromium-kiosk",
         "uri": "http://control.local/render/2?hb={heartbeatUrl}"
       },
-      "output": { "name": "HDMI-A-2" },
-      "audio": { "output": null },
-      "heartbeat": { "enabled": true, "timeoutSeconds": 25, "startupGraceSeconds": 60 }
+      "audio": {
+        "output": null
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      }
     },
     {
       "id": "renderer-3",
-      "enabled": true,
       "launcher": {
         "kind": "chromium-kiosk",
         "uri": "http://control.local/render/3?hb={heartbeatUrl}"
       },
-      "output": { "name": "HDMI-A-3" },
-      "audio": { "output": null },
-      "heartbeat": { "enabled": true, "timeoutSeconds": 25, "startupGraceSeconds": 60 }
+      "audio": {
+        "output": null
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      }
     },
     {
       "id": "renderer-4",
-      "enabled": true,
       "launcher": {
         "kind": "chromium-kiosk",
         "uri": "http://control.local/render/4?hb={heartbeatUrl}"
       },
-      "output": { "name": "HDMI-A-4" },
-      "audio": { "output": null },
-      "heartbeat": { "enabled": true, "timeoutSeconds": 25, "startupGraceSeconds": 60 }
+      "audio": {
+        "output": null
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      }
     }
   ],
   "settings": {
     "hideCursor": true,
     "outputPollIntervalSeconds": 5,
     "allowRawSwayCommands": false
-  }
+  },
+  "activeApp": "renderer-1"
 }

@@ -77,10 +77,11 @@ CONFIG='{
      "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":3840,"y":0}}
   ],
   "apps": [
-    {"id":"renderer-1","enabled":true,
+    {"id":"renderer-1",
      "launcher":{"kind":"exec","command":"sleep","args":["300"]},
      "heartbeat":{"enabled":true,"timeoutSeconds":25,"startupGraceSeconds":60}}
-  ]
+  ],
+  "activeApp": "renderer-1"
 }'
 RESULT="$(curl -s -X PUT "${BASE}/api/v1/config?wait=10" \
   -H 'content-type: application/json' -d "$CONFIG")"

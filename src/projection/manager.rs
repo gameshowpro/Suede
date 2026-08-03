@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 
 use crate::model::Divergence;
 
-use super::blend::OverlaySpec;
+use super::blend::{OverlaySpec, SlicerSpec};
 
 struct RunningOverlay {
     child: Child,
@@ -23,6 +23,8 @@ struct RunningOverlay {
 #[derive(Default)]
 pub struct BlendManager {
     overlays: HashMap<String, RunningOverlay>,
+    /// The one slicer process for the whole wall, when canvas mode is on.
+    slicer: Option<RunningOverlay>,
 }
 
 /// What a sync pass decided, before any process is touched. Pure, so the
@@ -134,6 +136,61 @@ impl BlendManager {
         divergences
     }
 
+    /// Make the running slicer match `spec`. `None` tears it down.
+    pub fn sync_slicer(&mut self, spec: Option<&SlicerSpec>) -> Vec<Divergence> {
+        // Reap an exit first so a crashed slicer is respawned, not trusted.
+        if let Some(running) = &mut self.slicer {
+            match running.child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    tracing::warn!(%status, "slicer exited; will respawn");
+                    self.slicer = None;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "could not check the slicer");
+                    self.slicer = None;
+                }
+            }
+        }
+
+        let wanted = spec.map(|spec| {
+            let mut hasher = DefaultHasher::new();
+            serde_json::to_string(spec)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            hasher.finish()
+        });
+        let running = self.slicer.as_ref().map(|s| s.fingerprint);
+        if wanted == running {
+            return Vec::new();
+        }
+
+        if let Some(mut old) = self.slicer.take() {
+            tracing::info!("stopping the slicer");
+            let _ = old.child.kill();
+            let _ = old.child.wait();
+        }
+        let (Some(spec), Some(fingerprint)) = (spec, wanted) else {
+            return Vec::new();
+        };
+        match spawn_internal("slice", &serde_json::to_string(spec).unwrap_or_default()) {
+            Ok(child) => {
+                tracing::info!(
+                    canvas = format!("{}x{}", spec.canvas_width, spec.canvas_height),
+                    slices = spec.slices.len(),
+                    "started the slicer"
+                );
+                self.slicer = Some(RunningOverlay { child, fingerprint });
+                Vec::new()
+            }
+            Err(error) => vec![Divergence::new(
+                "blend_overlay_failed",
+                "slicer",
+                format!("could not start the slicer: {error}"),
+            )],
+        }
+    }
+
     /// Kill everything. Called at daemon shutdown so no overlay outlives the
     /// configuration that asked for it.
     pub fn shutdown(&mut self) {
@@ -141,6 +198,11 @@ impl BlendManager {
             tracing::debug!(output, "stopping blend overlay");
             let _ = overlay.child.kill();
             let _ = overlay.child.wait();
+        }
+        if let Some(mut slicer) = self.slicer.take() {
+            tracing::debug!("stopping the slicer");
+            let _ = slicer.child.kill();
+            let _ = slicer.child.wait();
         }
     }
 }
@@ -153,11 +215,15 @@ impl Drop for BlendManager {
 
 /// The overlay is this same binary: one ELF on disk, per the packaging story.
 fn spawn_overlay(spec: &OverlaySpec) -> std::io::Result<Child> {
+    spawn_internal("blend", &serde_json::to_string(spec)?)
+}
+
+fn spawn_internal(subcommand: &str, spec: &str) -> std::io::Result<Child> {
     let program = std::env::current_exe()?;
     Command::new(program)
-        .arg("blend")
+        .arg(subcommand)
         .arg("--spec")
-        .arg(serde_json::to_string(spec)?)
+        .arg(spec)
         .stdin(Stdio::null())
         // Stderr flows to the daemon's own journal, tagged per process.
         .spawn()

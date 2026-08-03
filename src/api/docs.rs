@@ -56,6 +56,8 @@ impl Modify for SecurityAddon {
         super::apps::list_apps,
         super::apps::get_app_status,
         super::apps::restart_app,
+        super::apps::activate_app,
+        super::apps::deactivate_app,
         super::apps::heartbeat,
         super::config_routes::get_config,
         super::config_routes::put_config,

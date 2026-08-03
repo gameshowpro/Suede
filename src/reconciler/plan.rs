@@ -318,9 +318,11 @@ pub fn resolve_app_targets(
 
             let matched = observed.iter().find(|output| rule.matches(output));
             match matched {
-                Some(output) if workspaces.contains_key(&output.name) => AppTarget {
+                Some(output) if output.active => AppTarget {
                     id: app.id.clone(),
                     output: Some(output.name.clone()),
+                    // A pinned workspace when the output has one; otherwise the
+                    // placement falls back to move-to-output.
                     workspace: workspaces.get(&output.name).copied(),
                     blocked: None,
                 },
@@ -361,6 +363,7 @@ pub fn resolve_app_targets(
 pub fn placement_commands(
     window_id: i64,
     workspace: Option<u32>,
+    output: Option<&str>,
     fullscreen: bool,
     span_outputs: bool,
 ) -> Vec<String> {
@@ -368,6 +371,14 @@ pub fn placement_commands(
     if let Some(workspace) = workspace {
         commands.push(format!(
             "[con_id={window_id}] move container to workspace number {workspace}"
+        ));
+    } else if let Some(output) = output {
+        // No pinned workspace for this output (the canvas has none): move to
+        // whatever workspace is visible there. `workspace N output X` cannot
+        // do this — it only assigns where *future* workspaces appear, and an
+        // existing workspace stays put.
+        commands.push(format!(
+            "[con_id={window_id}] move container to output {output}"
         ));
     }
     if span_outputs {
@@ -909,7 +920,7 @@ mod tests {
 
     #[test]
     fn app_is_blocked_when_its_output_is_connected_but_disabled() {
-        let observed = vec![output("HDMI-A-1", true)];
+        let observed = vec![output("HDMI-A-1", false)];
         let targets =
             resolve_app_targets(&[app("a", Some("HDMI-A-1"))], &observed, &HashMap::new());
         assert!(!targets[0].runnable());
@@ -917,6 +928,23 @@ mod tests {
             targets[0].blocked.as_ref().unwrap().kind,
             "app_output_disabled"
         );
+    }
+
+    #[test]
+    fn an_active_output_without_a_pinned_workspace_is_still_a_target() {
+        // The canvas output has no configured workspace; the app is placed by
+        // moving it to the output directly.
+        let observed = vec![output("HEADLESS-1", true)];
+        let targets =
+            resolve_app_targets(&[app("a", Some("HEADLESS-1"))], &observed, &HashMap::new());
+        assert!(targets[0].runnable());
+        assert_eq!(targets[0].workspace, None);
+        assert_eq!(targets[0].output.as_deref(), Some("HEADLESS-1"));
+        let commands = placement_commands(7, None, Some("HEADLESS-1"), true, false);
+        assert!(commands
+            .iter()
+            .any(|c| c.contains("move container to output HEADLESS-1")));
+        assert!(commands.iter().any(|c| c.ends_with("fullscreen enable")));
     }
 
     #[test]
@@ -928,7 +956,7 @@ mod tests {
 
     #[test]
     fn placement_uses_per_output_fullscreen() {
-        let commands = placement_commands(42, Some(3), true, false);
+        let commands = placement_commands(42, Some(3), None, true, false);
         assert_eq!(
             commands,
             vec![
@@ -942,13 +970,13 @@ mod tests {
 
     #[test]
     fn placement_can_skip_fullscreen() {
-        assert_eq!(placement_commands(42, Some(3), false, false).len(), 1);
+        assert_eq!(placement_commands(42, Some(3), None, false, false).len(), 1);
     }
 
     #[test]
     fn spanning_uses_global_fullscreen() {
         // One browser across every output: the video-wall case.
-        let commands = placement_commands(42, Some(1), true, true);
+        let commands = placement_commands(42, Some(1), None, true, true);
         assert_eq!(
             commands,
             vec![
@@ -963,14 +991,14 @@ mod tests {
         // The regression that made spanning silently fill one monitor: with no
         // workspace resolved, placement produced nothing at all and the kiosk
         // browser kept its own per-output fullscreen.
-        let commands = placement_commands(9, None, true, true);
+        let commands = placement_commands(9, None, None, true, true);
         assert_eq!(commands, vec!["[con_id=9] fullscreen enable global"]);
         assert!(!commands.is_empty(), "spanning must still be applied");
     }
 
     #[test]
     fn without_a_workspace_nothing_is_moved() {
-        let commands = placement_commands(9, None, true, false);
+        let commands = placement_commands(9, None, None, true, false);
         assert!(!commands.iter().any(|c| c.contains("move container")));
         assert_eq!(commands, vec!["[con_id=9] fullscreen enable"]);
     }
@@ -988,7 +1016,7 @@ mod tests {
     fn spanning_wins_over_per_output_fullscreen() {
         // `global` already implies filling the screen; issuing both would
         // leave the window merely filling one output.
-        let commands = placement_commands(7, Some(2), false, true);
+        let commands = placement_commands(7, Some(2), None, false, true);
         assert!(commands
             .iter()
             .any(|c| c.ends_with("fullscreen enable global")));

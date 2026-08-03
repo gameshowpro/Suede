@@ -99,6 +99,141 @@ pub fn overlapping_pairs(participants: &[Participant]) -> Vec<(String, String)> 
     pairs
 }
 
+/// One projector's slice of the canvas: which columns it shows, and how its
+/// seam edges fade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SliceSpec {
+    pub output: String,
+    /// First canvas column this projector shows.
+    pub source_x: i32,
+    pub width: i32,
+    pub height: i32,
+    /// In slice-local coordinates. Left/Right only: the canvas is a row.
+    pub ramps: Vec<RampSpec>,
+}
+
+/// Everything the slicer process needs: capture this, cut it up like that.
+/// Serialized to the `suede slice` subcommand verbatim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlicerSpec {
+    /// Output to capture — the headless canvas.
+    pub source: String,
+    pub canvas_width: i32,
+    pub canvas_height: i32,
+    pub gamma: f64,
+    pub black_lift: f64,
+    /// Render this instead of capturing, for alignment and calibration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<TestPattern>,
+    /// Left to right across the wall.
+    pub slices: Vec<SliceSpec>,
+}
+
+/// The canvas a row of projectors renders: its size, and each projector's
+/// slice of it.
+///
+/// This is where the overlap is *managed by Suede* instead of by sway.
+/// The projectors sit edge to edge in sway's layout — nothing overlaps
+/// there, so nothing bleeds — while the physical beams overlap on the wall.
+/// The app renders once into a canvas of `Σwidths − (n−1)·overlap`; each
+/// projector is then handed its own copy of its slice, and neighbouring
+/// slices repeat `overlap` columns of the canvas. Because each copy is a
+/// separate buffer on a separate output, the two sides of a seam can carry
+/// opposite fades — the thing sway's shared coordinate space can never do.
+pub fn slicer_spec(
+    participants: &[Participant],
+    config: &ProjectionConfig,
+    source: &str,
+) -> Option<SlicerSpec> {
+    if participants.len() < 2 || config.overlap <= 0 {
+        return None;
+    }
+    let mut row: Vec<&Participant> = participants.iter().collect();
+    row.sort_by_key(|participant| participant.rect.x);
+
+    let overlap = config.overlap;
+    let canvas_height = row.iter().map(|p| p.rect.height).max().unwrap_or(0);
+    let mut slices = Vec::new();
+    let mut source_x = 0;
+
+    for (index, participant) in row.iter().enumerate() {
+        let width = participant.rect.width;
+        let mut ramps = Vec::new();
+        if config.blend {
+            if index > 0 {
+                ramps.push(RampSpec {
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: overlap,
+                        height: canvas_height,
+                    },
+                    fade_to: FadeTo::Left,
+                });
+            }
+            if index + 1 < row.len() {
+                ramps.push(RampSpec {
+                    rect: Rect {
+                        x: width - overlap,
+                        y: 0,
+                        width: overlap,
+                        height: canvas_height,
+                    },
+                    fade_to: FadeTo::Right,
+                });
+            }
+        }
+        slices.push(SliceSpec {
+            output: participant.name.clone(),
+            source_x,
+            width,
+            height: participant.rect.height,
+            ramps,
+        });
+        source_x += width - overlap;
+    }
+
+    Some(SlicerSpec {
+        source: source.to_string(),
+        canvas_width: source_x + overlap,
+        canvas_height,
+        gamma: config.gamma,
+        black_lift: config.black_lift,
+        pattern: config.test_pattern,
+        slices,
+    })
+}
+
+/// The signal multiplier and offset for one column of a slice, as fixed-point
+/// `(a, b)` where `out = (a·in) >> 8 + b`.
+///
+/// Combines the gamma-shaped ramp (inside a seam) with the black-level
+/// rescale (outside), so the slicer applies one table in one pass. Columns
+/// are enough: the canvas is a row, so every ramp spans full height.
+pub fn column_transfer(slice: &SliceSpec, gamma: f64, black_lift: f64, x: i32) -> (u16, u8) {
+    for ramp in &slice.ramps {
+        if x >= ramp.rect.x && x < ramp.rect.x + ramp.rect.width {
+            let along = match ramp.fade_to {
+                FadeTo::Right => {
+                    1.0 - (x as f64 + 0.5 - ramp.rect.x as f64) / ramp.rect.width as f64
+                }
+                FadeTo::Left => (x as f64 + 0.5 - ramp.rect.x as f64) / ramp.rect.width as f64,
+                // The canvas is a row; vertical fades cannot occur here.
+                FadeTo::Top | FadeTo::Bottom => 1.0,
+            };
+            let multiplier = along.clamp(0.0, 1.0).powf(1.0 / gamma);
+            return ((multiplier * 256.0).round() as u16, 0);
+        }
+    }
+    let lift = black_lift.clamp(0.0, 1.0);
+    (
+        ((1.0 - lift) * 256.0).round() as u16,
+        (lift * 255.0).round() as u8,
+    )
+}
+
 /// Derive one overlay spec per output that has a seam.
 ///
 /// Seams come from *adjacency*, not intersection: neighbouring outputs must

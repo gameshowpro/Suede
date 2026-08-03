@@ -341,12 +341,17 @@ impl Supervisor {
             // No workspace means no output was pinned, which is normal for a
             // spanning app; it still needs its fullscreen mode applied.
             let workspace = managed.target.as_ref().and_then(|target| target.workspace);
+            let output = managed
+                .target
+                .as_ref()
+                .and_then(|target| target.output.clone());
             let commands: Vec<String> = ids
                 .iter()
                 .flat_map(|window_id| {
                     placement_commands(
                         *window_id,
                         workspace,
+                        output.as_deref(),
                         managed.config.fullscreen,
                         managed.config.span_outputs,
                     )

@@ -50,6 +50,10 @@ enum Command {
     #[cfg(all(feature = "projection", unix))]
     #[command(hide = true)]
     Blend(BlendArgs),
+    /// Internal: capture the canvas and present per-projector slices.
+    #[cfg(all(feature = "projection", unix))]
+    #[command(hide = true)]
+    Slice(BlendArgs),
 }
 
 #[cfg(all(feature = "projection", unix))]
@@ -95,6 +99,23 @@ fn main() -> std::process::ExitCode {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(error) => {
                     eprintln!("blend overlay failed: {error}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
+        }
+        #[cfg(all(feature = "projection", unix))]
+        Some(Command::Slice(args)) => {
+            let spec = match serde_json::from_str(&args.spec) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    eprintln!("invalid --spec: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            match suede::projection::slicer::run(&spec) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("slicer failed: {error}");
                     std::process::ExitCode::FAILURE
                 }
             }

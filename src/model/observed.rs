@@ -293,6 +293,7 @@ impl Divergence {
         "projection_unavailable",
         "blend_overlay_failed",
         "blend_needs_distinct_outputs",
+        "headless_unavailable",
     ];
 
     /// Documentation page for a divergence kind, relative to the docs root.
@@ -311,9 +312,10 @@ impl Divergence {
                 "configuration/#backgrounds-and-wallpapers"
             }
             "tearing_unsupported" => "configuration/#outputs",
-            "projection_unavailable" | "blend_overlay_failed" | "blend_needs_distinct_outputs" => {
-                "configuration/#projection-edge-blending"
-            }
+            "projection_unavailable"
+            | "blend_overlay_failed"
+            | "blend_needs_distinct_outputs"
+            | "headless_unavailable" => "configuration/#projection-edge-blending",
             _ => return None,
         })
     }

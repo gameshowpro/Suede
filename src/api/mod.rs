@@ -126,6 +126,8 @@ pub fn router(state: ApiState) -> Router {
         .route("/apps", get(apps::list_apps))
         .route("/apps/{id}/status", get(apps::get_app_status))
         .route("/apps/{id}/restart", post(apps::restart_app))
+        .route("/apps/{id}/activate", post(apps::activate_app))
+        .route("/apps/{id}/deactivate", post(apps::deactivate_app))
         .route("/apps/{id}/heartbeat", post(apps::heartbeat))
         // Desired state.
         .route(

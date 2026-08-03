@@ -18,6 +18,14 @@ pub struct DesiredState {
     pub revision: u64,
     pub outputs: Vec<OutputConfig>,
     pub apps: Vec<AppConfig>,
+    /// Which app is running. `null` runs nothing.
+    ///
+    /// Exactly one app is ever active, and it always spans every display —
+    /// the appliance is a single canvas, not a window manager. Keeping the
+    /// choice as one pointer makes switching atomic: activating B cannot
+    /// leave A half-enabled the way per-app flags could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_app: Option<String>,
     /// Named background definitions outputs can refer to.
     ///
     /// A video wall usually wants one look across every screen, so the
@@ -225,6 +233,12 @@ impl DesiredState {
             }
         }
 
+        if let Some(active) = &self.active_app {
+            if !self.apps.iter().any(|app| &app.id == active) {
+                errors.push(format!("activeApp {active:?} does not name a listed app"));
+            }
+        }
+
         let mut seen_apps = std::collections::HashSet::new();
         for (index, app) in self.apps.iter().enumerate() {
             let prefix = format!("apps[{index}]");
@@ -260,13 +274,6 @@ impl DesiredState {
                     if command.trim().is_empty() {
                         errors.push(format!("{prefix}.launcher.command must not be empty"));
                     }
-                }
-            }
-            if let Some(output) = &app.output {
-                if output.is_empty() {
-                    errors.push(format!(
-                        "{prefix}.output must set at least one of name, make, model, serial"
-                    ));
                 }
             }
             if app.restart.delay_ms > app.restart.max_delay_ms {
@@ -825,21 +832,24 @@ impl Default for HeartbeatConfig {
 pub struct AppConfig {
     /// Client-chosen, unique, stable identifier.
     pub id: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     pub launcher: Launcher,
-    /// Output the window is moved to. When absent, Sway's default placement applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Whether this app runs. Not part of the API: derived from
+    /// [`DesiredState::active_app`] by the reconciler, kept as a field only
+    /// because the supervisor consumes per-app configs.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub enabled: bool,
+    /// Where the window goes. Not part of the API: the active app always
+    /// covers the whole canvas, and the reconciler decides whether that
+    /// canvas is the physical span or a headless output.
+    #[serde(skip)]
+    #[schema(ignore)]
     pub output: Option<OutputMatch>,
-    #[serde(default = "default_true")]
+    #[serde(skip)]
+    #[schema(ignore)]
     pub fullscreen: bool,
-    /// Stretch one window across *every* output instead of filling one.
-    ///
-    /// This is sway's `fullscreen enable global`, and it is how a single
-    /// browser drives a video wall: the outputs are positioned to form one
-    /// canvas, and the window covers the whole of it. When set, `output`
-    /// only decides where the window first appears.
-    #[serde(default)]
+    #[serde(skip)]
+    #[schema(ignore)]
     pub span_outputs: bool,
     /// Audio routing. Absent leaves routing untouched; `{"output": null}` silences.
     #[serde(default, skip_serializing_if = "Option::is_none")]

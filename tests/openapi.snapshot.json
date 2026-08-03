@@ -36,6 +36,77 @@
         }
       }
     },
+    "/api/v1/apps/{id}/activate": {
+      "post": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "activate_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such app"
+          }
+        }
+      }
+    },
+    "/api/v1/apps/{id}/deactivate": {
+      "post": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "deactivate_app",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "App identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The persisted document",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such app"
+          },
+          "409": {
+            "description": "A different app is active"
+          }
+        }
+      }
+    },
     "/api/v1/apps/{id}/heartbeat": {
       "post": {
         "tags": [
@@ -1311,9 +1382,6 @@
               }
             ]
           },
-          "enabled": {
-            "type": "boolean"
-          },
           "env": {
             "type": "object",
             "description": "Extra environment variables for the launched process.\n\nApplied last, so they override anything the launcher preset sets.\nHardware acceleration usually needs this: enabling NVDEC on an Nvidia\ncard, for instance, is a matter of `LIBVA_DRIVER_NAME` and\n`NVD_BACKEND` rather than any command-line flag.",
@@ -1323,9 +1391,6 @@
             "propertyNames": {
               "type": "string"
             }
-          },
-          "fullscreen": {
-            "type": "boolean"
           },
           "heartbeat": {
             "oneOf": [
@@ -1344,17 +1409,6 @@
           "launcher": {
             "$ref": "#/components/schemas/Launcher"
           },
-          "output": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/OutputMatch",
-                "description": "Output the window is moved to. When absent, Sway's default placement applies."
-              }
-            ]
-          },
           "persistProfile": {
             "type": "boolean",
             "description": "Keep the browser profile between launches instead of wiping it."
@@ -1372,10 +1426,6 @@
           },
           "restart": {
             "$ref": "#/components/schemas/RestartPolicy"
-          },
-          "spanOutputs": {
-            "type": "boolean",
-            "description": "Stretch one window across *every* output instead of filling one.\n\nThis is sway's `fullscreen enable global`, and it is how a single\nbrowser drives a video wall: the outputs are positioned to form one\ncanvas, and the window covers the whole of it. When set, `output`\nonly decides where the window first appears."
           }
         }
       },
@@ -1668,6 +1718,14 @@
         "type": "object",
         "description": "The complete desired-state document.",
         "properties": {
+          "activeApp": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which app is running. `null` runs nothing.\n\nExactly one app is ever active, and it always spans every display —\nthe appliance is a single canvas, not a window manager. Keeping the\nchoice as one pointer makes switching atomic: activating B cannot\nleave A half-enabled the way per-app flags could.",
+            "default": null
+          },
           "apps": {
             "type": "array",
             "items": {
