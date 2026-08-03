@@ -119,6 +119,23 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
 </style>
 </head>
 <body>
+<script>
+// Installed before the main script so even a parse error there is caught and
+// *visible*: a reference UI that fails silently teaches wrong lessons about
+// the API it demonstrates.
+window.addEventListener("error", (event) => {
+  let banner = document.getElementById("js-error");
+  if (!banner) {
+    banner = document.createElement("div");
+    banner.id = "js-error";
+    banner.style.cssText = "background:#c92a2a;color:#fff;padding:10px 20px;" +
+      "font:14px system-ui;position:sticky;top:0;z-index:99";
+    document.body.prepend(banner);
+  }
+  banner.textContent = "UI script error: " + event.message +
+    " (line " + event.lineno + ")";
+});
+</script>
 <header>
   <h1>Suede</h1>
   <span class="pill muted" id="version">—</span>
@@ -207,6 +224,14 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
           <input id="pj-gamma" type="number" step="0.05" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
           <input id="pj-lift" type="number" step="0.01" min="0" max="0.5" value="0"></div>
+        <div><label for="pj-pattern">Test pattern</label>
+          <select id="pj-pattern">
+            <option value="">None — show content</option>
+            <option value="grid">Grid — geometry and seam alignment</option>
+            <option value="white">White — inspect the blend ramps</option>
+            <option value="black">Black — tune the black-level lift</option>
+            <option value="gamma">Gamma — measure the projector gamma</option>
+          </select></div>
       </div>
       <p class="hint">Gamma shapes the fall-off — the projectors' transfer
         curve, usually 2.2. If seams glow on dark scenes (projector black is
@@ -809,15 +834,17 @@ function renderProjection() {
   $("pj-blend").value = projection?.blend === false ? "off" : (projection ? "on" : "off");
   $("pj-gamma").value = projection?.gamma ?? 2.2;
   $("pj-lift").value = projection?.blackLift ?? 0;
+  $("pj-pattern").value = projection?.testPattern ?? "";
 }
 
 $("pj-save").onclick = () => run(async () => {
   const blend = $("pj-blend").value === "on";
   const gamma = Number($("pj-gamma").value) || 2.2;
   const blackLift = Number($("pj-lift").value) || 0;
+  const testPattern = $("pj-pattern").value || null;
   // Off with default values: remove the section entirely.
-  const bodyValue = (!blend && gamma === 2.2 && blackLift === 0)
-    ? null : { blend, gamma, blackLift };
+  const bodyValue = (!blend && gamma === 2.2 && blackLift === 0 && !testPattern)
+    ? null : { blend, gamma, blackLift, testPattern };
   document.activeElement?.blur();
   await save("/config/projection", bodyValue);
 }, "saved projection");
@@ -836,7 +863,7 @@ function backgroundLabel(reference) {
 
 // Resolve an output's background reference to its properties.
 function resolveBackground(reference) {
-  if (typeof reference === "string") return presetById(reference)?.background ?? null;
+  if (typeof reference === "string") return presetById(reference) ?? null;
   return reference ?? null;
 }
 
@@ -868,7 +895,8 @@ function renderBackgrounds() {
     const users = (config?.outputs ?? [])
       .filter((o) => o.background === preset.id)
       .map((o) => o.match?.name ?? "");
-    const background = preset.background ?? {};
+    // Preset properties are flattened beside the id on the wire.
+    const background = preset;
     const colour = background.color || DEFAULT_BG_COLOR;
     const row = document.createElement("tr");
     row.innerHTML =
@@ -905,7 +933,8 @@ function renderBackgrounds() {
 
 function editBackground(preset) {
   editingBackground = preset?.id ?? null;
-  const background = preset?.background ?? {};
+  // Preset properties are flattened beside the id on the wire.
+  const background = preset ?? {};
   $("background-editor").classList.remove("hidden");
   $("bg-heading").textContent = preset ? `Edit ${preset.id}` : "Define a background";
   $("bg-id").value = preset?.id ?? "";
@@ -934,6 +963,10 @@ function refreshBackgroundPreview() {
 for (const id of ["bg-wallpaper", "bg-mode", "bg-color"]) {
   $(id).oninput = refreshBackgroundPreview;
 }
+$("bg-color").addEventListener("input", () => {
+  const value = $("bg-color").value.trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(value)) $("bg-swatch").value = value;
+});
 $("bg-swatch").oninput = () => {
   $("bg-color").value = $("bg-swatch").value;
   refreshBackgroundPreview();
@@ -976,7 +1009,7 @@ function updateOutputBackgroundSummary() {
     return;
   }
   const preset = presetById(value);
-  paintPreview($("o-bg-summary"), preset?.background,
+  paintPreview($("o-bg-summary"), preset,
     preset ? preset.id : `${value} \u2014 not defined`);
 }
 
@@ -995,7 +1028,7 @@ function renderWallpapers() {
 
   // An image counts as in use if any background names it, including one no
   // display has picked yet — that is still a definition somebody made.
-  const inUse = new Set(presets().map((p) => p.background?.wallpaper).filter(Boolean));
+  const inUse = new Set(presets().map((p) => p.wallpaper).filter(Boolean));
   for (const output of config?.outputs ?? []) {
     const resolved = resolveBackground(output.background);
     if (resolved?.wallpaper) inUse.add(resolved.wallpaper);
@@ -1179,7 +1212,10 @@ function connect() {
 
 window.addEventListener("resize", renderLayout);
 loadAll().catch((error) => toast(error.message, true));
-connect();
+// ?nosse: load once and stay static. For automated checks (a headless
+// browser's virtual clock never drains an endless event stream) — not for
+// people, who want the live view.
+if (!location.search.includes("nosse")) connect();
 </script>
 </body>
 </html>

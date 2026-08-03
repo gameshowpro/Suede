@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::Rect;
+use crate::model::{ProjectionConfig, Rect, TestPattern};
 
 /// An output taking part in seam derivation: its place in the global layout.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +49,13 @@ pub struct OverlaySpec {
     /// projector black inside them. `0.0` is off.
     #[serde(default)]
     pub black_lift: f64,
+    /// This output's rectangle in the global layout, so patterns can draw in
+    /// global coordinates and continue exactly across a seam.
+    #[serde(default)]
+    pub rect: Rect,
+    /// Test pattern to draw instead of showing the content through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<TestPattern>,
     pub ramps: Vec<RampSpec>,
 }
 
@@ -82,11 +89,7 @@ fn area(rect: &Rect) -> i64 {
 ///   product of each output's horizontal and vertical ramps, which sums to
 ///   constant luminance by construction — a third ramp from the diagonal
 ///   pair would darken it twice.
-pub fn overlay_specs(
-    participants: &[Participant],
-    gamma: f64,
-    black_lift: f64,
-) -> Vec<OverlaySpec> {
+pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) -> Vec<OverlaySpec> {
     let mut ramps: Vec<(usize, RampSpec)> = Vec::new();
 
     for i in 0..participants.len() {
@@ -148,6 +151,13 @@ pub fn overlay_specs(
         }
     }
 
+    // Blending off leaves the seams unfaded; a test pattern is still shown
+    // if one is requested, which is how alignment is done before enabling
+    // the blend.
+    if !config.blend {
+        ramps.clear();
+    }
+
     let mut specs: Vec<OverlaySpec> = Vec::new();
     for (index, participant) in participants.iter().enumerate() {
         let mine: Vec<RampSpec> = ramps
@@ -155,11 +165,15 @@ pub fn overlay_specs(
             .filter(|(owner, _)| *owner == index)
             .map(|(_, ramp)| ramp.clone())
             .collect();
-        if !mine.is_empty() {
+        // A test pattern goes to every output, seams or not; without one,
+        // only outputs that actually have something to fade need a process.
+        if !mine.is_empty() || config.test_pattern.is_some() {
             specs.push(OverlaySpec {
                 output: participant.name.clone(),
-                gamma,
-                black_lift,
+                gamma: config.gamma,
+                black_lift: config.black_lift,
+                rect: participant.rect,
+                pattern: config.test_pattern,
                 ramps: mine,
             });
         }
@@ -236,6 +250,14 @@ pub fn alpha_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
 /// the standard black-level rescale — matching the un-doubled regions to the
 /// seams' doubled projector black. Lift zero leaves them fully transparent.
 pub fn pixel_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
+    match spec.pattern {
+        None => transparent_map(width, height, spec),
+        Some(_) => pattern_map(width, height, spec),
+    }
+}
+
+/// The normal overlay: content shows through except in the seams.
+fn transparent_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     let lift = (spec.black_lift.clamp(0.0, 1.0) * 255.0).round() as u8;
     let mut pixels = vec![0u8; width as usize * height as usize * 4];
     for y in 0..height {
@@ -257,6 +279,38 @@ pub fn pixel_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     pixels
 }
 
+/// A test pattern: fully opaque, with the ramps and lift applied to the
+/// pattern itself exactly as they would be to real content — so what the
+/// operator aligns with is what content will experience.
+fn pattern_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
+    let rgb = super::pattern::render(width, height, spec);
+    let lift = spec.black_lift.clamp(0.0, 1.0);
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            let source = [rgb[index * 3], rgb[index * 3 + 1], rgb[index * 3 + 2]];
+            let shaped: [f64; 3] = match attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
+                // In a seam: scale the signal so the *light* is attenuated
+                // by t, exactly as the alpha ramp does to content.
+                Some(t) => {
+                    let scale = t.powf(1.0 / spec.gamma);
+                    [0, 1, 2].map(|c| source[c] as f64 * scale)
+                }
+                // Outside: the black-level rescale.
+                None => [0, 1, 2].map(|c| 255.0 * lift + (1.0 - lift) * source[c] as f64),
+            };
+            let offset = index * 4;
+            // Opaque and premultiplied: BGRA from the shaped RGB.
+            pixels[offset] = shaped[2].round().clamp(0.0, 255.0) as u8;
+            pixels[offset + 1] = shaped[1].round().clamp(0.0, 255.0) as u8;
+            pixels[offset + 2] = shaped[0].round().clamp(0.0, 255.0) as u8;
+            pixels[offset + 3] = 255;
+        }
+    }
+    pixels
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,8 +327,12 @@ mod tests {
         }
     }
 
+    fn config() -> ProjectionConfig {
+        ProjectionConfig::default()
+    }
+
     fn specs_for(participants: &[Participant]) -> Vec<OverlaySpec> {
-        overlay_specs(participants, 2.2, 0.0)
+        overlay_specs(participants, &config())
     }
 
     #[test]
@@ -411,12 +469,18 @@ mod tests {
                 participant("DP-1", 0, 0, 1920, 1080),
                 participant("DP-2", 1760, 0, 1920, 1080),
             ],
-            2.4,
-            0.05,
+            &ProjectionConfig {
+                gamma: 2.4,
+                black_lift: 0.05,
+                ..config()
+            },
         );
         for spec in &specs {
             assert_eq!(spec.gamma, 2.4);
             assert_eq!(spec.black_lift, 0.05);
+            // Each spec carries its own output's place in the layout, for
+            // global-coordinate pattern drawing.
+            assert!(spec.rect.width == 1920);
         }
     }
 
@@ -425,6 +489,8 @@ mod tests {
             output: "DP-1".into(),
             gamma,
             black_lift: 0.0,
+            rect: Rect::default(),
+            pattern: None,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,
@@ -470,8 +536,7 @@ mod tests {
                 participant("L", 0, 0, 1920, 1080),
                 participant("R", 1760, 0, 1920, 1080),
             ],
-            gamma,
-            0.0,
+            &config(),
         );
         let left = alpha_map(1920, 1, &specs[0]);
         let right = alpha_map(1920, 1, &specs[1]);
@@ -500,6 +565,8 @@ mod tests {
             output: "A".into(),
             gamma: 2.0,
             black_lift: 0.0,
+            rect: Rect::default(),
+            pattern: None,
             ramps: vec![
                 RampSpec {
                     rect: Rect {
@@ -537,6 +604,8 @@ mod tests {
             output: "DP-1".into(),
             gamma: 2.2,
             black_lift: 0.1,
+            rect: Rect::default(),
+            pattern: None,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,
@@ -575,6 +644,8 @@ mod tests {
             output: "DP-1".into(),
             gamma: 2.2,
             black_lift: 0.04,
+            rect: Rect::default(),
+            pattern: None,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 1760,
@@ -590,5 +661,107 @@ mod tests {
         assert!(json.contains(r#""blackLift":0.04"#), "{json}");
         let back: OverlaySpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn a_pattern_reaches_every_output_even_without_seams() {
+        // A lone bench monitor still shows the pattern; without one, a
+        // rampless output needs no process at all.
+        let lone = [participant("DP-1", 0, 0, 1920, 1080)];
+        assert!(specs_for(&lone).is_empty());
+
+        let with_pattern = overlay_specs(
+            &lone,
+            &ProjectionConfig {
+                test_pattern: Some(crate::model::TestPattern::Grid),
+                ..config()
+            },
+        );
+        assert_eq!(with_pattern.len(), 1);
+        assert!(with_pattern[0].ramps.is_empty());
+    }
+
+    #[test]
+    fn blend_off_keeps_the_pattern_but_drops_the_ramps() {
+        // Alignment happens before blending is enabled, so the pattern must
+        // not depend on it.
+        let wall = [
+            participant("DP-1", 0, 0, 1920, 1080),
+            participant("DP-2", 1760, 0, 1920, 1080),
+        ];
+        let specs = overlay_specs(
+            &wall,
+            &ProjectionConfig {
+                blend: false,
+                test_pattern: Some(crate::model::TestPattern::White),
+                ..config()
+            },
+        );
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|spec| spec.ramps.is_empty()));
+    }
+
+    #[test]
+    fn a_pattern_overlay_is_opaque_and_ramp_shaped() {
+        let spec = OverlaySpec {
+            output: "DP-1".into(),
+            gamma: 2.2,
+            black_lift: 0.0,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 1,
+            },
+            pattern: Some(crate::model::TestPattern::White),
+            ramps: vec![RampSpec {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 100,
+                    height: 1,
+                },
+                fade_to: FadeTo::Right,
+            }],
+        };
+        let pixels = pixel_map(100, 1, &spec);
+        // Every pixel opaque.
+        assert!((0..100).all(|x| pixels[x * 4 + 3] == 255));
+        // White through the ramp: midway the signal is 0.5^(1/2.2) of full.
+        let mid = pixels[50 * 4] as f64 / 255.0;
+        assert!((mid - 0.73).abs() < 0.02, "midpoint signal was {mid}");
+    }
+
+    #[test]
+    fn a_black_pattern_with_lift_shows_the_lift_itself() {
+        // Exactly the tuning scenario: black content everywhere, so the
+        // un-seamed region shows precisely the configured lift.
+        let spec = OverlaySpec {
+            output: "DP-1".into(),
+            gamma: 2.2,
+            black_lift: 0.1,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 1,
+            },
+            pattern: Some(crate::model::TestPattern::Black),
+            ramps: vec![RampSpec {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                fade_to: FadeTo::Left,
+            }],
+        };
+        let pixels = pixel_map(8, 1, &spec);
+        // Inside the seam: black stays black (the doubled projector black is
+        // the lift there).
+        assert_eq!(pixels[2 * 4], 0);
+        // Outside: the lift, verbatim.
+        assert_eq!(pixels[6 * 4], (0.1f64 * 255.0).round() as u8);
     }
 }

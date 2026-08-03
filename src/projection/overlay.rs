@@ -61,12 +61,31 @@ pub fn run(spec: &OverlaySpec) -> anyhow::Result<()> {
     }
     queue.roundtrip(&mut state)?;
 
+    // Log the roster: if a surface ever lands on the wrong display, this is
+    // the first place to look.
+    for (output, name) in &state.outputs {
+        use wayland_client::Proxy;
+        eprintln!(
+            "blend[{}]: sees wl_output id {} named {:?}",
+            spec.output,
+            output.id().protocol_id(),
+            name
+        );
+    }
     let target = state
         .outputs
         .iter()
         .find(|(_, name)| name.as_deref() == Some(spec.output.as_str()))
         .map(|(output, _)| output.clone())
         .ok_or_else(|| anyhow::anyhow!("no output named {} on this compositor", spec.output))?;
+    {
+        use wayland_client::Proxy;
+        eprintln!(
+            "blend[{}]: attaching to wl_output id {}",
+            spec.output,
+            target.id().protocol_id()
+        );
+    }
 
     let surface = compositor.create_surface(&handle, ());
     // An empty input region: clicks and touches fall through to the content.

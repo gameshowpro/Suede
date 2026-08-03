@@ -246,6 +246,11 @@ impl Reconciler {
             tracing::debug!("waiting for output topology to settle");
             tokio::time::sleep(SETTLE).await;
             self.refresh_outputs().await;
+        } else if !output_plan.commands.is_empty() {
+            // Even a plain move must be re-observed before anything downstream
+            // derives geometry from the snapshot — blend seams computed from
+            // pre-move rectangles paint ramps on the wrong edges.
+            self.refresh_outputs().await;
         }
 
         // --- projection ---
@@ -317,7 +322,11 @@ impl Reconciler {
         use crate::projection::{overlay_specs, Participant};
 
         let mut specs = Vec::new();
-        if let Some(projection) = desired.projection.as_ref().filter(|p| p.blend) {
+        if let Some(projection) = desired
+            .projection
+            .as_ref()
+            .filter(|p| p.blend || p.test_pattern.is_some())
+        {
             // Every active output takes part; the geometry sorts out the rest.
             // Outputs that overlap nothing get no ramps, and a mirror is
             // recognised and skipped, so there is no projector list to keep
@@ -332,7 +341,7 @@ impl Reconciler {
                     rect: output.rect,
                 })
                 .collect();
-            specs = overlay_specs(&participants, projection.gamma, projection.black_lift);
+            specs = overlay_specs(&participants, projection);
         }
 
         self.blend.lock().await.sync(&specs)

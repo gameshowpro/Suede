@@ -2192,6 +2192,18 @@
             "format": "double",
             "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\nwall — walls are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
             "default": 2.2
+          },
+          "testPattern": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TestPattern",
+                "description": "Show a built-in test pattern instead of the content. `null` is off.\n\nPatterns draw in *global* coordinates, so features continue exactly\nacross a seam — two aligned projectors superimpose them perfectly.\nThey are the bench-verification and field-alignment tool: the blend\nramps and black lift still apply on top, exactly as they would to\nreal content."
+              }
+            ],
+            "default": null
           }
         }
       },
@@ -2438,6 +2450,16 @@
             "description": "True when the reference web UI is being served."
           }
         }
+      },
+      "TestPattern": {
+        "type": "string",
+        "description": "A built-in projection test pattern.",
+        "enum": [
+          "grid",
+          "white",
+          "black",
+          "gamma"
+        ]
       },
       "Transform": {
         "type": "string",

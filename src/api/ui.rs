@@ -111,6 +111,7 @@ mod tests {
             "heartbeat",
             "env",
             "gamma",
+            "testPattern",
         ] {
             assert!(INDEX.contains(field), "the UI never sets {field}");
         }

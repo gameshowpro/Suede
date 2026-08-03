@@ -203,6 +203,8 @@ mod tests {
             output: "DP-1".into(),
             gamma: 2.2,
             black_lift: 0.0,
+            rect: Rect::default(),
+            pattern: None,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,

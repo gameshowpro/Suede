@@ -15,6 +15,7 @@ pub mod blend;
 pub mod manager;
 #[cfg(unix)]
 pub mod overlay;
+pub mod pattern;
 
 pub use blend::{overlay_specs, OverlaySpec, Participant};
 pub use manager::BlendManager;

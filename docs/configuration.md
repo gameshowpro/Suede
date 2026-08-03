@@ -417,6 +417,7 @@ The pieces:
 | `blend` | bool | `true` | `false` skips the entire chain: overlays are torn down, nothing runs |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0–4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0–0.5 |
+| `testPattern` | string \| null | null | `grid`, `white`, `black`, `gamma` — or null for content |
 
 One gamma for the whole wall: a wall is near-universally identical
 projectors, and a single measured value covers it. (Per-output overrides can
@@ -428,6 +429,25 @@ skips all projection work; nothing is spawned and nothing is checked.
 Rows, columns, and grids all work: seams are derived pairwise from wherever
 outputs intersect, and in a 2×2 grid the corner region multiplies its
 horizontal and vertical ramps, which sums correctly by construction.
+
+#### Test patterns {: #projection-test-patterns }
+
+Built into the blending component, sized automatically to each output, and
+drawn in **global** coordinates so features continue exactly across a seam:
+two aligned projectors superimpose the pattern pixel for pixel. The blend
+ramps and black lift apply to the pattern exactly as they would to content,
+so what you align with is what content will experience. Set
+`testPattern` (or use the Displays tab's Projection panel):
+
+| Pattern | For |
+|---|---|
+| `grid` | Geometry, focus, and seam alignment: 100 px colour tiles with crosses, each labelled with its global pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
+| `white` | The blend ramps in isolation, and brightness mismatch between projectors. On the bench, this is the clearest view of the ramp shape. |
+| `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the wall matches them. |
+| `gamma` | Measuring the `gamma` value: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the currently configured value is underlined. |
+
+The gamma chart assumes the output runs at scale 1 (its stripes are
+single-pixel rows); the other patterns have no such constraint.
 
 !!! warning "Keep an output at position 0,0"
     Sway anchors a spanned (`fullscreen global`) surface at the layout

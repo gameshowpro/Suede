@@ -67,6 +67,15 @@ pub struct ProjectionConfig {
     /// `out = lift + (1 − lift)·in`. On a black scene, raise this until the
     /// un-doubled regions match the seams.
     pub black_lift: f64,
+    /// Show a built-in test pattern instead of the content. `null` is off.
+    ///
+    /// Patterns draw in *global* coordinates, so features continue exactly
+    /// across a seam — two aligned projectors superimpose them perfectly.
+    /// They are the bench-verification and field-alignment tool: the blend
+    /// ramps and black lift still apply on top, exactly as they would to
+    /// real content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_pattern: Option<TestPattern>,
 }
 
 impl Default for ProjectionConfig {
@@ -75,8 +84,28 @@ impl Default for ProjectionConfig {
             blend: true,
             gamma: 2.2,
             black_lift: 0.0,
+            test_pattern: None,
         }
     }
+}
+
+/// A built-in projection test pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum TestPattern {
+    /// Coloured 100 px tiles with crosses, global pixel coordinates, and the
+    /// output name — for geometry, focus, and seam alignment.
+    Grid,
+    /// Full white: shows the blend ramps in isolation and exposes brightness
+    /// mismatch between projectors.
+    White,
+    /// Full black: for tuning `blackLift` — raise the lift until the
+    /// un-doubled regions match the glowing seams.
+    Black,
+    /// Gamma measurement: candidate patches beside a stripe field that
+    /// averages to half light. The patch that matches from a distance names
+    /// the projector's gamma; the configured value is marked.
+    Gamma,
 }
 
 impl DesiredState {

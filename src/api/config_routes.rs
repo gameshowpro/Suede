@@ -937,6 +937,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_test_pattern_round_trips_and_rejects_nonsense() {
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"testPattern":"grid"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["testPattern"], "grid");
+
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"testPattern":"plaid"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
     async fn projection_black_lift_is_range_checked() {
         let harness = harness(None);
         let (status, body) = call(
