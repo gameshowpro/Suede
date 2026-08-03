@@ -13,7 +13,8 @@ use utoipa::IntoParams;
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    AppConfig, BackgroundPreset, DesiredState, OutputConfig, OutputMatch, Settings,
+    AppConfig, BackgroundPreset, DesiredState, OutputConfig, OutputMatch, ProjectionConfig,
+    Settings,
 };
 
 /// Optional blocking behaviour for writes.
@@ -389,6 +390,39 @@ pub async fn put_settings(
     let mut next = state.store.get();
     next.settings = body;
     state.commit(next, "settings", query.wait).await.map(Json)
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/config/projection", tag = "config",
+    responses((
+        status = 200,
+        description = "The projection configuration; null when none is set",
+        body = Option<ProjectionConfig>,
+    ))
+)]
+pub async fn get_projection(State(state): State<ApiState>) -> Json<Option<ProjectionConfig>> {
+    Json(state.store.get().projection)
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/config/projection", tag = "config",
+    params(WaitQuery), request_body = Option<ProjectionConfig>,
+    responses(
+        (status = 200, description = "The persisted document", body = DesiredState),
+        (status = 422, description = "Validation failed"),
+    )
+)]
+pub async fn put_projection(
+    State(state): State<ApiState>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+    // `null` removes the section entirely — projection off, no trace left.
+    Json(body): Json<Option<ProjectionConfig>>,
+) -> ApiResult<Json<DesiredState>> {
+    state.check_precondition(if_match(&headers))?;
+    let mut next = state.store.get();
+    next.projection = body;
+    state.commit(next, "projection", query.wait).await.map(Json)
 }
 
 /// Shared by handlers that need to report an unexpected state error.
@@ -838,5 +872,88 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["outputs"][0]["background"]["color"], "#223344");
+    }
+
+    // --- projection -------------------------------------------------------
+
+    #[tokio::test]
+    async fn projection_round_trips_and_null_clears_it() {
+        let harness = harness(None);
+        let (status, body) = call(&harness, "GET", "/api/v1/config/projection", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_null(), "no projection by default");
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"blend":true,"outputs":[{"name":"DP-1","gamma":2.4},{"name":"DP-2"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["outputs"][0]["gamma"], 2.4);
+        // An unstated gamma takes the 2.2 default rather than being null.
+        assert_eq!(body["projection"]["outputs"][1]["gamma"], 2.2);
+
+        let (status, body) = call(&harness, "PUT", "/api/v1/config/projection", Some("null")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.get("projection").is_none_or(|p| p.is_null()),
+            "null must remove the section: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_gamma_is_range_checked() {
+        // 22 instead of 2.2 is the likely slip, and it would produce ramps so
+        // wrong they look like a broken projector rather than a typo.
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"blend":true,"outputs":[{"name":"DP-1","gamma":22}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("between 1.0 and 4.0"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_output_names_must_be_unique() {
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"blend":true,"outputs":[{"name":"DP-1"},{"name":"DP-1"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            body["detail"].as_str().unwrap().contains("not unique"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn blend_defaults_to_on_when_the_section_is_present() {
+        // Writing the section at all is the intent to blend; blend:false is
+        // the explicit way to keep the settings but skip the chain.
+        let harness = harness(None);
+        let (_, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"outputs":[{"name":"DP-1"}]}"#),
+        )
+        .await;
+        assert_eq!(body["projection"]["blend"], true);
     }
 }

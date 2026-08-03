@@ -65,6 +65,9 @@ pub struct Reconciler {
     wallpapers: Arc<WallpaperStore>,
     /// Base for the documentation links attached to divergences.
     docs_base_url: String,
+    /// Blend-overlay processes, one per projector output with seams.
+    #[cfg(feature = "projection")]
+    blend: Mutex<crate::projection::BlendManager>,
 }
 
 /// Everything a [`Reconciler`] collaborates with.
@@ -108,7 +111,16 @@ impl Reconciler {
             applied: Mutex::new(HashMap::new()),
             capabilities: Mutex::new(Capabilities::default()),
             cursor_parked_at: Mutex::new(None),
+            #[cfg(feature = "projection")]
+            blend: Mutex::new(crate::projection::BlendManager::new()),
         }
+    }
+
+    /// Stop everything this reconciler spawned. Called at daemon shutdown so
+    /// no blend overlay outlives the daemon that configured it.
+    pub async fn shutdown(&self) {
+        #[cfg(feature = "projection")]
+        self.blend.lock().await.shutdown();
     }
 
     /// Detect version-gated compositor features. Safe to call repeatedly.
@@ -236,6 +248,11 @@ impl Reconciler {
             self.refresh_outputs().await;
         }
 
+        // --- projection ---
+        // After the outputs have settled: seams are derived from the observed
+        // rectangles, so blending must see the layout it will actually cover.
+        divergences.extend(self.sync_projection(&desired).await);
+
         // --- apps ---
         let targets = resolve_app_targets(
             &desired.apps,
@@ -288,6 +305,62 @@ impl Reconciler {
         };
         self.publish_status(status.clone());
         status
+    }
+
+    /// Keep the blend overlays in step with the projection configuration.
+    ///
+    /// With blending off, absent, or the whole section missing, this passes an
+    /// empty spec list — every overlay is torn down and nothing else happens,
+    /// so a disabled feature costs exactly nothing per pass.
+    #[cfg(feature = "projection")]
+    async fn sync_projection(&self, desired: &crate::model::DesiredState) -> Vec<Divergence> {
+        use crate::projection::{overlay_specs, Participant};
+
+        let mut divergences = Vec::new();
+        let mut specs = Vec::new();
+
+        if let Some(projection) = desired.projection.as_ref().filter(|p| p.blend) {
+            let observed = self.snapshot.outputs();
+            let mut participants = Vec::new();
+            for configured in &projection.outputs {
+                match observed
+                    .iter()
+                    .find(|output| output.active && output.name == configured.name)
+                {
+                    Some(output) if output.rect.width > 0 => {
+                        participants.push(Participant::from_config(configured, output.rect));
+                    }
+                    _ => divergences.push(Divergence::new(
+                        "projection_output_not_found",
+                        &configured.name,
+                        format!(
+                            "{} is listed for edge blending, but no active output has that name",
+                            configured.name
+                        ),
+                    )),
+                }
+            }
+            specs = overlay_specs(&participants);
+        }
+
+        divergences.extend(self.blend.lock().await.sync(&specs));
+        divergences
+    }
+
+    /// Without the `projection` feature there is nothing to run — but asking
+    /// for blending anyway must be surfaced, not silently ignored.
+    #[cfg(not(feature = "projection"))]
+    async fn sync_projection(&self, desired: &crate::model::DesiredState) -> Vec<Divergence> {
+        if desired.projection.as_ref().is_some_and(|p| p.blend) {
+            vec![Divergence::new(
+                "projection_unavailable",
+                "projection",
+                "edge blending is configured, but this build of suede was compiled \
+                 without the 'projection' feature",
+            )]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Report apps whose configured audio sink is not currently present.

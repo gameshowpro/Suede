@@ -29,8 +29,32 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
+# Projection (edge blending) support files that build everywhere; the
+# Wayland stack itself is Unix-only and declared under the target below.
+tempfile = { version = "3", optional = true }
+
+[features]
+# Projection ships by default; packagers who do not need it can build with
+# `--no-default-features`. The configuration schema is NOT feature-gated —
+# a build without the machinery still parses, stores, and serves projection
+# settings, and reports a divergence if asked to blend.
+default = ["projection"]
+projection = [
+    "dep:tempfile",
+    "dep:wayland-client",
+    "dep:wayland-protocols",
+    "dep:wayland-protocols-wlr",
+]
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# Pure-Rust Wayland stack, so the single self-contained ELF invariant holds;
+# no libwayland is linked. The overlay client only exists on Unix — on other
+# hosts the `projection` feature still compiles the math and the manager, so
+# the cross-platform test suite covers them.
+wayland-client = { version = "0.31", optional = true }
+wayland-protocols = { version = "0.32", features = ["client"], optional = true }
+wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = "0.3"

@@ -25,7 +25,54 @@ pub struct DesiredState {
     /// output — makes the common case the laborious one and guarantees the
     /// screens drift apart the first time somebody edits only three of four.
     pub backgrounds: Vec<BackgroundPreset>,
+    /// Multi-projector features. Absent means no projection processing at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<ProjectionConfig>,
     pub settings: Settings,
+}
+
+/// Multi-projector configuration: edge blending today, warping later.
+///
+/// Phase one covers a soft-edge wall where the projectors handle their own
+/// geometry: outputs are *positioned to overlap* in the ordinary layout, a
+/// spanned window renders the shared strip on both, and a gamma-correct ramp
+/// fades each side so the overlapping light sums to constant luminance.
+///
+/// The blend regions are derived from wherever the listed outputs' rectangles
+/// intersect — there is no separate "overlap" setting to fall out of step
+/// with the layout. Corner pinning and source-rectangle warping are a later
+/// phase; this shape is designed to grow those fields without breaking.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionConfig {
+    /// Master switch. `false` keeps the configuration but skips the entire
+    /// blending chain: no overlays run, nothing is spawned, no divergences.
+    #[serde(default = "default_true")]
+    pub blend: bool,
+    /// The outputs that are projectors. Only these get blend ramps; a
+    /// non-projector output (an operator monitor) is simply not listed.
+    pub outputs: Vec<ProjectionOutput>,
+}
+
+/// One projector taking part in edge blending.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionOutput {
+    /// Connector name, e.g. `DP-1`. Projector rigs are fixed installations,
+    /// so plain names rather than match rules.
+    pub name: String,
+    /// This projector's transfer gamma, used to shape its blend ramps.
+    ///
+    /// A ramp that is linear in signal is not linear in light: the display
+    /// raises the signal to `gamma`. Each ramp is therefore pre-shaped as
+    /// `ramp^(1/gamma)` so that the *luminance* of two overlapping projectors
+    /// sums to a constant across the seam.
+    #[serde(default = "default_gamma")]
+    pub gamma: f64,
+}
+
+fn default_gamma() -> f64 {
+    2.2
 }
 
 impl DesiredState {
@@ -96,6 +143,27 @@ impl DesiredState {
                 errors.push(format!("{prefix}.id {:?} is not unique", preset.id));
             }
             errors.extend(preset.background.problems(&prefix));
+        }
+
+        if let Some(projection) = &self.projection {
+            let mut seen = std::collections::HashSet::new();
+            for (index, output) in projection.outputs.iter().enumerate() {
+                let prefix = format!("projection.outputs[{index}]");
+                if output.name.trim().is_empty() {
+                    errors.push(format!("{prefix}.name must not be empty"));
+                }
+                if !seen.insert(output.name.clone()) {
+                    errors.push(format!("{prefix}.name {:?} is not unique", output.name));
+                }
+                // 1.0 disables the correction; beyond 4.0 is no known display
+                // and almost certainly a typo'd measurement.
+                if !(output.gamma.is_finite() && (1.0..=4.0).contains(&output.gamma)) {
+                    errors.push(format!(
+                        "{prefix}.gamma must be between 1.0 and 4.0, not {}",
+                        output.gamma
+                    ));
+                }
+            }
         }
 
         let mut seen_apps = std::collections::HashSet::new();

@@ -161,6 +161,10 @@ pub fn router(state: ApiState) -> Router {
             "/config/settings",
             get(config_routes::get_settings).put(config_routes::put_settings),
         )
+        .route(
+            "/config/projection",
+            get(config_routes::get_projection).put(config_routes::put_projection),
+        )
         // Imperative escape hatches.
         .route("/reconcile", post(observed::reconcile_now))
         .route("/sway/command", post(observed::run_sway_command))

@@ -290,6 +290,9 @@ impl Divergence {
         "wallpaper_not_found",
         "background_preset_not_found",
         "tearing_unsupported",
+        "projection_output_not_found",
+        "projection_unavailable",
+        "blend_overlay_failed",
     ];
 
     /// Documentation page for a divergence kind, relative to the docs root.
@@ -308,6 +311,9 @@ impl Divergence {
                 "configuration/#backgrounds-and-wallpapers"
             }
             "tearing_unsupported" => "configuration/#outputs",
+            "projection_output_not_found" | "projection_unavailable" | "blend_overlay_failed" => {
+                "configuration/#projection-edge-blending"
+            }
             _ => return None,
         })
     }

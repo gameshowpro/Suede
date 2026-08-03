@@ -46,6 +46,18 @@ enum Command {
     /// Needs neither sway nor a network, so CI can build the published API
     /// reference from the exact code being released.
     Openapi,
+    /// Internal: draw edge-blend ramps on one output. Spawned by the daemon.
+    #[cfg(all(feature = "projection", unix))]
+    #[command(hide = true)]
+    Blend(BlendArgs),
+}
+
+#[cfg(all(feature = "projection", unix))]
+#[derive(Args)]
+struct BlendArgs {
+    /// The overlay specification, as serialized by the daemon.
+    #[arg(long, value_name = "JSON")]
+    spec: String,
 }
 
 #[derive(Args, Default)]
@@ -68,6 +80,24 @@ fn main() -> std::process::ExitCode {
         Some(Command::Openapi) => {
             println!("{}", api::docs::openapi_document());
             std::process::ExitCode::SUCCESS
+        }
+        // Synchronous and runtime-free: one Wayland socket, one static image.
+        #[cfg(all(feature = "projection", unix))]
+        Some(Command::Blend(args)) => {
+            let spec = match serde_json::from_str(&args.spec) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    eprintln!("invalid --spec: {error}");
+                    return std::process::ExitCode::FAILURE;
+                }
+            };
+            match suede::projection::overlay::run(&spec) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("blend overlay failed: {error}");
+                    std::process::ExitCode::FAILURE
+                }
+            }
         }
         Some(Command::Run(args)) => run(cli.config, args),
         None => run(cli.config, RunArgs::default()),
@@ -192,7 +222,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         sway,
         audio,
         supervisor: supervisor.clone(),
-        reconciler,
+        reconciler: reconciler.clone(),
         trigger,
         checks,
         wallpapers,
@@ -218,6 +248,8 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     // Terminate managed apps before exiting, so no orphan browsers linger.
     tracing::info!("stopping managed applications");
     supervisor.shutdown().await;
+    // Same rule for blend overlays: nothing spawned outlives the daemon.
+    reconciler.shutdown().await;
     tracing::info!("suede stopped");
     Ok(())
 }

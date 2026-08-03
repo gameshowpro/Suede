@@ -374,6 +374,76 @@ The watchdog **arms on the first heartbeat**. Before that, only `startupGraceSec
 
 The endpoint is unauthenticated but accepted only from loopback, so the key-free design cannot be abused from the network.
 
+### Projection and edge blending {: #projection-edge-blending }
+
+For a wall of projectors whose images physically overlap, Suede can fade each
+side of every seam so the doubled light adds up to one seamless picture. This
+is phase one of projection support: it assumes the projectors handle their own
+geometry (corner pinning), which most installation-class projectors do.
+
+The pieces:
+
+1. **Overlap comes from the layout.** Position the outputs so their
+   rectangles intersect — a 160&nbsp;px seam between two 1920-wide projectors
+   means positions `0` and `1760`. A spanned app
+   ([`spanOutputs`](#driving-a-video-wall)) then renders the shared strip on
+   both outputs. There is no separate overlap setting to fall out of step
+   with the layout: the blend regions *are* the intersections.
+2. **Blending is a ramp in light, not in signal.** A display raises its input
+   signal to a power (its gamma, typically 2.2), so a gradient that is linear
+   in signal is far from linear in light and produces a visible bright band
+   at every seam. Suede shapes each ramp as `ramp^(1/gamma)` per projector,
+   which makes the summed luminance across a seam constant — set each
+   projector's measured gamma and the seams disappear.
+3. **The overlays are tiny and passive.** Each projector gets one
+   `suede blend` process: a black, input-transparent layer surface whose
+   alpha channel holds the ramps. It is drawn once, costs nothing per frame,
+   and clicks pass straight through. The reconciler starts, restarts, and
+   retires them as the layout or configuration changes.
+
+```json
+"projection": {
+  "blend": true,
+  "outputs": [
+    { "name": "DP-1", "gamma": 2.2 },
+    { "name": "DP-2", "gamma": 2.15 }
+  ]
+}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `blend` | bool | `true` | `false` skips the entire chain: overlays are torn down, nothing runs |
+| `outputs[].name` | string | — | Connector name of a projector; unlisted outputs are untouched |
+| `outputs[].gamma` | number | `2.2` | That projector's transfer gamma, 1.0–4.0 |
+
+Only listed outputs take part, so an operator monitor beside the wall keeps
+rendering normally. Setting `blend: false` — or removing the section with
+`PUT /api/v1/config/projection` and a `null` body — stops every overlay and
+skips all projection work; nothing is spawned and nothing is checked.
+
+Rows, columns, and grids all work: seams are derived pairwise from wherever
+listed outputs intersect, and in a 2×2 grid the corner region multiplies its
+horizontal and vertical ramps, which sums correctly by construction.
+
+!!! warning "Keep an output at position 0,0"
+    Sway anchors a spanned (`fullscreen global`) surface at the layout
+    origin. If every remaining output sits away from `0,0` — say the
+    left-most projector is unplugged — the spanned window is clipped to the
+    missing region and the surviving outputs show only a sliver. Position
+    layouts so one output starts at the origin, which a normal
+    left-to-right arrangement does anyway.
+
+Suede must be built with the `projection` cargo feature (on by default). A
+build without it still accepts and stores this configuration, and reports a
+`projection_unavailable` divergence if asked to blend.
+
+!!! note "Phase two"
+    Corner pinning and per-output source rectangles (for projectors without
+    built-in geometry) are designed but not yet built; this configuration
+    shape is forward-compatible with them. Measure each projector's gamma
+    with a test pattern for best results — per-channel gamma is also planned.
+
 ### Settings
 
 | Field | Default | Meaning |

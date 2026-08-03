@@ -192,6 +192,29 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
         <span class="hint" id="o-note"></span>
       </div>
     </div>
+
+    <div class="panel" id="projection-panel">
+      <h2>Projection</h2>
+      <p class="hint">For a wall of projectors: position the outputs so they
+        overlap in the layout above, list the projectors here, and Suede fades
+        each side of every seam with a ramp shaped for that projector's gamma,
+        so the overlapping light adds up to a seamless picture. Displays not
+        listed are untouched.</p>
+      <div class="fields">
+        <div><label for="pj-blend">Edge blending</label>
+          <select id="pj-blend"><option value="off">Off</option><option value="on">On</option></select></div>
+      </div>
+      <table id="pj-outputs"><thead><tr>
+        <th>Projector</th><th>Gamma</th><th></th>
+      </tr></thead><tbody></tbody></table>
+      <div class="row" style="margin-top:10px">
+        <select id="pj-add-name" style="width:auto"></select>
+        <button class="action ghost" id="pj-add">Add projector</button>
+        <span class="grow"></span>
+        <button class="action" id="pj-save">Save</button>
+        <span class="hint" id="pj-note"></span>
+      </div>
+    </div>
   </section>
 
   <!-- Apps -->
@@ -773,6 +796,72 @@ $("a-save").onclick = () => run(async () => {
   clearAppForm();
 }, "saved application");
 
+// --- projection ----------------------------------------------------------
+
+function renderProjection() {
+  // Never stomp an edit in progress: rebuilding the rows would throw away
+  // half-typed gamma values every time another client changes the config.
+  const panel = $("projection-panel");
+  if (panel.contains(document.activeElement)) return;
+
+  const projection = config?.projection;
+  $("pj-blend").value = projection?.blend === false ? "off" : (projection ? "on" : "off");
+
+  const body = document.querySelector("#pj-outputs tbody");
+  body.innerHTML = "";
+  for (const output of projection?.outputs ?? []) {
+    addProjectionRow(output.name, output.gamma ?? 2.2);
+  }
+  renderProjectionChoices();
+}
+
+function addProjectionRow(name, gamma) {
+  const body = document.querySelector("#pj-outputs tbody");
+  const row = document.createElement("tr");
+  row.dataset.name = name;
+  row.innerHTML =
+    `<td class="mono">${escape(name)}</td>` +
+    `<td><input type="number" class="pj-gamma" step="0.05" min="1" max="4"` +
+    ` value="${escape(String(gamma))}" style="max-width:110px"></td>`;
+  const actions = document.createElement("td");
+  const remove = document.createElement("button");
+  remove.className = "action danger";
+  remove.textContent = "Remove";
+  remove.onclick = () => { row.remove(); renderProjectionChoices(); };
+  actions.appendChild(remove);
+  row.appendChild(actions);
+  body.appendChild(row);
+}
+
+function renderProjectionChoices() {
+  const listed = new Set([...document.querySelectorAll("#pj-outputs tbody tr")]
+    .map((row) => row.dataset.name));
+  const available = outputs.filter((o) => !listed.has(o.name));
+  const select = $("pj-add-name");
+  select.innerHTML = available
+    .map((o) => `<option value="${escape(o.name)}">${escape(o.name)}</option>`).join("");
+  $("pj-add").disabled = available.length === 0;
+}
+
+$("pj-add").onclick = () => {
+  const name = $("pj-add-name").value;
+  if (name) { addProjectionRow(name, 2.2); renderProjectionChoices(); }
+};
+
+$("pj-save").onclick = () => run(async () => {
+  const rows = [...document.querySelectorAll("#pj-outputs tbody tr")];
+  const projectors = rows.map((row) => ({
+    name: row.dataset.name,
+    gamma: Number(row.querySelector(".pj-gamma").value) || 2.2,
+  }));
+  const blend = $("pj-blend").value === "on";
+  // Nothing configured and nothing enabled: remove the section entirely.
+  const bodyValue = (projectors.length === 0 && !blend)
+    ? null : { blend, outputs: projectors };
+  document.activeElement?.blur();
+  await save("/config/projection", bodyValue);
+}, "saved projection");
+
 // --- backgrounds ---------------------------------------------------------
 
 const DEFAULT_BG_COLOR = "#000000";
@@ -1080,7 +1169,7 @@ async function loadConfig() {
   if (document.activeElement !== $("config-json")) {
     $("config-json").value = JSON.stringify(config, null, 2);
   }
-  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers();
+  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection();
   if (selected) renderOutputBackgroundChoices(
     (config?.outputs ?? []).find((o) => o.match?.name === selected)?.background);
 }

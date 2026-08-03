@@ -91,6 +91,7 @@ mod tests {
             "/events",
             "/reconcile",
             "/wallpapers",
+            "/config/projection",
         ] {
             assert!(INDEX.contains(path), "the UI never calls {path}");
         }
@@ -109,6 +110,7 @@ mod tests {
             "adaptiveSync",
             "heartbeat",
             "env",
+            "gamma",
         ] {
             assert!(INDEX.contains(field), "the UI never sets {field}");
         }

@@ -12,6 +12,8 @@ pub mod error;
 pub mod events;
 pub mod model;
 pub mod probe;
+#[cfg(feature = "projection")]
+pub mod projection;
 pub mod reconciler;
 pub mod snapshot;
 pub mod state;

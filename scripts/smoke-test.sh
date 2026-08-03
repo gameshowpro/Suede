@@ -96,6 +96,22 @@ check "stale If-Match is 409" "409" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config" \
      -H 'content-type: application/json' -H 'if-match: 0' -d '{}')"
 
+# Stored with blending off, so nothing tries to reach a compositor here.
+check "projection config accepted" "200" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
+     -H 'content-type: application/json' \
+     -d '{"blend":false,"outputs":[{"name":"HDMI-A-1","gamma":2.2}]}')"
+check "projection round trips" "2.2" \
+  "$(curl -s "${BASE}/api/v1/config/projection" \
+     | python3 -c 'import sys,json;print(json.load(sys.stdin)["outputs"][0]["gamma"])')"
+check "projection gamma is validated" "422" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
+     -H 'content-type: application/json' \
+     -d '{"blend":true,"outputs":[{"name":"HDMI-A-1","gamma":22}]}')"
+check "projection null clears it" "200" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
+     -H 'content-type: application/json' -d 'null')"
+
 echo
 echo "Reconciliation"
 check "inactive output was enabled" "true" \
@@ -144,7 +160,8 @@ start_daemon || exit 1
 # Give the boot-restore pass time to enable outputs (which includes a settle
 # delay) and launch apps.
 sleep 6
-check "configuration survived the restart" "1" \
+# Revision 3: the initial write plus the two accepted projection writes above.
+check "configuration survived the restart" "3" \
   "$(json_of "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
 check "app was relaunched after restart" "1" \
   "$(json_of "${BASE}/api/v1/apps" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
