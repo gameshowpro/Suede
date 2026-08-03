@@ -79,6 +79,8 @@ impl Modify for SecurityAddon {
         super::config_routes::put_settings,
         super::config_routes::get_projection,
         super::config_routes::put_projection,
+        super::config_routes::put_preview,
+        super::config_routes::delete_preview,
         super::events::stream,
         super::wallpapers::list,
         super::wallpapers::upload,

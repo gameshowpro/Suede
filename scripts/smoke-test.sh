@@ -101,7 +101,7 @@ check "stale If-Match is 409" "409" \
 check "projection config accepted" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' \
-     -d '{"blend":false,"gamma":2.4,"overlap":160,"blackLift":0.05}')"
+     -d '{"blend":false,"gamma":2.4,"blackLift":0.05}')"
 check "projection round trips" "2.4" \
   "$(curl -s "${BASE}/api/v1/config/projection" \
      | python3 -c 'import sys,json;print(json.load(sys.stdin)["gamma"])')"
@@ -111,6 +111,11 @@ check "projection gamma is validated" "422" \
 check "projection null clears it" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' -d 'null')"
+
+# Previews reach the reconciler but never the disk.
+check "preview applies" "204"   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/preview"      -H 'content-type: application/json'      -d "$(curl -s "${BASE}/api/v1/config")")"
+check "preview does not bump the revision" "3"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
+check "preview discards" "204"   "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${BASE}/api/v1/config/preview")"
 
 echo
 echo "Reconciliation"

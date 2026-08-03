@@ -76,40 +76,14 @@ fn area(rect: &Rect) -> i64 {
     rect.width as i64 * rect.height as i64
 }
 
-/// Pairs of outputs whose rectangles intersect in the layout.
-///
-/// Sway keeps every surface in one global coordinate space and each output
-/// renders whatever intersects its box — layer surfaces and windows alike.
-/// Two outputs that overlap therefore *necessarily* show identical pixels in
-/// the shared region, and an edge blend needs the opposite: each projector
-/// fading the other way. Measured on hardware, not inferred.
-pub fn overlapping_pairs(participants: &[Participant]) -> Vec<(String, String)> {
-    let mut pairs = Vec::new();
-    for i in 0..participants.len() {
-        for j in (i + 1)..participants.len() {
-            let (a, b) = (&participants[i], &participants[j]);
-            if let Some(seam) = intersect(&a.rect, &b.rect) {
-                // A mirror is a deliberate arrangement, not a wall seam.
-                if area(&seam) * 5 < area(&a.rect).min(area(&b.rect)) * 4 {
-                    pairs.push((a.name.clone(), b.name.clone()));
-                }
-            }
-        }
-    }
-    pairs
-}
-
-/// One projector's slice of the canvas: which columns it shows, and how its
-/// seam edges fade.
+/// One projector's slice of the canvas: which region it shows, and how its
+/// seam edges fade. `source` is in canvas coordinates; `ramps` are in
+/// slice-local coordinates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SliceSpec {
     pub output: String,
-    /// First canvas column this projector shows.
-    pub source_x: i32,
-    pub width: i32,
-    pub height: i32,
-    /// In slice-local coordinates. Left/Right only: the canvas is a row.
+    pub source: Rect,
     pub ramps: Vec<RampSpec>,
 }
 
@@ -127,242 +101,210 @@ pub struct SlicerSpec {
     /// Render this instead of capturing, for alignment and calibration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<TestPattern>,
-    /// Left to right across the wall.
     pub slices: Vec<SliceSpec>,
 }
 
-/// The canvas a row of projectors renders: its size, and each projector's
-/// slice of it.
+/// Everything the reconciler derives from the configured layout.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CanvasPlan {
+    pub canvas_width: i32,
+    pub canvas_height: i32,
+    /// Where each output goes in *sway's* layout: a plain edge-to-edge
+    /// tiling, row-major by the configured layout. Sway never sees overlaps.
+    pub sway_positions: Vec<(String, i32, i32)>,
+    /// The slices, ready for a [`SlicerSpec`] once the canvas output exists.
+    pub slices: Vec<SliceSpec>,
+}
+
+/// Derive the canvas from the configured layout.
 ///
-/// This is where the overlap is *managed by Suede* instead of by sway.
-/// The projectors sit edge to edge in sway's layout — nothing overlaps
-/// there, so nothing bleeds — while the physical beams overlap on the wall.
-/// The app renders once into a canvas of `Σwidths − (n−1)·overlap`; each
-/// projector is then handed its own copy of its slice, and neighbouring
-/// slices repeat `overlap` columns of the canvas. Because each copy is a
-/// separate buffer on a separate output, the two sides of a seam can carry
-/// opposite fades — the thing sway's shared coordinate space can never do.
-pub fn slicer_spec(
+/// **The layout is the projection configuration.** Each participant's
+/// rectangle is where its beam lands in canvas space; wherever two
+/// rectangles intersect, both projectors show that region of the canvas, and
+/// with `blend` on each fades its own copy toward the neighbour. Every seam
+/// carries its own width because every seam *is* its own intersection —
+/// a top row may overlap differently from a bottom row, grids included.
+///
+/// Returns `None` when nothing overlaps: sway can tile non-overlapping
+/// layouts natively, and the direct path costs nothing per frame.
+pub fn canvas_plan(
     participants: &[Participant],
-    config: &ProjectionConfig,
-    source: &str,
-) -> Option<SlicerSpec> {
-    if participants.len() < 2 || config.overlap <= 0 {
+    config: Option<&ProjectionConfig>,
+) -> Option<CanvasPlan> {
+    if participants.len() < 2 {
         return None;
     }
-    let mut row: Vec<&Participant> = participants.iter().collect();
-    row.sort_by_key(|participant| participant.rect.x);
-
-    let overlap = config.overlap;
-    let canvas_height = row.iter().map(|p| p.rect.height).max().unwrap_or(0);
-    let mut slices = Vec::new();
-    let mut source_x = 0;
-
-    for (index, participant) in row.iter().enumerate() {
-        let width = participant.rect.width;
-        let mut ramps = Vec::new();
-        if config.blend {
-            if index > 0 {
-                ramps.push(RampSpec {
-                    rect: Rect {
-                        x: 0,
-                        y: 0,
-                        width: overlap,
-                        height: canvas_height,
-                    },
-                    fade_to: FadeTo::Left,
-                });
-            }
-            if index + 1 < row.len() {
-                ramps.push(RampSpec {
-                    rect: Rect {
-                        x: width - overlap,
-                        y: 0,
-                        width: overlap,
-                        height: canvas_height,
-                    },
-                    fade_to: FadeTo::Right,
-                });
-            }
-        }
-        slices.push(SliceSpec {
-            output: participant.name.clone(),
-            source_x,
-            width,
-            height: participant.rect.height,
-            ramps,
-        });
-        source_x += width - overlap;
+    let any_overlap = participants.iter().enumerate().any(|(i, a)| {
+        participants[i + 1..]
+            .iter()
+            .any(|b| intersect(&a.rect, &b.rect).is_some())
+    });
+    if !any_overlap {
+        return None;
     }
 
-    Some(SlicerSpec {
-        source: source.to_string(),
-        canvas_width: source_x + overlap,
+    // Normalise so the canvas starts at 0,0 wherever the user drew it.
+    let min_x = participants.iter().map(|p| p.rect.x).min().unwrap_or(0);
+    let min_y = participants.iter().map(|p| p.rect.y).min().unwrap_or(0);
+    let rects: Vec<(String, Rect)> = participants
+        .iter()
+        .map(|p| {
+            (
+                p.name.clone(),
+                Rect {
+                    x: p.rect.x - min_x,
+                    y: p.rect.y - min_y,
+                    width: p.rect.width,
+                    height: p.rect.height,
+                },
+            )
+        })
+        .collect();
+
+    let canvas_width = rects.iter().map(|(_, r)| r.x + r.width).max().unwrap_or(0);
+    let canvas_height = rects.iter().map(|(_, r)| r.y + r.height).max().unwrap_or(0);
+
+    // Ramps from pairwise intersections, when blending is on.
+    let blend = config.is_some_and(|p| p.blend);
+    let mut ramps: Vec<Vec<RampSpec>> = vec![Vec::new(); rects.len()];
+    if blend {
+        for i in 0..rects.len() {
+            for j in (i + 1)..rects.len() {
+                let (a, b) = (&rects[i].1, &rects[j].1);
+                let Some(seam) = intersect(a, b) else {
+                    continue;
+                };
+                // A near-total overlap is a deliberate duplicate (stacked
+                // projectors, a mirror) — both show it at full strength.
+                if area(&seam) * 5 >= area(a).min(area(b)) * 4 {
+                    continue;
+                }
+                // Edge adjacency: the seam spans (most of) the shorter
+                // output along the axis perpendicular to the fade. In a
+                // grid, a corner already receives the product of each
+                // output's horizontal and vertical ramps, which sums to
+                // constant luminance by construction — a diagonal pair must
+                // not add a third.
+                let horizontal = seam.height * 2 >= a.height.min(b.height);
+                let vertical = seam.width * 2 >= a.width.min(b.width);
+                let center_dx = (a.x * 2 + a.width) - (b.x * 2 + b.width);
+                let center_dy = (a.y * 2 + a.height) - (b.y * 2 + b.height);
+                let axis = match (horizontal, vertical) {
+                    (true, false) => Axis::X,
+                    (false, true) => Axis::Y,
+                    (true, true) => {
+                        if center_dx.abs() >= center_dy.abs() {
+                            Axis::X
+                        } else {
+                            Axis::Y
+                        }
+                    }
+                    (false, false) => continue,
+                };
+                let (fade_a, fade_b) = match axis {
+                    Axis::X if center_dx <= 0 => (FadeTo::Right, FadeTo::Left),
+                    Axis::X => (FadeTo::Left, FadeTo::Right),
+                    Axis::Y if center_dy <= 0 => (FadeTo::Bottom, FadeTo::Top),
+                    Axis::Y => (FadeTo::Top, FadeTo::Bottom),
+                };
+                for (index, fade_to) in [(i, fade_a), (j, fade_b)] {
+                    let origin = &rects[index].1;
+                    ramps[index].push(RampSpec {
+                        rect: Rect {
+                            x: seam.x - origin.x,
+                            y: seam.y - origin.y,
+                            width: seam.width,
+                            height: seam.height,
+                        },
+                        fade_to,
+                    });
+                }
+            }
+        }
+    }
+
+    let slices: Vec<SliceSpec> = rects
+        .iter()
+        .zip(ramps)
+        .map(|((name, rect), ramps)| SliceSpec {
+            output: name.clone(),
+            source: *rect,
+            ramps,
+        })
+        .collect();
+
+    // Sway's layout: row-major order of the configured layout, tiled edge to
+    // edge in one row. Purely internal — presenters cover every output.
+    let mut order: Vec<usize> = (0..rects.len()).collect();
+    order.sort_by_key(|&i| (rects[i].1.y, rects[i].1.x));
+    let mut sway_positions = Vec::new();
+    let mut x = 0;
+    for index in order {
+        sway_positions.push((rects[index].0.clone(), x, 0));
+        x += rects[index].1.width;
+    }
+
+    Some(CanvasPlan {
+        canvas_width,
         canvas_height,
-        gamma: config.gamma,
-        black_lift: config.black_lift,
-        pattern: config.test_pattern,
+        sway_positions,
         slices,
     })
 }
 
-/// The signal multiplier and offset for one column of a slice, as fixed-point
-/// `(a, b)` where `out = (a·in) >> 8 + b`.
+/// The signal transfer for one pixel of a slice, as fixed-point `(a, b)`
+/// where `out = (a·in) >> 8 + b`.
 ///
-/// Combines the gamma-shaped ramp (inside a seam) with the black-level
-/// rescale (outside), so the slicer applies one table in one pass. Columns
-/// are enough: the canvas is a row, so every ramp spans full height.
-pub fn column_transfer(slice: &SliceSpec, gamma: f64, black_lift: f64, x: i32) -> (u16, u8) {
-    for ramp in &slice.ramps {
-        if x >= ramp.rect.x && x < ramp.rect.x + ramp.rect.width {
-            let along = match ramp.fade_to {
-                FadeTo::Right => {
-                    1.0 - (x as f64 + 0.5 - ramp.rect.x as f64) / ramp.rect.width as f64
-                }
-                FadeTo::Left => (x as f64 + 0.5 - ramp.rect.x as f64) / ramp.rect.width as f64,
-                // The canvas is a row; vertical fades cannot occur here.
-                FadeTo::Top | FadeTo::Bottom => 1.0,
-            };
-            let multiplier = along.clamp(0.0, 1.0).powf(1.0 / gamma);
-            return ((multiplier * 256.0).round() as u16, 0);
+/// Combines the gamma-shaped ramps (inside seams, multiplied where they
+/// overlap at grid corners) with the black-level rescale (outside), so the
+/// slicer applies one table in one pass.
+pub fn pixel_transfer(
+    ramps: &[RampSpec],
+    gamma: f64,
+    black_lift: f64,
+    x: i32,
+    y: i32,
+) -> (u16, u8) {
+    match ramps_attenuation(ramps, x as f64 + 0.5, y as f64 + 0.5) {
+        Some(transmitted) => {
+            let multiplier = transmitted.clamp(0.0, 1.0).powf(1.0 / gamma);
+            ((multiplier * 256.0).round() as u16, 0)
+        }
+        None => {
+            let lift = black_lift.clamp(0.0, 1.0);
+            (
+                ((1.0 - lift) * 256.0).round() as u16,
+                (lift * 255.0).round() as u8,
+            )
         }
     }
-    let lift = black_lift.clamp(0.0, 1.0);
-    (
-        ((1.0 - lift) * 256.0).round() as u16,
-        (lift * 255.0).round() as u8,
-    )
 }
 
-/// Derive one overlay spec per output that has a seam.
+enum Axis {
+    X,
+    Y,
+}
+
+/// One pattern overlay per output, for bench alignment when no canvas runs.
 ///
-/// Seams come from *adjacency*, not intersection: neighbouring outputs must
-/// abut in the layout, and [`ProjectionConfig::overlap`] says how many pixels
-/// of each one's edge its neighbour also projects onto the wall. That ramp
-/// region lies inside each output, so the two projectors can be given
-/// opposite fades — which is the whole point, and which overlapping outputs
-/// cannot deliver (see [`overlapping_pairs`]).
-///
-/// In a grid, the corner region receives the product of an output's
-/// horizontal and vertical ramps, which sums to constant luminance by
-/// construction; no diagonal seam is needed or wanted.
+/// Ramps live in the slicer now — the canvas is where seams exist. These
+/// overlays only carry test patterns, drawn in layout coordinates so two
+/// physically-aligned projectors superimpose them.
 pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) -> Vec<OverlaySpec> {
-    let mut ramps: Vec<(usize, RampSpec)> = Vec::new();
-    let overlap = config.overlap;
-
-    if config.blend && overlap > 0 {
-        for i in 0..participants.len() {
-            for j in (i + 1)..participants.len() {
-                let (a, b) = (&participants[i].rect, &participants[j].rect);
-
-                // Shared extent along each axis, for the seam's other dimension.
-                let y0 = a.y.max(b.y);
-                let y1 = (a.y + a.height).min(b.y + b.height);
-                let x0 = a.x.max(b.x);
-                let x1 = (a.x + a.width).min(b.x + b.width);
-
-                // Left/right neighbours: one's right edge meets the other's left.
-                if y1 > y0 {
-                    let horizontal = if a.x + a.width == b.x {
-                        Some((i, j, a.x + a.width))
-                    } else if b.x + b.width == a.x {
-                        Some((j, i, b.x + b.width))
-                    } else {
-                        None
-                    };
-                    if let Some((left, right, edge)) = horizontal {
-                        let origin = &participants[left].rect;
-                        ramps.push((
-                            left,
-                            RampSpec {
-                                rect: Rect {
-                                    x: edge - overlap - origin.x,
-                                    y: y0 - origin.y,
-                                    width: overlap,
-                                    height: y1 - y0,
-                                },
-                                fade_to: FadeTo::Right,
-                            },
-                        ));
-                        let origin = &participants[right].rect;
-                        ramps.push((
-                            right,
-                            RampSpec {
-                                rect: Rect {
-                                    x: edge - origin.x,
-                                    y: y0 - origin.y,
-                                    width: overlap,
-                                    height: y1 - y0,
-                                },
-                                fade_to: FadeTo::Left,
-                            },
-                        ));
-                        continue;
-                    }
-                }
-
-                // Above/below neighbours.
-                if x1 > x0 {
-                    let vertical = if a.y + a.height == b.y {
-                        Some((i, j, a.y + a.height))
-                    } else if b.y + b.height == a.y {
-                        Some((j, i, b.y + b.height))
-                    } else {
-                        None
-                    };
-                    if let Some((top, bottom, edge)) = vertical {
-                        let origin = &participants[top].rect;
-                        ramps.push((
-                            top,
-                            RampSpec {
-                                rect: Rect {
-                                    x: x0 - origin.x,
-                                    y: edge - overlap - origin.y,
-                                    width: x1 - x0,
-                                    height: overlap,
-                                },
-                                fade_to: FadeTo::Bottom,
-                            },
-                        ));
-                        let origin = &participants[bottom].rect;
-                        ramps.push((
-                            bottom,
-                            RampSpec {
-                                rect: Rect {
-                                    x: x0 - origin.x,
-                                    y: edge - origin.y,
-                                    width: x1 - x0,
-                                    height: overlap,
-                                },
-                                fade_to: FadeTo::Top,
-                            },
-                        ));
-                    }
-                }
-            }
-        }
+    if config.test_pattern.is_none() {
+        return Vec::new();
     }
-
-    let mut specs: Vec<OverlaySpec> = Vec::new();
-    for (index, participant) in participants.iter().enumerate() {
-        let mine: Vec<RampSpec> = ramps
-            .iter()
-            .filter(|(owner, _)| *owner == index)
-            .map(|(_, ramp)| ramp.clone())
-            .collect();
-        // A test pattern goes to every output, seams or not; without one,
-        // only outputs that actually have something to fade need a process.
-        if !mine.is_empty() || config.test_pattern.is_some() {
-            specs.push(OverlaySpec {
-                output: participant.name.clone(),
-                gamma: config.gamma,
-                black_lift: config.black_lift,
-                rect: participant.rect,
-                pattern: config.test_pattern,
-                ramps: mine,
-            });
-        }
-    }
+    let mut specs: Vec<OverlaySpec> = participants
+        .iter()
+        .map(|participant| OverlaySpec {
+            output: participant.name.clone(),
+            gamma: config.gamma,
+            black_lift: config.black_lift,
+            rect: participant.rect,
+            pattern: config.test_pattern,
+            ramps: Vec::new(),
+        })
+        .collect();
     specs.sort_by(|a, b| a.output.cmp(&b.output));
     specs
 }
@@ -374,9 +316,13 @@ pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) ->
 /// a seam (no lift there — the doubled projector black is the lift), while an
 /// uncovered pixel is outside every seam and receives the black-lift.
 fn attenuation_at(spec: &OverlaySpec, x: f64, y: f64) -> Option<f64> {
+    ramps_attenuation(&spec.ramps, x, y)
+}
+
+fn ramps_attenuation(ramps: &[RampSpec], x: f64, y: f64) -> Option<f64> {
     let mut covered = false;
     let mut transmitted = 1.0;
-    for ramp in &spec.ramps {
+    for ramp in ramps {
         let inside = x >= ramp.rect.x as f64
             && x < (ramp.rect.x + ramp.rect.width) as f64
             && y >= ramp.rect.y as f64
@@ -507,31 +453,43 @@ mod tests {
         }
     }
 
-    fn config() -> ProjectionConfig {
-        // 160 px of beam overlap, the classic two-projector soft edge.
-        ProjectionConfig {
-            overlap: 160,
-            ..ProjectionConfig::default()
-        }
+    fn blending() -> ProjectionConfig {
+        ProjectionConfig::default()
     }
 
-    fn specs_for(participants: &[Participant]) -> Vec<OverlaySpec> {
-        overlay_specs(participants, &config())
-    }
+    // --- the canvas plan: the layout IS the configuration -----------------
 
     #[test]
-    fn two_abutting_outputs_get_mirrored_ramps() {
-        // Edge to edge in the layout; the overlap lives on the wall.
-        let specs = specs_for(&[
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1920, 0, 1920, 1080),
-        ]);
-        assert_eq!(specs.len(), 2);
+    fn an_overlapping_pair_becomes_a_canvas_with_mirrored_ramps() {
+        let plan = canvas_plan(
+            &[
+                participant("DP-3", 0, 0, 1920, 1080),
+                participant("DP-1", 1760, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .expect("overlap must produce a plan");
 
-        let left = &specs[0];
-        assert_eq!(left.output, "DP-1");
+        assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
+        // Sway sees a plain tiling, never the overlap.
+        assert_eq!(
+            plan.sway_positions,
+            vec![("DP-3".into(), 0, 0), ("DP-1".into(), 1920, 0)]
+        );
+
+        let left = &plan.slices[0];
+        assert_eq!(left.output, "DP-3");
+        assert_eq!(
+            left.source,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }
+        );
         assert_eq!(left.ramps.len(), 1);
-        // The seam sits at the right edge of DP-1, in its own coordinates.
+        assert_eq!(left.ramps[0].fade_to, FadeTo::Right);
         assert_eq!(
             left.ramps[0].rect,
             Rect {
@@ -539,149 +497,240 @@ mod tests {
                 y: 0,
                 width: 160,
                 height: 1080
-            },
-            "the left projector fades across its own last 160 px"
-        );
-        assert_eq!(left.ramps[0].fade_to, FadeTo::Right);
-
-        let right = &specs[1];
-        assert_eq!(
-            right.ramps[0].rect,
-            Rect {
-                x: 0,
-                y: 0,
-                width: 160,
-                height: 1080
             }
         );
+
+        let right = &plan.slices[1];
+        assert_eq!(right.source.x, 1760);
         assert_eq!(right.ramps[0].fade_to, FadeTo::Left);
+        assert_eq!(right.ramps[0].rect.width, 160);
     }
 
     #[test]
-    fn a_row_of_four_has_three_seams() {
-        let specs = specs_for(&[
-            participant("DP-1", 0, 0, 1920, 1200),
-            participant("DP-2", 1920, 0, 1920, 1200),
-            participant("DP-3", 3840, 0, 1920, 1200),
-            participant("DP-4", 5760, 0, 1920, 1200),
-        ]);
-        assert_eq!(specs.len(), 4);
-        // The middle projectors blend on both sides; the ends on one.
-        assert_eq!(specs[0].ramps.len(), 1);
-        assert_eq!(specs[1].ramps.len(), 2);
-        assert_eq!(specs[2].ramps.len(), 2);
-        assert_eq!(specs[3].ramps.len(), 1);
-    }
-
-    #[test]
-    fn separated_outputs_produce_nothing() {
-        // A gap in the layout is not a wall: nothing abuts, nothing blends.
-        let specs = specs_for(&[
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 2400, 0, 1920, 1080),
-        ]);
-        assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn a_zero_overlap_means_no_ramps() {
-        // The default: a wall is not blended until its overlap is measured.
-        let specs = overlay_specs(
+    fn every_seam_carries_its_own_overlap() {
+        // A row of three where the rigger got 160 px on one seam and 100 on
+        // the other. No single number can describe this; the layout can.
+        let plan = canvas_plan(
             &[
-                participant("DP-1", 0, 0, 1920, 1080),
-                participant("DP-2", 1920, 0, 1920, 1080),
+                participant("A", 0, 0, 1920, 1080),
+                participant("B", 1760, 0, 1920, 1080),
+                participant("C", 3580, 0, 1920, 1080),
             ],
-            &ProjectionConfig::default(),
-        );
-        assert!(specs.is_empty());
+            Some(&blending()),
+        )
+        .unwrap();
+
+        assert_eq!(plan.canvas_width, 5500);
+        let middle = &plan.slices[1];
+        assert_eq!(middle.ramps.len(), 2);
+        let widths: Vec<i32> = middle.ramps.iter().map(|r| r.rect.width).collect();
+        assert!(widths.contains(&160) && widths.contains(&100), "{widths:?}");
     }
 
     #[test]
-    fn a_mirrored_output_is_not_a_seam() {
-        // The sway same-position trick: a confidence monitor showing the
-        // projector's picture. It does not abut anything, so no ramps.
-        let specs = specs_for(&[
-            participant("PROJECTOR", 0, 0, 1920, 1080),
-            participant("MONITOR", 0, 0, 1920, 1080),
-        ]);
-        assert!(specs.is_empty(), "a full mirror must produce no ramps");
-    }
+    fn rows_can_overlap_differently_from_columns() {
+        // The 2x2 the redesign asked for: the top pair overlaps 160 in x,
+        // the rows overlap 90 in y. Corners come out as the product of the
+        // horizontal and vertical ramps; no diagonal ramp is generated.
+        let plan = canvas_plan(
+            &[
+                participant("A", 0, 0, 1920, 1080),
+                participant("B", 1760, 0, 1920, 1080),
+                participant("C", 0, 990, 1920, 1080),
+                participant("D", 1760, 990, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
 
-    #[test]
-    fn an_operator_monitor_set_apart_is_untouched() {
-        // Two projectors abut; the monitor sits away from them with a gap.
-        let specs = specs_for(&[
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1920, 0, 1920, 1080),
-            participant("HDMI-A-1", 4400, 0, 1920, 1080),
-        ]);
-        assert_eq!(specs.len(), 2);
-        assert!(specs.iter().all(|spec| spec.output != "HDMI-A-1"));
-    }
-
-    #[test]
-    fn vertical_stacks_fade_up_and_down() {
-        let specs = specs_for(&[
-            participant("TOP", 0, 0, 1920, 1080),
-            participant("BOT", 0, 1080, 1920, 1080),
-        ]);
-        // Sorted by name: specs[0] is BOT, specs[1] is TOP. The upper
-        // projector hands over toward its bottom edge, and vice versa.
-        assert_eq!(specs[1].ramps[0].fade_to, FadeTo::Bottom);
-        assert_eq!(specs[0].ramps[0].fade_to, FadeTo::Top);
-        assert_eq!(specs[0].ramps[0].rect.height, 160);
-        // Each ramp sits inside its own output, which is what lets the two
-        // projectors be given opposite fades at all.
-        assert_eq!(specs[0].ramps[0].rect.y, 0, "BOT fades from its top edge");
-        assert_eq!(
-            specs[1].ramps[0].rect.y, 920,
-            "TOP fades into its bottom edge"
-        );
-    }
-
-    #[test]
-    fn a_2x2_grid_gets_two_ramps_per_output_and_no_diagonals() {
-        // Each output overlaps its horizontal neighbour, vertical neighbour,
-        // and (in the middle) its diagonal. The diagonal pair must not add a
-        // third ramp: the corner is already the product of the other two.
-        let specs = specs_for(&[
-            participant("A", 0, 0, 1920, 1080),
-            participant("B", 1920, 0, 1920, 1080),
-            participant("C", 0, 1080, 1920, 1080),
-            participant("D", 1920, 1080, 1920, 1080),
-        ]);
-        assert_eq!(specs.len(), 4);
-        for spec in &specs {
+        assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 2070));
+        for slice in &plan.slices {
             assert_eq!(
-                spec.ramps.len(),
+                slice.ramps.len(),
                 2,
-                "{} should blend on exactly two edges",
-                spec.output
+                "{} should fade on exactly two edges",
+                slice.output
             );
         }
+        let a = &plan.slices[0];
+        let horizontal = a.ramps.iter().find(|r| r.fade_to == FadeTo::Right).unwrap();
+        let vertical = a
+            .ramps
+            .iter()
+            .find(|r| r.fade_to == FadeTo::Bottom)
+            .unwrap();
+        assert_eq!(horizontal.rect.width, 160);
+        assert_eq!(vertical.rect.height, 90);
     }
 
     #[test]
-    fn the_wall_shares_one_gamma_and_lift() {
-        let specs = overlay_specs(
+    fn a_layout_without_overlaps_needs_no_canvas() {
+        // Sway tiles non-overlapping layouts natively; the slicer would be
+        // pure overhead.
+        assert!(canvas_plan(
             &[
-                participant("DP-1", 0, 0, 1920, 1080),
-                participant("DP-2", 1920, 0, 1920, 1080),
+                participant("DP-3", 0, 0, 1920, 1080),
+                participant("DP-1", 1920, 0, 1920, 1080),
             ],
+            Some(&blending()),
+        )
+        .is_none());
+        assert!(canvas_plan(&[participant("DP-1", 0, 0, 1920, 1080)], None).is_none());
+    }
+
+    #[test]
+    fn the_canvas_normalises_wherever_the_layout_was_drawn() {
+        // An operator who drew the wall starting at 500,300 still gets a
+        // canvas anchored at zero.
+        let plan = canvas_plan(
+            &[
+                participant("L", 500, 300, 1920, 1080),
+                participant("R", 2260, 300, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
+        assert_eq!(plan.slices[0].source.x, 0);
+        assert_eq!(plan.slices[0].source.y, 0);
+    }
+
+    #[test]
+    fn a_full_mirror_is_duplicated_but_never_ramped() {
+        // Two projectors stacked for brightness, or a confidence monitor:
+        // both show the region at full strength.
+        let plan = canvas_plan(
+            &[
+                participant("MAIN", 0, 0, 1920, 1080),
+                participant("STACKED", 0, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
+        assert_eq!(plan.slices[0].source, plan.slices[1].source);
+    }
+
+    #[test]
+    fn blend_off_still_slices_but_does_not_fade() {
+        // Physically overlapping beams need the duplication even unblended.
+        let plan = canvas_plan(
+            &[
+                participant("L", 0, 0, 1920, 1080),
+                participant("R", 1760, 0, 1920, 1080),
+            ],
+            Some(&ProjectionConfig {
+                blend: false,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
+
+        // And with no projection section at all, the same.
+        let plan = canvas_plan(
+            &[
+                participant("L", 0, 0, 1920, 1080),
+                participant("R", 1760, 0, 1920, 1080),
+            ],
+            None,
+        )
+        .unwrap();
+        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
+    }
+
+    // --- the per-pixel transfer -------------------------------------------
+
+    #[test]
+    fn seam_light_sums_to_one_through_the_transfer() {
+        let plan = canvas_plan(
+            &[
+                participant("L", 0, 0, 1920, 1080),
+                participant("R", 1760, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        let gamma = 2.2;
+        let left = &plan.slices[0];
+        let right = &plan.slices[1];
+        for offset in 0..160 {
+            let (a_left, _) = pixel_transfer(&left.ramps, gamma, 0.0, 1760 + offset, 500);
+            let (a_right, _) = pixel_transfer(&right.ramps, gamma, 0.0, offset, 500);
+            let light = (a_left as f64 / 256.0).powf(gamma) + (a_right as f64 / 256.0).powf(gamma);
+            assert!(
+                (light - 1.0).abs() < 0.03,
+                "column {offset}: light sums to {light}"
+            );
+        }
+        // Outside the seam: identity.
+        assert_eq!(pixel_transfer(&left.ramps, gamma, 0.0, 800, 500), (256, 0));
+    }
+
+    #[test]
+    fn black_lift_applies_outside_seams_only() {
+        let plan = canvas_plan(
+            &[
+                participant("L", 0, 0, 1920, 1080),
+                participant("R", 1760, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        let left = &plan.slices[0];
+        // Outside: out = lift + (1-lift)*in.
+        let (a, b) = pixel_transfer(&left.ramps, 2.2, 0.1, 800, 500);
+        assert_eq!(b, 26, "lift offset should be 0.1*255");
+        assert_eq!(a, 230, "multiplier should be (1-0.1)*256");
+        // Inside the seam: no lift, the doubled projector black is the lift.
+        let (_, b) = pixel_transfer(&left.ramps, 2.2, 0.1, 1840, 500);
+        assert_eq!(b, 0);
+    }
+
+    #[test]
+    fn corner_regions_multiply_their_ramps() {
+        let plan = canvas_plan(
+            &[
+                participant("A", 0, 0, 1920, 1080),
+                participant("B", 1760, 0, 1920, 1080),
+                participant("C", 0, 990, 1920, 1080),
+                participant("D", 1760, 990, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        // Slice A, mid-corner: both ramps at half strength -> product 0.25
+        // of the light, signal multiplier 0.25^(1/gamma).
+        let a = &plan.slices[0];
+        let (mid, _) = pixel_transfer(&a.ramps, 2.0, 0.0, 1840, 1035);
+        let expected = (0.25f64).powf(0.5);
+        assert!(
+            ((mid as f64 / 256.0) - expected).abs() < 0.02,
+            "corner multiplier was {mid}"
+        );
+    }
+
+    // --- pattern overlays --------------------------------------------------
+
+    #[test]
+    fn overlays_exist_only_for_test_patterns() {
+        let wall = [
+            participant("DP-3", 0, 0, 1920, 1080),
+            participant("DP-1", 1920, 0, 1920, 1080),
+        ];
+        assert!(overlay_specs(&wall, &blending()).is_empty());
+        let specs = overlay_specs(
+            &wall,
             &ProjectionConfig {
-                gamma: 2.4,
-                black_lift: 0.05,
-                ..config()
+                test_pattern: Some(TestPattern::Grid),
+                ..Default::default()
             },
         );
-        for spec in &specs {
-            assert_eq!(spec.gamma, 2.4);
-            assert_eq!(spec.black_lift, 0.05);
-            // Each spec carries its own output's place in the layout, for
-            // global-coordinate pattern drawing.
-            assert!(spec.rect.width == 1920);
-        }
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|spec| spec.ramps.is_empty()));
     }
+
+    // --- the overlay pixel paths (unchanged math, kept honest) -------------
 
     fn ramp_only_spec(gamma: f64, width: i32) -> OverlaySpec {
         OverlaySpec {
@@ -705,203 +754,14 @@ mod tests {
     #[test]
     fn gamma_shapes_the_alpha() {
         let map = alpha_map(100, 1, &ramp_only_spec(2.2, 100));
-        // Midway across the ramp, half the light must remain: the *signal*
-        // multiplier is 0.5^(1/2.2) ≈ 0.73, so alpha ≈ 0.27 — noticeably
-        // less than the 0.5 a signal-space gradient would apply.
         let mid = map[50] as f64 / 255.0;
         assert!((mid - 0.27).abs() < 0.02, "alpha at midpoint was {mid}");
-        // The interior edge leaves the picture essentially untouched (the
-        // first pixel centre sits half a pixel into the ramp, so ≤1/255).
-        assert!(map[0] <= 1, "interior edge should be clear, was {}", map[0]);
-        // The far edge is almost fully handed over. Not 255: gamma shaping is
-        // steepest near zero (0.5% of the light still needs 9% of the signal),
-        // and the last pixel centre sits half a pixel shy of the true edge —
-        // where the neighbour's mirrored ramp makes up exactly the remainder.
-        assert!(
-            map[99] >= 220,
-            "far edge should be near-opaque, was {}",
-            map[99]
-        );
+        assert!(map[0] <= 1);
+        assert!(map[99] >= 220);
     }
 
     #[test]
-    fn luminance_sums_to_one_across_a_seam() {
-        // The mathematical point of the whole feature: at every column of the
-        // seam, what the left projector still shows plus what the right one
-        // shows adds to the full picture, within 8-bit quantisation.
-        let gamma = 2.2;
-        let specs = overlay_specs(
-            &[
-                participant("L", 0, 0, 1920, 1080),
-                participant("R", 1920, 0, 1920, 1080),
-            ],
-            &config(),
-        );
-        let left = alpha_map(1920, 1, &specs[0]);
-        let right = alpha_map(1920, 1, &specs[1]);
-        for offset in 0..160u32 {
-            let a = 1.0 - left[(1760 + offset) as usize] as f64 / 255.0;
-            let b = 1.0 - right[offset as usize] as f64 / 255.0;
-            let luminance = a.powf(gamma) + b.powf(gamma);
-            assert!(
-                (luminance - 1.0).abs() < 0.02,
-                "column {offset}: luminance sums to {luminance}"
-            );
-        }
-    }
-
-    #[test]
-    fn gamma_one_is_a_plain_linear_gradient() {
-        let map = alpha_map(256, 1, &ramp_only_spec(1.0, 256));
-        let quarter = map[64] as f64 / 255.0;
-        assert!((quarter - 0.25).abs() < 0.01);
-    }
-
-    #[test]
-    fn overlapping_ramps_multiply_in_light() {
-        // A grid corner: horizontal and vertical ramps cover the same pixels.
-        let spec = OverlaySpec {
-            output: "A".into(),
-            gamma: 2.0,
-            black_lift: 0.0,
-            rect: Rect::default(),
-            pattern: None,
-            ramps: vec![
-                RampSpec {
-                    rect: Rect {
-                        x: 0,
-                        y: 0,
-                        width: 10,
-                        height: 10,
-                    },
-                    fade_to: FadeTo::Right,
-                },
-                RampSpec {
-                    rect: Rect {
-                        x: 0,
-                        y: 0,
-                        width: 10,
-                        height: 10,
-                    },
-                    fade_to: FadeTo::Bottom,
-                },
-            ],
-        };
-        let map = alpha_map(10, 10, &spec);
-        // At (5,5) each ramp transmits 0.45 of the light; together 0.2025.
-        let alpha = map[5 * 10 + 5] as f64 / 255.0;
-        let transmitted = (1.0 - alpha).powf(2.0);
-        assert!(
-            (transmitted - 0.2025).abs() < 0.02,
-            "transmitted {transmitted}"
-        );
-    }
-
-    #[test]
-    fn black_lift_paints_white_outside_the_seam_only() {
-        let spec = OverlaySpec {
-            output: "DP-1".into(),
-            gamma: 2.2,
-            black_lift: 0.1,
-            rect: Rect::default(),
-            pattern: None,
-            ramps: vec![RampSpec {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 4,
-                    height: 1,
-                },
-                fade_to: FadeTo::Left,
-            }],
-        };
-        let pixels = pixel_map(8, 1, &spec);
-
-        // Inside the seam: black — colour bytes zero, only alpha set. The
-        // doubled projector black is the lift there; adding more would glow.
-        assert_eq!(&pixels[0..3], &[0, 0, 0], "seam pixels must stay black");
-        // Outside: premultiplied white at the lift alpha. Compositing gives
-        // out = 0.9·content + 0.1·white — the black-level rescale.
-        let lift = (0.1f64 * 255.0).round() as u8;
-        assert_eq!(&pixels[6 * 4..6 * 4 + 4], &[lift, lift, lift, lift]);
-    }
-
-    #[test]
-    fn zero_lift_leaves_the_rest_of_the_screen_alone() {
-        let pixels = pixel_map(8, 1, &ramp_only_spec(2.2, 4));
-        assert_eq!(
-            &pixels[6 * 4..6 * 4 + 4],
-            &[0, 0, 0, 0],
-            "no lift: fully transparent outside the seam"
-        );
-    }
-
-    #[test]
-    fn the_spec_serialises_stably_for_the_subcommand() {
-        // The spec crosses a process boundary as JSON; field names are ABI.
-        let spec = OverlaySpec {
-            output: "DP-1".into(),
-            gamma: 2.2,
-            black_lift: 0.04,
-            rect: Rect::default(),
-            pattern: None,
-            ramps: vec![RampSpec {
-                rect: Rect {
-                    x: 1760,
-                    y: 0,
-                    width: 160,
-                    height: 1080,
-                },
-                fade_to: FadeTo::Right,
-            }],
-        };
-        let json = serde_json::to_string(&spec).unwrap();
-        assert!(json.contains(r#""fadeTo":"right""#), "{json}");
-        assert!(json.contains(r#""blackLift":0.04"#), "{json}");
-        let back: OverlaySpec = serde_json::from_str(&json).unwrap();
-        assert_eq!(back, spec);
-    }
-
-    #[test]
-    fn a_pattern_reaches_every_output_even_without_seams() {
-        // A lone bench monitor still shows the pattern; without one, a
-        // rampless output needs no process at all.
-        let lone = [participant("DP-1", 0, 0, 1920, 1080)];
-        assert!(specs_for(&lone).is_empty());
-
-        let with_pattern = overlay_specs(
-            &lone,
-            &ProjectionConfig {
-                test_pattern: Some(crate::model::TestPattern::Grid),
-                ..config()
-            },
-        );
-        assert_eq!(with_pattern.len(), 1);
-        assert!(with_pattern[0].ramps.is_empty());
-    }
-
-    #[test]
-    fn blend_off_keeps_the_pattern_but_drops_the_ramps() {
-        // Alignment happens before blending is enabled, so the pattern must
-        // not depend on it.
-        let wall = [
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1920, 0, 1920, 1080),
-        ];
-        let specs = overlay_specs(
-            &wall,
-            &ProjectionConfig {
-                blend: false,
-                test_pattern: Some(crate::model::TestPattern::White),
-                ..config()
-            },
-        );
-        assert_eq!(specs.len(), 2);
-        assert!(specs.iter().all(|spec| spec.ramps.is_empty()));
-    }
-
-    #[test]
-    fn a_pattern_overlay_is_opaque_and_ramp_shaped() {
+    fn a_pattern_overlay_is_opaque() {
         let spec = OverlaySpec {
             output: "DP-1".into(),
             gamma: 2.2,
@@ -912,99 +772,46 @@ mod tests {
                 width: 100,
                 height: 1,
             },
-            pattern: Some(crate::model::TestPattern::White),
-            ramps: vec![RampSpec {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 100,
-                    height: 1,
-                },
-                fade_to: FadeTo::Right,
-            }],
+            pattern: Some(TestPattern::White),
+            ramps: Vec::new(),
         };
         let pixels = pixel_map(100, 1, &spec);
-        // Every pixel opaque.
         assert!((0..100).all(|x| pixels[x * 4 + 3] == 255));
-        // White through the ramp: midway the signal is 0.5^(1/2.2) of full.
-        let mid = pixels[50 * 4] as f64 / 255.0;
-        assert!((mid - 0.73).abs() < 0.02, "midpoint signal was {mid}");
     }
 
     #[test]
-    fn a_black_pattern_with_lift_shows_the_lift_itself() {
-        // Exactly the tuning scenario: black content everywhere, so the
-        // un-seamed region shows precisely the configured lift.
-        let spec = OverlaySpec {
-            output: "DP-1".into(),
+    fn the_slicer_spec_serialises_stably() {
+        // The spec crosses a process boundary as JSON; field names are ABI.
+        let spec = SlicerSpec {
+            source: "HEADLESS-1".into(),
+            canvas_width: 3680,
+            canvas_height: 1080,
             gamma: 2.2,
-            black_lift: 0.1,
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: 8,
-                height: 1,
-            },
-            pattern: Some(crate::model::TestPattern::Black),
-            ramps: vec![RampSpec {
-                rect: Rect {
+            black_lift: 0.04,
+            pattern: None,
+            slices: vec![SliceSpec {
+                output: "DP-3".into(),
+                source: Rect {
                     x: 0,
                     y: 0,
-                    width: 4,
-                    height: 1,
+                    width: 1920,
+                    height: 1080,
                 },
-                fade_to: FadeTo::Left,
+                ramps: vec![RampSpec {
+                    rect: Rect {
+                        x: 1760,
+                        y: 0,
+                        width: 160,
+                        height: 1080,
+                    },
+                    fade_to: FadeTo::Right,
+                }],
             }],
         };
-        let pixels = pixel_map(8, 1, &spec);
-        // Inside the seam: black stays black (the doubled projector black is
-        // the lift there).
-        assert_eq!(pixels[2 * 4], 0);
-        // Outside: the lift, verbatim.
-        assert_eq!(pixels[6 * 4], (0.1f64 * 255.0).round() as u8);
-    }
-
-    // --- the overlapping-output limitation --------------------------------
-
-    #[test]
-    fn overlapping_outputs_are_reported_as_unblendable() {
-        // Measured on hardware, not assumed: sway renders every surface that
-        // intersects an output's box, so two overlapping outputs show the
-        // same pixels there and no ramp can fade them apart.
-        let pairs = overlapping_pairs(&[
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1760, 0, 1920, 1080),
-        ]);
-        assert_eq!(pairs, vec![("DP-1".to_string(), "DP-2".to_string())]);
-    }
-
-    #[test]
-    fn outputs_laid_edge_to_edge_are_blendable() {
-        // The arrangement that does work: no intersection, nothing bleeds.
-        let pairs = overlapping_pairs(&[
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("DP-2", 1920, 0, 1920, 1080),
-        ]);
-        assert!(pairs.is_empty());
-    }
-
-    #[test]
-    fn a_mirror_is_not_reported_as_an_unblendable_overlap() {
-        // A confidence monitor duplicating a projector is deliberate, and
-        // produces no seam, so it must not raise the divergence either.
-        let pairs = overlapping_pairs(&[
-            participant("PROJECTOR", 0, 0, 1920, 1080),
-            participant("MONITOR", 0, 0, 1920, 1080),
-        ]);
-        assert!(pairs.is_empty());
-    }
-
-    #[test]
-    fn an_operator_monitor_beside_the_wall_is_not_an_overlap() {
-        let pairs = overlapping_pairs(&[
-            participant("DP-1", 0, 0, 1920, 1080),
-            participant("HDMI-A-1", 1920, 0, 1920, 1080),
-        ]);
-        assert!(pairs.is_empty());
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains(r#""canvasWidth":3680"#), "{json}");
+        assert!(json.contains(r#""fadeTo":"right""#), "{json}");
+        let back: SlicerSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, spec);
     }
 }

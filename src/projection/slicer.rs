@@ -39,7 +39,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-use super::blend::{column_transfer, OverlaySpec, SlicerSpec};
+use super::blend::{pixel_transfer, OverlaySpec, SlicerSpec};
 
 /// Consecutive capture failures tolerated before giving up. The daemon
 /// respawns the slicer on its next pass, which is the retry policy.
@@ -90,9 +90,12 @@ struct Presenter {
     /// Two buffers, alternated so we never write one the compositor reads.
     buffers: Vec<(WlBuffer, memmap2::MmapMut)>,
     next_buffer: usize,
-    /// Fixed-point per-column transfer `(a, b)`: `out = (a·in)>>8 + b`.
+    /// Fixed-point per-pixel transfer `(a, b)`: `out = (a·in)>>8 + b`,
+    /// row-major at the configured size. Two-dimensional because seams can
+    /// run on any edge — a grid corner is the product of two ramps.
     transfer: Vec<(u16, u8)>,
-    source_x: i32,
+    /// This presenter's region of the canvas.
+    source: crate::model::Rect,
 }
 
 #[derive(Default)]
@@ -176,17 +179,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         layer_surface.set_size(0, 0);
         surface.commit();
 
-        let transfer = (0..slice.width)
-            .map(|x| column_transfer(slice, spec.gamma, spec.black_lift, x))
-            .collect();
         state.presenters.push(Presenter {
             surface,
             layer_surface,
             configured: None,
             buffers: Vec::new(),
             next_buffer: 0,
-            transfer,
-            source_x: slice.source_x,
+            transfer: Vec::new(),
+            source: slice.source,
         });
     }
 
@@ -196,13 +196,28 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    for presenter in &mut state.presenters {
+    for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
         let (width, height) = presenter.configured.unwrap();
         for _ in 0..2 {
             presenter
                 .buffers
                 .push(shm_buffer(&shm, &handle, width, height)?);
         }
+        // Built at the *presented* size: ramps are defined against the
+        // slice, and any mismatch shows up as identity pixels, not a panic.
+        let mut transfer = Vec::with_capacity(width as usize * height as usize);
+        for y in 0..height as i32 {
+            for x in 0..width as i32 {
+                transfer.push(pixel_transfer(
+                    &slice.ramps,
+                    spec.gamma,
+                    spec.black_lift,
+                    x,
+                    y,
+                ));
+            }
+        }
+        presenter.transfer = transfer;
     }
 
     if let Some(pattern) = spec.pattern {
@@ -367,24 +382,35 @@ fn present_frame(state: &mut State, _spec: &SlicerSpec) {
         let Some((width, height)) = presenter.configured else {
             continue;
         };
-        let rows = height.min(usable_height);
+        let source_x = presenter.source.x.max(0) as u32;
+        let source_y = presenter.source.y.max(0) as u32;
+        let rows = height.min(usable_height.saturating_sub(source_y));
         let index = presenter.next_buffer % presenter.buffers.len();
         presenter.next_buffer = presenter.next_buffer.wrapping_add(1);
-        let source_x = presenter.source_x.max(0) as u32;
         let copy_width = width.min(usable_width.saturating_sub(source_x)) as usize;
-        if copy_width == 0 {
+        if copy_width == 0 || rows == 0 {
             continue;
         }
 
         {
             let (_, map) = &mut presenter.buffers[index];
             for y in 0..rows {
-                let source_y = if y_invert { usable_height - 1 - y } else { y };
-                let src_row = source_y as usize * stride as usize;
+                let canvas_row = source_y + y;
+                let canvas_row = if y_invert {
+                    usable_height - 1 - canvas_row
+                } else {
+                    canvas_row
+                };
+                let src_row = canvas_row as usize * stride as usize;
                 let dst_row = y as usize * width as usize * 4;
+                let transfer_row = y as usize * width as usize;
                 for x in 0..copy_width {
                     let src = src_row + (source_x as usize + x) * format.bytes;
-                    let (a, b) = presenter.transfer.get(x).copied().unwrap_or((256, 0));
+                    let (a, b) = presenter
+                        .transfer
+                        .get(transfer_row + x)
+                        .copied()
+                        .unwrap_or((256, 0));
                     let shade = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
                     let dst = &mut map[dst_row + x * 4..dst_row + x * 4 + 4];
                     // Presenters are always BGRA, opaque.
@@ -416,12 +442,7 @@ fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::
             output: slice.output.clone(),
             gamma: spec.gamma,
             black_lift: 0.0,
-            rect: crate::model::Rect {
-                x: slice.source_x,
-                y: 0,
-                width: slice.width,
-                height: slice.height,
-            },
+            rect: slice.source,
             pattern: Some(pattern),
             ramps: Vec::new(),
         };
@@ -429,7 +450,11 @@ fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::
         let (_, map) = &mut presenter.buffers[0];
         for y in 0..height as usize {
             for x in 0..width as usize {
-                let (a, b) = presenter.transfer.get(x).copied().unwrap_or((256, 0));
+                let (a, b) = presenter
+                    .transfer
+                    .get(y * width as usize + x)
+                    .copied()
+                    .unwrap_or((256, 0));
                 let src = &rgb[(y * width as usize + x) * 3..(y * width as usize + x) * 3 + 3];
                 let out = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
                 let dst = &mut map[(y * width as usize + x) * 4..(y * width as usize + x) * 4 + 4];

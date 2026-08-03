@@ -425,6 +425,37 @@ pub async fn put_projection(
     state.commit(next, "projection", query.wait).await.map(Json)
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/config/preview", tag = "config",
+    request_body = DesiredState,
+    responses(
+        (status = 204, description = "Preview applied to the outputs; nothing persisted"),
+        (status = 422, description = "Validation failed"),
+    )
+)]
+pub async fn put_preview(
+    State(state): State<ApiState>,
+    Json(body): Json<DesiredState>,
+) -> ApiResult<StatusCode> {
+    // Same validation as a real write: a preview that could not be saved
+    // must not reach the outputs either.
+    body.validate()
+        .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
+    state.store.set_preview(Some(body));
+    state.trigger.request("preview");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete, path = "/api/v1/config/preview", tag = "config",
+    responses((status = 204, description = "Preview discarded; persisted state re-applied"))
+)]
+pub async fn delete_preview(State(state): State<ApiState>) -> StatusCode {
+    state.store.set_preview(None);
+    state.trigger.request("preview cancelled");
+    StatusCode::NO_CONTENT
+}
+
 /// Shared by handlers that need to report an unexpected state error.
 #[allow(dead_code)]
 fn internal(error: impl std::fmt::Display) -> ApiError {
@@ -887,13 +918,12 @@ mod tests {
             &harness,
             "PUT",
             "/api/v1/config/projection",
-            Some(r#"{"blend":true,"gamma":2.4,"overlap":160,"blackLift":0.04}"#),
+            Some(r#"{"blend":true,"gamma":2.4,"blackLift":0.04}"#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["projection"]["gamma"], 2.4);
         assert_eq!(body["projection"]["blackLift"], 0.04);
-        assert_eq!(body["projection"]["overlap"], 160);
 
         let (status, body) = call(&harness, "PUT", "/api/v1/config/projection", Some("null")).await;
         assert_eq!(status, StatusCode::OK);
@@ -913,24 +943,76 @@ mod tests {
         assert_eq!(body["projection"]["blend"], true);
         assert_eq!(body["projection"]["gamma"], 2.2);
         assert_eq!(body["projection"]["blackLift"], 0.0);
-        // Zero overlap: a wall is not blended until its seam is measured.
-        assert_eq!(body["projection"]["overlap"], 0);
     }
 
     #[tokio::test]
-    async fn projection_overlap_is_range_checked() {
+    async fn a_preview_reaches_the_reconciler_but_never_the_disk() {
         let harness = harness(None);
-        let (status, body) = call(
+        let persisted = harness.state.store.get();
+
+        let mut preview = persisted.clone();
+        preview.settings.allow_raw_sway_commands = true;
+        let (status, _) = call(
             &harness,
             "PUT",
-            "/api/v1/config/projection",
-            Some(r#"{"overlap":9000}"#),
+            "/api/v1/config/preview",
+            Some(&serde_json::to_string(&preview).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(harness.state.store.has_preview());
+        assert!(
+            harness
+                .state
+                .store
+                .effective()
+                .settings
+                .allow_raw_sway_commands
+        );
+        // The persisted document is untouched — a restart would discard it.
+        assert!(!harness.state.store.get().settings.allow_raw_sway_commands);
+
+        let (status, _) = call(&harness, "DELETE", "/api/v1/config/preview", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(!harness.state.store.has_preview());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_preview_is_refused_like_any_write() {
+        let harness = harness(None);
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/preview",
+            Some(
+                r#"{"apps":[{"id":"x","launcher":{"kind":"exec","command":"true"}},
+                              {"id":"x","launcher":{"kind":"exec","command":"true"}}]}"#,
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!harness.state.store.has_preview());
+    }
+
+    #[tokio::test]
+    async fn a_committed_write_discards_the_preview() {
+        let harness = harness(None);
+        let mut preview = harness.state.store.get();
+        preview.settings.allow_raw_sway_commands = true;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config/preview",
+            Some(&serde_json::to_string(&preview).unwrap()),
+        )
+        .await;
+        assert!(harness.state.store.has_preview());
+
+        let (status, _) = call(&harness, "PUT", "/api/v1/config/backgrounds", Some("[]")).await;
+        assert_eq!(status, StatusCode::OK);
         assert!(
-            body["detail"].as_str().unwrap().contains("0 and 4096"),
-            "{body}"
+            !harness.state.store.has_preview(),
+            "saving must supersede the preview"
         );
     }
 

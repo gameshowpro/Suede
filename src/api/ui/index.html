@@ -213,19 +213,14 @@ window.addEventListener("error", (event) => {
 
     <div class="panel" id="projection-panel">
       <h2>Projection</h2>
-      <p class="hint">For a wall of projectors: lay the outputs <b>edge to
-        edge</b> above, give each projector its own app showing its slice of
-        the content, and set how many pixels the beams overlap on the wall.
-        Each seam is then faded from both sides so the doubled light adds up
-        to one seamless picture. Displays that touch nothing are untouched.</p>
-      <p class="hint">Outputs positioned to <i>overlap</i> cannot be blended:
-        sway gives both projectors the same pixels there, so no ramp can fade
-        them apart. Suede reports that instead of making the seam worse.</p>
+      <p class="hint">The overlaps come from the layout above: drag the
+        displays so they overlap exactly as the beams do on the wall — every
+        seam its own amount. Suede renders the app once into that canvas and
+        slices it per projector; with blending on, each seam is faded from
+        both sides so the doubled light adds up to one seamless picture.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <select id="pj-blend"><option value="off">Off</option><option value="on">On</option></select></div>
-        <div><label for="pj-overlap">Beam overlap (px)</label>
-          <input id="pj-overlap" type="number" step="10" min="0" max="4096" value="0"></div>
         <div><label for="pj-gamma">Projector gamma</label>
           <input id="pj-gamma" type="number" step="0.05" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
@@ -245,6 +240,7 @@ window.addEventListener("error", (event) => {
         matches them.</p>
       <div class="row" style="margin-top:10px">
         <button class="action" id="pj-save">Save</button>
+        <button class="action ghost" id="pj-cancel">Cancel</button>
         <span class="hint" id="pj-note"></span>
       </div>
     </div>
@@ -454,6 +450,42 @@ const escape = (v) => String(v ?? "").replace(/[&<>"]/g,
 const modeLabel = (m) => m ? `${m.width}×${m.height} @ ${Math.round(m.refreshHz * 100) / 100}Hz` : "—";
 const bytes = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} kB`;
 
+// --- live preview --------------------------------------------------------
+//
+// Edits are pushed to the outputs as they are made, but nothing touches disk
+// until Save: the daemon holds them as a preview that any committed write or
+// restart discards. Cancel reverts to the snapshot taken at load/save.
+let configSnapshot = null;
+let previewTimer = null;
+let previewActive = false;
+
+function pushPreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(async () => {
+    try {
+      await api("/config/preview", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(config),
+      });
+      previewActive = true;
+    } catch (error) {
+      toast(error.message, true);
+    }
+  }, 300);
+}
+
+async function cancelPreview() {
+  clearTimeout(previewTimer);
+  if (previewActive) {
+    previewActive = false;
+    try { await api("/config/preview", { method: "DELETE" }); } catch {}
+  }
+  config = structuredClone(configSnapshot);
+  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection();
+  if (selected) selectOutput(selected);
+}
+
 async function run(operation, successMessage) {
   try {
     const result = await operation();
@@ -602,40 +634,58 @@ function renderAlerts() {
 
 // --- displays ------------------------------------------------------------
 
+// The rectangle an output occupies in *canvas space*: the configured
+// position and mode. This is the layout the operator edits — overlaps here
+// are the projection overlaps, resolved by the slicer, and sway never sees
+// them. Observed geometry is only a fallback for unconfigured displays.
+function canvasRect(output) {
+  const configured = (config?.outputs ?? []).find((o) => o.match?.name === output.name);
+  const width = configured?.mode?.width ?? output.rect.width;
+  const height = configured?.mode?.height ?? output.rect.height;
+  const x = configured?.position?.x ?? output.rect.x;
+  const y = configured?.position?.y ?? output.rect.y;
+  return { x, y, width, height, configured };
+}
+
+function physicalOutputs() {
+  // The canvas output is Suede's own machinery, not a display to arrange.
+  return outputs.filter((o) => !/^(HEADLESS|WL|X11)-/.test(o.name));
+}
+
 function renderLayout() {
   const container = $("layout");
   container.innerHTML = "";
-  // The canvas output is Suede's own machinery, not a display to arrange.
-  const physical = outputs.filter((o) => !/^(HEADLESS|WL|X11)-/.test(o.name));
+  const physical = physicalOutputs();
   const active = physical.filter((o) => o.active && o.rect.width > 0);
   $("layout-hint").textContent = active.length
-    ? "Click a display to configure it."
+    ? "Click a display to configure it. Overlaps drawn here are projected " +
+      "by both machines and blended — sway itself never sees them."
     : (physical.length ? "No outputs are enabled. Click one below to enable it."
                        : "No outputs detected.");
 
-  const spanX = Math.max(...active.map((o) => o.rect.x + o.rect.width), 1920);
-  const spanY = Math.max(...active.map((o) => o.rect.y + o.rect.height), 1080);
+  const rects = physical.map((o) => ({ output: o, r: canvasRect(o) }));
+  const spanX = Math.max(...rects.map(({ r }) => r.x + r.width), 1920);
+  const spanY = Math.max(...rects.map(({ r }) => r.y + r.height), 1080);
   const box = container.getBoundingClientRect();
   const scale = Math.min((box.width - 20) / spanX, (box.height - 62) / spanY);
 
-  physical.forEach((output, index) => {
+  rects.forEach(({ output, r }, index) => {
     const el = document.createElement("div");
     el.className = "screen" + (output.active ? "" : " inactive")
                  + (selected === output.name ? " selected" : "");
-    if (output.active && output.rect.width > 0) {
-      el.style.left = `${10 + output.rect.x * scale}px`;
-      el.style.top = `${10 + output.rect.y * scale}px`;
-      el.style.width = `${output.rect.width * scale}px`;
-      el.style.height = `${output.rect.height * scale}px`;
+    if (r.width > 0) {
+      el.style.left = `${10 + r.x * scale}px`;
+      el.style.top = `${10 + r.y * scale}px`;
+      el.style.width = `${r.width * scale}px`;
+      el.style.height = `${r.height * scale}px`;
     } else {
       el.style.left = `${10 + index * 130}px`;
       el.style.bottom = "10px"; el.style.width = "120px"; el.style.height = "42px";
     }
-    const configured = (config?.outputs ?? []).find((o) => o.match?.name === output.name);
     el.innerHTML = `<b>${escape(output.name)}</b>` +
-      `<span>${output.active ? escape(modeLabel(output.currentMode)) : "disabled"}</span>` +
-      (configured?.background
-        ? `<span class="muted">bg: ${escape(backgroundLabel(configured.background))}</span>` : "");
+      `<span>${r.width}×${r.height}${output.active ? "" : " (disabled)"}</span>` +
+      (r.configured?.background
+        ? `<span class="muted">bg: ${escape(backgroundLabel(r.configured.background))}</span>` : "");
     el.onclick = () => selectOutput(output.name);
     container.appendChild(el);
   });
@@ -653,50 +703,39 @@ function renderLayout() {
   }
 }
 
-// What a spanned app is actually handed: the bounding box of the layout.
-// Overlaps make that smaller than the sum of the panels, and the difference
-// is exactly the pixels each seam shows twice — the number an operator needs
-// when authoring content for the wall.
+// The canvas the active app renders into: the bounding box of the configured
+// layout. Overlapping regions are inside the box once — authored once,
+// projected twice — so no arithmetic beyond the bounding box is needed.
 function renderLayoutSize() {
-  const active = outputs.filter((o) => o.active && o.rect.width > 0 &&
-    !/^(HEADLESS|WL|X11)-/.test(o.name));
   const el = $("layout-size");
-  if (active.length === 0) { el.textContent = ""; return; }
+  const entries = physicalOutputs()
+    .map((o) => ({ o, r: canvasRect(o) }))
+    .filter(({ o, r }) => r.width > 0 && (r.configured?.enable ?? o.active));
+  if (entries.length === 0) { el.textContent = ""; return; }
 
-  const left = Math.min(...active.map((o) => o.rect.x));
-  const top = Math.min(...active.map((o) => o.rect.y));
-  const right = Math.max(...active.map((o) => o.rect.x + o.rect.width));
-  const bottom = Math.max(...active.map((o) => o.rect.y + o.rect.height));
-  const width = right - left;
-  const height = bottom - top;
+  const left = Math.min(...entries.map(({ r }) => r.x));
+  const top = Math.min(...entries.map(({ r }) => r.y));
+  const width = Math.max(...entries.map(({ r }) => r.x + r.width)) - left;
+  const height = Math.max(...entries.map(({ r }) => r.y + r.height)) - top;
 
-  const panelWidth = active.reduce((sum, o) => sum + o.rect.width, 0);
-  const sharedX = active.length > 1 ? panelWidth - width : 0;
-
-  let text = `Displays: ${active.length}, ${width} × ${height} laid out`;
-  if (sharedX > 0) {
-    text += ` — overlapping by ${sharedX} px, which cannot work: lay them` +
-      ` edge to edge and put the beam overlap in the Projection panel`;
+  // Count overlapping pairs so the operator can see the slicer will engage.
+  let overlaps = 0;
+  for (let i = 0; i < entries.length; i++) {
+    for (let j = i + 1; j < entries.length; j++) {
+      const a = entries[i].r, b = entries[j].r;
+      if (Math.min(a.x + a.width, b.x + b.width) > Math.max(a.x, b.x) &&
+          Math.min(a.y + a.height, b.y + b.height) > Math.max(a.y, b.y)) {
+        overlaps++;
+      }
+    }
   }
-  if (left !== 0 || top !== 0) {
-    text += `. Origin is ${left},${top} — keep one display at 0,0`;
-  }
-  text += ".";
 
-  // The number that matters: the canvas the active app renders into. With a
-  // beam overlap configured, every seam is authored once and projected
-  // twice, so the canvas is narrower than the sum of the panels.
-  const overlap = config?.projection?.overlap ?? 0;
-  const seams = active.length > 1 ? active.length - 1 : 0;
-  const panelWidthSum = active.reduce((sum, o) => sum + o.rect.width, 0);
-  const canvasWidth = overlap > 0 && seams > 0
-    ? panelWidthSum - seams * overlap : width;
-  text += ` App canvas: ${canvasWidth} × ${height}`;
-  if (overlap > 0 && seams > 0) {
-    text += ` (${panelWidthSum} px of panel − ${seams} seam` +
-      `${seams === 1 ? "" : "s"} × ${overlap} px overlap)`;
-  }
-  text += ` — author content to this size.`;
+  let text = `App canvas: ${width} × ${height} — author content to this size.`;
+  text += overlaps > 0
+    ? ` ${overlaps} overlapping region${overlaps === 1 ? "" : "s"}: rendered` +
+      ` once, projected by both displays` +
+      (config?.projection?.blend === false ? "" : ", blended at the seams") + "."
+    : ` No overlaps: displays are tiled directly.`;
   el.textContent = text;
 }
 
@@ -730,14 +769,13 @@ function selectOutput(name) {
   renderLayout();
 }
 
-$("o-save").onclick = () => run(async () => {
+function outputEntryFromForm() {
   const name = $("output-name").textContent;
   const [width, height, refreshHz] = ($("o-mode").value || "").split("x").map(Number);
   // A preset is sent as its bare name; the API accepts that or a full object.
   const background = $("o-bg").value || null;
   const mrt = $("o-mrt").value.trim();
-
-  await save(`/config/outputs/${encodeURIComponent(name)}`, {
+  return {
     match: { name },
     enable: $("o-enable").value === "true",
     mode: width ? { width, height, refreshHz } : null,
@@ -748,14 +786,39 @@ $("o-save").onclick = () => run(async () => {
     allowTearing: $("o-tearing").value === "true",
     maxRenderTimeMs: mrt ? Number(mrt) : null,
     background,
-  });
+  };
+}
+
+// Every edit lands on the outputs immediately (as an unsaved preview) and
+// redraws the layout, so dragging the numbers shows the wall responding.
+function outputEdited() {
+  if (!selected) return;
+  const entry = outputEntryFromForm();
+  const index = (config.outputs ?? []).findIndex((o) => o.match?.name === selected);
+  if (index >= 0) config.outputs[index] = entry;
+  else (config.outputs ??= []).push(entry);
+  renderLayout();
+  pushPreview();
+}
+for (const id of ["o-enable", "o-mode", "o-x", "o-y", "o-scale", "o-transform",
+                  "o-adaptive", "o-tearing", "o-mrt", "o-bg"]) {
+  $(id).addEventListener("input", outputEdited);
+}
+
+$("o-save").onclick = () => run(async () => {
+  const name = $("output-name").textContent;
+  await save(`/config/outputs/${encodeURIComponent(name)}`, outputEntryFromForm());
 }, "saved display configuration");
 
 $("o-remove").onclick = () => run(() =>
   api(`/config/outputs/${encodeURIComponent($("output-name").textContent)}`, { method: "DELETE" }),
   "removed from configuration");
-$("o-cancel").onclick = () => {
-  selected = null; $("output-editor").classList.add("hidden"); renderLayout();
+$("o-cancel").onclick = () => run(async () => {
+  await cancelPreview();
+  $("output-editor").classList.add("hidden");
+  selected = null;
+  renderLayout();
+}, "reverted"); $("output-editor").classList.add("hidden"); renderLayout();
 };
 
 // --- apps ----------------------------------------------------------------
@@ -890,23 +953,35 @@ function renderProjection() {
   const projection = config?.projection;
   $("pj-blend").value = projection?.blend === false ? "off" : (projection ? "on" : "off");
   $("pj-gamma").value = projection?.gamma ?? 2.2;
-  $("pj-overlap").value = projection?.overlap ?? 0;
   $("pj-lift").value = projection?.blackLift ?? 0;
   $("pj-pattern").value = projection?.testPattern ?? "";
 }
 
-$("pj-save").onclick = () => run(async () => {
+function projectionFromForm() {
   const blend = $("pj-blend").value === "on";
   const gamma = Number($("pj-gamma").value) || 2.2;
-  const overlap = Number($("pj-overlap").value) || 0;
   const blackLift = Number($("pj-lift").value) || 0;
   const testPattern = $("pj-pattern").value || null;
   // Off with default values: remove the section entirely.
-  const bodyValue = (!blend && gamma === 2.2 && overlap === 0 && blackLift === 0 && !testPattern)
-    ? null : { blend, gamma, overlap, blackLift, testPattern };
+  return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern)
+    ? null : { blend, gamma, blackLift, testPattern };
+}
+
+for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-pattern"]) {
+  $(id).addEventListener("input", () => {
+    config.projection = projectionFromForm();
+    renderLayoutSize();
+    pushPreview();
+  });
+}
+
+$("pj-save").onclick = () => run(async () => {
   document.activeElement?.blur();
-  await save("/config/projection", bodyValue);
+  await save("/config/projection", projectionFromForm());
 }, "saved projection");
+$("pj-cancel").onclick = () => run(async () => {
+  await cancelPreview();
+}, "reverted");
 
 // --- backgrounds ---------------------------------------------------------
 
@@ -1216,6 +1291,8 @@ document.querySelectorAll("nav button").forEach((button) => {
 
 async function loadConfig() {
   config = await api("/config");
+  configSnapshot = structuredClone(config);
+  previewActive = false;
   // Another client's change should not wipe out an edit in progress here.
   if (document.activeElement !== $("config-json")) {
     $("config-json").value = JSON.stringify(config, null, 2);

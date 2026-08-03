@@ -383,62 +383,66 @@ The endpoint is unauthenticated but accepted only from loopback, so the key-free
 
 ### Projection and edge blending {: #projection-edge-blending }
 
-For a wall of two to four projectors whose beams physically overlap, Suede
-manages the overlap itself — sway cannot. (Sway keeps every surface in one
-global coordinate space and each output renders whatever intersects its box,
-so outputs positioned to overlap necessarily show *identical* pixels in the
-shared region: the exact opposite of a blend, which needs each side fading
-the other way. Measured on hardware, twice.)
+For a wall of two to four projectors whose beams physically overlap, **the
+layout is the projection configuration**. Position each output in canvas
+space exactly as its beam lands on the wall — overlapping the neighbours by
+however much the rigging actually overlaps, each seam its own amount, rows
+and grids included. The canvas is the layout's bounding box, and the Displays
+tab reports it live.
 
-The architecture, end to end:
+Sway never sees any of this. It is always handed a plain edge-to-edge tiling
+(sway cannot render overlapping outputs distinctly — its single global
+coordinate space gives every output the same pixels in a shared region,
+measured on hardware). Instead:
 
-1. **The outputs sit edge to edge** in sway's layout — `0` and `1920` for two
-   1920-wide projectors. Nothing overlaps in sway, so nothing bleeds.
-2. **`projection.overlap` states the physical overlap**: how many pixels each
-   pair of neighbouring beams shares on the wall. This is rig knowledge, not
-   layout — it lives in configuration.
-3. **The active app renders into a headless canvas** that Suede creates and
-   sizes to `Σwidths − (n−1)·overlap` (7200 × 1200 for four 1920-wide
-   projectors with 160 px seams). The app never knows about projectors; it
-   sees one ordinary output. The Displays tab shows this canvas size.
-4. **The slicer** — `suede slice`, one process for the whole wall — captures
-   the canvas each frame, cuts it into per-projector slices whose neighbours
-   *repeat* the seam columns, applies the gamma-shaped blend ramps and the
-   black-level lift, and presents each slice fullscreen on its own physical
-   output. Each projector has its own buffer, which is what makes opposite
-   fades possible at all. The loop is damage-driven: a static page costs
-   nothing.
+1. The active app renders once into a **headless canvas** the size of the
+   layout's bounding box.
+2. The **slicer** (`suede slice`, one process per wall) captures the canvas
+   each frame, cuts out each projector's configured rectangle — intersecting
+   regions are cut into *both* neighbours — applies the gamma-shaped blend
+   ramps and black lift per pixel, and presents each slice fullscreen on its
+   own output. The loop is damage-driven; a static page costs nothing.
 
 Superimposed on the wall, the two copies of every seam sum to constant
-luminance. The cost is one frame of latency and one GPU→CPU readback per
-frame, which is the price of taking the overlap away from the compositor.
+luminance (measured: worst deviation 0.008 across a 160 px seam). A layout
+with no overlaps skips all of this: sway tiles it directly, at zero cost.
 
 ```json
-"projection": { "blend": true, "overlap": 160, "gamma": 2.2, "blackLift": 0.04 }
+"projection": { "blend": true, "gamma": 2.2, "blackLift": 0.04 }
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `blend` | bool | `true` | `false` presents the slices without ramps — duplication still happens, which is what physically overlapping beams need even unblended |
-| `overlap` | number | `0` | Pixels each pair of neighbouring beams shares on the wall, 0–4096. `0` disables canvas mode entirely: the app spans the physical outputs directly |
-| `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0–4.0; shapes every ramp's fall-off |
-| `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0–0.5 |
-| `testPattern` | string \| null | null | `grid`, `white`, `black`, `gamma` — or null for content |
+| `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
+| `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
+| `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
+| `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma` - or null for content |
+
+Slicing engages whenever the configured layout overlaps, with or without
+this section; the section adds the blending. A full overlap (a stacked
+projector, a mirror) is duplicated at full strength and never ramped.
 
 **Blending is a ramp in light, not in signal.** A display raises its input
 signal to a power (its gamma, typically 2.2), so a gradient linear in signal
-leaves a bright band at every seam. The ramps are shaped as `ramp^(1/gamma)`,
-making the summed luminance across a seam constant. Verified by pixel
-measurement: worst deviation from uniform across a 160 px seam, 0.005.
+leaves a bright band at every seam. Ramps are shaped as `ramp^(1/gamma)`.
 
 **Black-level compensation.** Projector black is not zero light, so seams
 glow on dark scenes. The seam cannot be darkened, so `blackLift` brightens
-everything else to match: `out = lift + (1 − lift) · in` outside the seams.
+everything else to match: `out = lift + (1 - lift) * in` outside the seams.
 Show the `black` test pattern and raise it until the wall is even.
 
-Canvas mode requires sway's headless backend (`WLR_BACKENDS=drm,libinput,headless`,
-set by provisioning). Without it Suede reports `headless_unavailable` and the
-active app spans the physical outputs unsliced until the backend is available.
+Canvas mode requires sway's headless backend
+(`WLR_BACKENDS=drm,libinput,headless`, set by provisioning); without it Suede
+reports `headless_unavailable` and tiles the layout unsliced.
+
+#### Live preview {: #live-preview }
+
+The web UI pushes layout and projection edits to the outputs as you make
+them, without touching disk: `PUT /api/v1/config/preview` applies a full
+document as an ephemeral preview, any committed write or a daemon restart
+discards it, and `DELETE /api/v1/config/preview` reverts explicitly - which
+is what the Cancel buttons do. Save persists exactly what you have been
+looking at.
 
 #### Test patterns {: #projection-test-patterns }
 

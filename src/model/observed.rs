@@ -292,7 +292,6 @@ impl Divergence {
         "tearing_unsupported",
         "projection_unavailable",
         "blend_overlay_failed",
-        "blend_needs_distinct_outputs",
         "headless_unavailable",
     ];
 
@@ -312,10 +311,9 @@ impl Divergence {
                 "configuration/#backgrounds-and-wallpapers"
             }
             "tearing_unsupported" => "configuration/#outputs",
-            "projection_unavailable"
-            | "blend_overlay_failed"
-            | "blend_needs_distinct_outputs"
-            | "headless_unavailable" => "configuration/#projection-edge-blending",
+            "projection_unavailable" | "blend_overlay_failed" | "headless_unavailable" => {
+                "configuration/#projection-edge-blending"
+            }
             _ => return None,
         })
     }

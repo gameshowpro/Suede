@@ -851,6 +851,43 @@
         }
       }
     },
+    "/api/v1/config/preview": {
+      "put": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "put_preview",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DesiredState"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Preview applied to the outputs; nothing persisted"
+          },
+          "422": {
+            "description": "Validation failed"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "delete_preview",
+        "responses": {
+          "204": {
+            "description": "Preview discarded; persisted state re-applied"
+          }
+        }
+      }
+    },
     "/api/v1/config/projection": {
       "get": {
         "tags": [
@@ -2232,7 +2269,7 @@
       },
       "ProjectionConfig": {
         "type": "object",
-        "description": "Multi-projector configuration: edge blending today, warping later.\n\nPhase one covers a soft-edge wall where the projectors handle their own\ngeometry. The outputs must sit **edge to edge** in the layout, each\nprojector showing its own region: sway keeps every surface in one global\ncoordinate space and each output renders whatever intersects its box, so\noutputs positioned to *overlap* necessarily show identical pixels there —\nthe exact opposite of what a blend needs. [`overlapping_pairs`] detects\nthat arrangement and the reconciler refuses it.\n\n[`Self::overlap`] therefore states how wide the shared strip is on the\nwall, and the content handed to each projector must repeat it. There is no\nlist of projectors: a seam exists wherever two outputs abut, so an operator\nmonitor that touches nothing is untouched.\n\nCorner pinning and source-rectangle warping are a later phase; this shape\ngrows those fields without breaking.\n\n[`overlapping_pairs`]: crate::projection::blend::overlapping_pairs",
+        "description": "Multi-projector configuration: edge blending today, warping later.\n\nThere is no overlap setting here, because the *layout is* the overlap\nconfiguration. Outputs are positioned in canvas space — the space the\ncontent is authored in — and wherever their rectangles intersect, that\nregion is projected by both machines. Different seams may overlap by\ndifferent amounts; rows and grids work the same way.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
         "properties": {
           "blackLift": {
             "type": "number",
@@ -2250,12 +2287,6 @@
             "format": "double",
             "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\nwall — walls are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
             "default": 2.2
-          },
-          "overlap": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Width in pixels of the region each pair of neighbouring projectors\nshows twice — the physical overlap of their beams, measured on the\nwall and converted to pixels.\n\nThis cannot be derived from the layout: the outputs must sit edge to\nedge (see [`ProjectionConfig`]), so the shared strip exists on the\n*wall*, not in the coordinate space. `0` means no seams and no ramps.\n\nThe content each projector is given must repeat that strip: for\nprojectors of width `W`, projector `i` shows canvas columns\n`i·(W−overlap)` to `i·(W−overlap)+W`, and the canvas is\n`n·W − (n−1)·overlap` wide.",
-            "default": 0
           },
           "testPattern": {
             "oneOf": [

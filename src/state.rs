@@ -35,6 +35,10 @@ pub enum StateError {
 pub struct StateStore {
     dir: PathBuf,
     current: RwLock<DesiredState>,
+    /// An unsaved document being tried out live. Never persisted: a daemon
+    /// restart or any committed write discards it, so disk state stays the
+    /// only durable truth.
+    preview: RwLock<Option<DesiredState>>,
 }
 
 impl StateStore {
@@ -84,6 +88,7 @@ impl StateStore {
 
         Ok(Self {
             dir,
+            preview: RwLock::new(None),
             current: RwLock::new(state),
         })
     }
@@ -92,12 +97,32 @@ impl StateStore {
     pub fn ephemeral(dir: PathBuf) -> Self {
         Self {
             dir,
+            preview: RwLock::new(None),
             current: RwLock::new(DesiredState::new()),
         }
     }
 
     pub fn get(&self) -> DesiredState {
         self.current.read().unwrap().clone()
+    }
+
+    /// What the reconciler should realize: the preview if one is being tried
+    /// out, else the persisted document.
+    pub fn effective(&self) -> DesiredState {
+        self.preview
+            .read()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.get())
+    }
+
+    /// Set or clear the live preview. The caller validates.
+    pub fn set_preview(&self, preview: Option<DesiredState>) {
+        *self.preview.write().unwrap() = preview;
+    }
+
+    pub fn has_preview(&self) -> bool {
+        self.preview.read().unwrap().is_some()
     }
 
     pub fn revision(&self) -> u64 {
@@ -113,6 +138,8 @@ impl StateStore {
         next.revision = guard.revision.saturating_add(1);
         self.persist(&next)?;
         *guard = next.clone();
+        // A committed write supersedes whatever was being previewed.
+        *self.preview.write().unwrap() = None;
         Ok(next)
     }
 

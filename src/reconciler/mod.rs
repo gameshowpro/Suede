@@ -194,7 +194,9 @@ impl Reconciler {
     pub async fn reconcile(&self) -> Status {
         let _guard = self.pass.lock().await;
 
-        let desired = self.store.get();
+        // The effective document: a live preview when one is being tried out
+        // in the UI, otherwise the persisted state.
+        let desired = self.store.effective();
         let capabilities = *self.capabilities.lock().await;
         let mut divergences: Vec<Divergence> = Vec::new();
 
@@ -208,12 +210,19 @@ impl Reconciler {
 
         self.refresh_outputs().await;
 
+        // --- the canvas plan ---
+        // The configured layout lives in canvas space and may overlap; sway
+        // must only ever see a plain tiling. Decide the mapping first, so the
+        // output planner below works on what sway is actually given.
+        let canvas_plan = self.plan_canvas(&desired);
+        let sway_outputs = self.outputs_for_sway(&desired, canvas_plan.as_ref());
+
         // --- outputs ---
         let output_plan = {
             let applied = self.applied.lock().await;
             crate::reconciler::plan::plan_outputs_with(
                 &self.snapshot.outputs(),
-                &desired.outputs,
+                &sway_outputs,
                 &desired.backgrounds,
                 &applied,
                 capabilities,
@@ -258,7 +267,8 @@ impl Reconciler {
         // rectangles. In canvas mode this creates and sizes the headless
         // canvas and runs the slicer; it returns which output the active app
         // must render into.
-        let (canvas_output, projection_divergences) = self.sync_projection(&desired).await;
+        let (canvas_output, projection_divergences) =
+            self.sync_projection(&desired, canvas_plan).await;
         divergences.extend(projection_divergences);
 
         // --- apps ---
@@ -318,110 +328,55 @@ impl Reconciler {
         status
     }
 
-    /// Projection: decide the mode, run the machinery, name the canvas.
+    /// Run the projection machinery for this pass's canvas plan.
     ///
-    /// Three modes, chosen by the configuration alone:
-    ///
-    /// - **No projection / zero overlap** — nothing runs; the active app
-    ///   spans the physical outputs directly and the return is `None`.
-    /// - **Canvas mode** (`overlap > 0`, two or more displays) — sway cannot
-    ///   blend overlapping outputs, so the overlap is managed by Suede: a
-    ///   headless output the size of the content canvas is created, the
-    ///   active app renders into it, and the slicer captures it and presents
-    ///   each projector its own ramped slice. Returns the canvas output name.
-    /// - **Test pattern only** — the overlay path draws patterns per output
-    ///   for alignment before any canvas exists.
+    /// With a plan (the configured layout overlaps somewhere): ensure the
+    /// headless canvas exists at the right size, run the slicer with the
+    /// plan's slices, and report which output the active app must render
+    /// into. Without one: retire any lingering canvas and show test patterns
+    /// per output if asked.
     #[cfg(feature = "projection")]
     async fn sync_projection(
         &self,
         desired: &crate::model::DesiredState,
+        plan: Option<crate::projection::CanvasPlan>,
     ) -> (Option<String>, Vec<Divergence>) {
         use crate::checks::is_synthetic_output;
-        use crate::projection::{overlay_specs, slicer_spec, Participant};
+        use crate::projection::{overlay_specs, Participant, SlicerSpec};
 
         let mut divergences = Vec::new();
         let mut overlay = Vec::new();
         let mut slicer = None;
         let mut canvas: Option<String> = None;
+        let projection = desired.projection.clone().unwrap_or_default();
 
-        let projection = desired.projection.as_ref();
-        let wants_canvas = projection.is_some_and(|p| p.overlap > 0);
-
-        // The physical wall: active, real outputs.
-        let participants: Vec<Participant> = self
-            .snapshot
-            .outputs()
-            .iter()
-            .filter(|output| {
-                output.active && output.rect.width > 0 && !is_synthetic_output(&output.name)
-            })
-            .map(|output| Participant {
-                name: output.name.clone(),
-                rect: output.rect,
-            })
-            .collect();
-
-        // Overlapping outputs break both modes: sway gives every output the
-        // same pixels in the shared region, so ramps cannot differ there and
-        // even the slicer's presenters would bleed onto the neighbour.
-        let overlapping = crate::projection::blend::overlapping_pairs(&participants);
-        if projection.is_some() && !overlapping.is_empty() {
-            let pairs = overlapping
-                .iter()
-                .map(|(a, b)| format!("{a} and {b}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            divergences.push(Divergence::new(
-                "blend_needs_distinct_outputs",
-                "projection",
-                format!(
-                    "{pairs} overlap in sway's layout, which makes every surface                      bleed across the shared region. Lay the outputs edge to edge;                      the beam overlap belongs in projection.overlap, where Suede                      manages it."
-                ),
-            ));
-        } else if wants_canvas && participants.len() >= 2 {
-            let projection = projection.unwrap();
-            // The canvas is a headless output. It must be created (needs the
-            // headless backend), sized to the content canvas, parked far from
-            // the physical row, and given a workspace for the app.
-            let headless = self
-                .snapshot
-                .outputs()
-                .iter()
-                .find(|output| output.name.starts_with("HEADLESS-"))
-                .map(|output| (output.name.clone(), output.rect, output.active));
-
-            if headless.is_none() {
+        if let Some(plan) = plan {
+            // The canvas is a headless output: create it if the backend is
+            // there, size it to the plan, park it away from the tiling.
+            let find_headless = |outputs: &[crate::model::Output]| {
+                outputs
+                    .iter()
+                    .find(|output| output.name.starts_with("HEADLESS-"))
+                    .map(|output| (output.name.clone(), output.rect, output.active))
+            };
+            if find_headless(&self.snapshot.outputs()).is_none() {
                 if let Err(error) = self.sway.run_command("create_output").await {
-                    divergences.push(Divergence::new(
-                        "headless_unavailable",
-                        "projection",
-                        format!(
-                            "the content canvas needs sway's headless backend                              (WLR_BACKENDS=drm,headless), which this compositor                              did not load: {error}"
-                        ),
-                    ));
+                    tracing::warn!(%error, "create_output failed");
                 }
                 self.refresh_outputs().await;
             }
-            let headless = self
-                .snapshot
-                .outputs()
-                .iter()
-                .find(|output| output.name.starts_with("HEADLESS-"))
-                .map(|output| (output.name.clone(), output.rect, output.active));
-
-            if headless.is_none() {
-                divergences.push(Divergence::new(
+            match find_headless(&self.snapshot.outputs()) {
+                None => divergences.push(Divergence::new(
                     "headless_unavailable",
                     "projection",
-                    "the content canvas needs sway's headless backend                      (WLR_BACKENDS=drm,libinput,headless) and none was created;                      the active app spans the physical outputs unsliced meanwhile"
+                    "the overlapping layout needs sway's headless backend \
+                     (WLR_BACKENDS=drm,libinput,headless) and no canvas output \
+                     could be created; the layout is tiled without slicing \
+                     meanwhile"
                         .to_string(),
-                ));
-            }
-            if let Some((name, rect, active)) = headless {
-                if let Some(spec) = slicer_spec(&participants, projection, &name) {
-                    let (width, height) = (spec.canvas_width, spec.canvas_height);
-                    // Parked below the physical row so nothing pointer- or
-                    // layout-related wanders into it.
+                )),
+                Some((name, rect, active)) => {
+                    let (width, height) = (plan.canvas_width, plan.canvas_height);
                     if !active || rect.width != width || rect.height != height || rect.y != 20000 {
                         for command in [
                             format!("output {name} enable"),
@@ -442,33 +397,53 @@ impl Reconciler {
                         }
                         self.refresh_outputs().await;
                     }
-                    slicer = Some(spec);
+                    slicer = Some(SlicerSpec {
+                        source: name.clone(),
+                        canvas_width: width,
+                        canvas_height: height,
+                        gamma: projection.gamma,
+                        black_lift: projection.black_lift,
+                        pattern: projection.test_pattern,
+                        slices: plan.slices,
+                    });
                     canvas = Some(name);
                 }
             }
-        } else if let Some((name, ..)) = self
-            .snapshot
-            .outputs()
-            .iter()
-            .find(|output| output.name.starts_with("HEADLESS-"))
-            .map(|output| (output.name.clone(), ()))
-        {
+        } else {
             // Leaving canvas mode: a lingering headless output would be
             // spanned by fullscreen-global apps, so retire it.
-            if let Err(error) = self
-                .sway
-                .run_command(&format!("output {name} unplug"))
-                .await
+            if let Some(name) = self
+                .snapshot
+                .outputs()
+                .iter()
+                .find(|output| output.name.starts_with("HEADLESS-"))
+                .map(|output| output.name.clone())
             {
-                tracing::warn!(%error, output = %name, "could not unplug the canvas output");
+                if let Err(error) = self
+                    .sway
+                    .run_command(&format!("output {name} unplug"))
+                    .await
+                {
+                    tracing::warn!(%error, output = %name, "could not unplug the canvas output");
+                }
+                self.refresh_outputs().await;
             }
-            self.refresh_outputs().await;
-        }
 
-        // Test patterns without a canvas: per-output overlays, as on a bench.
-        if slicer.is_none() {
-            if let Some(projection) = projection.filter(|p| p.test_pattern.is_some()) {
-                overlay = overlay_specs(&participants, projection);
+            // Test patterns without a canvas: per-output, as on a bench.
+            if desired.projection.is_some() {
+                let participants: Vec<Participant> = self
+                    .snapshot
+                    .outputs()
+                    .iter()
+                    .filter(|output| {
+                        output.active && output.rect.width > 0 && !is_synthetic_output(&output.name)
+                    })
+                    .map(|output| Participant {
+                        name: output.name.clone(),
+                        rect: output.rect,
+                    })
+                    .collect();
+                overlay = overlay_specs(&participants, &projection);
             }
         }
 
@@ -478,29 +453,121 @@ impl Reconciler {
         (canvas, divergences)
     }
 
-    /// Without the `projection` feature there is nothing to run — but asking
-    /// for blending anyway must be surfaced, not silently ignored.
+    /// Without the `projection` feature there is nothing to run — but a
+    /// layout that needs slicing must be surfaced, not silently mis-tiled.
     #[cfg(not(feature = "projection"))]
     async fn sync_projection(
         &self,
         desired: &crate::model::DesiredState,
+        _plan: Option<()>,
     ) -> (Option<String>, Vec<Divergence>) {
-        if desired
-            .projection
-            .as_ref()
-            .is_some_and(|p| p.blend || p.overlap > 0)
-        {
+        if desired.projection.is_some() {
             (
                 None,
                 vec![Divergence::new(
                     "projection_unavailable",
                     "projection",
-                    "projection is configured, but this build of suede was compiled                      without the 'projection' feature",
+                    "projection is configured, but this build of suede was compiled \
+                     without the 'projection' feature",
                 )],
             )
         } else {
             (None, Vec::new())
         }
+    }
+
+    /// The configured layout, in canvas space, resolved to output names.
+    ///
+    /// Only enabled, configured outputs that are currently connected take
+    /// part; sizes come from the configured mode, falling back to what the
+    /// display currently runs.
+    #[cfg(feature = "projection")]
+    fn plan_canvas(
+        &self,
+        desired: &crate::model::DesiredState,
+    ) -> Option<crate::projection::CanvasPlan> {
+        use crate::projection::Participant;
+        let observed = self.snapshot.outputs();
+        let mut participants = Vec::new();
+        for config in desired.outputs.iter().filter(|output| output.enable) {
+            let Some(matched) = observed
+                .iter()
+                .find(|output| config.r#match.matches(output))
+            else {
+                continue;
+            };
+            let size = config
+                .mode
+                .map(|mode| (mode.width, mode.height))
+                .or_else(|| matched.current_mode.map(|mode| (mode.width, mode.height)));
+            let Some((width, height)) = size else {
+                continue;
+            };
+            let position = config.position.unwrap_or(crate::model::Position {
+                x: matched.rect.x,
+                y: matched.rect.y,
+            });
+            participants.push(Participant {
+                name: matched.name.clone(),
+                rect: crate::model::Rect {
+                    x: position.x,
+                    y: position.y,
+                    width,
+                    height,
+                },
+            });
+        }
+        crate::projection::canvas_plan(&participants, desired.projection.as_ref())
+    }
+
+    #[cfg(not(feature = "projection"))]
+    fn plan_canvas(&self, _desired: &crate::model::DesiredState) -> Option<()> {
+        None
+    }
+
+    /// What sway is told about the outputs. With a canvas plan, the
+    /// configured (possibly overlapping) positions are replaced by the
+    /// plan's synthesized edge-to-edge tiling; without one, the configured
+    /// layout goes to sway verbatim.
+    #[cfg(feature = "projection")]
+    fn outputs_for_sway(
+        &self,
+        desired: &crate::model::DesiredState,
+        plan: Option<&crate::projection::CanvasPlan>,
+    ) -> Vec<crate::model::OutputConfig> {
+        let Some(plan) = plan else {
+            return desired.outputs.clone();
+        };
+        let observed = self.snapshot.outputs();
+        desired
+            .outputs
+            .iter()
+            .cloned()
+            .map(|mut output| {
+                // Resolve the config to its connector name the same way the
+                // canvas plan did, then take that name's synthesized slot.
+                let name = observed
+                    .iter()
+                    .find(|candidate| output.r#match.matches(candidate))
+                    .map(|candidate| candidate.name.clone());
+                if let Some(name) = name {
+                    if let Some((_, x, y)) = plan.sway_positions.iter().find(|(n, _, _)| *n == name)
+                    {
+                        output.position = Some(crate::model::Position { x: *x, y: *y });
+                    }
+                }
+                output
+            })
+            .collect()
+    }
+
+    #[cfg(not(feature = "projection"))]
+    fn outputs_for_sway(
+        &self,
+        desired: &crate::model::DesiredState,
+        _plan: Option<&()>,
+    ) -> Vec<crate::model::OutputConfig> {
+        desired.outputs.clone()
     }
 
     /// The apps as the supervisor should see them: exactly one enabled (the
@@ -916,14 +983,11 @@ mod tests {
             .update(|state| {
                 state.apps.push(app("renderer", None, None));
                 state.active_app = Some("renderer".into());
-                // Canvas mode wanted, but the mock compositor has no headless
-                // backend, so the canvas can never materialise.
-                state.projection = Some(crate::model::ProjectionConfig {
-                    overlap: 160,
-                    ..Default::default()
-                });
+                // An overlapping layout wants a canvas, but the mock
+                // compositor has no headless backend, so it can never
+                // materialise.
                 state.outputs.push(configured_output("HDMI-A-1", 0));
-                state.outputs.push(configured_output("HDMI-A-2", 1920));
+                state.outputs.push(configured_output("HDMI-A-2", 1760));
             })
             .unwrap();
 
