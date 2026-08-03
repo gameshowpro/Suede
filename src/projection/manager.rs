@@ -202,6 +202,7 @@ mod tests {
         let mut spec = OverlaySpec {
             output: "DP-1".into(),
             gamma: 2.2,
+            black_lift: 0.0,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,

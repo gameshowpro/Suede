@@ -316,35 +316,26 @@ impl Reconciler {
     async fn sync_projection(&self, desired: &crate::model::DesiredState) -> Vec<Divergence> {
         use crate::projection::{overlay_specs, Participant};
 
-        let mut divergences = Vec::new();
         let mut specs = Vec::new();
-
         if let Some(projection) = desired.projection.as_ref().filter(|p| p.blend) {
-            let observed = self.snapshot.outputs();
-            let mut participants = Vec::new();
-            for configured in &projection.outputs {
-                match observed
-                    .iter()
-                    .find(|output| output.active && output.name == configured.name)
-                {
-                    Some(output) if output.rect.width > 0 => {
-                        participants.push(Participant::from_config(configured, output.rect));
-                    }
-                    _ => divergences.push(Divergence::new(
-                        "projection_output_not_found",
-                        &configured.name,
-                        format!(
-                            "{} is listed for edge blending, but no active output has that name",
-                            configured.name
-                        ),
-                    )),
-                }
-            }
-            specs = overlay_specs(&participants);
+            // Every active output takes part; the geometry sorts out the rest.
+            // Outputs that overlap nothing get no ramps, and a mirror is
+            // recognised and skipped, so there is no projector list to keep
+            // in step with the machine.
+            let participants: Vec<Participant> = self
+                .snapshot
+                .outputs()
+                .iter()
+                .filter(|output| output.active && output.rect.width > 0)
+                .map(|output| Participant {
+                    name: output.name.clone(),
+                    rect: output.rect,
+                })
+                .collect();
+            specs = overlay_specs(&participants, projection.gamma, projection.black_lift);
         }
 
-        divergences.extend(self.blend.lock().await.sync(&specs));
-        divergences
+        self.blend.lock().await.sync(&specs)
     }
 
     /// Without the `projection` feature there is nothing to run — but asking

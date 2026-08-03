@@ -887,13 +887,12 @@ mod tests {
             &harness,
             "PUT",
             "/api/v1/config/projection",
-            Some(r#"{"blend":true,"outputs":[{"name":"DP-1","gamma":2.4},{"name":"DP-2"}]}"#),
+            Some(r#"{"blend":true,"gamma":2.4,"blackLift":0.04}"#),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["projection"]["outputs"][0]["gamma"], 2.4);
-        // An unstated gamma takes the 2.2 default rather than being null.
-        assert_eq!(body["projection"]["outputs"][1]["gamma"], 2.2);
+        assert_eq!(body["projection"]["gamma"], 2.4);
+        assert_eq!(body["projection"]["blackLift"], 0.04);
 
         let (status, body) = call(&harness, "PUT", "/api/v1/config/projection", Some("null")).await;
         assert_eq!(status, StatusCode::OK);
@@ -901,6 +900,18 @@ mod tests {
             body.get("projection").is_none_or(|p| p.is_null()),
             "null must remove the section: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_projection_section_gets_sensible_defaults() {
+        // `{}` is the whole intended configuration for a wall of typical
+        // projectors: blending on, gamma 2.2, no black lift.
+        let harness = harness(None);
+        let (status, body) = call(&harness, "PUT", "/api/v1/config/projection", Some("{}")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["blend"], true);
+        assert_eq!(body["projection"]["gamma"], 2.2);
+        assert_eq!(body["projection"]["blackLift"], 0.0);
     }
 
     #[tokio::test]
@@ -912,7 +923,7 @@ mod tests {
             &harness,
             "PUT",
             "/api/v1/config/projection",
-            Some(r#"{"blend":true,"outputs":[{"name":"DP-1","gamma":22}]}"#),
+            Some(r#"{"gamma":22}"#),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -926,34 +937,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn projection_output_names_must_be_unique() {
+    async fn projection_black_lift_is_range_checked() {
         let harness = harness(None);
         let (status, body) = call(
             &harness,
             "PUT",
             "/api/v1/config/projection",
-            Some(r#"{"blend":true,"outputs":[{"name":"DP-1"},{"name":"DP-1"}]}"#),
+            Some(r#"{"blackLift":0.9}"#),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(
-            body["detail"].as_str().unwrap().contains("not unique"),
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("between 0.0 and 0.5"),
             "{body}"
         );
-    }
-
-    #[tokio::test]
-    async fn blend_defaults_to_on_when_the_section_is_present() {
-        // Writing the section at all is the intent to blend; blend:false is
-        // the explicit way to keep the settings but skip the chain.
-        let harness = harness(None);
-        let (_, body) = call(
-            &harness,
-            "PUT",
-            "/api/v1/config/projection",
-            Some(r#"{"outputs":[{"name":"DP-1"}]}"#),
-        )
-        .await;
-        assert_eq!(body["projection"]["blend"], true);
     }
 }

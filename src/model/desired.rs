@@ -38,41 +38,45 @@ pub struct DesiredState {
 /// spanned window renders the shared strip on both, and a gamma-correct ramp
 /// fades each side so the overlapping light sums to constant luminance.
 ///
-/// The blend regions are derived from wherever the listed outputs' rectangles
-/// intersect — there is no separate "overlap" setting to fall out of step
-/// with the layout. Corner pinning and source-rectangle warping are a later
-/// phase; this shape is designed to grow those fields without breaking.
+/// There is no list of projectors and no overlap setting: blend regions are
+/// derived from wherever the layout's outputs intersect, so they cannot fall
+/// out of step with it. An operator monitor beside the wall overlaps nothing
+/// and is untouched; a mirrored output overlaps *entirely* and is recognised
+/// as a mirror rather than a seam. Corner pinning and source-rectangle
+/// warping are a later phase; this shape grows those fields without breaking.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct ProjectionConfig {
     /// Master switch. `false` keeps the configuration but skips the entire
     /// blending chain: no overlays run, nothing is spawned, no divergences.
-    #[serde(default = "default_true")]
     pub blend: bool,
-    /// The outputs that are projectors. Only these get blend ramps; a
-    /// non-projector output (an operator monitor) is simply not listed.
-    pub outputs: Vec<ProjectionOutput>,
-}
-
-/// One projector taking part in edge blending.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectionOutput {
-    /// Connector name, e.g. `DP-1`. Projector rigs are fixed installations,
-    /// so plain names rather than match rules.
-    pub name: String,
-    /// This projector's transfer gamma, used to shape its blend ramps.
+    /// The projectors' transfer gamma, shaping every ramp's fall-off.
     ///
     /// A ramp that is linear in signal is not linear in light: the display
     /// raises the signal to `gamma`. Each ramp is therefore pre-shaped as
-    /// `ramp^(1/gamma)` so that the *luminance* of two overlapping projectors
-    /// sums to a constant across the seam.
-    #[serde(default = "default_gamma")]
+    /// `ramp^(1/gamma)` so that the *luminance* of the two overlapping
+    /// projectors sums to a constant across the seam. One value for the whole
+    /// wall — walls are near-universally identical projectors; per-output
+    /// overrides can be added later if mixed models ever matter.
     pub gamma: f64,
+    /// Black-level compensation, `0.0` (off) to `0.5`.
+    ///
+    /// Projector black is not zero light, so seams glow in dark scenes: they
+    /// receive two projectors' worth of leaked black. The fix cannot darken
+    /// the seam, so it lifts the signal everywhere *else* to match —
+    /// `out = lift + (1 − lift)·in`. On a black scene, raise this until the
+    /// un-doubled regions match the seams.
+    pub black_lift: f64,
 }
 
-fn default_gamma() -> f64 {
-    2.2
+impl Default for ProjectionConfig {
+    fn default() -> Self {
+        Self {
+            blend: true,
+            gamma: 2.2,
+            black_lift: 0.0,
+        }
+    }
 }
 
 impl DesiredState {
@@ -146,23 +150,22 @@ impl DesiredState {
         }
 
         if let Some(projection) = &self.projection {
-            let mut seen = std::collections::HashSet::new();
-            for (index, output) in projection.outputs.iter().enumerate() {
-                let prefix = format!("projection.outputs[{index}]");
-                if output.name.trim().is_empty() {
-                    errors.push(format!("{prefix}.name must not be empty"));
-                }
-                if !seen.insert(output.name.clone()) {
-                    errors.push(format!("{prefix}.name {:?} is not unique", output.name));
-                }
-                // 1.0 disables the correction; beyond 4.0 is no known display
-                // and almost certainly a typo'd measurement.
-                if !(output.gamma.is_finite() && (1.0..=4.0).contains(&output.gamma)) {
-                    errors.push(format!(
-                        "{prefix}.gamma must be between 1.0 and 4.0, not {}",
-                        output.gamma
-                    ));
-                }
+            // 1.0 disables the correction; beyond 4.0 is no known display and
+            // almost certainly a typo'd measurement (22 for 2.2).
+            if !(projection.gamma.is_finite() && (1.0..=4.0).contains(&projection.gamma)) {
+                errors.push(format!(
+                    "projection.gamma must be between 1.0 and 4.0, not {}",
+                    projection.gamma
+                ));
+            }
+            // Above 0.5 the "compensation" is brighter than mid-grey, which
+            // is no black level anyone measured.
+            if !(projection.black_lift.is_finite() && (0.0..=0.5).contains(&projection.black_lift))
+            {
+                errors.push(format!(
+                    "projection.blackLift must be between 0.0 and 0.5, not {}",
+                    projection.black_lift
+                ));
             }
         }
 

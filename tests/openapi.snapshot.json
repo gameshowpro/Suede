@@ -2174,39 +2174,24 @@
       },
       "ProjectionConfig": {
         "type": "object",
-        "description": "Multi-projector configuration: edge blending today, warping later.\n\nPhase one covers a soft-edge wall where the projectors handle their own\ngeometry: outputs are *positioned to overlap* in the ordinary layout, a\nspanned window renders the shared strip on both, and a gamma-correct ramp\nfades each side so the overlapping light sums to constant luminance.\n\nThe blend regions are derived from wherever the listed outputs' rectangles\nintersect — there is no separate \"overlap\" setting to fall out of step\nwith the layout. Corner pinning and source-rectangle warping are a later\nphase; this shape is designed to grow those fields without breaking.",
-        "required": [
-          "outputs"
-        ],
+        "description": "Multi-projector configuration: edge blending today, warping later.\n\nPhase one covers a soft-edge wall where the projectors handle their own\ngeometry: outputs are *positioned to overlap* in the ordinary layout, a\nspanned window renders the shared strip on both, and a gamma-correct ramp\nfades each side so the overlapping light sums to constant luminance.\n\nThere is no list of projectors and no overlap setting: blend regions are\nderived from wherever the layout's outputs intersect, so they cannot fall\nout of step with it. An operator monitor beside the wall overlaps nothing\nand is untouched; a mirrored output overlaps *entirely* and is recognised\nas a mirror rather than a seam. Corner pinning and source-rectangle\nwarping are a later phase; this shape grows those fields without breaking.",
         "properties": {
+          "blackLift": {
+            "type": "number",
+            "format": "double",
+            "description": "Black-level compensation, `0.0` (off) to `0.5`.\n\nProjector black is not zero light, so seams glow in dark scenes: they\nreceive two projectors' worth of leaked black. The fix cannot darken\nthe seam, so it lifts the signal everywhere *else* to match —\n`out = lift + (1 − lift)·in`. On a black scene, raise this until the\nun-doubled regions match the seams.",
+            "default": 0.0
+          },
           "blend": {
             "type": "boolean",
-            "description": "Master switch. `false` keeps the configuration but skips the entire\nblending chain: no overlays run, nothing is spawned, no divergences."
+            "description": "Master switch. `false` keeps the configuration but skips the entire\nblending chain: no overlays run, nothing is spawned, no divergences.",
+            "default": true
           },
-          "outputs": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/ProjectionOutput"
-            },
-            "description": "The outputs that are projectors. Only these get blend ramps; a\nnon-projector output (an operator monitor) is simply not listed."
-          }
-        }
-      },
-      "ProjectionOutput": {
-        "type": "object",
-        "description": "One projector taking part in edge blending.",
-        "required": [
-          "name"
-        ],
-        "properties": {
           "gamma": {
             "type": "number",
             "format": "double",
-            "description": "This projector's transfer gamma, used to shape its blend ramps.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of two overlapping projectors\nsums to a constant across the seam."
-          },
-          "name": {
-            "type": "string",
-            "description": "Connector name, e.g. `DP-1`. Projector rigs are fixed installations,\nso plain names rather than match rules."
+            "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\nwall — walls are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
+            "default": 2.2
           }
         }
       },

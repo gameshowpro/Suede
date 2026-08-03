@@ -9,25 +9,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ProjectionOutput, Rect};
+use crate::model::Rect;
 
-/// One projector taking part in blending, with its observed place in the layout.
+/// An output taking part in seam derivation: its place in the global layout.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Participant {
     pub name: String,
-    /// Position and size in the global layout, as observed from sway.
     pub rect: Rect,
-    pub gamma: f64,
-}
-
-impl Participant {
-    pub fn from_config(config: &ProjectionOutput, rect: Rect) -> Self {
-        Self {
-            name: config.name.clone(),
-            rect,
-            gamma: config.gamma,
-        }
-    }
 }
 
 /// The side of a ramp at which attenuation reaches zero — the side where the
@@ -49,14 +37,18 @@ pub struct RampSpec {
     pub fade_to: FadeTo,
 }
 
-/// Everything one overlay process needs: which output, how its display bends
-/// light, and where the gradients go. Serialized to the `suede blend`
+/// Everything one overlay process needs. Serialized to the `suede blend`
 /// subcommand verbatim — this struct *is* the daemon↔overlay contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlaySpec {
     pub output: String,
+    /// Shapes the ramps' fall-off; see [`crate::model::ProjectionConfig`].
     pub gamma: f64,
+    /// Signal lift applied *outside* the seams, compensating for the doubled
+    /// projector black inside them. `0.0` is off.
+    #[serde(default)]
+    pub black_lift: f64,
     pub ramps: Vec<RampSpec>,
 }
 
@@ -73,15 +65,28 @@ fn intersect(a: &Rect, b: &Rect) -> Option<Rect> {
     })
 }
 
-/// Derive one overlay spec per participating output that has any seam.
+fn area(rect: &Rect) -> i64 {
+    rect.width as i64 * rect.height as i64
+}
+
+/// Derive one overlay spec per output that has any seam.
 ///
-/// A seam is a pairwise intersection of two participants' rectangles. Only
-/// *edge* adjacency produces ramps: in a 2×2 grid the corner region already
-/// receives the product of each output's horizontal and vertical ramps, which
-/// sums to constant luminance by construction — a third ramp from the
-/// diagonal pair would darken it twice. Diagonal pairs are recognised by
-/// their intersection being small along both axes, and skipped.
-pub fn overlay_specs(participants: &[Participant]) -> Vec<OverlaySpec> {
+/// A seam is a pairwise intersection of two participants' rectangles, with
+/// two structural exclusions:
+///
+/// - **Mirrors.** An intersection covering most of either output is a
+///   mirrored display (the sway same-position trick — a confidence monitor
+///   showing a projector's picture), not a projection seam; fading it would
+///   black out both screens.
+/// - **Diagonals.** In a 2×2 grid the corner region already receives the
+///   product of each output's horizontal and vertical ramps, which sums to
+///   constant luminance by construction — a third ramp from the diagonal
+///   pair would darken it twice.
+pub fn overlay_specs(
+    participants: &[Participant],
+    gamma: f64,
+    black_lift: f64,
+) -> Vec<OverlaySpec> {
     let mut ramps: Vec<(usize, RampSpec)> = Vec::new();
 
     for i in 0..participants.len() {
@@ -90,6 +95,11 @@ pub fn overlay_specs(participants: &[Participant]) -> Vec<OverlaySpec> {
             let Some(seam) = intersect(&a.rect, &b.rect) else {
                 continue;
             };
+
+            // A mirror, not a seam.
+            if area(&seam) * 5 >= area(&a.rect).min(area(&b.rect)) * 4 {
+                continue;
+            }
 
             // Edge adjacency: the seam spans (most of) the shorter output
             // along the axis perpendicular to the fade.
@@ -148,7 +158,8 @@ pub fn overlay_specs(participants: &[Participant]) -> Vec<OverlaySpec> {
         if !mine.is_empty() {
             specs.push(OverlaySpec {
                 output: participant.name.clone(),
-                gamma: participant.gamma,
+                gamma,
+                black_lift,
                 ramps: mine,
             });
         }
@@ -162,57 +173,88 @@ enum Axis {
     Y,
 }
 
-/// Attenuation (in light, 0..=1) a single ramp applies at a pixel centre.
-/// Pixels outside the ramp are untouched (1.0).
-fn ramp_attenuation(ramp: &RampSpec, x: f64, y: f64) -> f64 {
-    let inside = x >= ramp.rect.x as f64
-        && x < (ramp.rect.x + ramp.rect.width) as f64
-        && y >= ramp.rect.y as f64
-        && y < (ramp.rect.y + ramp.rect.height) as f64;
-    if !inside {
-        return 1.0;
+/// Combined light attenuation of every ramp covering the pixel centre
+/// `(x, y)`, or `None` when no ramp covers it at all.
+///
+/// The distinction matters: a covered pixel with attenuation 1.0 is *inside*
+/// a seam (no lift there — the doubled projector black is the lift), while an
+/// uncovered pixel is outside every seam and receives the black-lift.
+fn attenuation_at(spec: &OverlaySpec, x: f64, y: f64) -> Option<f64> {
+    let mut covered = false;
+    let mut transmitted = 1.0;
+    for ramp in &spec.ramps {
+        let inside = x >= ramp.rect.x as f64
+            && x < (ramp.rect.x + ramp.rect.width) as f64
+            && y >= ramp.rect.y as f64
+            && y < (ramp.rect.y + ramp.rect.height) as f64;
+        if !inside {
+            continue;
+        }
+        covered = true;
+        let along = match ramp.fade_to {
+            FadeTo::Right => 1.0 - (x - ramp.rect.x as f64) / ramp.rect.width as f64,
+            FadeTo::Left => (x - ramp.rect.x as f64) / ramp.rect.width as f64,
+            FadeTo::Bottom => 1.0 - (y - ramp.rect.y as f64) / ramp.rect.height as f64,
+            FadeTo::Top => (y - ramp.rect.y as f64) / ramp.rect.height as f64,
+        };
+        // Where ramps overlap (grid corners), attenuations multiply in
+        // light, which is what makes a 2×2 corner sum to constant luminance.
+        transmitted *= along.clamp(0.0, 1.0);
     }
-    let along = match ramp.fade_to {
-        FadeTo::Right => 1.0 - (x - ramp.rect.x as f64) / ramp.rect.width as f64,
-        FadeTo::Left => (x - ramp.rect.x as f64) / ramp.rect.width as f64,
-        FadeTo::Bottom => 1.0 - (y - ramp.rect.y as f64) / ramp.rect.height as f64,
-        FadeTo::Top => (y - ramp.rect.y as f64) / ramp.rect.height as f64,
-    };
-    along.clamp(0.0, 1.0)
+    covered.then_some(transmitted)
 }
 
-/// The overlay's per-pixel alpha, one byte per pixel, row-major.
+/// The ramp alpha for a covered pixel.
 ///
 /// The overlay is black; compositing `content·(1−α)` happens in signal space,
 /// and the display then raises the signal to `gamma`. To attenuate *light* by
 /// `t`, the alpha must therefore be `1 − t^(1/gamma)` — the mathematically
-/// required shaping that a naive signal-space gradient gets wrong. Where
-/// several ramps cover one pixel (grid corners), their attenuations multiply
-/// in light before shaping, which is exactly what makes a 2×2 corner sum to
-/// constant luminance.
+/// required shaping that a naive signal-space gradient gets wrong.
+fn ramp_alpha(transmitted: f64, gamma: f64) -> u8 {
+    let alpha = 1.0 - transmitted.powf(1.0 / gamma);
+    (alpha * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
+/// Ramp alpha per pixel, row-major; 0 outside every seam. The seam math in
+/// isolation, kept for tests and for the future warp shader.
 pub fn alpha_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
-    let exponent = 1.0 / spec.gamma;
     let mut map = vec![0u8; width as usize * height as usize];
-    for ramp in &spec.ramps {
-        let x0 = ramp.rect.x.max(0) as u32;
-        let y0 = ramp.rect.y.max(0) as u32;
-        let x1 = (ramp.rect.x + ramp.rect.width).clamp(0, width as i32) as u32;
-        let y1 = (ramp.rect.y + ramp.rect.height).clamp(0, height as i32) as u32;
-        for y in y0..y1 {
-            for x in x0..x1 {
-                let index = (y * width + x) as usize;
-                // Recover the light already transmitted at this pixel, apply
-                // this ramp on top, and re-shape. This is how multiple ramps
-                // multiply without a second full-frame pass.
-                let current = 1.0 - map[index] as f64 / 255.0;
-                let transmitted = current.powf(spec.gamma)
-                    * ramp_attenuation(ramp, x as f64 + 0.5, y as f64 + 0.5);
-                let alpha = 1.0 - transmitted.powf(exponent);
-                map[index] = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+    for y in 0..height {
+        for x in 0..width {
+            if let Some(t) = attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
+                map[(y * width + x) as usize] = ramp_alpha(t, spec.gamma);
             }
         }
     }
     map
+}
+
+/// The complete overlay image: premultiplied BGRA bytes, row-major.
+///
+/// Seam pixels are black at the ramp alpha. Everything else is white at
+/// `blackLift` alpha, which composites to `out = lift + (1−lift)·content` —
+/// the standard black-level rescale — matching the un-doubled regions to the
+/// seams' doubled projector black. Lift zero leaves them fully transparent.
+pub fn pixel_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
+    let lift = (spec.black_lift.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let mut pixels = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = ((y * width + x) * 4) as usize;
+            match attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
+                // Black: only the alpha byte is nonzero.
+                Some(t) => pixels[offset + 3] = ramp_alpha(t, spec.gamma),
+                // White at the lift alpha; premultiplied, so B=G=R=A.
+                None => {
+                    pixels[offset] = lift;
+                    pixels[offset + 1] = lift;
+                    pixels[offset + 2] = lift;
+                    pixels[offset + 3] = lift;
+                }
+            }
+        }
+    }
+    pixels
 }
 
 #[cfg(test)]
@@ -228,14 +270,17 @@ mod tests {
                 width,
                 height,
             },
-            gamma: 2.2,
         }
+    }
+
+    fn specs_for(participants: &[Participant]) -> Vec<OverlaySpec> {
+        overlay_specs(participants, 2.2, 0.0)
     }
 
     #[test]
     fn two_overlapping_outputs_get_mirrored_ramps() {
         // 160 px of shared strip: the classic two-projector soft edge.
-        let specs = overlay_specs(&[
+        let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1080),
             participant("DP-2", 1760, 0, 1920, 1080),
         ]);
@@ -271,7 +316,7 @@ mod tests {
 
     #[test]
     fn a_row_of_four_has_three_seams() {
-        let specs = overlay_specs(&[
+        let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1200),
             participant("DP-2", 1760, 0, 1920, 1200),
             participant("DP-3", 3520, 0, 1920, 1200),
@@ -287,7 +332,7 @@ mod tests {
 
     #[test]
     fn separated_outputs_produce_nothing() {
-        let specs = overlay_specs(&[
+        let specs = specs_for(&[
             participant("DP-1", 0, 0, 1920, 1080),
             participant("DP-2", 1920, 0, 1920, 1080),
         ]);
@@ -295,8 +340,38 @@ mod tests {
     }
 
     #[test]
+    fn a_mirrored_output_is_not_a_seam() {
+        // The sway same-position trick: a confidence monitor showing the
+        // projector's picture. Fading "the overlap" would black out both.
+        let specs = specs_for(&[
+            participant("PROJECTOR", 0, 0, 1920, 1080),
+            participant("MONITOR", 0, 0, 1920, 1080),
+        ]);
+        assert!(specs.is_empty(), "a full mirror must produce no ramps");
+
+        // Still a mirror when the monitor is a different, contained size.
+        let specs = specs_for(&[
+            participant("PROJECTOR", 0, 0, 1920, 1080),
+            participant("MONITOR", 0, 0, 1280, 1024),
+        ]);
+        assert!(specs.is_empty(), "a contained mirror must produce no ramps");
+    }
+
+    #[test]
+    fn an_operator_monitor_beside_the_wall_is_untouched() {
+        // Two projectors overlap; the monitor sits beyond them, no overlap.
+        let specs = specs_for(&[
+            participant("DP-1", 0, 0, 1920, 1080),
+            participant("DP-2", 1760, 0, 1920, 1080),
+            participant("HDMI-A-1", 3680, 0, 1920, 1080),
+        ]);
+        assert_eq!(specs.len(), 2);
+        assert!(specs.iter().all(|spec| spec.output != "HDMI-A-1"));
+    }
+
+    #[test]
     fn vertical_stacks_fade_up_and_down() {
-        let specs = overlay_specs(&[
+        let specs = specs_for(&[
             participant("TOP", 0, 0, 1920, 1080),
             participant("BOT", 0, 960, 1920, 1080),
         ]);
@@ -312,7 +387,7 @@ mod tests {
         // Each output overlaps its horizontal neighbour, vertical neighbour,
         // and (in the middle) its diagonal. The diagonal pair must not add a
         // third ramp: the corner is already the product of the other two.
-        let specs = overlay_specs(&[
+        let specs = specs_for(&[
             participant("A", 0, 0, 1920, 1080),
             participant("B", 1760, 0, 1920, 1080),
             participant("C", 0, 960, 1920, 1080),
@@ -330,21 +405,41 @@ mod tests {
     }
 
     #[test]
-    fn gamma_shapes_the_alpha() {
-        let spec = OverlaySpec {
+    fn the_wall_shares_one_gamma_and_lift() {
+        let specs = overlay_specs(
+            &[
+                participant("DP-1", 0, 0, 1920, 1080),
+                participant("DP-2", 1760, 0, 1920, 1080),
+            ],
+            2.4,
+            0.05,
+        );
+        for spec in &specs {
+            assert_eq!(spec.gamma, 2.4);
+            assert_eq!(spec.black_lift, 0.05);
+        }
+    }
+
+    fn ramp_only_spec(gamma: f64, width: i32) -> OverlaySpec {
+        OverlaySpec {
             output: "DP-1".into(),
-            gamma: 2.2,
+            gamma,
+            black_lift: 0.0,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,
                     y: 0,
-                    width: 100,
+                    width,
                     height: 1,
                 },
                 fade_to: FadeTo::Right,
             }],
-        };
-        let map = alpha_map(100, 1, &spec);
+        }
+    }
+
+    #[test]
+    fn gamma_shapes_the_alpha() {
+        let map = alpha_map(100, 1, &ramp_only_spec(2.2, 100));
         // Midway across the ramp, half the light must remain: the *signal*
         // multiplier is 0.5^(1/2.2) ≈ 0.73, so alpha ≈ 0.27 — noticeably
         // less than the 0.5 a signal-space gradient would apply.
@@ -369,11 +464,15 @@ mod tests {
         // The mathematical point of the whole feature: at every column of the
         // seam, what the left projector still shows plus what the right one
         // shows adds to the full picture, within 8-bit quantisation.
-        let specs = overlay_specs(&[
-            participant("L", 0, 0, 1920, 1080),
-            participant("R", 1760, 0, 1920, 1080),
-        ]);
         let gamma = 2.2;
+        let specs = overlay_specs(
+            &[
+                participant("L", 0, 0, 1920, 1080),
+                participant("R", 1760, 0, 1920, 1080),
+            ],
+            gamma,
+            0.0,
+        );
         let left = alpha_map(1920, 1, &specs[0]);
         let right = alpha_map(1920, 1, &specs[1]);
         for offset in 0..160u32 {
@@ -389,20 +488,7 @@ mod tests {
 
     #[test]
     fn gamma_one_is_a_plain_linear_gradient() {
-        let spec = OverlaySpec {
-            output: "DP-1".into(),
-            gamma: 1.0,
-            ramps: vec![RampSpec {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 256,
-                    height: 1,
-                },
-                fade_to: FadeTo::Right,
-            }],
-        };
-        let map = alpha_map(256, 1, &spec);
+        let map = alpha_map(256, 1, &ramp_only_spec(1.0, 256));
         let quarter = map[64] as f64 / 255.0;
         assert!((quarter - 0.25).abs() < 0.01);
     }
@@ -413,6 +499,7 @@ mod tests {
         let spec = OverlaySpec {
             output: "A".into(),
             gamma: 2.0,
+            black_lift: 0.0,
             ramps: vec![
                 RampSpec {
                     rect: Rect {
@@ -445,11 +532,49 @@ mod tests {
     }
 
     #[test]
+    fn black_lift_paints_white_outside_the_seam_only() {
+        let spec = OverlaySpec {
+            output: "DP-1".into(),
+            gamma: 2.2,
+            black_lift: 0.1,
+            ramps: vec![RampSpec {
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 1,
+                },
+                fade_to: FadeTo::Left,
+            }],
+        };
+        let pixels = pixel_map(8, 1, &spec);
+
+        // Inside the seam: black — colour bytes zero, only alpha set. The
+        // doubled projector black is the lift there; adding more would glow.
+        assert_eq!(&pixels[0..3], &[0, 0, 0], "seam pixels must stay black");
+        // Outside: premultiplied white at the lift alpha. Compositing gives
+        // out = 0.9·content + 0.1·white — the black-level rescale.
+        let lift = (0.1f64 * 255.0).round() as u8;
+        assert_eq!(&pixels[6 * 4..6 * 4 + 4], &[lift, lift, lift, lift]);
+    }
+
+    #[test]
+    fn zero_lift_leaves_the_rest_of_the_screen_alone() {
+        let pixels = pixel_map(8, 1, &ramp_only_spec(2.2, 4));
+        assert_eq!(
+            &pixels[6 * 4..6 * 4 + 4],
+            &[0, 0, 0, 0],
+            "no lift: fully transparent outside the seam"
+        );
+    }
+
+    #[test]
     fn the_spec_serialises_stably_for_the_subcommand() {
         // The spec crosses a process boundary as JSON; field names are ABI.
         let spec = OverlaySpec {
             output: "DP-1".into(),
             gamma: 2.2,
+            black_lift: 0.04,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 1760,
@@ -462,6 +587,7 @@ mod tests {
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains(r#""fadeTo":"right""#), "{json}");
+        assert!(json.contains(r#""blackLift":0.04"#), "{json}");
         let back: OverlaySpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
     }

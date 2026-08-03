@@ -1,9 +1,9 @@
 //! The blend overlay: a tiny layer-shell client run as `suede blend`.
 //!
-//! One process per projector. It puts a black, input-transparent surface on
-//! the overlay layer of its output and fills the alpha channel with the ramps
-//! from its [`OverlaySpec`] — the content underneath keeps rendering and
-//! receiving input untouched; only the seam regions are attenuated.
+//! One process per projector. It puts an input-transparent surface on the
+//! overlay layer of its output: black ramps over the seam regions, and — when
+//! black-lift compensation is on — a faint white wash over everything else.
+//! The content underneath keeps rendering and receiving input untouched.
 //!
 //! The image is static: it is computed once per configure and never redrawn,
 //! so at steady state this process costs nothing per frame. The daemon spawns
@@ -29,7 +29,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
-use super::blend::{alpha_map, OverlaySpec};
+use super::blend::{pixel_map, OverlaySpec};
 
 #[derive(Default)]
 struct State {
@@ -117,14 +117,9 @@ fn paint(
     height: u32,
     handle: &QueueHandle<State>,
 ) -> anyhow::Result<WlBuffer> {
-    let alpha = alpha_map(width, height, spec);
-
-    // ARGB8888, premultiplied: black at alpha a is simply (a, 0, 0, 0),
-    // stored little-endian as B G R A.
-    let mut pixels = vec![0u8; alpha.len() * 4];
-    for (index, a) in alpha.iter().enumerate() {
-        pixels[index * 4 + 3] = *a;
-    }
+    // Premultiplied BGRA, straight from the pure math: black ramps in the
+    // seams, white-at-lift-alpha everywhere else.
+    let pixels = pixel_map(width, height, spec);
 
     // The content is static, so plain file IO suffices: no mmap on our side.
     let mut file = tempfile::tempfile()?;

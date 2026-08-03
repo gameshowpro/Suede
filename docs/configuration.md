@@ -387,43 +387,46 @@ The pieces:
    rectangles intersect — a 160&nbsp;px seam between two 1920-wide projectors
    means positions `0` and `1760`. A spanned app
    ([`spanOutputs`](#driving-a-video-wall)) then renders the shared strip on
-   both outputs. There is no separate overlap setting to fall out of step
-   with the layout: the blend regions *are* the intersections.
+   both outputs. There is no separate overlap setting, and no list of
+   projectors either: the blend regions *are* the intersections. A monitor
+   beside the wall overlaps nothing and is untouched; an output that
+   *mirrors* another (near-total overlap) is recognised as a mirror, not a
+   seam.
 2. **Blending is a ramp in light, not in signal.** A display raises its input
    signal to a power (its gamma, typically 2.2), so a gradient that is linear
    in signal is far from linear in light and produces a visible bright band
-   at every seam. Suede shapes each ramp as `ramp^(1/gamma)` per projector,
-   which makes the summed luminance across a seam constant — set each
-   projector's measured gamma and the seams disappear.
-3. **The overlays are tiny and passive.** Each projector gets one
-   `suede blend` process: a black, input-transparent layer surface whose
-   alpha channel holds the ramps. It is drawn once, costs nothing per frame,
-   and clicks pass straight through. The reconciler starts, restarts, and
-   retires them as the layout or configuration changes.
+   at every seam. Suede shapes each ramp as `ramp^(1/gamma)`, which makes the
+   summed luminance across a seam constant.
+3. **Black-level compensation.** Projector black is not zero light, so seams
+   glow on dark scenes — they receive two projectors' worth of leaked black.
+   The seam cannot be made darker, so `blackLift` brightens everything *else*
+   to match: `out = lift + (1 − lift) · in` outside the seams. Show a black
+   scene and raise it until the picture is even.
+4. **The overlays are tiny and passive.** Each projector gets one
+   `suede blend` process: an input-transparent layer surface carrying the
+   ramps and the lift. It is drawn once, costs nothing per frame, and clicks
+   pass straight through. The reconciler starts, restarts, and retires them
+   as the layout or configuration changes.
 
 ```json
-"projection": {
-  "blend": true,
-  "outputs": [
-    { "name": "DP-1", "gamma": 2.2 },
-    { "name": "DP-2", "gamma": 2.15 }
-  ]
-}
+"projection": { "blend": true, "gamma": 2.2, "blackLift": 0.04 }
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `blend` | bool | `true` | `false` skips the entire chain: overlays are torn down, nothing runs |
-| `outputs[].name` | string | — | Connector name of a projector; unlisted outputs are untouched |
-| `outputs[].gamma` | number | `2.2` | That projector's transfer gamma, 1.0–4.0 |
+| `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0–4.0; shapes every ramp's fall-off |
+| `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0–0.5 |
 
-Only listed outputs take part, so an operator monitor beside the wall keeps
-rendering normally. Setting `blend: false` — or removing the section with
+One gamma for the whole wall: a wall is near-universally identical
+projectors, and a single measured value covers it. (Per-output overrides can
+be added later without breaking this shape, should mixed models ever
+matter.) Setting `blend: false` — or removing the section with
 `PUT /api/v1/config/projection` and a `null` body — stops every overlay and
 skips all projection work; nothing is spawned and nothing is checked.
 
 Rows, columns, and grids all work: seams are derived pairwise from wherever
-listed outputs intersect, and in a 2×2 grid the corner region multiplies its
+outputs intersect, and in a 2×2 grid the corner region multiplies its
 horizontal and vertical ramps, which sums correctly by construction.
 
 !!! warning "Keep an output at position 0,0"

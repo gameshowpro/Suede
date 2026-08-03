@@ -100,14 +100,13 @@ check "stale If-Match is 409" "409" \
 check "projection config accepted" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' \
-     -d '{"blend":false,"outputs":[{"name":"HDMI-A-1","gamma":2.2}]}')"
-check "projection round trips" "2.2" \
+     -d '{"blend":false,"gamma":2.4,"blackLift":0.05}')"
+check "projection round trips" "2.4" \
   "$(curl -s "${BASE}/api/v1/config/projection" \
-     | python3 -c 'import sys,json;print(json.load(sys.stdin)["outputs"][0]["gamma"])')"
+     | python3 -c 'import sys,json;print(json.load(sys.stdin)["gamma"])')"
 check "projection gamma is validated" "422" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
-     -H 'content-type: application/json' \
-     -d '{"blend":true,"outputs":[{"name":"HDMI-A-1","gamma":22}]}')"
+     -H 'content-type: application/json' -d '{"gamma":22}')"
 check "projection null clears it" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' -d 'null')"

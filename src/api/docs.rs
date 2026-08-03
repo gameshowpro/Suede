@@ -114,7 +114,6 @@ impl Modify for SecurityAddon {
         crate::model::AppConfig,
         crate::model::Settings,
         crate::model::ProjectionConfig,
-        crate::model::ProjectionOutput,
         crate::model::Background,
         crate::model::BackgroundMode,
         crate::model::BackgroundPreset,
