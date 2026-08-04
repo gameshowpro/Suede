@@ -495,6 +495,24 @@ Canvas mode requires sway's headless backend
 (`WLR_BACKENDS=drm,libinput,headless`, set by provisioning); without it Suede
 reports `headless_unavailable` and tiles the layout unsliced.
 
+#### Backgrounds in canvas mode {: #canvas-backgrounds }
+
+The slicer presents on the overlay layer, above everything sway draws on
+those outputs — including their backgrounds. That is correct while an
+application is producing frames and wrong the moment it is not, so the slicer
+only runs when there is something to show: an active application, or a test
+pattern. Deactivate the application and the slicer stands down, uncovering
+the outputs so their configured backgrounds appear.
+
+Because the pass that stops the slicer runs before the one that stops the
+application, the background is already visible by the time the browser exits
+— the change is a clean swap rather than a flash of one and then the other.
+
+!!! note "A relaunch still shows black"
+    The slicer stands down when no application is *active*, not when the
+    active one happens to be restarting. During a relaunch the canvas is
+    briefly empty and the projectors show black rather than the background.
+
 #### Working copies and the committed flag {: #live-preview }
 
 The document carries a truth flag, `committed`. Reads report it honestly:

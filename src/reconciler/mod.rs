@@ -397,11 +397,26 @@ impl Reconciler {
                         }
                         self.refresh_outputs().await;
                     }
+                    // The slicer's surfaces sit on the overlay layer, above
+                    // everything sway draws on these outputs — including the
+                    // backgrounds. That is right while an app is producing
+                    // frames, and wrong the moment it is not: a canvas with
+                    // nothing on it would paint black over every configured
+                    // background. So the slicer runs only when there is
+                    // something for it to show. Standing it down uncovers
+                    // the outputs and their backgrounds appear, which is the
+                    // whole point of having configured one.
+                    //
+                    // Test patterns are drawn rather than captured, so they
+                    // are a reason to run with no app at all — that is the
+                    // bench-alignment case.
+                    let anything_to_show =
+                        desired.active_app.is_some() || projection.test_pattern.is_some();
                     // With nothing attached there is nowhere to present, but
                     // the canvas stays exactly as configured so the app is
                     // never resized — displays coming back find the frame
                     // they left.
-                    if !plan.slices.is_empty() {
+                    if anything_to_show && !plan.slices.is_empty() {
                         slicer = Some(SlicerSpec {
                             source: name.clone(),
                             canvas_width: width,
