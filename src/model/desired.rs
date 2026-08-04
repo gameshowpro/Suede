@@ -40,7 +40,7 @@ pub struct DesiredState {
     /// Named background definitions outputs can refer to.
     ///
     /// A multi-display installation usually wants one look across every
-    /// alternative — repeating a wallpaper, scaling mode and colour on each
+    /// alternative — repeating a wallpaper, scaling mode and color on each
     /// output — makes the common case the laborious one and guarantees the
     /// screens drift apart the first time somebody edits only three of four.
     pub backgrounds: Vec<BackgroundPreset>,
@@ -112,7 +112,7 @@ impl Default for ProjectionConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TestPattern {
-    /// Coloured 100 px tiles with crosses, global pixel coordinates, and the
+    /// Colored 100 px tiles with crosses, global pixel coordinates, and the
     /// output name — for geometry, focus, and seam alignment.
     Grid,
     /// Full white: shows the blend ramps in isolation and exposes brightness
@@ -560,7 +560,7 @@ impl BackgroundMode {
     }
 }
 
-/// Colour shown where no wallpaper reaches.
+/// Color shown where no wallpaper reaches.
 ///
 /// Black rather than "nothing": an unpainted output is whatever the compositor
 /// last left there, which on a display appliance is usually a stale frame of the
@@ -613,7 +613,7 @@ impl Background {
         errors
     }
 
-    /// Sway wants `#rrggbb` without the hash. Never empty: an unset colour
+    /// Sway wants `#rrggbb` without the hash. Never empty: an unset color
     /// falls back to black rather than leaving swaybg to invent one.
     pub fn sway_color(&self) -> String {
         self.color

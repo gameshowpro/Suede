@@ -329,11 +329,11 @@ window.addEventListener("error", (event) => {
     <div class="panel">
       <h2>Backgrounds</h2>
       <p class="hint">A background bundles an image, how it is scaled, and the
-        colour behind it. Define one here, then pick it by name on the Displays
+        color behind it. Define one here, then pick it by name on the Displays
         tab — so every screen shares one definition instead of four copies
         that drift apart.</p>
       <table id="backgrounds"><thead><tr>
-        <th></th><th>Name</th><th>Image</th><th>Scaling</th><th>Colour</th><th>Used by</th><th></th>
+        <th></th><th>Name</th><th>Image</th><th>Scaling</th><th>Color</th><th>Used by</th><th></th>
       </tr></thead><tbody></tbody></table>
       <p class="hint" id="backgrounds-empty">None defined yet.</p>
       <div class="row" style="margin-top:12px">
@@ -350,16 +350,17 @@ window.addEventListener("error", (event) => {
           <option value="fill">fill — cover, cropping the overflow</option>
           <option value="fit">fit — whole image, letterboxed</option>
           <option value="stretch">stretch — ignore aspect ratio</option>
-          <option value="center">center — original size, centred</option>
+          <option value="center">center — original size, centered</option>
           <option value="tile">tile — original size, repeated</option>
         </select></div>
-        <div><label for="bg-color">Colour</label>
+        <div><label for="bg-color">Color</label>
           <div class="row">
             <input id="bg-color" placeholder="#000000">
-            <input id="bg-swatch" type="color" value="#000000" title="Pick a colour">
-          </div></div>
+            <input id="bg-swatch" type="color" value="#000000" title="Pick a color">
+          </div>
+          <p class="hint" id="bg-color-note"></p></div>
       </div>
-      <p class="hint">The colour shows wherever the image does not reach, and on
+      <p class="hint">The color shows wherever the image does not reach, and on
         its own if you choose no image. Blank means black.</p>
       <div class="row" style="margin-top:12px">
         <button class="action" id="bg-save">Save</button>
@@ -746,6 +747,7 @@ function addToLayout(name) {
     background: null,
   });
   renderLayout();
+  renderBackgrounds();
   pushPreview();
   selectOutput(name);
 }
@@ -757,6 +759,7 @@ function removeFromLayout(name) {
     $("output-editor").classList.add("hidden");
   }
   renderLayout();
+  renderBackgrounds();
   pushPreview();
 }
 
@@ -960,6 +963,9 @@ function outputEdited() {
   if (index >= 0) config.outputs[index] = entry;
   else (config.outputs ??= []).push(entry);
   renderLayout();
+  // Which displays use which background is derived from this edit, so the
+  // Backgrounds table's "Used by" column goes stale unless it is redrawn.
+  renderBackgrounds();
   pushPreview();
 }
 for (const id of ["o-enable", "o-mode", "o-x", "o-y", "o-scale", "o-transform",
@@ -1211,16 +1217,16 @@ function renderBackgrounds() {
       .map((o) => o.match?.name ?? "");
     // Preset properties are flattened beside the id on the wire.
     const background = preset;
-    const colour = background.color || DEFAULT_BG_COLOR;
+    const color = background.color || DEFAULT_BG_COLOR;
     const row = document.createElement("tr");
     row.innerHTML =
       `<td>${background.wallpaper
         ? `<img class="thumb" src="${API}/wallpapers/${encodeURIComponent(background.wallpaper)}" alt="">`
-        : `<span class="thumb" style="background:${escape(colour)}"></span>`}</td>` +
+        : `<span class="thumb" style="background:${escape(color)}"></span>`}</td>` +
       `<td class="mono">${escape(preset.id)}</td>` +
       `<td>${escape(background.wallpaper || "\u2014")}</td>` +
       `<td>${escape(background.wallpaper ? (background.mode || "fill") : "\u2014")}</td>` +
-      `<td><span class="swatch" style="background:${escape(colour)}"></span>${escape(colour)}</td>` +
+      `<td><span class="swatch" style="background:${escape(color)}"></span>${escape(color)}</td>` +
       `<td class="muted">${users.length ? escape(users.join(", ")) : "not used"}</td>`;
 
     const actions = document.createElement("td");
@@ -1254,7 +1260,7 @@ function editBackground(preset) {
   $("bg-id").value = preset?.id ?? "";
   // Renaming would orphan every output pointing at the old name.
   $("bg-id").disabled = Boolean(preset);
-  $("bg-wallpaper").innerHTML = `<option value="">None \u2014 colour only</option>` +
+  $("bg-wallpaper").innerHTML = `<option value="">None \u2014 color only</option>` +
     wallpapers.map((w) => `<option value="${escape(w.id)}">${escape(w.id)}</option>`).join("");
   $("bg-wallpaper").value = background.wallpaper ?? "";
   $("bg-mode").value = background.mode ?? "fill";
@@ -1271,20 +1277,37 @@ function backgroundFromForm() {
 }
 
 function refreshBackgroundPreview() {
-  paintPreview($("bg-preview"), backgroundFromForm(), "Preview");
+  const background = backgroundFromForm();
+  paintPreview($("bg-preview"), background, "Preview");
+  // A color behind an image that covers the whole screen can never be seen.
+  // Without saying so, picking one looks exactly like a broken control.
+  const covered = background.wallpaper &&
+    (background.mode === "fill" || background.mode === "stretch");
+  $("bg-color-note").textContent = covered
+    ? "This image covers the whole screen, so the color will not show. " +
+      "Choose fit, center or tile to see it."
+    : "";
 }
 
 for (const id of ["bg-wallpaper", "bg-mode", "bg-color"]) {
-  $(id).oninput = refreshBackgroundPreview;
+  $(id).addEventListener("input", refreshBackgroundPreview);
 }
+// The hex field and the picker are two views of one value; typing in one
+// moves the other.
 $("bg-color").addEventListener("input", () => {
   const value = $("bg-color").value.trim();
   if (/^#[0-9a-fA-F]{6}$/.test(value)) $("bg-swatch").value = value;
 });
-$("bg-swatch").oninput = () => {
-  $("bg-color").value = $("bg-swatch").value;
-  refreshBackgroundPreview();
-};
+// Listen for both events. Browsers disagree about what a native color
+// dialog emits: some report every change live as `input`, others send only
+// `change` once the dialog is dismissed. Listening for just one leaves the
+// picker looking dead on the browsers that send the other.
+for (const event of ["input", "change"]) {
+  $("bg-swatch").addEventListener(event, () => {
+    $("bg-color").value = $("bg-swatch").value;
+    refreshBackgroundPreview();
+  });
+}
 
 $("bg-new").onclick = () => editBackground(null);
 $("bg-cancel").onclick = () => {

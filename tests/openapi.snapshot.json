@@ -1781,7 +1781,7 @@
             "items": {
               "$ref": "#/components/schemas/BackgroundPreset"
             },
-            "description": "Named background definitions outputs can refer to.\n\nA multi-display installation usually wants one look across every\nalternative — repeating a wallpaper, scaling mode and colour on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
+            "description": "Named background definitions outputs can refer to.\n\nA multi-display installation usually wants one look across every\nalternative — repeating a wallpaper, scaling mode and color on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
             "default": []
           },
           "committed": {

@@ -129,11 +129,11 @@ A background has three properties, all optional:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `wallpaper` | string \| null | null | Id of an uploaded image. Absent means the colour alone |
+| `wallpaper` | string \| null | null | Id of an uploaded image. Absent means the color alone |
 | `color` | string \| null | `#000000` | `#rrggbb`, used alone or wherever the image does not reach |
 | `mode` | string | `fill` | `fill`, `fit`, `stretch`, `center`, `tile` |
 
-The colour is never left unstated. Every mode except `fill` and `stretch`
+The color is never left unstated. Every mode except `fill` and `stretch`
 leaves part of the screen uncovered, and an unpainted region shows whatever the
 compositor last left there — usually a stale frame of the previous app.
 
@@ -547,7 +547,7 @@ right tool for checking a rig before committing to a layout.
 
 | Pattern | For |
 |---|---|
-| `grid` | Geometry, focus, and seam alignment: 100 px colour tiles with crosses, each labelled with its global pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
+| `grid` | Geometry, focus, and seam alignment: 100 px color tiles with crosses, each labelled with its global pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |
