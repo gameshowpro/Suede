@@ -26,6 +26,24 @@ case "$1" in
       fi
     done
 
+    # A machine provisioned before device groups were part of provisioning
+    # keeps working displays and silent audio, and an upgrade alone will not
+    # correct it. Say so rather than changing a user's groups from a package
+    # script, which is exactly the session meddling this file avoids.
+    for uid in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $1}'); do
+      user=$(getent passwd "$uid" | cut -d: -f1) || continue
+      [ -n "$user" ] || continue
+      env XDG_RUNTIME_DIR=/run/user/${uid} systemctl --user --machine="${uid}@"         is-active suede.service >/dev/null 2>&1 || continue
+      if ! id -nG "$user" 2>/dev/null | tr ' ' '
+' | grep -qx audio; then
+        echo
+        echo "NOTE: '$user' runs Suede but is not in the 'audio' group, so"
+        echo "      PipeWire cannot open the sound devices and audio will be"
+        echo "      silent. Re-run provisioning to fix it, then reboot:"
+        echo "        sudo /usr/share/suede/provision.sh"
+      fi
+    done
+
     if [ -z "${SUEDE_QUIET_INSTALL:-}" ]; then
       cat <<'EOF'
 

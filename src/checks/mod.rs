@@ -18,6 +18,54 @@ use crate::model::{Check, CheckStatus, PackageVersion};
 use crate::sway::SwayClient;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where ALSA exposes its device nodes.
+const SOUND_DEVICES: &str = "/dev/snd";
+
+/// What the sound devices themselves say, when PipeWire offers no output.
+///
+/// "No sinks" has three quite different causes and one useless summary, so
+/// the check asks the kernel directly rather than guessing. Opening a
+/// control node read-only is what any mixer does; it takes nothing
+/// exclusively and disturbs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SoundDevices {
+    /// No control nodes at all: no sound hardware, or no driver bound.
+    Absent,
+    /// Nodes exist, but this user may not open them.
+    Denied,
+    /// Nodes exist and open, so silence has some other cause.
+    Available,
+}
+
+fn sound_devices() -> SoundDevices {
+    sound_devices_in(SOUND_DEVICES)
+}
+
+fn sound_devices_in(root: &str) -> SoundDevices {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return SoundDevices::Absent;
+    };
+    let controls: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("control"))
+        })
+        .collect();
+    if controls.is_empty() {
+        SoundDevices::Absent
+    } else if controls
+        .iter()
+        .any(|path| std::fs::File::open(path).is_ok())
+    {
+        SoundDevices::Available
+    } else {
+        SoundDevices::Denied
+    }
+}
 const UNIT_NAME: &str = "suede.service";
 
 /// Checks that `fix()` can remediate. Kept beside the dispatch so the two
@@ -701,15 +749,38 @@ impl CheckRunner {
         let real = sinks.iter().filter(|sink| !sink.is_null_sink).count();
 
         let (status, detail) = match (dump_works, pulse_socket, real) {
-            (true, true, 0) => (
-                CheckStatus::Warn,
-                "pipewire is serving, but no audio devices are available - \
-                 only a dummy sink exists, so nothing can be heard. On an \
-                 appliance this is usually device permissions: with no seated \
-                 login, the session user must be in the 'audio' group to open \
-                 /dev/snd."
-                    .to_string(),
-            ),
+            // No real output. Which of the three reasons it is decides what
+            // the operator should do, so say which rather than listing them.
+            (true, true, 0) => match sound_devices() {
+                SoundDevices::Denied => (
+                    CheckStatus::Warn,
+                    "no audio output: the sound devices exist but this user \
+                     cannot open them, so PipeWire fell back to a dummy sink. \
+                     An appliance has no seated login, so the ACLs that \
+                     normally grant access are never applied and group \
+                     membership is what counts. Run: sudo usermod -aG audio \
+                     $USER, then reboot - a running session keeps the groups \
+                     it started with."
+                        .to_string(),
+                ),
+                SoundDevices::Absent => (
+                    CheckStatus::Warn,
+                    "no audio output: this machine reports no sound devices at \
+                     all. Either it has no audio hardware, or no driver is \
+                     bound to it - check `lspci -nn | grep -i audio` and \
+                     whether the snd_hda_intel module is loaded."
+                        .to_string(),
+                ),
+                SoundDevices::Available => (
+                    CheckStatus::Warn,
+                    "no audio output: the sound devices are present and \
+                     accessible, but no output is active, so PipeWire fell \
+                     back to a dummy sink. Analog outputs go inactive when \
+                     nothing is plugged into the jacks. Run `wpctl status` to \
+                     see the devices and their profiles."
+                        .to_string(),
+                ),
+            },
             (true, true, _) => (
                 CheckStatus::Pass,
                 format!("{real} audio device(s) available; pipewire-pulse is serving"),
@@ -733,7 +804,11 @@ impl CheckRunner {
             "PipeWire audio",
             status,
             detail,
-            Some("getting-started/#audio"),
+            Some(if status == CheckStatus::Pass {
+                "getting-started/#audio"
+            } else {
+                "troubleshooting/#dummy-output"
+            }),
         );
         if check.status != CheckStatus::Pass && units_would_help {
             check.fix_available = true;
@@ -1216,6 +1291,64 @@ mod tests {
     use super::*;
     use crate::audio::mock::MockAudio;
     use crate::sway::mock::MockSway;
+
+    #[test]
+    fn no_sound_nodes_at_all_reads_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            sound_devices_in(dir.path().to_str().unwrap()),
+            SoundDevices::Absent
+        );
+        // A directory that is not there at all is the same answer, not a panic.
+        assert_eq!(
+            sound_devices_in("/definitely/not/here"),
+            SoundDevices::Absent
+        );
+    }
+
+    #[test]
+    fn only_non_control_nodes_still_reads_as_absent() {
+        // seq and timer exist on machines with no sound card; neither is a
+        // card, so neither should suggest one is present.
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["seq", "timer"] {
+            std::fs::write(dir.path().join(name), b"").unwrap();
+        }
+        assert_eq!(
+            sound_devices_in(dir.path().to_str().unwrap()),
+            SoundDevices::Absent
+        );
+    }
+
+    #[test]
+    fn a_readable_control_node_reads_as_available() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("controlC0"), b"").unwrap();
+        std::fs::write(dir.path().join("pcmC0D0p"), b"").unwrap();
+        assert_eq!(
+            sound_devices_in(dir.path().to_str().unwrap()),
+            SoundDevices::Available
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unopenable_control_node_reads_as_denied() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let node = dir.path().join("controlC0");
+        std::fs::write(&node, b"").unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores the mode bits, so this can only be asserted as a
+        // normal user; skip rather than fail in a root container.
+        if std::fs::File::open(&node).is_ok() {
+            return;
+        }
+        assert_eq!(
+            sound_devices_in(dir.path().to_str().unwrap()),
+            SoundDevices::Denied
+        );
+    }
 
     fn runner(state_dir: std::path::PathBuf) -> CheckRunner {
         let store = Arc::new(crate::state::StateStore::ephemeral(state_dir.clone()));
