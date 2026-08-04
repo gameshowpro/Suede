@@ -48,6 +48,7 @@ button.action { background: var(--accent); color: #fff; border: 0; padding: 7px 
 button.action.ghost { background: transparent; color: var(--accent); border: 1px solid var(--line); }
 button.action.danger { background: transparent; color: var(--bad); border: 1px solid var(--line); }
 button.action:disabled { opacity: .5; cursor: not-allowed; }
+input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
 a { color: var(--accent); }
 
 /* --- alerts: the operator's first stop ------------------------------- */
@@ -218,6 +219,11 @@ window.addEventListener("error", (event) => {
         seam its own amount. Suede renders the app once into that canvas and
         slices it per projector; with blending on, each seam is faded from
         both sides so the doubled light adds up to one seamless picture.</p>
+      <p class="hint" id="pj-idle" hidden><strong>These settings are
+        inactive: no displays overlap in the layout above.</strong> With no
+        overlaps there is nothing to blend, so the displays are tiled
+        directly and none of this applies. Position displays so they overlap
+        — as the projector beams do on the wall — and blending engages.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <select id="pj-blend"><option value="off">Off</option><option value="on">On</option></select></div>
@@ -717,14 +723,9 @@ function renderLayoutSize() {
   const entries = physicalOutputs()
     .map((o) => ({ o, r: canvasRect(o) }))
     .filter(({ o, r }) => r.width > 0 && (r.configured?.enable ?? o.active));
-  if (entries.length === 0) { el.textContent = ""; return; }
 
-  const left = Math.min(...entries.map(({ r }) => r.x));
-  const top = Math.min(...entries.map(({ r }) => r.y));
-  const width = Math.max(...entries.map(({ r }) => r.x + r.width)) - left;
-  const height = Math.max(...entries.map(({ r }) => r.y + r.height)) - top;
-
-  // Count overlapping pairs so the operator can see the slicer will engage.
+  // Count overlapping pairs so the operator can see the slicer will engage —
+  // and so the Projection panel can grey itself out when it will not.
   let overlaps = 0;
   for (let i = 0; i < entries.length; i++) {
     for (let j = i + 1; j < entries.length; j++) {
@@ -735,6 +736,13 @@ function renderLayoutSize() {
       }
     }
   }
+  renderProjectionAvailability(overlaps);
+  if (entries.length === 0) { el.textContent = ""; return; }
+
+  const left = Math.min(...entries.map(({ r }) => r.x));
+  const top = Math.min(...entries.map(({ r }) => r.y));
+  const width = Math.max(...entries.map(({ r }) => r.x + r.width)) - left;
+  const height = Math.max(...entries.map(({ r }) => r.y + r.height)) - top;
 
   let text = `App canvas: ${width} × ${height} — author content to this size.`;
   text += overlaps > 0
@@ -950,6 +958,18 @@ $("a-save").onclick = () => run(async () => {
 }, "saved application");
 
 // --- projection ----------------------------------------------------------
+
+// Projection settings only do anything when displays overlap: the slicer
+// engages on intersections, and with none the layout tiles directly. Say
+// so instead of presenting live-looking controls that change nothing.
+// Driven from renderLayoutSize so it tracks every layout edit as it is made.
+function renderProjectionAvailability(overlaps) {
+  const idle = overlaps === 0;
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-pattern", "pj-save"]) {
+    $(id).disabled = idle;
+  }
+  $("pj-idle").hidden = !idle;
+}
 
 function renderProjection() {
   // Never stomp an edit in progress.
