@@ -296,7 +296,12 @@ pub fn parse_sinks(dump: &[u8]) -> AudioResult<Vec<AudioSink>> {
         sinks.push(AudioSink {
             id: name.to_string(),
             description: property(props, "node.description").map(str::to_string),
-            is_null_sink: name == NULL_SINK_NAME,
+            // Any sink built on the null factory discards what it is
+            // given: the one Suede manages for silent routing, and the
+            // `auto_null` dummy PipeWire falls back to when it can see no
+            // audio devices at all.
+            is_null_sink: name == NULL_SINK_NAME
+                || property(props, "factory.name") == Some("support.null-audio-sink"),
             is_default: default_sink.as_deref() == Some(name),
             output_hint: property(props, "api.alsa.path")
                 .or_else(|| property(props, "api.alsa.pcm.name"))
@@ -318,7 +323,7 @@ mod tests {
     #[test]
     fn parses_sinks_from_a_real_dump() {
         let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
-        assert_eq!(sinks.len(), 3);
+        assert_eq!(sinks.len(), 4);
         let ids: Vec<&str> = sinks.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"alsa_output.pci-0000_01_00.1.hdmi-stereo"));
         assert!(ids.contains(&NULL_SINK_NAME));
@@ -344,6 +349,18 @@ mod tests {
         let null = sinks.iter().find(|s| s.id == NULL_SINK_NAME).unwrap();
         assert!(null.is_null_sink);
         assert!(!null.is_default);
+    }
+
+    #[test]
+    fn pipewires_own_fallback_dummy_counts_as_a_null_sink() {
+        // When PipeWire can open no devices it invents `auto_null`. Reading
+        // that as a working output is how a machine with no audio at all
+        // reports itself healthy.
+        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let dummy = sinks.iter().find(|s| s.id == "auto_null").unwrap();
+        assert!(dummy.is_null_sink);
+        // Real devices are still told apart from both dummies.
+        assert_eq!(sinks.iter().filter(|s| !s.is_null_sink).count(), 2);
     }
 
     #[test]

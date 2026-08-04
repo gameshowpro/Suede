@@ -72,6 +72,29 @@ if ! command -v chromium >/dev/null 2>&1 && ! command -v firefox >/dev/null 2>&1
   echo "         Install one before configuring a kiosk app:  apt install chromium"
 fi
 
+# --- 1b. Device group membership ----------------------------------------
+#
+# An appliance has no seated graphical login, so systemd-logind never applies
+# its `uaccess` ACLs to /dev/dri or /dev/snd — those are granted per session,
+# to sessions attached to a seat, and a machine started by auto-login into a
+# systemd user service does not reliably have one. Without the static groups
+# the symptom is silent and confusing: sway may run fine while PipeWire finds
+# no audio devices at all and falls back to a dummy sink, so everything looks
+# healthy and nothing can be heard.
+step "Adding '$APPLIANCE_USER' to the device groups"
+for group in audio video render; do
+  if ! getent group "$group" >/dev/null; then
+    echo "  $group: no such group on this system, skipping"
+  elif id -nG "$APPLIANCE_USER" | tr ' ' '
+' | grep -qx "$group"; then
+    echo "  $group: already a member"
+  else
+    usermod -aG "$group" "$APPLIANCE_USER"
+    echo "  $group: added (takes effect at the next login)"
+    GROUPS_CHANGED=1
+  fi
+done
+
 # --- 2. Auto-login on tty1 ----------------------------------------------
 step "Configuring auto-login on tty1"
 install -d /etc/systemd/system/getty@tty1.service.d
@@ -229,6 +252,16 @@ cat <<EOF
   After a reboot the machine will log in, start sway, and start Suede.
   Open http://\$(hostname):9088/ from another computer to configure it.
 EOF
+
+if [[ -n "${GROUPS_CHANGED:-}" ]]; then
+  cat <<'EOF'
+
+  NOTE: group membership changed. A running session keeps the groups it
+  started with, so restarting the user services is not enough - the machine
+  must be rebooted (or the user session fully terminated) before PipeWire
+  can open the sound devices.
+EOF
+fi
 
 if [[ "$ASK_REBOOT" -eq 1 ]]; then
   echo

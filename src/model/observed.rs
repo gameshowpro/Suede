@@ -226,7 +226,9 @@ pub struct AudioSink {
     pub id: String,
     /// Human-readable `node.description`.
     pub description: Option<String>,
-    /// True for the null sink Suede manages for silent routing.
+    /// True for sinks that discard whatever is routed to them: the one
+    /// Suede manages for silent routing, and the dummy PipeWire falls back
+    /// to when it can find no audio devices at all. Never a real output.
     pub is_null_sink: bool,
     /// True when this is PipeWire's current default sink.
     pub is_default: bool,

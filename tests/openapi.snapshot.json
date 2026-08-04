@@ -1605,7 +1605,7 @@
           },
           "isNullSink": {
             "type": "boolean",
-            "description": "True for the null sink Suede manages for silent routing."
+            "description": "True for sinks that discard whatever is routed to them: the one\nSuede manages for silent routing, and the dummy PipeWire falls back\nto when it can find no audio devices at all. Never a real output."
           },
           "outputHint": {
             "type": [

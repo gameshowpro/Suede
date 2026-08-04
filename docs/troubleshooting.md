@@ -143,6 +143,42 @@ Use the `id` field (PipeWire's `node.name`) in the app's `audio.output`; it is s
 
 If no sinks appear at all, `pw-dump` is failing — check that PipeWire is running. If sinks appear but browsers have no audio device, `pipewire-pulse` is missing; browsers reach PipeWire through its PulseAudio compatibility layer, which is what `PULSE_SINK` routing depends on.
 
+### Only a "Dummy Output" is listed {: #dummy-output }
+
+The most common cause on an appliance, and the most confusing, because
+everything else looks healthy: PipeWire is running, `pipewire-pulse` is
+serving, and one sink is listed. But that sink is `auto_null`, the dummy
+PipeWire invents when it can open no audio devices at all, and anything
+routed to it is discarded. Suede reports this as a **warning** on the
+PipeWire health check rather than a pass.
+
+The cause is almost always device permissions. `/dev/snd/*` is owned by
+`root:audio` with no world access, and the ACLs that normally grant a
+desktop user access are applied by `systemd-logind` **per session, to
+sessions attached to a seat**. An appliance auto-logs in and runs its
+compositor from a systemd user service, which does not reliably get a seat,
+so those ACLs are never applied. Confirm it directly:
+
+```bash
+id -nG | tr ' ' '
+' | grep -x audio    # is the user in the group at all?
+loginctl list-sessions                  # SEAT column empty means no ACLs
+ls -l /dev/snd/                         # root:audio, mode 0660
+```
+
+The fix is static group membership, which does not depend on a session:
+
+```bash
+sudo usermod -aG audio "$USER"
+sudo reboot
+```
+
+A reboot is genuinely required. A running process keeps the groups it
+started with, so restarting the PipeWire units is not enough — they are
+spawned by a user manager that still has the old set. Provisioning does this
+for you (`provision.sh` adds `audio`, `video` and `render`); a machine set up
+by hand is the usual way to end up here.
+
 Changing an app's sink **relaunches** it. That is expected: routing is applied at launch.
 
 ## Configuration was lost

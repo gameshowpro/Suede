@@ -421,7 +421,9 @@ impl CheckRunner {
         if check.status != CheckStatus::Pass {
             check.fix_available = true;
             check.fix_description = Some(
-                "Write a systemd drop-in setting WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 on the                  compositor's unit. You then restart the compositor yourself, since that                  tears down every window."
+                "Write a systemd drop-in setting WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 \
+                 on the compositor's unit. You then restart the compositor \
+                 yourself, since that tears down every window."
                     .to_string(),
             );
         }
@@ -596,12 +598,17 @@ impl CheckRunner {
             ),
             (n, Some(path)) => (
                 CheckStatus::Pass,
-                format!("{n} output(s) use a background; swaybg is at {}", path.display()),
+                format!(
+                    "{n} output(s) use a background; swaybg is at {}",
+                    path.display()
+                ),
             ),
             (n, None) => (
                 CheckStatus::Fail,
                 format!(
-                    "{n} output(s) configure a background but swaybg is not installed, so                      sway will accept the command and draw nothing. Install `swaybg`."
+                    "{n} output(s) configure a background but swaybg is not \
+                     installed, so sway will accept the command and draw \
+                     nothing. Install `swaybg`."
                 ),
             ),
         };
@@ -686,24 +693,40 @@ impl CheckRunner {
             .map(|dir| dir.join("pulse/native").exists())
             .unwrap_or(false);
 
-        let (status, detail) = match (dump_works, pulse_socket) {
-            (true, true) => (
-                CheckStatus::Pass,
-                format!(
-                    "{} sinks visible; pipewire-pulse is serving",
-                    self.audio.sinks().len()
-                ),
+        // Counting sinks is not enough. When PipeWire can open no devices at
+        // all it invents a dummy one, so a machine with no working audio
+        // reports the same "1 sink" as a machine with a sound card — the
+        // check would pass while nothing could ever be heard.
+        let sinks = self.audio.sinks();
+        let real = sinks.iter().filter(|sink| !sink.is_null_sink).count();
+
+        let (status, detail) = match (dump_works, pulse_socket, real) {
+            (true, true, 0) => (
+                CheckStatus::Warn,
+                "pipewire is serving, but no audio devices are available - \
+                 only a dummy sink exists, so nothing can be heard. On an \
+                 appliance this is usually device permissions: with no seated \
+                 login, the session user must be in the 'audio' group to open \
+                 /dev/snd."
+                    .to_string(),
             ),
-            (true, false) => (
+            (true, true, _) => (
+                CheckStatus::Pass,
+                format!("{real} audio device(s) available; pipewire-pulse is serving"),
+            ),
+            (true, false, _) => (
                 CheckStatus::Warn,
                 "pipewire is running but pipewire-pulse is not; audio routing will not work"
                     .to_string(),
             ),
-            (false, _) => (
+            (false, _, _) => (
                 CheckStatus::Fail,
                 "pw-dump is unavailable; audio features are disabled".to_string(),
             ),
         };
+        // Restarting the user units cannot conjure a device the user has no
+        // permission to open, so do not offer it as the remedy for that.
+        let units_would_help = !(dump_works && pulse_socket);
 
         let mut check = self.check(
             ids::PIPEWIRE,
@@ -712,10 +735,12 @@ impl CheckRunner {
             detail,
             Some("getting-started/#audio"),
         );
-        if check.status != CheckStatus::Pass {
+        if check.status != CheckStatus::Pass && units_would_help {
             check.fix_available = true;
             check.fix_description = Some(
-                "Start the PipeWire user units (pipewire, wireplumber, pipewire-pulse).                  These belong to the session user, so no privileges are needed."
+                "Start the PipeWire user units (pipewire, wireplumber, \
+                 pipewire-pulse). These belong to the session user, so no \
+                 privileges are needed."
                     .to_string(),
             );
         }

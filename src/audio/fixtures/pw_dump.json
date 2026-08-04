@@ -71,6 +71,18 @@
     }
   },
   {
+    "id": 65,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "node.name": "auto_null",
+        "node.description": "Dummy Output",
+        "media.class": "Audio/Sink",
+        "factory.name": "support.null-audio-sink"
+      }
+    }
+  },
+  {
     "id": 70,
     "type": "PipeWire:Interface:Device",
     "info": {
