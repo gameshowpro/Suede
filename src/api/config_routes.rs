@@ -33,10 +33,15 @@ fn if_match(headers: &HeaderMap) -> Option<&str> {
 
 #[utoipa::path(
     get, path = "/api/v1/config", tag = "config",
-    responses((status = 200, description = "The desired-state document", body = DesiredState))
+    responses((
+        status = 200,
+        description = "The current document. `committed: false` means a \
+                       working copy is live on the outputs but not saved.",
+        body = DesiredState,
+    ))
 )]
 pub async fn get_config(State(state): State<ApiState>) -> Json<DesiredState> {
-    Json(state.store.get())
+    Json(state.store.effective())
 }
 
 #[utoipa::path(
@@ -55,7 +60,16 @@ pub async fn put_config(
     Json(body): Json<DesiredState>,
 ) -> ApiResult<Json<DesiredState>> {
     state.check_precondition(if_match(&headers))?;
-    state.commit(body, "all", query.wait).await.map(Json)
+    if body.committed {
+        return state.commit(body, "all", query.wait).await.map(Json);
+    }
+    // Not committed: everything except persistence. The document reaches the
+    // outputs immediately; disk keeps the last saved state.
+    body.validate()
+        .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
+    state.store.set_preview(Some(body));
+    state.trigger.request("working copy");
+    Ok(Json(state.store.effective()))
 }
 
 #[utoipa::path(
@@ -426,34 +440,18 @@ pub async fn put_projection(
 }
 
 #[utoipa::path(
-    put, path = "/api/v1/config/preview", tag = "config",
-    request_body = DesiredState,
-    responses(
-        (status = 204, description = "Preview applied to the outputs; nothing persisted"),
-        (status = 422, description = "Validation failed"),
-    )
+    post, path = "/api/v1/config/revert", tag = "config",
+    responses((
+        status = 200,
+        description = "Working copy discarded; the saved document is \
+                       re-applied and returned",
+        body = DesiredState,
+    ))
 )]
-pub async fn put_preview(
-    State(state): State<ApiState>,
-    Json(body): Json<DesiredState>,
-) -> ApiResult<StatusCode> {
-    // Same validation as a real write: a preview that could not be saved
-    // must not reach the outputs either.
-    body.validate()
-        .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
-    state.store.set_preview(Some(body));
-    state.trigger.request("preview");
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[utoipa::path(
-    delete, path = "/api/v1/config/preview", tag = "config",
-    responses((status = 204, description = "Preview discarded; persisted state re-applied"))
-)]
-pub async fn delete_preview(State(state): State<ApiState>) -> StatusCode {
+pub async fn revert_config(State(state): State<ApiState>) -> Json<DesiredState> {
     state.store.set_preview(None);
-    state.trigger.request("preview cancelled");
-    StatusCode::NO_CONTENT
+    state.trigger.request("revert");
+    Json(state.store.get())
 }
 
 /// Shared by handlers that need to report an unexpected state error.
@@ -517,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn putting_the_whole_document_bumps_the_revision() {
         let harness = harness(None);
-        let document = format!(r#"{{"outputs":[{OUTPUT}],"apps":[]}}"#);
+        let document = format!(r#"{{"outputs":[{OUTPUT}],"apps":[],"committed":true}}"#);
         let (status, body) = call(&harness, "PUT", "/api/v1/config", Some(&document)).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["revision"], 1);
@@ -946,21 +944,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_preview_reaches_the_reconciler_but_never_the_disk() {
+    async fn an_uncommitted_write_reaches_the_outputs_but_never_the_disk() {
         let harness = harness(None);
-        let persisted = harness.state.store.get();
+        let mut working = harness.state.store.get();
+        working.settings.allow_raw_sway_commands = true;
+        working.committed = false;
 
-        let mut preview = persisted.clone();
-        preview.settings.allow_raw_sway_commands = true;
-        let (status, _) = call(
+        let (status, body) = call(
             &harness,
             "PUT",
-            "/api/v1/config/preview",
-            Some(&serde_json::to_string(&preview).unwrap()),
+            "/api/v1/config",
+            Some(&serde_json::to_string(&working).unwrap()),
         )
         .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        assert!(harness.state.store.has_preview());
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // Reads now serve the working copy, honestly flagged.
+        assert_eq!(body["committed"], false);
         assert!(
             harness
                 .state
@@ -969,24 +968,56 @@ mod tests {
                 .settings
                 .allow_raw_sway_commands
         );
-        // The persisted document is untouched — a restart would discard it.
+        // Disk keeps the saved state - a restart would return to it.
         assert!(!harness.state.store.get().settings.allow_raw_sway_commands);
+        assert!(harness.state.store.get().committed);
 
-        let (status, _) = call(&harness, "DELETE", "/api/v1/config/preview", None).await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
+        // Revert discards the working copy and returns the saved document.
+        let (status, body) = call(&harness, "POST", "/api/v1/config/revert", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["committed"], true);
         assert!(!harness.state.store.has_preview());
     }
 
     #[tokio::test]
-    async fn an_invalid_preview_is_refused_like_any_write() {
+    async fn committing_the_same_document_persists_it() {
+        let harness = harness(None);
+        let mut document = harness.state.store.get();
+        document.settings.allow_raw_sway_commands = true;
+        document.committed = false;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&document).unwrap()),
+        )
+        .await;
+
+        // Save: the same document with the flag set.
+        document.committed = true;
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&document).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(harness.state.store.get().settings.allow_raw_sway_commands);
+        assert!(!harness.state.store.has_preview());
+    }
+
+    #[tokio::test]
+    async fn an_invalid_working_copy_is_refused_like_any_write() {
         let harness = harness(None);
         let (status, _) = call(
             &harness,
             "PUT",
-            "/api/v1/config/preview",
+            "/api/v1/config",
             Some(
-                r#"{"apps":[{"id":"x","launcher":{"kind":"exec","command":"true"}},
-                              {"id":"x","launcher":{"kind":"exec","command":"true"}}]}"#,
+                r#"{"committed":false,
+                    "apps":[{"id":"x","launcher":{"kind":"exec","command":"true"}},
+                            {"id":"x","launcher":{"kind":"exec","command":"true"}}]}"#,
             ),
         )
         .await;
@@ -995,15 +1026,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_committed_write_discards_the_preview() {
+    async fn a_committed_section_write_discards_the_working_copy() {
         let harness = harness(None);
-        let mut preview = harness.state.store.get();
-        preview.settings.allow_raw_sway_commands = true;
+        let mut working = harness.state.store.get();
+        working.settings.allow_raw_sway_commands = true;
+        working.committed = false;
         call(
             &harness,
             "PUT",
-            "/api/v1/config/preview",
-            Some(&serde_json::to_string(&preview).unwrap()),
+            "/api/v1/config",
+            Some(&serde_json::to_string(&working).unwrap()),
         )
         .await;
         assert!(harness.state.store.has_preview());
@@ -1012,7 +1044,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(
             !harness.state.store.has_preview(),
-            "saving must supersede the preview"
+            "saving must supersede the working copy"
         );
     }
 

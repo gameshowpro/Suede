@@ -89,7 +89,13 @@ impl StateStore {
         Ok(Self {
             dir,
             preview: RwLock::new(None),
-            current: RwLock::new(state),
+            current: RwLock::new({
+                let mut state = state;
+                // Whatever we booted from is the committed baseline, even a
+                // pre-flag document or the empty default.
+                state.committed = true;
+                state
+            }),
         })
     }
 
@@ -98,7 +104,11 @@ impl StateStore {
         Self {
             dir,
             preview: RwLock::new(None),
-            current: RwLock::new(DesiredState::new()),
+            current: RwLock::new({
+                let mut state = DesiredState::new();
+                state.committed = true;
+                state
+            }),
         }
     }
 
@@ -116,8 +126,15 @@ impl StateStore {
             .unwrap_or_else(|| self.get())
     }
 
-    /// Set or clear the live preview. The caller validates.
+    /// Set or clear the working copy. The caller validates.
     pub fn set_preview(&self, preview: Option<DesiredState>) {
+        let preview = preview.map(|mut document| {
+            // A working copy always reads back honestly: not committed, and
+            // carrying the revision of the saved document it shadows.
+            document.committed = false;
+            document.revision = self.revision();
+            document
+        });
         *self.preview.write().unwrap() = preview;
     }
 
@@ -136,6 +153,8 @@ impl StateStore {
         let mut guard = self.current.write().unwrap();
         next.schema_version = SCHEMA_VERSION;
         next.revision = guard.revision.saturating_add(1);
+        // What reaches disk is by definition the committed document.
+        next.committed = true;
         self.persist(&next)?;
         *guard = next.clone();
         // A committed write supersedes whatever was being previewed.
@@ -303,7 +322,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE_NAME), b"nonsense").unwrap();
         let store = StateStore::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(store.get(), DesiredState::new());
+        let mut expected = DesiredState::new();
+        expected.committed = true;
+        assert_eq!(store.get(), expected);
     }
 
     #[test]

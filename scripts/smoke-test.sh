@@ -81,7 +81,8 @@ CONFIG='{
      "launcher":{"kind":"exec","command":"sleep","args":["300"]},
      "heartbeat":{"enabled":true,"timeoutSeconds":25,"startupGraceSeconds":60}}
   ],
-  "activeApp": "renderer-1"
+  "activeApp": "renderer-1",
+  "committed": true
 }'
 RESULT="$(curl -s -X PUT "${BASE}/api/v1/config?wait=10" \
   -H 'content-type: application/json' -d "$CONFIG")"
@@ -112,10 +113,11 @@ check "projection null clears it" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' -d 'null')"
 
-# Previews reach the reconciler but never the disk.
-check "preview applies" "204"   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/preview"      -H 'content-type: application/json'      -d "$(curl -s "${BASE}/api/v1/config")")"
-check "preview does not bump the revision" "3"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
-check "preview discards" "204"   "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE "${BASE}/api/v1/config/preview")"
+# An uncommitted write reaches the outputs but never the disk.
+check "uncommitted write applies" "200"   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config"      -H 'content-type: application/json'      -d "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;d=json.load(sys.stdin);d["committed"]=False;print(json.dumps(d))')")"
+check "the document now reads uncommitted" "False"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["committed"])')"
+check "the revision did not move" "3"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
+check "revert restores the committed document" "True"   "$(curl -s -X POST "${BASE}/api/v1/config/revert" | python3 -c 'import sys,json;print(json.load(sys.stdin)["committed"])')"
 
 echo
 echo "Reconciliation"

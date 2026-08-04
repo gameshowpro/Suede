@@ -135,5 +135,6 @@
     "outputPollIntervalSeconds": 5,
     "allowRawSwayCommands": false
   },
-  "activeApp": "renderer-1"
+  "activeApp": "renderer-1",
+  "committed": true
 }

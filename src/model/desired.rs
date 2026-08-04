@@ -16,6 +16,17 @@ pub struct DesiredState {
     pub schema_version: u32,
     /// Monotonic revision, incremented by Suede on every accepted write.
     pub revision: u64,
+    /// Whether this document is persisted, or a working copy being tried out.
+    ///
+    /// On reads, Suede reports the truth: `true` for the saved document,
+    /// `false` when a working copy is live. On writes, the *client* speaks:
+    /// `committed: true` persists; anything else applies the document to the
+    /// outputs — reconciled immediately, exactly as if saved — but leaves
+    /// disk untouched, so a restart or `POST /config/revert` returns to the
+    /// saved state. A UI can therefore push every edit as it happens and
+    /// only set the flag when the operator presses Save.
+    #[serde(default)]
+    pub committed: bool,
     pub outputs: Vec<OutputConfig>,
     pub apps: Vec<AppConfig>,
     /// Which app is running. `null` runs nothing.

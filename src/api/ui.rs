@@ -91,7 +91,7 @@ mod tests {
             "/events",
             "/reconcile",
             "/wallpapers",
-            "/config/projection",
+            "/config/revert",
         ] {
             assert!(INDEX.contains(path), "the UI never calls {path}");
         }

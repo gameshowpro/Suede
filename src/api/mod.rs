@@ -167,10 +167,7 @@ pub fn router(state: ApiState) -> Router {
             "/config/projection",
             get(config_routes::get_projection).put(config_routes::put_projection),
         )
-        .route(
-            "/config/preview",
-            put(config_routes::put_preview).delete(config_routes::delete_preview),
-        )
+        .route("/config/revert", post(config_routes::revert_config))
         // Imperative escape hatches.
         .route("/reconcile", post(observed::reconcile_now))
         .route("/sway/command", post(observed::run_sway_command))

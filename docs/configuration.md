@@ -435,14 +435,26 @@ Canvas mode requires sway's headless backend
 (`WLR_BACKENDS=drm,libinput,headless`, set by provisioning); without it Suede
 reports `headless_unavailable` and tiles the layout unsliced.
 
-#### Live preview {: #live-preview }
+#### Working copies and the committed flag {: #live-preview }
 
-The web UI pushes layout and projection edits to the outputs as you make
-them, without touching disk: `PUT /api/v1/config/preview` applies a full
-document as an ephemeral preview, any committed write or a daemon restart
-discards it, and `DELETE /api/v1/config/preview` reverts explicitly - which
-is what the Cancel buttons do. Save persists exactly what you have been
-looking at.
+The document carries a truth flag, `committed`. Reads report it honestly:
+`true` for the saved document, `false` when a working copy is live. Writes
+use it to speak:
+
+- `PUT /api/v1/config` with `"committed": true` validates and **persists** -
+  the normal save.
+- The same request **without** `committed: true` does everything except
+  persist: the document is validated, applied to the outputs, and reconciled
+  immediately - but disk keeps the last saved state, so a daemon restart
+  returns to it.
+- `POST /api/v1/config/revert` discards the working copy, re-applies the
+  saved document, and returns it.
+
+Any committed write (including the section endpoints, which always commit)
+supersedes a live working copy. The web UI uses this grammar for the layout
+and projection editors: every edit is pushed uncommitted as it is made - the
+wall follows the numbers as you type - Save sends the same document with the
+flag set, and Cancel calls revert.
 
 #### Test patterns {: #projection-test-patterns }
 

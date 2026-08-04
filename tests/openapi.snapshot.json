@@ -236,7 +236,7 @@
         "operationId": "get_config",
         "responses": {
           "200": {
-            "description": "The desired-state document",
+            "description": "The current document. `committed: false` means a working copy is live on the outputs but not saved.",
             "content": {
               "application/json": {
                 "schema": {
@@ -851,43 +851,6 @@
         }
       }
     },
-    "/api/v1/config/preview": {
-      "put": {
-        "tags": [
-          "config"
-        ],
-        "operationId": "put_preview",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DesiredState"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Preview applied to the outputs; nothing persisted"
-          },
-          "422": {
-            "description": "Validation failed"
-          }
-        }
-      },
-      "delete": {
-        "tags": [
-          "config"
-        ],
-        "operationId": "delete_preview",
-        "responses": {
-          "204": {
-            "description": "Preview discarded; persisted state re-applied"
-          }
-        }
-      }
-    },
     "/api/v1/config/projection": {
       "get": {
         "tags": [
@@ -961,6 +924,26 @@
           },
           "422": {
             "description": "Validation failed"
+          }
+        }
+      }
+    },
+    "/api/v1/config/revert": {
+      "post": {
+        "tags": [
+          "config"
+        ],
+        "operationId": "revert_config",
+        "responses": {
+          "200": {
+            "description": "Working copy discarded; the saved document is re-applied and returned",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            }
           }
         }
       }
@@ -1777,6 +1760,11 @@
             },
             "description": "Named background definitions outputs can refer to.\n\nA video wall usually wants one look across every screen, so the\nalternative — repeating a wallpaper, scaling mode and colour on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
             "default": []
+          },
+          "committed": {
+            "type": "boolean",
+            "description": "Whether this document is persisted, or a working copy being tried out.\n\nOn reads, Suede reports the truth: `true` for the saved document,\n`false` when a working copy is live. On writes, the *client* speaks:\n`committed: true` persists; anything else applies the document to the\noutputs — reconciled immediately, exactly as if saved — but leaves\ndisk untouched, so a restart or `POST /config/revert` returns to the\nsaved state. A UI can therefore push every edit as it happens and\nonly set the flag when the operator presses Save.",
+            "default": false
           },
           "outputs": {
             "type": "array",

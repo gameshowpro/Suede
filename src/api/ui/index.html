@@ -463,10 +463,12 @@ function pushPreview() {
   clearTimeout(previewTimer);
   previewTimer = setTimeout(async () => {
     try {
-      await api("/config/preview", {
+      // committed: false — the daemon applies it to the outputs and keeps
+      // disk untouched. Save later sends the same document with true.
+      await api("/config", {
         method: "PUT",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(config),
+        body: JSON.stringify({ ...config, committed: false }),
       });
       previewActive = true;
     } catch (error) {
@@ -477,13 +479,17 @@ function pushPreview() {
 
 async function cancelPreview() {
   clearTimeout(previewTimer);
-  if (previewActive) {
-    previewActive = false;
-    try { await api("/config/preview", { method: "DELETE" }); } catch {}
-  }
-  config = structuredClone(configSnapshot);
+  previewActive = false;
+  // Revert returns the saved document; adopt it as the new baseline.
+  config = await api("/config/revert", { method: "POST" });
+  configSnapshot = structuredClone(config);
   renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection();
   if (selected) selectOutput(selected);
+}
+
+// Persist exactly what is being looked at: the whole working document.
+function saveCommitted() {
+  return save("/config", { ...config, committed: true });
 }
 
 async function run(operation, successMessage) {
@@ -806,8 +812,9 @@ for (const id of ["o-enable", "o-mode", "o-x", "o-y", "o-scale", "o-transform",
 }
 
 $("o-save").onclick = () => run(async () => {
-  const name = $("output-name").textContent;
-  await save(`/config/outputs/${encodeURIComponent(name)}`, outputEntryFromForm());
+  outputEdited();
+  clearTimeout(previewTimer);
+  await saveCommitted();
 }, "saved display configuration");
 
 $("o-remove").onclick = () => run(() =>
@@ -818,8 +825,7 @@ $("o-cancel").onclick = () => run(async () => {
   $("output-editor").classList.add("hidden");
   selected = null;
   renderLayout();
-}, "reverted"); $("output-editor").classList.add("hidden"); renderLayout();
-};
+}, "reverted");
 
 // --- apps ----------------------------------------------------------------
 
@@ -977,7 +983,9 @@ for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-pattern"]) {
 
 $("pj-save").onclick = () => run(async () => {
   document.activeElement?.blur();
-  await save("/config/projection", projectionFromForm());
+  config.projection = projectionFromForm();
+  clearTimeout(previewTimer);
+  await saveCommitted();
 }, "saved projection");
 $("pj-cancel").onclick = () => run(async () => {
   await cancelPreview();
@@ -1318,7 +1326,9 @@ async function loadAll() {
   await loadChecks();
 }
 
-$("c-save").onclick = () => run(() => save("/config", JSON.parse($("config-json").value)), "saved configuration");
+$("c-save").onclick = () => run(() =>
+  save("/config", { ...JSON.parse($("config-json").value), committed: true }),
+  "saved configuration");
 $("c-reload").onclick = () => run(async () => $("config-json").blur(), "reloaded from the daemon");
 $("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
 
