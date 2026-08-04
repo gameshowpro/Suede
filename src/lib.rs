@@ -11,6 +11,7 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod model;
+pub mod ports;
 pub mod probe;
 #[cfg(feature = "projection")]
 pub mod projection;

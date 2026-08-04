@@ -1082,6 +1082,29 @@
         }
       }
     },
+    "/api/v1/ports": {
+      "get": {
+        "tags": [
+          "observed"
+        ],
+        "operationId": "list_ports",
+        "responses": {
+          "200": {
+            "description": "Every connector on the graphics hardware, attached or not. Offered so a client can let the operator configure a socket before its display arrives; sway remains the authority on what is actually driving a display.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Port"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/reconcile": {
       "post": {
         "tags": [
@@ -1758,7 +1781,7 @@
             "items": {
               "$ref": "#/components/schemas/BackgroundPreset"
             },
-            "description": "Named background definitions outputs can refer to.\n\nA video wall usually wants one look across every screen, so the\nalternative — repeating a wallpaper, scaling mode and colour on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
+            "description": "Named background definitions outputs can refer to.\n\nA multi-display installation usually wants one look across every\nalternative — repeating a wallpaper, scaling mode and colour on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
             "default": []
           },
           "committed": {
@@ -2208,6 +2231,24 @@
           }
         }
       },
+      "Port": {
+        "type": "object",
+        "description": "A connector on the graphics hardware, attached or not.",
+        "required": [
+          "name",
+          "connected"
+        ],
+        "properties": {
+          "connected": {
+            "type": "boolean",
+            "description": "Whether a display is currently attached."
+          },
+          "name": {
+            "type": "string",
+            "description": "Connector name as sway would report it, e.g. `DP-2`."
+          }
+        }
+      },
       "Position": {
         "type": "object",
         "required": [
@@ -2273,7 +2314,7 @@
           "gamma": {
             "type": "number",
             "format": "double",
-            "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\nwall — walls are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
+            "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\ninstallation — these are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
             "default": 2.2
           },
           "testPattern": {

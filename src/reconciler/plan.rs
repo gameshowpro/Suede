@@ -383,7 +383,7 @@ pub fn placement_commands(
     }
     if span_outputs {
         // `global` stretches the window across the whole layout, which is what
-        // drives a video wall from a single browser. Sway upgrades straight
+        // drives every display from a single browser. Sway upgrades straight
         // from per-output fullscreen, so no need to clear it first.
         commands.push(format!("[con_id={window_id}] fullscreen enable global"));
     } else if fullscreen {
@@ -975,7 +975,7 @@ mod tests {
 
     #[test]
     fn spanning_uses_global_fullscreen() {
-        // One browser across every output: the video-wall case.
+        // One browser across every output: the spanning case.
         let commands = placement_commands(42, Some(1), None, true, true);
         assert_eq!(
             commands,
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn one_preset_paints_every_output_that_names_it() {
-        // The whole point: a video wall is configured once, not once per screen.
+        // The whole point: an installation is configured once, not once per screen.
         let observed = vec![output("HDMI-A-1", true), output("HDMI-A-2", true)];
         let presets = vec![preset(
             "wall",
@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn editing_a_preset_repaints_the_outputs_using_it() {
         // The reference is unchanged, so diffing it would conclude nothing has
-        // happened and leave the old picture on the wall.
+        // happened and leave the old picture on the displays.
         let observed = vec![output("HDMI-A-1", true)];
         let desired = vec![referencing("HDMI-A-1", "lobby")];
         let before = vec![preset(

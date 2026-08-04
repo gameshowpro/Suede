@@ -11,7 +11,7 @@
 //! Each projector gets its own buffer, so the two sides of a seam can carry
 //! opposite fades — the thing the compositor's shared space can never do.
 //!
-//! One process for the whole wall: capture happens once per frame no matter
+//! One process for the whole installation: capture happens once per frame no matter
 //! how many projectors consume it. The frame loop is damage-driven — a
 //! static page costs nothing per second.
 

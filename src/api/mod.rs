@@ -116,6 +116,7 @@ pub fn router(state: ApiState) -> Router {
         // Observed state.
         .route("/outputs", get(observed::list_outputs))
         .route("/outputs/{name}", get(observed::get_output))
+        .route("/ports", get(observed::list_ports))
         .route("/windows", get(observed::list_windows))
         .route("/audio/outputs", get(observed::list_audio_outputs))
         .route("/status", get(observed::get_status))

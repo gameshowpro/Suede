@@ -39,7 +39,7 @@ pub struct DesiredState {
     pub active_app: Option<String>,
     /// Named background definitions outputs can refer to.
     ///
-    /// A video wall usually wants one look across every screen, so the
+    /// A multi-display installation usually wants one look across every
     /// alternative — repeating a wallpaper, scaling mode and colour on each
     /// output — makes the common case the laborious one and guarantees the
     /// screens drift apart the first time somebody edits only three of four.
@@ -75,7 +75,7 @@ pub struct ProjectionConfig {
     /// raises the signal to `gamma`. Each ramp is therefore pre-shaped as
     /// `ramp^(1/gamma)` so that the *luminance* of the two overlapping
     /// projectors sums to a constant across the seam. One value for the whole
-    /// wall — walls are near-universally identical projectors; per-output
+    /// installation — these are near-universally identical projectors; per-output
     /// overrides can be added later if mixed models ever matter.
     pub gamma: f64,
     /// Black-level compensation, `0.0` (off) to `0.5`.
@@ -563,7 +563,7 @@ impl BackgroundMode {
 /// Colour shown where no wallpaper reaches.
 ///
 /// Black rather than "nothing": an unpainted output is whatever the compositor
-/// last left there, which on a video wall is usually a stale frame of the
+/// last left there, which on a display appliance is usually a stale frame of the
 /// previous app. Something deliberate is always better than something leftover.
 pub const DEFAULT_BACKGROUND_COLOR: &str = "#000000";
 

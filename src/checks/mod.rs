@@ -497,7 +497,7 @@ impl CheckRunner {
 
     /// Hardware video decode fails *silently*: Chromium asks for VA-API, finds
     /// no driver for the GPU, and quietly decodes on the CPU. Nothing errors,
-    /// so the only symptom is a hot CPU and dropped frames on a video wall.
+    /// so the only symptom is a hot CPU and dropped frames on the displays.
     fn check_video_decode(&self) -> Check {
         let vendors = gpu_vendors();
         if vendors.is_empty() {
@@ -1003,7 +1003,7 @@ impl CheckRunner {
         Ok(format!(
             "wrote {} for {unit}. Restart the compositor to apply it \
              (`systemctl --user restart {unit}`) — Suede will not do that itself, \
-             because it would tear down every window on the wall.",
+             because it would tear down every window on every display.",
             path.display()
         ))
     }

@@ -18,6 +18,21 @@ pub async fn list_outputs(State(state): State<ApiState>) -> Json<Vec<Output>> {
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/ports", tag = "observed",
+    responses((
+        status = 200,
+        description = "Every connector on the graphics hardware, attached or \
+                       not. Offered so a client can let the operator configure \
+                       a socket before its display arrives; sway remains the \
+                       authority on what is actually driving a display.",
+        body = Vec<crate::ports::Port>,
+    ))
+)]
+pub async fn list_ports() -> Json<Vec<crate::ports::Port>> {
+    Json(crate::ports::enumerate())
+}
+
+#[utoipa::path(
     get, path = "/api/v1/outputs/{name}", tag = "observed",
     params(("name" = String, Path, description = "Connector name, e.g. HDMI-A-1")),
     responses(

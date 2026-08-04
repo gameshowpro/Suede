@@ -92,6 +92,7 @@ mod tests {
             "/reconcile",
             "/wallpapers",
             "/config/revert",
+            "/ports",
         ] {
             assert!(INDEX.contains(path), "the UI never calls {path}");
         }

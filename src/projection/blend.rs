@@ -16,6 +16,15 @@ use crate::model::{ProjectionConfig, Rect, TestPattern};
 pub struct Participant {
     pub name: String,
     pub rect: Rect,
+    /// Whether a display is currently attached to this output.
+    ///
+    /// Absent outputs still take full part in the plan: they shape the
+    /// canvas and every ramp, because the *configuration* describes the
+    /// installation and a dark projector does not change where the light
+    /// from its neighbours lands. Only presentation is skipped — the region
+    /// simply goes unshown. So unplugging one projector never alters what
+    /// the others display, and plugging it back in needs no re-authoring.
+    pub connected: bool,
 }
 
 /// The side of a ramp at which attenuation reaches zero — the side where the
@@ -125,6 +134,14 @@ pub struct CanvasPlan {
 /// carries its own width because every seam *is* its own intersection —
 /// a top row may overlap differently from a bottom row, grids included.
 ///
+/// The plan is a function of the *configuration alone*. Whether a display is
+/// currently attached decides only which slices get presented — never the
+/// canvas size and never a ramp. That is what keeps a failure local: pull the
+/// cable on one projector and the others carry on showing exactly the pixels
+/// they showed a moment earlier, with the dead projector's region simply
+/// unlit. Deriving any of the geometry from what happens to be plugged in
+/// would make one loose connector reflow the whole installation.
+///
 /// Returns `None` when nothing overlaps: sway can tile non-overlapping
 /// layouts natively, and the direct path costs nothing per frame.
 pub fn canvas_plan(
@@ -223,10 +240,16 @@ pub fn canvas_plan(
         }
     }
 
+    // Only connected outputs can be presented on. Everything above — the
+    // canvas size and every ramp — was computed from the full configured
+    // layout, so a disconnected output leaves its region unshown without
+    // altering a single pixel of its neighbours'.
     let slices: Vec<SliceSpec> = rects
         .iter()
         .zip(ramps)
-        .map(|((name, rect), ramps)| SliceSpec {
+        .zip(participants)
+        .filter(|((_, _), participant)| participant.connected)
+        .map(|(((name, rect), ramps), _)| SliceSpec {
             output: name.clone(),
             source: *rect,
             ramps,
@@ -235,7 +258,9 @@ pub fn canvas_plan(
 
     // Sway's layout: row-major order of the configured layout, tiled edge to
     // edge in one row. Purely internal — presenters cover every output.
-    let mut order: Vec<usize> = (0..rects.len()).collect();
+    let mut order: Vec<usize> = (0..rects.len())
+        .filter(|&i| participants[i].connected)
+        .collect();
     order.sort_by_key(|&i| (rects[i].1.y, rects[i].1.x));
     let mut sway_positions = Vec::new();
     let mut x = 0;
@@ -296,6 +321,7 @@ pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) ->
     }
     let mut specs: Vec<OverlaySpec> = participants
         .iter()
+        .filter(|participant| participant.connected)
         .map(|participant| OverlaySpec {
             output: participant.name.clone(),
             gamma: config.gamma,
@@ -450,6 +476,15 @@ mod tests {
                 width,
                 height,
             },
+            connected: true,
+        }
+    }
+
+    /// The same output, configured but with nothing plugged into it.
+    fn absent(name: &str, x: i32, y: i32, width: i32, height: i32) -> Participant {
+        Participant {
+            connected: false,
+            ..participant(name, x, y, width, height)
         }
     }
 
@@ -504,6 +539,84 @@ mod tests {
         assert_eq!(right.source.x, 1760);
         assert_eq!(right.ramps[0].fade_to, FadeTo::Left);
         assert_eq!(right.ramps[0].rect.width, 160);
+    }
+
+    #[test]
+    fn losing_a_projector_changes_nothing_the_others_show() {
+        // The requirement, stated as a test: take a working three-projector
+        // installation, unplug the middle one, and every pixel the survivors
+        // were showing must still be the same pixel of the same canvas.
+        let configured = [
+            participant("DP-3", 0, 0, 1920, 1080),
+            participant("DP-1", 1760, 0, 1920, 1080),
+            participant("DP-2", 3520, 0, 1920, 1080),
+        ];
+        let whole = canvas_plan(&configured, Some(&blending())).expect("plan");
+
+        let mut degraded = configured;
+        degraded[1].connected = false;
+        let degraded = canvas_plan(&degraded, Some(&blending())).expect("plan");
+
+        // The canvas is unchanged, so the app renders exactly as before and
+        // is never reloaded at a different size.
+        assert_eq!(
+            (degraded.canvas_width, degraded.canvas_height),
+            (whole.canvas_width, whole.canvas_height)
+        );
+        assert_eq!(
+            (degraded.canvas_width, degraded.canvas_height),
+            (5440, 1080)
+        );
+
+        // The survivors keep their source rectangles and their ramps — the
+        // seam toward the dark projector still fades, so nothing brightens.
+        for name in ["DP-3", "DP-2"] {
+            let before = whole.slices.iter().find(|s| s.output == name).unwrap();
+            let after = degraded.slices.iter().find(|s| s.output == name).unwrap();
+            assert_eq!(before, after, "{name} must be untouched");
+        }
+        // The absent output is simply not presented.
+        assert!(!degraded.slices.iter().any(|s| s.output == "DP-1"));
+        assert!(!degraded.sway_positions.iter().any(|(n, _, _)| n == "DP-1"));
+    }
+
+    #[test]
+    fn an_output_that_was_never_plugged_in_still_shapes_the_canvas() {
+        // Configuring a rig from the desk before the projectors arrive: the
+        // canvas is the full installation, and the one display present shows
+        // its own region of it, already blended for the neighbour to come.
+        let plan = canvas_plan(
+            &[
+                participant("DP-3", 0, 0, 1920, 1080),
+                absent("DP-1", 1760, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .expect("a configured overlap is a plan even with nothing attached");
+
+        assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
+        assert_eq!(plan.slices.len(), 1);
+        assert_eq!(plan.slices[0].output, "DP-3");
+        assert_eq!(plan.slices[0].ramps.len(), 1);
+        assert_eq!(plan.slices[0].ramps[0].fade_to, FadeTo::Right);
+        assert_eq!(plan.sway_positions, vec![("DP-3".into(), 0, 0)]);
+    }
+
+    #[test]
+    fn a_test_pattern_is_only_sent_to_attached_displays() {
+        let config = ProjectionConfig {
+            test_pattern: Some(TestPattern::Grid),
+            ..ProjectionConfig::default()
+        };
+        let specs = overlay_specs(
+            &[
+                participant("DP-3", 0, 0, 1920, 1080),
+                absent("DP-1", 1920, 0, 1920, 1080),
+            ],
+            &config,
+        );
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].output, "DP-3");
     }
 
     #[test]
@@ -580,7 +693,7 @@ mod tests {
 
     #[test]
     fn the_canvas_normalises_wherever_the_layout_was_drawn() {
-        // An operator who drew the wall starting at 500,300 still gets a
+        // An operator who drew the layout starting at 500,300 still gets a
         // canvas anchored at zero.
         let plan = canvas_plan(
             &[
@@ -714,13 +827,13 @@ mod tests {
 
     #[test]
     fn overlays_exist_only_for_test_patterns() {
-        let wall = [
+        let installation = [
             participant("DP-3", 0, 0, 1920, 1080),
             participant("DP-1", 1920, 0, 1920, 1080),
         ];
-        assert!(overlay_specs(&wall, &blending()).is_empty());
+        assert!(overlay_specs(&installation, &blending()).is_empty());
         let specs = overlay_specs(
-            &wall,
+            &installation,
             &ProjectionConfig {
                 test_pattern: Some(TestPattern::Grid),
                 ..Default::default()

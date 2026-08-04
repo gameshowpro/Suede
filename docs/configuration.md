@@ -61,8 +61,60 @@ or by EDID, for installations where connector enumeration is unstable:
 
 Every field you specify must match. A configured output that is not currently connected is a reported divergence, not an error — Suede keeps the configuration and applies it when the display appears.
 
+#### Connectors, not displays {: #connectors-not-displays }
+
+Matching by `name` anchors an entry to the **socket on the graphics card**,
+not to the display plugged into it. The kernel enumerates every connector at
+driver probe, independently of what is attached, so `DP-2` means the same
+port whether it has a projector on it, has had its cable pulled, or has never
+had anything connected. Unplug an installation and plug it back into
+different ports and each entry keeps applying to its own port.
+
+That is usually what an appliance wants: the rigging defines which projector
+is which. Matching by EDID instead (`make`/`model`/`serial`) anchors to the
+*panel*, so configuration follows a display between ports — useful for a desk,
+but note that identical projectors often ship with blank or duplicated EDID
+serial numbers, which is exactly the case where it matters.
+
+Two caveats on connector naming. DisplayPort MST hubs and daisy-chains create
+connectors dynamically (`DP-1-1`, `DP-1-2`) whose numbering depends on the
+chain, and adding or moving a GPU can renumber connectors, because the index
+is per-card. A single-GPU appliance with directly-attached displays — the
+normal case — is stable across reboots and any amount of replugging.
+
+`GET /api/v1/ports` lists every connector the hardware has with its current
+connection status, including ones sway cannot report because nothing is
+attached. It exists so a client can offer the operator a real choice instead
+of asking them to type a connector name; sway remains the authority on what
+is actually driving a display.
+
+```json
+[ { "name": "DP-1", "connected": true }, { "name": "DP-2", "connected": false } ]
+```
+
+#### An unplugged display changes nothing else {: #unplugged }
+
+An output that is configured but not attached keeps its place in the layout.
+The canvas stays the size the configuration describes, every blend ramp stays
+where it was, and the other displays carry on showing exactly the pixels they
+showed a moment earlier — the missing output's region is simply not shown.
+
+This is deliberate, and it is why the geometry is derived from the
+configuration rather than from what is currently plugged in. The alternative
+would mean one loose connector resizing the canvas mid-show, reflowing the
+application, and moving the picture on every *working* projector. A rig can
+therefore also be configured completely before the projectors are unpacked.
+
 !!! info "Layout is the client's job"
     Suede does no layout arithmetic. Positions are always explicit. The web UI offers left-to-right arrangement as a convenience that simply computes `position` values, and any client can do the same.
+
+!!! info "The Displays tab shows every connector"
+    Being *in the layout* means having a configuration entry, which has
+    nothing to do with what is plugged in. The layout diagram draws the
+    configured entries, marking any with nothing attached; every remaining
+    connector the machine has is listed below it as something to add. So a
+    connector with no display can be placed in the layout, and a display
+    removed from the layout returns to that list rather than disappearing.
 
 !!! warning "Connected outputs with no entry are left alone"
     Suede only touches outputs you have configured. To turn one off, give it an entry with `"enable": false`.
@@ -87,7 +139,7 @@ compositor last left there — usually a stale frame of the previous app.
 
 #### Named backgrounds {: #named-backgrounds }
 
-Define a background once and let any number of outputs name it. A video wall
+Define a background once and let any number of outputs name it. A multi-display installation
 normally wants one look across every screen, and repeating the same three
 properties per output guarantees they drift apart the first time somebody edits
 only three of four.
@@ -107,7 +159,7 @@ only three of four.
 
 Editing the preset repaints every output using it — the reference has not
 changed, but Suede diffs the *resolved* properties, so the new picture reaches
-the wall on the next pass.
+the displays on the next pass.
 
 An output's `background` accepts either form:
 
@@ -166,7 +218,7 @@ An application is a *launch specification*, not a window. That is what makes it 
 
 **One application is active at a time — `activeApp` — and it always covers
 the whole canvas.** The rest of the list is a library to switch between:
-`POST /api/v1/apps/{id}/activate` swaps the wall to another app atomically,
+`POST /api/v1/apps/{id}/activate` swaps every display to another app atomically,
 killing the previous one and launching the new. There is no per-app output
 targeting and no per-app enable flag; the appliance is a single canvas, not a
 window manager.
@@ -186,7 +238,7 @@ window manager.
 | `restart` | object | always/1s/30s | Restart policy and backoff |
 | `persistProfile` | bool | `false` | Keep the browser profile between launches |
 
-#### Driving a video wall
+#### Driving a multi-display installation
 
 Setting `spanOutputs: true` stretches a single window across the whole layout
 rather than filling one output — sway's `fullscreen enable global`. This is how
@@ -383,9 +435,9 @@ The endpoint is unauthenticated but accepted only from loopback, so the key-free
 
 ### Projection and edge blending {: #projection-edge-blending }
 
-For a wall of two to four projectors whose beams physically overlap, **the
+For two to four projectors whose beams physically overlap, **the
 layout is the projection configuration**. Position each output in canvas
-space exactly as its beam lands on the wall — overlapping the neighbours by
+space exactly as its beam lands on the surface — overlapping the neighbours by
 however much the rigging actually overlaps, each seam its own amount, rows
 and grids included. The canvas is the layout's bounding box, and the Displays
 tab reports it live.
@@ -405,13 +457,13 @@ measured on hardware). Instead:
 
 1. The active app renders once into a **headless canvas** the size of the
    layout's bounding box.
-2. The **slicer** (`suede slice`, one process per wall) captures the canvas
+2. The **slicer** (`suede slice`, one process per installation) captures the canvas
    each frame, cuts out each projector's configured rectangle — intersecting
    regions are cut into *both* neighbours — applies the gamma-shaped blend
    ramps and black lift per pixel, and presents each slice fullscreen on its
    own output. The loop is damage-driven; a static page costs nothing.
 
-Superimposed on the wall, the two copies of every seam sum to constant
+Superimposed on the surface, the two copies of every seam sum to constant
 luminance (measured: worst deviation 0.008 across a 160 px seam). A layout
 with no overlaps skips all of this: sway tiles it directly, at zero cost.
 
@@ -437,7 +489,7 @@ leaves a bright band at every seam. Ramps are shaped as `ramp^(1/gamma)`.
 **Black-level compensation.** Projector black is not zero light, so seams
 glow on dark scenes. The seam cannot be darkened, so `blackLift` brightens
 everything else to match: `out = lift + (1 - lift) * in` outside the seams.
-Show the `black` test pattern and raise it until the wall is even.
+Show the `black` test pattern and raise it until the projected image is even.
 
 Canvas mode requires sway's headless backend
 (`WLR_BACKENDS=drm,libinput,headless`, set by provisioning); without it Suede
@@ -461,7 +513,7 @@ use it to speak:
 Any committed write (including the section endpoints, which always commit)
 supersedes a live working copy. The web UI uses this grammar for the layout
 and projection editors: every edit is pushed uncommitted as it is made - the
-wall follows the numbers as you type - Save sends the same document with the
+picture follows the numbers as you type - Save sends the same document with the
 flag set, and Cancel calls revert.
 
 #### Test patterns {: #projection-test-patterns }
@@ -479,7 +531,7 @@ right tool for checking a rig before committing to a layout.
 |---|---|
 | `grid` | Geometry, focus, and seam alignment: 100 px colour tiles with crosses, each labelled with its global pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
-| `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the wall matches them. |
+| `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |
 
 The gamma chart assumes the output runs at scale 1 (its stripes are

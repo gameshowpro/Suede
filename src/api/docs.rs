@@ -44,6 +44,7 @@ impl Modify for SecurityAddon {
     ),
     paths(
         super::observed::list_outputs,
+        super::observed::list_ports,
         super::observed::get_output,
         super::observed::list_windows,
         super::observed::list_audio_outputs,
@@ -91,6 +92,7 @@ impl Modify for SecurityAddon {
         crate::model::Position,
         crate::model::Rect,
         crate::model::Output,
+        crate::ports::Port,
         crate::model::Window,
         crate::model::AppState,
         crate::model::AppStatus,

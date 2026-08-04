@@ -397,15 +397,21 @@ impl Reconciler {
                         }
                         self.refresh_outputs().await;
                     }
-                    slicer = Some(SlicerSpec {
-                        source: name.clone(),
-                        canvas_width: width,
-                        canvas_height: height,
-                        gamma: projection.gamma,
-                        black_lift: projection.black_lift,
-                        pattern: projection.test_pattern,
-                        slices: plan.slices,
-                    });
+                    // With nothing attached there is nowhere to present, but
+                    // the canvas stays exactly as configured so the app is
+                    // never resized — displays coming back find the frame
+                    // they left.
+                    if !plan.slices.is_empty() {
+                        slicer = Some(SlicerSpec {
+                            source: name.clone(),
+                            canvas_width: width,
+                            canvas_height: height,
+                            gamma: projection.gamma,
+                            black_lift: projection.black_lift,
+                            pattern: projection.test_pattern,
+                            slices: plan.slices,
+                        });
+                    }
                     canvas = Some(name);
                 }
             }
@@ -441,6 +447,7 @@ impl Reconciler {
                     .map(|output| Participant {
                         name: output.name.clone(),
                         rect: output.rect,
+                        connected: true,
                     })
                     .collect();
                 overlay = overlay_specs(&participants, &projection);
@@ -478,9 +485,12 @@ impl Reconciler {
 
     /// The configured layout, in canvas space, resolved to output names.
     ///
-    /// Only enabled, configured outputs that are currently connected take
-    /// part; sizes come from the configured mode, falling back to what the
-    /// display currently runs.
+    /// Every enabled output the configuration pins down takes part, whether
+    /// or not a display is attached: the installation is described by the
+    /// configuration, so a projector that is unplugged (or not yet
+    /// delivered) still holds its place in the canvas. Sizes come from the
+    /// configured mode, falling back to what a connected display currently
+    /// runs.
     #[cfg(feature = "projection")]
     fn plan_canvas(
         &self,
@@ -490,31 +500,40 @@ impl Reconciler {
         let observed = self.snapshot.outputs();
         let mut participants = Vec::new();
         for config in desired.outputs.iter().filter(|output| output.enable) {
-            let Some(matched) = observed
+            let matched = observed
                 .iter()
-                .find(|output| config.r#match.matches(output))
-            else {
-                continue;
-            };
+                .find(|output| config.r#match.matches(output));
+            // Geometry comes from the configuration first. Only an output
+            // that is both connected *and* unpinned falls back to what it
+            // currently runs — a disconnected output has no "currently".
             let size = config
                 .mode
                 .map(|mode| (mode.width, mode.height))
-                .or_else(|| matched.current_mode.map(|mode| (mode.width, mode.height)));
-            let Some((width, height)) = size else {
+                .or_else(|| matched?.current_mode.map(|mode| (mode.width, mode.height)));
+            let position = config.position.or_else(|| {
+                matched.map(|output| crate::model::Position {
+                    x: output.rect.x,
+                    y: output.rect.y,
+                })
+            });
+            // Without a size and a place, the entry describes no rectangle
+            // and cannot take part in a layout at all.
+            let (Some((width, height)), Some(position)) = (size, position) else {
                 continue;
             };
-            let position = config.position.unwrap_or(crate::model::Position {
-                x: matched.rect.x,
-                y: matched.rect.y,
-            });
             participants.push(Participant {
-                name: matched.name.clone(),
+                // Absent outputs are named by their match key, which never
+                // collides with a connector name sway would report.
+                name: matched
+                    .map(|output| output.name.clone())
+                    .unwrap_or_else(|| config.r#match.key()),
                 rect: crate::model::Rect {
                     x: position.x,
                     y: position.y,
                     width,
                     height,
                 },
+                connected: matched.is_some(),
             });
         }
         crate::projection::canvas_plan(&participants, desired.projection.as_ref())

@@ -65,7 +65,7 @@ fn grid(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
     }
 
     // Tile annotations: global coordinates top corners, output name at the
-    // bottom. Text is screen truth — a photo of the wall says exactly which
+    // bottom. Text is screen truth — a photo of the projection says exactly which
     // output and which pixels are in frame.
     let first_tx = rect.x.div_euclid(TILE);
     let first_ty = rect.y.div_euclid(TILE);

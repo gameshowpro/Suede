@@ -91,8 +91,11 @@ legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
   align-items: center; justify-content: center; font-size: 12px; cursor: pointer; overflow: hidden;
   padding: 4px; text-align: center; }
 .screen.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
+.screen.offline { border-color: var(--warn); border-style: dashed;
+  background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .screen.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
 .screen b { font-size: 13px; }
+.screen .offline-mark { color: var(--warn); font-weight: 600; cursor: help; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
 .card { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--sunken); }
 .card img { width: 100%; height: 108px; object-fit: cover; display: block; background: #0b1020; }
@@ -165,8 +168,15 @@ window.addEventListener("error", (event) => {
       <p class="hint" id="layout-hint">Click a display to configure it.</p>
       <p class="hint" id="layout-size"></p>
       <!-- The diagram alone left the editor undiscoverable, so every display
-           also gets a plain button that opens it. -->
+           in the layout also gets a plain button that opens it. -->
       <div class="row" id="display-buttons" style="margin-top:10px"></div>
+      <!-- Everything the hardware has that is not in the layout yet. Names
+           are never typed: the operator picks from what actually exists. -->
+      <div id="unused-outputs" class="hidden" style="margin-top:14px">
+        <h3 style="margin:0 0 8px">Not in the layout</h3>
+        <div class="row" id="unused-buttons"></div>
+        <p class="hint" id="unused-hint"></p>
+      </div>
     </div>
     <div class="panel hidden" id="output-editor">
       <h2>Configure <span id="output-name" class="mono"></span></h2>
@@ -215,7 +225,7 @@ window.addEventListener("error", (event) => {
     <div class="panel" id="projection-panel">
       <h2>Projection</h2>
       <p class="hint">The overlaps come from the layout above: drag the
-        displays so they overlap exactly as the beams do on the wall — every
+        displays so they overlap exactly as the beams do on the surface — every
         seam its own amount. Suede renders the app once into that canvas and
         slices it per projector; with blending on, each seam is faded from
         both sides so the doubled light adds up to one seamless picture.</p>
@@ -223,7 +233,7 @@ window.addEventListener("error", (event) => {
         inactive: no displays overlap in the layout above.</strong> With no
         overlaps there is nothing to blend, so the displays are tiled
         directly and none of this applies. Position displays so they overlap
-        — as the projector beams do on the wall — and blending engages.</p>
+        — as the projector beams do on the surface — and blending engages.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <select id="pj-blend"><option value="off">Off</option><option value="on">On</option></select></div>
@@ -320,7 +330,7 @@ window.addEventListener("error", (event) => {
       <h2>Backgrounds</h2>
       <p class="hint">A background bundles an image, how it is scaled, and the
         colour behind it. Define one here, then pick it by name on the Displays
-        tab — so a wall of screens shares one definition instead of four copies
+        tab — so every screen shares one definition instead of four copies
         that drift apart.</p>
       <table id="backgrounds"><thead><tr>
         <th></th><th>Name</th><th>Image</th><th>Scaling</th><th>Colour</th><th>Used by</th><th></th>
@@ -417,7 +427,9 @@ window.addEventListener("error", (event) => {
 const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
 let outputs = [], config = null, apps = [], sinks = [], checks = [], status = null,
-    wallpapers = [], selected = null, editingApp = null, editingBackground = null;
+    wallpapers = [], selected = null, editingApp = null, editingBackground = null,
+    // The graphics card's connectors, including those with nothing attached.
+    ports = [];
 
 // Every screen's background comes from here, so the lookup is shared.
 const presets = () => config?.backgrounds ?? [];
@@ -650,41 +662,134 @@ function renderAlerts() {
 // position and mode. This is the layout the operator edits — overlaps here
 // are the projection overlaps, resolved by the slicer, and sway never sees
 // them. Observed geometry is only a fallback for unconfigured displays.
-function canvasRect(output) {
-  const configured = (config?.outputs ?? []).find((o) => o.match?.name === output.name);
-  const width = configured?.mode?.width ?? output.rect.width;
-  const height = configured?.mode?.height ?? output.rect.height;
-  const x = configured?.position?.x ?? output.rect.x;
-  const y = configured?.position?.y ?? output.rect.y;
-  return { x, y, width, height, configured };
-}
-
 function physicalOutputs() {
   // The canvas output is Suede's own machinery, not a display to arrange.
   return outputs.filter((o) => !/^(HEADLESS|WL|X11)-/.test(o.name));
 }
 
+// Modes offered for a socket with nothing plugged into it, where there is no
+// display to ask. The operator picks; they never type a connector name, and
+// the real mode list replaces this the moment something is attached.
+const COMMON_MODES = [
+  { width: 1920, height: 1080, refreshHz: 60 },
+  { width: 3840, height: 2160, refreshHz: 60 },
+  { width: 2560, height: 1440, refreshHz: 60 },
+  { width: 1280, height: 720, refreshHz: 60 },
+  { width: 1024, height: 768, refreshHz: 60 },
+];
+
+// Every output this machine could ever drive, whether or not a display is
+// attached: the graphics card's connectors, whatever sway currently reports,
+// and anything the configuration names. Keyed by connector name, which is a
+// property of the socket rather than of the display plugged into it — so a
+// projector moved to another port picks up that port's configuration.
+function knownOutputs() {
+  const known = new Map();
+  const add = (name, fields) => {
+    if (/^(HEADLESS|WL|X11)-/.test(name)) return;
+    known.set(name, { name, connected: false, output: null, ...known.get(name), ...fields });
+  };
+  for (const port of ports) add(port.name, { connected: port.connected });
+  for (const output of physicalOutputs()) add(output.name, { connected: true, output });
+  for (const entry of config?.outputs ?? []) if (entry.match?.name) add(entry.match.name, {});
+  return [...known.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+}
+
+function configEntry(name) {
+  return (config?.outputs ?? []).find((o) => o.match?.name === name);
+}
+
+// Where an output sits in canvas space. The configuration is the authority —
+// that is what makes the layout survive a display being unplugged — and only
+// an output that is both attached and unpinned falls back to what it runs.
+function canvasRect(known) {
+  const configured = configEntry(known.name);
+  const rect = known.output?.rect;
+  return {
+    x: configured?.position?.x ?? rect?.x ?? 0,
+    y: configured?.position?.y ?? rect?.y ?? 0,
+    width: configured?.mode?.width ?? rect?.width ?? 0,
+    height: configured?.mode?.height ?? rect?.height ?? 0,
+    configured,
+  };
+}
+
+// Being "in the layout" means having a configured entry — nothing to do with
+// what is plugged in. Everything else is offered below as something to add.
+function layoutEntries() {
+  return knownOutputs()
+    .filter((known) => configEntry(known.name))
+    .map((known) => ({ known, r: canvasRect(known) }));
+}
+
+function unusedOutputs() {
+  return knownOutputs().filter((known) => !configEntry(known.name));
+}
+
+// Add a socket to the layout, flush against the right of what is already
+// there so the result is contiguous, and open it for editing.
+function addToLayout(name) {
+  const known = knownOutputs().find((k) => k.name === name);
+  const entries = layoutEntries().filter(({ r }) => r.width > 0);
+  const right = entries.length ? Math.max(...entries.map(({ r }) => r.x + r.width)) : 0;
+  const mode = known?.output?.currentMode ?? COMMON_MODES[0];
+  (config.outputs ??= []).push({
+    match: { name },
+    enable: true,
+    mode: { width: mode.width, height: mode.height, refreshHz: mode.refreshHz },
+    position: { x: right, y: 0 },
+    scale: 1,
+    transform: "normal",
+    adaptiveSync: false,
+    allowTearing: false,
+    maxRenderTimeMs: null,
+    background: null,
+  });
+  renderLayout();
+  pushPreview();
+  selectOutput(name);
+}
+
+function removeFromLayout(name) {
+  config.outputs = (config.outputs ?? []).filter((o) => o.match?.name !== name);
+  if (selected === name) {
+    selected = null;
+    $("output-editor").classList.add("hidden");
+  }
+  renderLayout();
+  pushPreview();
+}
+
+const OFFLINE_TOOLTIP =
+  "Configured here, but no display is attached to this connector right now. " +
+  "Its place in the canvas is kept, so the other displays carry on showing " +
+  "exactly what they show now; this region is simply dark until something " +
+  "is plugged back in.";
+
 function renderLayout() {
   const container = $("layout");
   container.innerHTML = "";
-  const physical = physicalOutputs();
-  const active = physical.filter((o) => o.active && o.rect.width > 0);
-  $("layout-hint").textContent = active.length
+  const entries = layoutEntries();
+  const offline = entries.filter(({ known }) => !known.connected).length;
+  $("layout-hint").textContent = entries.length
     ? "Click a display to configure it. Overlaps drawn here are projected " +
-      "by both machines and blended — sway itself never sees them."
-    : (physical.length ? "No outputs are enabled. Click one below to enable it."
-                       : "No outputs detected.");
+      "by both machines and blended — sway itself never sees them." +
+      (offline ? "  Dashed amber displays have nothing plugged in." : "")
+    : (unusedOutputs().length
+        ? "Nothing in the layout yet. Add a display from the list below."
+        : "No outputs detected.");
 
-  const rects = physical.map((o) => ({ output: o, r: canvasRect(o) }));
-  const spanX = Math.max(...rects.map(({ r }) => r.x + r.width), 1920);
-  const spanY = Math.max(...rects.map(({ r }) => r.y + r.height), 1080);
+  const spanX = Math.max(...entries.map(({ r }) => r.x + r.width), 1920);
+  const spanY = Math.max(...entries.map(({ r }) => r.y + r.height), 1080);
   const box = container.getBoundingClientRect();
   const scale = Math.min((box.width - 20) / spanX, (box.height - 62) / spanY);
 
-  rects.forEach(({ output, r }, index) => {
+  entries.forEach(({ known, r }, index) => {
+    const enabled = r.configured?.enable ?? true;
     const el = document.createElement("div");
-    el.className = "screen" + (output.active ? "" : " inactive")
-                 + (selected === output.name ? " selected" : "");
+    el.className = "screen" + (enabled ? "" : " inactive")
+                 + (known.connected ? "" : " offline")
+                 + (selected === known.name ? " selected" : "");
     if (r.width > 0) {
       el.style.left = `${10 + r.x * scale}px`;
       el.style.top = `${10 + r.y * scale}px`;
@@ -694,11 +799,13 @@ function renderLayout() {
       el.style.left = `${10 + index * 130}px`;
       el.style.bottom = "10px"; el.style.width = "120px"; el.style.height = "42px";
     }
-    el.innerHTML = `<b>${escape(output.name)}</b>` +
-      `<span>${r.width}×${r.height}${output.active ? "" : " (disabled)"}</span>` +
+    el.innerHTML = `<b>${escape(known.name)}</b>` +
+      `<span>${r.width}×${r.height}${enabled ? "" : " (disabled)"}</span>` +
+      (known.connected ? ""
+        : `<span class="offline-mark" title="${escape(OFFLINE_TOOLTIP)}">⚠ not connected</span>`) +
       (r.configured?.background
         ? `<span class="muted">bg: ${escape(backgroundLabel(r.configured.background))}</span>` : "");
-    el.onclick = () => selectOutput(output.name);
+    el.onclick = () => selectOutput(known.name);
     container.appendChild(el);
   });
 
@@ -706,13 +813,36 @@ function renderLayout() {
 
   const buttons = $("display-buttons");
   buttons.innerHTML = "";
-  for (const output of physical) {
+  for (const { known } of entries) {
     const button = document.createElement("button");
-    button.className = "action" + (selected === output.name ? "" : " ghost");
-    button.textContent = "Configure " + output.name;
-    button.onclick = () => selectOutput(output.name);
+    button.className = "action" + (selected === known.name ? "" : " ghost");
+    button.textContent = "Configure " + known.name;
+    button.onclick = () => selectOutput(known.name);
     buttons.appendChild(button);
   }
+
+  // Everything the hardware has that the layout does not use yet, including
+  // sockets with nothing plugged in — that is the whole point: a rig can be
+  // configured from a desk before the projectors are unpacked.
+  const unused = unusedOutputs();
+  $("unused-outputs").classList.toggle("hidden", unused.length === 0);
+  const spare = $("unused-buttons");
+  spare.innerHTML = "";
+  for (const known of unused) {
+    const button = document.createElement("button");
+    button.className = "action ghost";
+    button.textContent = `+ ${known.name}` + (known.connected ? "" : " (not connected)");
+    button.title = known.connected
+      ? `Add ${known.name} to the layout`
+      : `Add ${known.name} to the layout. Nothing is plugged into this ` +
+        `connector, so pick the mode the display will run.`;
+    button.onclick = () => addToLayout(known.name);
+    spare.appendChild(button);
+  }
+  $("unused-hint").textContent = unused.length
+    ? "These are the machine's own connectors. Adding one places it to the " +
+      "right of the layout; move it from there."
+    : "";
 }
 
 // The canvas the active app renders into: the bounding box of the configured
@@ -720,9 +850,11 @@ function renderLayout() {
 // projected twice — so no arithmetic beyond the bounding box is needed.
 function renderLayoutSize() {
   const el = $("layout-size");
-  const entries = physicalOutputs()
-    .map((o) => ({ o, r: canvasRect(o) }))
-    .filter(({ o, r }) => r.width > 0 && (r.configured?.enable ?? o.active));
+  // Exactly what the daemon plans from: enabled configured entries, whether
+  // or not anything is attached. That is why the canvas never changes size
+  // when a projector is unplugged.
+  const entries = layoutEntries()
+    .filter(({ r }) => r.width > 0 && (r.configured?.enable ?? true));
 
   // Count overlapping pairs so the operator can see the slicer will engage —
   // and so the Projection panel can grey itself out when it will not.
@@ -754,32 +886,48 @@ function renderLayoutSize() {
 }
 
 function selectOutput(name) {
+  const known = knownOutputs().find((k) => k.name === name);
+  if (!known) return;
   selected = name;
-  const output = outputs.find((o) => o.name === name);
-  const existing = (config?.outputs ?? []).find((o) => o.match?.name === name);
-  if (!output) return;
+  const output = known.output;
+  const existing = configEntry(name);
 
   $("output-editor").classList.remove("hidden");
   $("output-name").textContent = name;
   $("o-enable").value = String(existing?.enable ?? true);
 
-  const modes = output.modes.length ? output.modes : (output.currentMode ? [output.currentMode] : []);
-  $("o-mode").innerHTML = `<option value="">Leave to sway</option>` + modes.map((m) =>
-    `<option value="${m.width}x${m.height}x${m.refreshHz}">${escape(modeLabel(m))}</option>`).join("");
-  const wanted = existing?.mode ?? output.currentMode;
+  // An attached display states its own modes. A bare socket cannot, so offer
+  // the common ones plus whatever is already configured — the operator picks
+  // the mode the display will run when it arrives.
+  const offered = output
+    ? (output.modes.length ? output.modes : (output.currentMode ? [output.currentMode] : []))
+    : COMMON_MODES.slice();
+  if (existing?.mode && !offered.some((m) =>
+      m.width === existing.mode.width && m.height === existing.mode.height &&
+      Math.round(m.refreshHz) === Math.round(existing.mode.refreshHz))) {
+    offered.unshift(existing.mode);
+  }
+  $("o-mode").innerHTML =
+    (output ? `<option value="">Leave to sway</option>` : "") +
+    offered.map((m) =>
+      `<option value="${m.width}x${m.height}x${m.refreshHz}">${escape(modeLabel(m))}</option>`).join("");
+  const wanted = existing?.mode ?? output?.currentMode;
   if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
 
-  $("o-x").value = existing?.position?.x ?? output.rect.x ?? 0;
-  $("o-y").value = existing?.position?.y ?? output.rect.y ?? 0;
-  $("o-scale").value = existing?.scale ?? output.scale ?? 1;
-  $("o-transform").value = existing?.transform ?? output.transform ?? "normal";
+  $("o-x").value = existing?.position?.x ?? output?.rect.x ?? 0;
+  $("o-y").value = existing?.position?.y ?? output?.rect.y ?? 0;
+  $("o-scale").value = existing?.scale ?? output?.scale ?? 1;
+  $("o-transform").value = existing?.transform ?? output?.transform ?? "normal";
   $("o-adaptive").value = String(existing?.adaptiveSync ?? false);
   $("o-tearing").value = String(existing?.allowTearing ?? false);
   $("o-mrt").value = existing?.maxRenderTimeMs ?? "";
 
   renderOutputBackgroundChoices(existing?.background);
 
-  $("o-note").textContent = existing ? "" : "not yet in the configuration";
+  // Say which of the two states this is: configured but dark, or attached.
+  $("o-note").textContent = !existing ? "not yet in the layout"
+    : known.connected ? ""
+    : "nothing is plugged into this connector — its place in the canvas is kept";
   renderLayout();
 }
 
@@ -804,7 +952,7 @@ function outputEntryFromForm() {
 }
 
 // Every edit lands on the outputs immediately (as an unsaved preview) and
-// redraws the layout, so dragging the numbers shows the wall responding.
+// redraws the layout, so dragging the numbers shows the displays responding.
 function outputEdited() {
   if (!selected) return;
   const entry = outputEntryFromForm();
@@ -825,9 +973,13 @@ $("o-save").onclick = () => run(async () => {
   await saveCommitted();
 }, "saved display configuration");
 
-$("o-remove").onclick = () => run(() =>
-  api(`/config/outputs/${encodeURIComponent($("output-name").textContent)}`, { method: "DELETE" }),
-  "removed from configuration");
+$("o-remove").onclick = () => {
+  // A layout edit like any other: it goes to the outputs immediately, Save
+  // persists it, Cancel puts the display back. The display returns to the
+  // list below, ready to be added again.
+  removeFromLayout($("output-name").textContent);
+  toast("removed from the layout — Save to keep, Cancel to undo");
+};
 $("o-cancel").onclick = () => run(async () => {
   await cancelPreview();
   $("output-editor").classList.add("hidden");
@@ -869,7 +1021,7 @@ function renderApps() {
     restart.onclick = () => run(() =>
       api(`/apps/${encodeURIComponent(app.id)}/restart`, { method: "POST" }), `restarted ${app.id}`);
 
-    // The one switch that matters: which app owns the wall right now.
+    // The one switch that matters: which app owns the displays right now.
     const toggle = document.createElement("button");
     toggle.className = isActive ? "action ghost" : "action";
     toggle.textContent = isActive ? "Deactivate" : "Activate";
@@ -1337,6 +1489,9 @@ async function loadChecks() {
 }
 async function loadAll() {
   outputs = await api("/outputs");
+  // Advisory: an older daemon, or a host without /sys, simply offers fewer
+  // choices — never a reason to fail the page.
+  ports = await api("/ports").catch(() => []);
   sinks = await api("/audio/outputs");
   apps = await api("/apps");
   wallpapers = await api("/wallpapers");
@@ -1361,8 +1516,12 @@ function connect() {
   };
   source.onerror = () => { $("live").textContent = "reconnecting…"; $("live").className = "pill bad"; };
 
-  source.addEventListener("outputs_changed", (e) => {
-    outputs = JSON.parse(e.data); renderLayout(); renderOutputChoices();
+  source.addEventListener("outputs_changed", async (e) => {
+    outputs = JSON.parse(e.data);
+    // A display appearing or vanishing also changes a connector's status.
+    ports = await api("/ports").catch(() => ports);
+    renderLayout(); renderOutputChoices();
+    if (selected) selectOutput(selected);
   });
   source.addEventListener("audio_outputs_changed", (e) => { sinks = JSON.parse(e.data); renderSinks(); });
   source.addEventListener("app_status_changed", (e) => {

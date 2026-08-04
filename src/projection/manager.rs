@@ -23,7 +23,7 @@ struct RunningOverlay {
 #[derive(Default)]
 pub struct BlendManager {
     overlays: HashMap<String, RunningOverlay>,
-    /// The one slicer process for the whole wall, when canvas mode is on.
+    /// The one slicer process for the whole installation, in canvas mode.
     slicer: Option<RunningOverlay>,
 }
 

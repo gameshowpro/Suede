@@ -933,7 +933,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_empty_projection_section_gets_sensible_defaults() {
-        // `{}` is the whole intended configuration for a wall of typical
+        // `{}` is the whole intended configuration for an installation of typical
         // projectors: blending on, gamma 2.2, no black lift.
         let harness = harness(None);
         let (status, body) = call(&harness, "PUT", "/api/v1/config/projection", Some("{}")).await;
