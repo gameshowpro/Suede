@@ -712,6 +712,11 @@ impl Reconciler {
         let mut poll = tokio::time::interval(Duration::from_secs(poll_seconds));
         poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // An app that begins failing changes the appliance's health without
+        // changing anything a pass is normally triggered by, so its state is
+        // watched explicitly.
+        let mut faults = self.supervisor.fault_signature().await;
+
         loop {
             tokio::select! {
                 _ = shutdown.changed() => {
@@ -728,6 +733,11 @@ impl Reconciler {
                 _ = tick.tick() => {
                     let windows = self.refresh_windows().await;
                     self.supervisor.tick(&windows).await;
+                    let current = self.supervisor.fault_signature().await;
+                    if current != faults {
+                        faults = current;
+                        self.reconcile().await;
+                    }
                 }
                 _ = poll.tick() => {
                     // Backstop in case an event was missed or sway restarted.

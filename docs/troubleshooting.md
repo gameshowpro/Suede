@@ -86,6 +86,31 @@ curl -s http://appliance:9088/api/v1/apps | python3 -m json.tool
 | `crashed` | The restart policy declined a relaunch |
 | `starting` | Launched, but no window has appeared yet |
 
+An app that cannot run does not stay a private matter: after three
+consecutive failed launches Suede raises an `app_crash_looping` divergence and
+the appliance reports `degraded`, and an app whose restart policy declines a
+relaunch raises `app_halted` at once. Both name the app and carry the reason,
+so `GET /api/v1/status` is enough to see what is wrong:
+
+```bash
+curl -s http://appliance:9088/api/v1/status | python3 -m json.tool
+```
+
+The commonest reason is the simplest: the browser the app asks for is not
+installed. A `firefox-kiosk` app on a machine with only Chromium can never
+start, however healthy everything else is. The `browsers` health check reports
+this before it happens, because it compares the *configured* apps against what
+is actually present rather than just confirming that some browser exists:
+
+```
+FAIL  configured apps cannot start: test-card needs firefox or firefox-esr.
+      Install the browser, or change those apps to one that is present
+      (available: /usr/bin/google-chrome-stable ...)
+```
+
+Note that Firefox is also subject to the autoplay policy Suede cannot disable
+for it — see [above](#autoplay) — so `chromium-kiosk` is the better default.
+
 An app stuck in `starting` usually means the browser is failing before it maps a window. The `browsers` health check runs `chromium --version` to catch an unusable install. Beyond that, run the same command by hand in the session:
 
 ```bash

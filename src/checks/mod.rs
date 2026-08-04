@@ -699,7 +699,45 @@ impl CheckRunner {
             }
         }
 
-        let (status, detail) = if working.is_empty() && broken.is_empty() {
+        // What is installed in general matters less than whether the apps
+        // this machine is actually configured to run can start. A box with
+        // Chromium and a Firefox app is not "fine": that app can never
+        // launch, and reporting a pass because *a* browser exists is how
+        // that goes unnoticed.
+        let mut unrunnable = Vec::new();
+        for app in self.store.effective().apps {
+            let family = match &app.launcher {
+                crate::model::Launcher::ChromiumKiosk { .. } => {
+                    crate::supervisor::launcher::CHROMIUM_PROGRAMS
+                }
+                crate::model::Launcher::FirefoxKiosk { .. } => {
+                    crate::supervisor::launcher::FIREFOX_PROGRAMS
+                }
+                // An `exec` app names its own program; the supervisor reports
+                // a missing one as a divergence against that app.
+                crate::model::Launcher::Exec { .. } => continue,
+            };
+            let candidates: Vec<String> = family.iter().map(|p| p.to_string()).collect();
+            if crate::supervisor::launcher::resolve_program(&candidates).is_none() {
+                unrunnable.push(format!("{} needs {}", app.id, family.join(" or ")));
+            }
+        }
+
+        let (status, detail) = if !unrunnable.is_empty() {
+            (
+                CheckStatus::Fail,
+                format!(
+                    "configured apps cannot start: {}. Install the browser, \
+                     or change those apps to one that is present{}",
+                    unrunnable.join("; "),
+                    if working.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (available: {})", working.join(", "))
+                    }
+                ),
+            )
+        } else if working.is_empty() && broken.is_empty() {
             (
                 CheckStatus::Fail,
                 "neither chromium nor firefox is installed".to_string(),

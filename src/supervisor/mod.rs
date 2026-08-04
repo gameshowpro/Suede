@@ -95,6 +95,32 @@ impl Supervisor {
     /// Bring the managed set in line with desired state, then advance lifecycles.
     ///
     /// Returns divergences for apps that cannot run right now.
+    /// A stable summary of which apps are currently failing, and how badly.
+    ///
+    /// The reconciler watches this because nothing else would notice an app
+    /// that starts crash-looping: no output changed and no configuration was
+    /// written, so no pass runs and the reported health stays whatever it was
+    /// when the machine was last healthy. The attempt count is clamped at the
+    /// crash-loop threshold so a long-running failure settles on one value
+    /// instead of provoking a pass on every retry.
+    pub async fn fault_signature(&self) -> String {
+        let apps = self.apps.lock().await;
+        let mut faults: Vec<String> = apps
+            .values()
+            .filter(|managed| matches!(managed.status.state, AppState::Backoff | AppState::Crashed))
+            .map(|managed| {
+                format!(
+                    "{}:{:?}:{}",
+                    managed.config.id,
+                    managed.status.state,
+                    managed.attempts.min(CRASH_LOOP_ATTEMPTS)
+                )
+            })
+            .collect();
+        faults.sort();
+        faults.join(",")
+    }
+
     pub async fn reconcile(&self, desired: &[AppConfig], targets: &[AppTarget]) -> Vec<Divergence> {
         let mut apps = self.apps.lock().await;
         let mut divergences = Vec::new();
@@ -148,6 +174,35 @@ impl Supervisor {
         }
 
         self.advance(&mut apps).await;
+
+        // An app that cannot run is a fault in the appliance, not a private
+        // matter between the supervisor and the process table. Without this
+        // the daemon reported `synced` while its active app failed to launch
+        // for ever, so the one place an operator looks said all was well.
+        //
+        // A single crash and relaunch is normal life and says nothing, so
+        // only a repeated failure counts; a halted app counts immediately,
+        // because nothing will retry it.
+        for managed in apps.values() {
+            let detail = managed
+                .status
+                .detail
+                .clone()
+                .unwrap_or_else(|| "no detail".to_string());
+            match managed.status.state {
+                AppState::Crashed => {
+                    divergences.push(Divergence::new("app_halted", &managed.config.id, detail))
+                }
+                AppState::Backoff if managed.attempts >= CRASH_LOOP_ATTEMPTS => {
+                    divergences.push(Divergence::new(
+                        "app_crash_looping",
+                        &managed.config.id,
+                        format!("failed {} times: {detail}", managed.attempts),
+                    ))
+                }
+                _ => {}
+            }
+        }
         divergences
     }
 
@@ -640,6 +695,13 @@ fn last_stderr_line(path: &std::path::Path) -> Option<String> {
     let line: String = line.chars().take(300).collect();
     Some(line)
 }
+
+/// Consecutive failed launches before an app is called crash-looping.
+///
+/// One crash is an event; three in a row is a fault worth reporting. With
+/// the default backoff this is reached within a few seconds, so a genuinely
+/// broken app surfaces quickly while a browser that died once does not.
+const CRASH_LOOP_ATTEMPTS: u32 = 3;
 
 /// Queue a restart, or halt the app when its policy declines one.
 ///
@@ -1150,6 +1212,83 @@ mod tests {
             .unwrap()
             .last_heartbeat
             .is_some());
+        supervisor.shutdown().await;
+    }
+
+    /// An app whose program does not exist — the shape of a `firefox-kiosk`
+    /// app on a machine with no Firefox.
+    fn unlaunchable(id: &str) -> AppConfig {
+        AppConfig {
+            launcher: Launcher::Exec {
+                command: "/nonexistent/definitely-not-a-program".into(),
+                args: vec![],
+            },
+            // A real backoff would make this test take seconds; the logic
+            // under test is the counting, not the waiting.
+            restart: RestartPolicy {
+                policy: RestartPolicyKind::Always,
+                delay_ms: 1,
+                max_delay_ms: 1,
+            },
+            ..sleeper(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn an_app_that_cannot_start_is_reported_as_a_divergence() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let apps = [unlaunchable("ghost")];
+        let targets = [target("ghost", None)];
+
+        // The first failure is just an event; the machine is not condemned
+        // for one crash.
+        let first = supervisor.reconcile(&apps, &targets).await;
+        assert!(
+            !first.iter().any(|d| d.kind == "app_crash_looping"),
+            "a single failure must not degrade the appliance: {first:?}"
+        );
+
+        // Let it fail repeatedly of its own accord: each pass retries once the
+        // (deliberately tiny) backoff has elapsed, exactly as it would in the
+        // field, just faster.
+        let mut divergences = Vec::new();
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            divergences = supervisor.reconcile(&apps, &targets).await;
+        }
+        let found = divergences
+            .iter()
+            .find(|d| d.kind == "app_crash_looping")
+            .unwrap_or_else(|| panic!("expected a crash-loop divergence, got {divergences:?}"));
+        assert_eq!(found.subject, "ghost");
+        assert!(
+            found.detail.contains("definitely-not-a-program") || found.detail.contains("failed"),
+            "the divergence must carry the reason: {}",
+            found.detail
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_app_that_will_never_be_retried_is_reported_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let mut app = unlaunchable("ghost");
+        // `never` means nothing will start it again, so waiting for a third
+        // failure would mean waiting for ever.
+        app.restart = RestartPolicy {
+            policy: RestartPolicyKind::Never,
+            ..RestartPolicy::default()
+        };
+
+        let divergences = supervisor.reconcile(&[app], &[target("ghost", None)]).await;
+        assert!(
+            divergences
+                .iter()
+                .any(|d| d.kind == "app_halted" && d.subject == "ghost"),
+            "a halted app must be reported immediately: {divergences:?}"
+        );
         supervisor.shutdown().await;
     }
 

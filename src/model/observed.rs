@@ -286,6 +286,8 @@ impl Divergence {
         "mode_unsupported",
         "command_failed",
         "app_waiting_for_output",
+        "app_crash_looping",
+        "app_halted",
         "app_output_disabled",
         "audio_sink_not_present",
         "null_sink_unavailable",
@@ -303,9 +305,10 @@ impl Divergence {
             "output_not_connected" | "mode_unsupported" | "command_failed" => {
                 "troubleshooting/#a-display-stays-dark"
             }
-            "app_waiting_for_output" | "app_output_disabled" => {
-                "troubleshooting/#a-browser-will-not-start"
-            }
+            "app_waiting_for_output"
+            | "app_output_disabled"
+            | "app_crash_looping"
+            | "app_halted" => "troubleshooting/#a-browser-will-not-start",
             "audio_sink_not_present" | "null_sink_unavailable" => {
                 "troubleshooting/#audio-goes-to-the-wrong-place-or-nowhere"
             }
