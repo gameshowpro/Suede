@@ -185,6 +185,71 @@ impl DesiredState {
             }
         }
 
+        // The layout must be one contiguous surface: every output chained
+        // back to the first through any run of overlaps or shared edges. A
+        // gap in the chain means part of the canvas maps to no projector at
+        // all — content silently lost — and there is no use case for it.
+        // Only entries whose rectangle the document actually pins down
+        // (enabled, with both mode and position) can be checked; the rest
+        // take their geometry from whatever is observed at reconcile time.
+        //
+        // Flood fill over pairwise touch tests. At the design maximum of
+        // four outputs that is at most a dozen integer comparisons —
+        // asymptotically cleverer schemes (sweep lines) only pay for
+        // themselves at hundreds of rectangles.
+        let rects: Vec<(String, i64, i64, i64, i64)> = self
+            .outputs
+            .iter()
+            .filter(|output| output.enable)
+            .filter_map(|output| {
+                let mode = output.mode?;
+                let position = output.position?;
+                Some((
+                    output.r#match.key(),
+                    position.x as i64,
+                    position.y as i64,
+                    mode.width as i64,
+                    mode.height as i64,
+                ))
+            })
+            .collect();
+        if rects.len() > 1 {
+            // Chained = closed rectangles meeting in more than a single
+            // point: overlap, or a shared edge segment. A corner-to-corner
+            // touch is not a chain — no pixel row or column is continuous
+            // across it.
+            let chained = |a: &(String, i64, i64, i64, i64), b: &(String, i64, i64, i64, i64)| {
+                let ox = (a.1 + a.3).min(b.1 + b.3) - a.1.max(b.1);
+                let oy = (a.2 + a.4).min(b.2 + b.4) - a.2.max(b.2);
+                ox >= 0 && oy >= 0 && (ox > 0 || oy > 0)
+            };
+            let mut reached = vec![false; rects.len()];
+            reached[0] = true;
+            let mut frontier = vec![0usize];
+            while let Some(current) = frontier.pop() {
+                for (index, rect) in rects.iter().enumerate() {
+                    if !reached[index] && chained(&rects[current], rect) {
+                        reached[index] = true;
+                        frontier.push(index);
+                    }
+                }
+            }
+            let stranded: Vec<&str> = rects
+                .iter()
+                .zip(&reached)
+                .filter(|(_, reached)| !**reached)
+                .map(|(rect, _)| rect.0.as_str())
+                .collect();
+            if !stranded.is_empty() {
+                errors.push(format!(
+                    "layout is not contiguous: {} cannot be chained back to {} \
+                     through overlapping or edge-sharing outputs",
+                    stranded.join(", "),
+                    rects[0].0
+                ));
+            }
+        }
+
         let mut seen_backgrounds = std::collections::HashSet::new();
         for (index, preset) in self.backgrounds.iter().enumerate() {
             let prefix = format!("backgrounds[{index}]");
@@ -1017,6 +1082,127 @@ mod tests {
         };
         let errors = state.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("is not unique")));
+    }
+
+    fn placed(name: &str, x: i32, y: i32, width: i32, height: i32) -> OutputConfig {
+        OutputConfig {
+            r#match: OutputMatch::by_name(name),
+            enable: true,
+            mode: Some(Mode {
+                width,
+                height,
+                refresh_hz: 60.0,
+            }),
+            position: Some(Position { x, y }),
+            scale: None,
+            transform: None,
+            adaptive_sync: false,
+            allow_tearing: false,
+            max_render_time_ms: None,
+            background: None,
+        }
+    }
+
+    fn layout(outputs: Vec<OutputConfig>) -> DesiredState {
+        DesiredState {
+            outputs,
+            ..DesiredState::new()
+        }
+    }
+
+    #[test]
+    fn a_layout_chained_by_overlaps_and_edges_is_valid() {
+        // A overlaps B; C only shares an edge with B; D reaches A through
+        // both of them. Chaining is transitive.
+        layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 1760, 0, 1920, 1080),
+            placed("C", 3680, 0, 1920, 1080),
+            placed("D", 3680, 1080, 1920, 1080),
+        ])
+        .validate()
+        .expect("chained layout must validate");
+    }
+
+    #[test]
+    fn a_gap_in_the_layout_is_rejected() {
+        let errors = layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 2000, 0, 1920, 1080),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("not contiguous")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_corner_touch_is_not_a_chain() {
+        // Diagonal neighbours meet in a single point: no pixel row or column
+        // crosses between them, so the canvas is still split in two.
+        let errors = layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 1920, 1080, 1920, 1080),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("not contiguous")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_stranded_island_names_its_outputs() {
+        // A and B chain; C floats alone. The error must say which.
+        let errors = layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 1760, 0, 1920, 1080),
+            placed("C", 10_000, 0, 1920, 1080),
+        ])
+        .validate()
+        .unwrap_err();
+        let message = errors
+            .iter()
+            .find(|e| e.contains("not contiguous"))
+            .expect("contiguity error");
+        assert!(
+            message.contains("C cannot be chained back to A"),
+            "{message}"
+        );
+        assert!(!message.contains('B'), "{message}");
+    }
+
+    #[test]
+    fn outputs_without_a_pinned_rectangle_are_not_checked() {
+        // No configured mode or position: geometry comes from observation at
+        // reconcile time, so the document alone cannot condemn it.
+        let mut floating = placed("B", 9_999, 0, 1920, 1080);
+        floating.position = None;
+        layout(vec![placed("A", 0, 0, 1920, 1080), floating])
+            .validate()
+            .expect("unpinned outputs are exempt");
+    }
+
+    #[test]
+    fn disabled_outputs_do_not_bridge_a_gap() {
+        // The disabled middle output would chain A to C if it counted — but
+        // it emits no pixels, so the gap is real.
+        let mut bridge = placed("B", 1800, 0, 1920, 1080);
+        bridge.enable = false;
+        let errors = layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            bridge,
+            placed("C", 3600, 0, 1920, 1080),
+        ])
+        .validate()
+        .unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("not contiguous")),
+            "{errors:?}"
+        );
     }
 
     #[test]

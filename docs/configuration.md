@@ -390,6 +390,14 @@ however much the rigging actually overlaps, each seam its own amount, rows
 and grids included. The canvas is the layout's bounding box, and the Displays
 tab reports it live.
 
+The layout must be **contiguous**: every enabled output must chain back to
+the first through overlaps or shared edges (any number of intermediates; a
+corner-to-corner touch does not count). A gap would leave part of the canvas
+mapped to no projector — content silently lost — so validation rejects it
+like any other invalid write. Outputs with no configured `mode` or
+`position` take their geometry from observation and are exempt from the
+check.
+
 Sway never sees any of this. It is always handed a plain edge-to-edge tiling
 (sway cannot render overlapping outputs distinctly — its single global
 coordinate space gives every output the same pixels in a shared region,
