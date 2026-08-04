@@ -24,6 +24,14 @@ const CHROMIUM_KIOSK_ARGS: &[&str] = &[
     "--aggressive-cache-discard",
     "--app-auto-launched",
     "--force-device-scale-factor=1",
+    // Without this a page cannot make a sound until somebody clicks it, and
+    // on an appliance nobody ever will: Chromium suspends the AudioContext
+    // and every <audio> and <video> element until a "user gesture", so a
+    // stream that plays perfectly on a desk is silent on the machine. There
+    // is no gesture to wait for here, and the operator chose what the
+    // machine runs when they configured it, which is the consent the policy
+    // exists to obtain.
+    "--autoplay-policy=no-user-gesture-required",
     "--ozone-platform=wayland",
     // Vulkan is deliberately absent: Chromium rejects it under
     // `--ozone-platform=wayland` ("not compatible with Vulkan") and logs an
@@ -256,6 +264,11 @@ mod tests {
         assert!(spec.args.iter().any(|a| a == "--kiosk"));
         assert!(spec.args.iter().any(|a| a == "--ozone-platform=wayland"));
         assert!(spec.args.iter().any(|a| a == "--password-store=basic"));
+        // An appliance has nobody to click "play".
+        assert!(spec
+            .args
+            .iter()
+            .any(|a| a == "--autoplay-policy=no-user-gesture-required"));
     }
 
     #[test]

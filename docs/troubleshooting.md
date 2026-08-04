@@ -181,6 +181,31 @@ by hand is the usual way to end up here.
 
 Changing an app's sink **relaunches** it. That is expected: routing is applied at launch.
 
+### The page is silent, but everything looks right {: #autoplay }
+
+If a sink exists, the app is running, and still nothing is heard, check
+whether the page was ever allowed to start playing. Browsers block audio
+until a "user gesture", and an appliance never provides one. The
+`chromium-kiosk` preset disables that policy; a page run some other way (an
+`exec` launcher, or `firefox-kiosk`) may still be blocked.
+
+A page can report the answer itself — `new AudioContext().state` is
+`suspended` when blocked and `running` when not. Writing it into
+`document.title` makes it readable straight from the API, with no access to
+the machine's screen:
+
+```bash
+curl -s http://appliance:9088/api/v1/windows | python3 -m json.tool
+```
+
+Whether audio is genuinely reaching a device is a separate question, and
+PipeWire answers it: a playing app appears as a `Stream/Output/Audio` node.
+
+```bash
+pw-dump | grep -A2 Stream/Output/Audio
+wpctl status          # sinks in state "running" are being fed
+```
+
 ## Configuration was lost
 
 It should not be. Desired state lives in `$XDG_STATE_HOME/suede/state.json`, is written atomically, and keeps a `.bak`. Package upgrades do not touch it.

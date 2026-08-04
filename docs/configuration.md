@@ -289,7 +289,20 @@ entirely yours.
     }
     ```
 
-    Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
+    Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, `--autoplay-policy=no-user-gesture-required`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
+
+!!! info "Pages may make a sound without being clicked"
+    Chromium normally suspends every `AudioContext`, `<audio>` and `<video>`
+    until a "user gesture", and on an appliance no gesture is ever coming — a
+    page that plays perfectly on a desk is simply silent on the machine. The
+    preset therefore sets `--autoplay-policy=no-user-gesture-required`. The
+    consent the policy exists to obtain was given when the operator chose what
+    the machine runs.
+
+    **Firefox has no equivalent flag.** Its autoplay control is a preference
+    (`media.autoplay.default`), which needs a profile Suede does not currently
+    manage for Firefox, so a `firefox-kiosk` app stays subject to the default
+    blocking policy. Use `chromium-kiosk` where sound matters.
 
 === "Firefox kiosk"
 
