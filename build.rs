@@ -34,7 +34,11 @@ fn main() {
     // Composed here rather than at runtime so it can be a `&'static str`,
     // which is what a command-line parser wants for `--version`.
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
-    let shown = if id == "unknown" || id == version {
+    // A release build's identity is its own tag, so showing both would read
+    // "0.1.1 (v0.1.1)". The parenthesis earns its place only when it says
+    // something the version does not.
+    let is_its_own_tag = id == version || id == format!("v{version}");
+    let shown = if id == "unknown" || is_its_own_tag {
         version
     } else {
         format!("{version} ({id})")

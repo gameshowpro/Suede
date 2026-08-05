@@ -125,6 +125,17 @@ The release it is meant to be, then the last tag, how far past it, and the
 exact commit. A working tree with uncommitted changes says so — `-dirty` —
 which matters most on the machine where the changes are being made.
 
+A release build has nothing to add, so it does not pad the line out:
+
+```
+$ suede --version
+suede 0.1.1
+```
+
+The parenthesis appears only when it says something the version does not.
+Its absence is therefore information in itself: this is a release, not a
+build that happens to be near one.
+
 `GET /api/v1/system` reports the same thing as `buildId` beside
 `suedeVersion`, so it can be read from a machine you are not sitting at.
 
