@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Local development check: build, lint, unit test, then smoke test.
 #
-# Mirrors what CI does, so a green run here means a green run there.
+# Mirrors what CI does, with one exception: `all` does not build the docs,
+# because that needs pip and a network, which a working checkout may not have.
+# Run `dev-check.sh docs` separately when documentation changed. CI builds it
+# on every push either way, so the gap is caught - just later.
 set -uo pipefail
 
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -66,6 +69,12 @@ fi
 echo "====================="
 if [[ "$FAILED" -eq 0 ]]; then
   echo "ALL STAGES PASSED"
+  # Naming what was not covered, so this banner cannot be read as more than
+  # it is. Only when docs could actually have changed - otherwise it is noise
+  # that teaches you to ignore the line.
+  if [[ "$STAGE" == "all" ]] && ! git diff --quiet --exit-code HEAD -- docs mkdocs.yml 2>/dev/null; then
+    echo "(docs not built - you changed them; run: ./scripts/dev-check.sh docs)"
+  fi
 else
   echo "SOME STAGES FAILED"
 fi
