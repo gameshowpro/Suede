@@ -43,7 +43,7 @@ deploy this.
 | GPU | NVIDIA Quadro RTX 6000, proprietary driver — sway needs `--unsupported-gpu` | Intel, AMD, Raspberry Pi VideoCore |
 | Displays | 2 × DisplayPort, including an overlapping edge-blended canvas | 3–4 outputs. The projection code is written for up to four and has only ever run on two |
 | Audio | PipeWire, WirePlumber and `pipewire-pulse`; HDMI and USB sinks | Onboard analog sinks, Bluetooth |
-| Browser | Google Chrome 151 via `chromium-kiosk` | Chromium proper. **`firefox-kiosk` has never been run at all** |
+| Browser | Google Chrome 151 via `chromium-kiosk` | Chromium proper. **`firefox-kiosk` has never been run at all.** Snap browsers are ignored by design — see [the note on snaps](https://suede.gameshow.pro/configuration/#applications) |
 | Install | The `.deb` and `provision.sh` have both been installed and run on real hardware (Ubuntu 26.04 amd64) and, in a container, upgraded, removed and reset repeatedly | The same on Debian or Raspberry Pi OS, and on aarch64 |
 | Privileges | Session user, with `audio`, `video` and `render` group membership | — |
 

@@ -109,6 +109,37 @@ curl -s http://appliance:9088/api/v1/apps | python3 -m json.tool
 | `crashed` | The restart policy declined a relaunch |
 | `starting` | Launched, but no window has appeared yet |
 
+### "Failed to create a ProcessSingleton for your profile directory" {: #process-singleton }
+
+The app crash-loops, and Chromium's own log says:
+
+```
+Failed to create /home/you/.local/state/suede/profiles/<app>/SingletonLock:
+  Permission denied (13)
+Failed to create a ProcessSingleton for your profile directory. ...
+  Aborting now to avoid profile corruption.
+```
+
+Chromium is describing a symptom, not the cause. Nothing is corrupt: the
+browser is a **snap**, and a confined snap may write anywhere in `$HOME`
+*except* a hidden directory — which is exactly where Suede keeps its state.
+
+Current versions of Suede do not choose a snap at all, so this only appears
+when one was named deliberately with `launcher.program`, and even then the
+profile is placed under `~/snap/<name>/common/suede-profiles/<app>` so it
+works. If you are seeing it, either the daemon predates that behaviour or
+something else is passing `--user-data-dir`. Check which binary is actually
+being launched:
+
+```bash
+curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="browsers"][0]["detail"])'
+```
+
+The reliable fix is a browser from a `.deb` rather than a snap — on Debian
+`apt install chromium`, on Ubuntu Google Chrome's own package — because a
+snap also restarts itself whenever it updates, which on an appliance means
+the screens go blank mid-show.
+
 An app that cannot run does not stay a private matter: after three
 consecutive failed launches Suede raises an `app_crash_looping` divergence and
 the appliance reports `degraded`, and an app whose restart policy declines a

@@ -297,11 +297,24 @@ entirely yours.
       "kind": "chromium-kiosk",
       "uri": "http://control.local/render/1",
       "showFpsCounter": false,
-      "extraArgs": []
+      "extraArgs": [],
+      "program": null
     }
     ```
 
     Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, `--autoplay-policy=no-user-gesture-required`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
+
+    | Field | Meaning |
+    |---|---|
+    | `uri` | Page to load; `{appId}` and `{heartbeatUrl}` are expanded |
+    | `showFpsCounter` | Chromium's frame-rate overlay, for diagnosing dropped frames |
+    | `extraArgs` | Appended after the preset, before the URI |
+    | `program` | Which binary to launch, overriding the search |
+
+    Without `program`, Suede tries `chromium`, `chromium-browser`,
+    `google-chrome-stable` and `google-chrome` in that order, ignoring any
+    that is a snap. Naming one settles it: a bare name is looked up on
+    `PATH`, a path is used as given.
 
 !!! warning "A snap browser does not count as installed"
     Ubuntu's `chromium` package is a shim for a snap, and Suede's search
