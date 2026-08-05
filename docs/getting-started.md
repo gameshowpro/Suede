@@ -15,11 +15,16 @@
     machine: Ubuntu 26.04 on x86-64, Sway 1.11, an NVIDIA GPU with the
     proprietary driver, two DisplayPort outputs, and Chromium.
 
-    Not yet exercised anywhere: aarch64 and Raspberry Pi hardware, Debian
-    itself, Sway older than 1.11, more than two displays, the `.deb` package,
-    this provisioning script end to end, and the `firefox-kiosk` launcher.
-    None of that is expected to be broken; none of it is known to work.
-    Reports from any of those are the most useful thing you could send.
+    Since then the package and this provisioning script have both been
+    installed and run on that machine from nothing, upgraded in place, and
+    reset back to nothing again. The aarch64 package installs and runs under
+    emulation.
+
+    Not yet exercised anywhere: real aarch64 or Raspberry Pi hardware, Debian
+    itself, Sway older than 1.11, more than two displays, and the
+    `firefox-kiosk` launcher. None of that is expected to be broken; none of
+    it is known to work. Reports from any of those are the most useful thing
+    you could send.
 
 ## Install
 
@@ -31,11 +36,13 @@
     sudo apt install ./suede_*_arm64.deb
     ```
 
-    `apt` pulls in `sway`, `pipewire`, and `pipewire-pulse` automatically. A browser is *recommended* rather than required, so install one explicitly if the machine has none:
+    `apt` pulls in `sway`, `pipewire`, and `pipewire-pulse` automatically. It does **not** pull in a browser: the package declares no relationship to one, because Suede resolves whichever it finds at launch rather than linking against any. Install one yourself.
 
     ```bash
-    sudo apt install chromium
+    sudo apt install chromium        # Debian, Raspberry Pi OS
     ```
+
+    On Ubuntu that command installs a **snap**, which Suede ignores — it updates itself on its own schedule and restarts the browser when it does, which on an appliance blanks the screens mid-show. Install Google Chrome's own `.deb` there instead, or accept the snap deliberately with `launcher.program` on the application. The `browsers` health check says which it found and which it declined.
 
 === "From source"
 
@@ -58,13 +65,20 @@ sudo /usr/share/suede/provision.sh
 
 It is idempotent, so re-running it after an upgrade is safe. It will:
 
-1. Install any missing required packages.
-2. Configure auto-login on `tty1` for the appliance user.
-3. Start Sway from that user's login shell.
-4. Create a minimal Sway config, including the block Suede manages.
-5. Install `sway-session.target` and enable `suede.service`.
-6. Disable and mask competing display managers and compositors.
-7. Open port 9088 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
+1. Install any missing required packages, and report which browser it found.
+2. Add the appliance user to the `audio`, `video` and `render` groups. Without those, PipeWire cannot open the sound devices and there is no audio at all — an appliance has no seated login, so the ACLs that normally grant access are never applied.
+3. Configure auto-login on `tty1` for the appliance user.
+4. Start Sway from that user's login shell, adding `--unsupported-gpu` when the NVIDIA proprietary driver is loaded, since Sway will not start on it otherwise.
+5. Create a minimal Sway config, including the block Suede manages.
+6. Install `sway-session.target` and enable `suede.service`.
+7. Disable and mask competing display managers and compositors.
+8. Open port 9088 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
+
+It warns rather than proceeds silently in two cases worth knowing about: if
+something else on the machine already starts Sway — two compositors cannot
+share a graphics card, and whichever publishes `SWAYSOCK` last is the one
+Suede attaches to — and if it changed your group membership, since that only
+takes effect after a reboot.
 
 !!! note "Raspberry Pi OS"
     Pi OS ships `labwc`, which will fight Sway for the displays. The provisioning script disables it, including its autostart entry. This path is written but untested — see the warning above.
@@ -79,8 +93,8 @@ The web UI shows a banner for any health check that is not passing, with a **Fix
 
 Then:
 
-1. Go to **Displays**. Click a display, set its mode and position, and save.
-2. Go to **Apps**. Add a Chromium kiosk pointing at the URI you want shown, pinned to that display.
+1. Go to **Displays**. Every connector the machine has is listed, including ones with nothing plugged in. Add the ones you want to the layout, set each one's mode and position, and save.
+2. Go to **Apps**. Add a Chromium kiosk pointing at the URI you want shown, then activate it. One application is active at a time and it covers every display as a single canvas — there is no per-display targeting. The dialog shows the command, arguments and environment it will actually be launched with, resolved on this machine.
 3. Reboot the machine to prove it comes back on its own.
 
 That last step is the point of the whole exercise; do it once before you leave the site.
@@ -107,6 +121,8 @@ If the block is missing, the `sway-config` health check offers to add it.
 Suede launches browsers as its own child processes, not through Sway's `exec`. That is what gives it a real PID for clean termination, exit-code observation, and restart policies.
 
 Chromium refuses to start a second instance sharing a profile, so each app automatically gets a private `--user-data-dir` beneath the state directory. Profiles are wiped on launch by default; set `persistProfile: true` on an app to keep it.
+
+The exception is a browser named explicitly as a snap, whose profile goes under `~/snap/<name>/common/` instead — a confined snap may write anywhere in `$HOME` except a hidden directory, and the state directory is under `~/.local/state`. The app dialog shows where the profile will land, so this is visible rather than surprising.
 
 ## Audio {: #audio }
 
