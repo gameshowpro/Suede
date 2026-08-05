@@ -226,6 +226,15 @@ jobs:
           echo "reports: $reported"
           expected_version="${{ steps.version.outputs.version }}"
           expected_id="${{ steps.version.outputs.build_id }}"
+          # An empty or unknown id would make the bare-version form below
+          # match, passing this check while the identity was in fact lost.
+          case "$expected_id" in
+            ""|unknown)
+              echo "::error::the build id was not worked out; refusing to" \
+                   "ship a binary that cannot say which commit it is"
+              exit 1
+              ;;
+          esac
           case "$reported" in
             "suede $expected_version"|"suede $expected_version ($expected_id)") ;;
             *)
@@ -234,6 +243,22 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Verify the cross-built binary carries the same identity
+        if: matrix.target != 'x86_64-unknown-linux-gnu'
+        run: |
+          # This one cannot be run here, but the identity is a static string
+          # compiled into it, so it can still be read without executing.
+          # Without this the arm64 package would be the only artifact nobody
+          # checks, which is where a mislabelled build would next hide.
+          binary=target/${{ matrix.target }}/release/suede
+          expected_id="${{ steps.version.outputs.build_id }}"
+          if grep -qa -- "$expected_id" "$binary"; then
+            echo "contains: $expected_id"
+          else
+            echo "::error::$binary does not contain the build id $expected_id"
+            exit 1
+          fi
 
       - name: Verify the binary is self-contained
         if: matrix.target == 'x86_64-unknown-linux-gnu'
