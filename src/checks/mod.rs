@@ -723,7 +723,32 @@ impl CheckRunner {
             }
         }
 
-        let (status, detail) = if !unrunnable.is_empty() {
+        // A snap browser is only reached when nothing else is installed, and
+        // it will fail in a way that reads as a Chromium bug rather than a
+        // packaging one.
+        let snapped: Vec<String> = [
+            crate::supervisor::launcher::CHROMIUM_PROGRAMS,
+            crate::supervisor::launcher::FIREFOX_PROGRAMS,
+        ]
+        .concat()
+        .iter()
+        .filter_map(|name| {
+            crate::supervisor::launcher::resolve_program(&[name.to_string()])
+                .filter(|path| crate::supervisor::launcher::is_snap(path))
+                .map(|path| path.display().to_string())
+        })
+        .collect();
+        let only_snap = !snapped.is_empty() && working.is_empty();
+
+        let (status, detail) = if only_snap {
+            (
+                CheckStatus::Warn,
+                format!(
+                    "the only browser here is a snap ({}). Suede works with                      it - the profile is placed under ~/snap where a confined                      snap may write, since it cannot reach the state                      directory - but a snap updates itself on its own                      schedule and restarts the browser when it does, which on                      an appliance means the screens go blank mid-show. A                      browser from a .deb is the better choice, and                      `launcher.program` names one explicitly.",
+                    snapped.join(", ")
+                ),
+            )
+        } else if !unrunnable.is_empty() {
             (
                 CheckStatus::Fail,
                 format!(

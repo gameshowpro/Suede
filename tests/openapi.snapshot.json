@@ -1933,6 +1933,13 @@
                   "chromium-kiosk"
                 ]
               },
+              "program": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which binary to launch, overriding the search.\n\nSuede normally tries `chromium`, `chromium-browser`,\n`google-chrome-stable` and `google-chrome` in that order,\npreferring any that is not a snap. Name one here to settle it —\na bare name is looked up on `PATH`, a path is used as given."
+              },
               "showFpsCounter": {
                 "type": "boolean"
               },
@@ -1961,6 +1968,13 @@
                 "enum": [
                   "firefox-kiosk"
                 ]
+              },
+              "program": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Which binary to launch, overriding the search. See\n[`Launcher::ChromiumKiosk::program`]."
               },
               "uri": {
                 "type": "string"

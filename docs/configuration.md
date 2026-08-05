@@ -303,6 +303,31 @@ entirely yours.
 
     Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, `--autoplay-policy=no-user-gesture-required`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
 
+!!! warning "Snap browsers work, but pick a .deb if you can"
+    Ubuntu's `chromium` package is a shim for a snap. Suede runs it: a
+    confined snap may write anywhere in `$HOME` **except a hidden
+    directory**, and Suede's profiles live under `~/.local/state`, so a snap
+    browser gets its profile at `~/snap/<name>/common/suede-profiles/<app>`
+    instead. Without that, Chromium cannot create its `SingletonLock`, aborts
+    with a message about profile corruption, and the app crash-loops.
+
+    It is still the worse choice. A snap updates itself on its own schedule
+    and restarts the browser when it does, which on an appliance means the
+    screens go blank in the middle of whatever you were showing. Suede
+    therefore prefers any non-snap binary it can find, and only falls back to
+    a snap when nothing else is installed — where it says so as a health-check
+    warning rather than failing silently.
+
+    `launcher.program` settles the question outright:
+
+    ```json
+    { "kind": "chromium-kiosk", "uri": "http://…",
+      "program": "/usr/bin/google-chrome-stable" }
+    ```
+
+    A bare name is looked up on `PATH`; a path is used as given. It applies to
+    `firefox-kiosk` too.
+
 !!! info "Pages may make a sound without being clicked"
     Chromium normally suspends every `AudioContext`, `<audio>` and `<video>`
     until a "user gesture", and on an appliance no gesture is ever coming — a

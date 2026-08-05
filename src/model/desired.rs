@@ -754,6 +754,14 @@ pub enum Launcher {
         /// Appended after the preset's arguments.
         #[serde(default)]
         extra_args: Vec<String>,
+        /// Which binary to launch, overriding the search.
+        ///
+        /// Suede normally tries `chromium`, `chromium-browser`,
+        /// `google-chrome-stable` and `google-chrome` in that order,
+        /// preferring any that is not a snap. Name one here to settle it —
+        /// a bare name is looked up on `PATH`, a path is used as given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<String>,
     },
     /// Firefox with its kiosk argument set.
     #[serde(rename_all = "camelCase")]
@@ -761,6 +769,10 @@ pub enum Launcher {
         uri: String,
         #[serde(default)]
         extra_args: Vec<String>,
+        /// Which binary to launch, overriding the search. See
+        /// [`Launcher::ChromiumKiosk::program`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        program: Option<String>,
     },
     /// Any executable, launched verbatim.
     #[serde(rename_all = "camelCase")]
@@ -1270,6 +1282,7 @@ mod tests {
             uri: "http://example.com".into(),
             show_fps_counter: true,
             extra_args: vec!["--mute-audio".into()],
+            program: None,
         };
         let json = serde_json::to_value(&launcher).unwrap();
         assert_eq!(json["kind"], "chromium-kiosk");

@@ -126,8 +126,18 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             uri,
             show_fps_counter,
             extra_args,
+            program,
         } => {
-            let profile_dir = profile_dir_for(&context.profiles_root, &app.id);
+            let programs = program_list(program.as_deref(), CHROMIUM_PROGRAMS);
+            // Where the profile can live depends on what is going to open it.
+            // A confined snap may write anywhere in $HOME except a hidden
+            // directory, and Suede's state directory is under `.local` - so
+            // the profile has to move rather than the browser be refused.
+            let profile_dir = match resolve_program(&programs) {
+                Some(found) if is_snap(&found) => snap_profile_dir(&found, &app.id)
+                    .unwrap_or_else(|| profile_dir_for(&context.profiles_root, &app.id)),
+                _ => profile_dir_for(&context.profiles_root, &app.id),
+            };
             let mut args: Vec<String> = CHROMIUM_KIOSK_ARGS.iter().map(|a| a.to_string()).collect();
             // Chromium refuses a second instance sharing a profile, so every
             // app gets its own.
@@ -139,14 +149,18 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             args.push(expand_uri(uri, &app.id, context));
 
             LaunchSpec {
-                programs: CHROMIUM_PROGRAMS.iter().map(|p| p.to_string()).collect(),
+                programs,
                 args,
                 env,
                 profile_dir: Some(profile_dir),
                 wipe_profile: !app.persist_profile,
             }
         }
-        Launcher::FirefoxKiosk { uri, extra_args } => {
+        Launcher::FirefoxKiosk {
+            uri,
+            extra_args,
+            program,
+        } => {
             let mut args: Vec<String> = FIREFOX_KIOSK_ARGS.iter().map(|a| a.to_string()).collect();
             args.extend(extra_args.iter().cloned());
             args.push(expand_uri(uri, &app.id, context));
@@ -154,7 +168,7 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             env.push(("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string()));
 
             LaunchSpec {
-                programs: FIREFOX_PROGRAMS.iter().map(|p| p.to_string()).collect(),
+                programs: program_list(program.as_deref(), FIREFOX_PROGRAMS),
                 args,
                 env,
                 profile_dir: None,
@@ -178,6 +192,50 @@ fn profile_dir_for(root: &Path, app_id: &str) -> PathBuf {
     root.join(app_id)
 }
 
+/// The candidates to search, or just the one the operator named.
+fn program_list(override_program: Option<&str>, preset: &[&str]) -> Vec<String> {
+    match override_program {
+        Some(named) => vec![named.to_string()],
+        None => preset.iter().map(|p| p.to_string()).collect(),
+    }
+}
+
+/// A profile directory a confined snap can actually open.
+///
+/// Snap's `home` interface grants access to `$HOME` but excludes hidden
+/// directories, which is precisely where Suede keeps its state. Measured:
+/// a profile under `~/.local/state` fails to create `SingletonLock` and
+/// Chromium aborts; the same profile under a visible path works. The snap's
+/// own `common` directory is chosen over inventing a visible one, because it
+/// belongs to that snap and goes away when it is removed.
+fn snap_profile_dir(program: &Path, app_id: &str) -> Option<PathBuf> {
+    let snap = program.file_name()?.to_str()?;
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join("snap")
+            .join(snap)
+            .join("common")
+            .join("suede-profiles")
+            .join(app_id),
+    )
+}
+
+/// Whether a resolved program is a snap.
+///
+/// This matters because a confined snap cannot write outside its own
+/// directories, and Suede hands every browser a private `--user-data-dir`
+/// under its state directory. Chromium's answer to being unable to create
+/// `SingletonLock` there is to abort, so the app crash-loops with a message
+/// about profile corruption that says nothing about confinement.
+pub fn is_snap(path: &Path) -> bool {
+    // The launcher in $PATH is a symlink into /snap; resolving it is what
+    // distinguishes Ubuntu's `chromium` shim from Debian's real binary of
+    // the same name.
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    resolved.starts_with("/snap/") || path.starts_with("/snap/")
+}
+
 /// The first candidate that exists, searching `$PATH` for bare names.
 ///
 /// `lookup` decides whether a resolved path is usable, so the search itself
@@ -190,26 +248,43 @@ pub fn resolve_program_with<F>(
 where
     F: Fn(&Path) -> bool,
 {
+    let mut snap_fallback = None;
     for candidate in candidates {
+        let mut found = None;
         let path = Path::new(candidate);
         if path.is_absolute() || candidate.contains('/') {
             if exists(path) {
-                return Some(path.to_path_buf());
+                found = Some(path.to_path_buf());
             }
+        } else {
+            for dir in path_var
+                .unwrap_or_default()
+                .split(':')
+                .filter(|d| !d.is_empty())
+            {
+                let full = Path::new(dir).join(candidate);
+                if exists(&full) {
+                    found = Some(full);
+                    break;
+                }
+            }
+        }
+        let Some(found) = found else { continue };
+        // A snap is remembered but passed over: on Ubuntu, `chromium` is a
+        // shim for one while `chromium-browser` and `google-chrome-stable`
+        // are ordinary binaries that can use the profile directory. On
+        // Debian the same name is a real package and is taken immediately.
+        // Reordering the candidate list could not express that, since which
+        // name is the snap depends on the distribution.
+        if is_snap(&found) {
+            snap_fallback.get_or_insert(found);
             continue;
         }
-        for dir in path_var
-            .unwrap_or_default()
-            .split(':')
-            .filter(|d| !d.is_empty())
-        {
-            let full = Path::new(dir).join(candidate);
-            if exists(&full) {
-                return Some(full);
-            }
-        }
+        return Some(found);
     }
-    None
+    // Nothing else is installed. Better a browser that may fail loudly than
+    // no browser at all, and the health check explains what to expect.
+    snap_fallback
 }
 
 /// The first candidate program actually present on this machine.
@@ -253,7 +328,84 @@ mod tests {
             uri: uri.into(),
             show_fps_counter: false,
             extra_args: vec![],
+            program: None,
         }
+    }
+
+    #[test]
+    fn a_snap_is_passed_over_when_a_real_binary_exists() {
+        // Ubuntu's `chromium` is a shim for a confined snap that cannot
+        // write to the profile directory Suede assigns; `chromium-browser`
+        // beside it is an ordinary binary that can.
+        let candidates: Vec<String> = ["chromium", "chromium-browser"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let found = resolve_program_with(&candidates, Some("/snap/bin:/usr/bin"), |path| {
+            matches!(
+                path.to_str(),
+                Some("/snap/bin/chromium") | Some("/usr/bin/chromium-browser")
+            )
+        });
+        assert_eq!(found.unwrap(), PathBuf::from("/usr/bin/chromium-browser"));
+    }
+
+    #[test]
+    fn a_snap_is_still_used_when_it_is_all_there_is() {
+        // No browser at all is worse than one that fails loudly, and the
+        // health check explains what will happen.
+        let candidates: Vec<String> = ["chromium", "chromium-browser"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let found = resolve_program_with(&candidates, Some("/snap/bin:/usr/bin"), |path| {
+            path.to_str() == Some("/snap/bin/chromium")
+        });
+        assert_eq!(found.unwrap(), PathBuf::from("/snap/bin/chromium"));
+    }
+
+    #[test]
+    fn a_plain_binary_is_taken_in_order() {
+        // Debian's `chromium` is real, and must not be passed over.
+        let candidates: Vec<String> = ["chromium", "chromium-browser"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let found = resolve_program_with(&candidates, Some("/usr/bin"), |path| {
+            path.starts_with("/usr/bin")
+        });
+        assert_eq!(found.unwrap(), PathBuf::from("/usr/bin/chromium"));
+    }
+
+    #[test]
+    fn an_explicit_program_settles_the_search() {
+        let spec = build(
+            &app(
+                "r1",
+                Launcher::ChromiumKiosk {
+                    uri: "http://example.com".into(),
+                    show_fps_counter: false,
+                    extra_args: vec![],
+                    program: Some("/opt/google/chrome/chrome".into()),
+                },
+            ),
+            &context(),
+        );
+        assert_eq!(spec.programs, vec!["/opt/google/chrome/chrome".to_string()]);
+    }
+
+    #[test]
+    fn a_snap_profile_goes_where_a_snap_can_write() {
+        // Not the state directory: that is under `.local`, and the snap
+        // `home` interface excludes hidden directories, which is what made
+        // Chromium abort on being unable to create SingletonLock.
+        let dir = snap_profile_dir(Path::new("/snap/bin/chromium"), "renderer").unwrap();
+        let shown = dir.display().to_string().replace('\\', "/");
+        assert!(
+            shown.ends_with("/snap/chromium/common/suede-profiles/renderer"),
+            "{shown}"
+        );
+        assert!(!shown.contains("/.local/"), "must not be hidden: {shown}");
     }
 
     #[test]
@@ -326,6 +478,7 @@ mod tests {
                     uri: "http://a".into(),
                     show_fps_counter: true,
                     extra_args: vec![],
+                    program: None,
                 },
             ),
             &context(),
@@ -342,6 +495,7 @@ mod tests {
                     uri: "http://a".into(),
                     show_fps_counter: false,
                     extra_args: vec!["--mute-audio".into()],
+                    program: None,
                 },
             ),
             &context(),
@@ -359,6 +513,7 @@ mod tests {
                 Launcher::FirefoxKiosk {
                     uri: "http://a".into(),
                     extra_args: vec![],
+                    program: None,
                 },
             ),
             &context(),
@@ -476,6 +631,7 @@ mod tests {
             Launcher::FirefoxKiosk {
                 uri: "http://a".into(),
                 extra_args: vec![],
+                program: None,
             },
         );
         config.env.insert("MOZ_ENABLE_WAYLAND".into(), "0".into());

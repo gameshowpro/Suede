@@ -1459,6 +1459,7 @@ mod tests {
             uri: "http://example.com".into(),
             show_fps_counter: false,
             extra_args: vec![],
+            program: None,
         };
         // Chromium is absent in CI, so the launch fails — but only after the
         // profile directory has been prepared, which is what we assert.
