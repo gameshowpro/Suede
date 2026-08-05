@@ -149,26 +149,40 @@ jobs:
           echo "version=$version" >> $GITHUB_OUTPUT
           echo "tag=v$version" >> $GITHUB_OUTPUT
 
-          # The identity the binary will report.
-          build_id=$(git describe --tags --always --match 'v*' || echo unknown)
-          echo "build_id=$build_id" >> $GITHUB_OUTPUT
-
-          # The Debian revision. A build sitting exactly on its tag is the
-          # release and takes a plain `1`; anything after it takes
-          # `1+<height>.g<sha>`, the height being commits since that tag.
+          # A release build cannot recognise itself by its tag, because the
+          # tag does not exist yet: the release job creates it after this one
+          # finishes. Testing for it here always failed, so the first release
+          # through this path labelled itself a development build sixteen
+          # commits past the PREVIOUS release, which is the one thing the
+          # revision exists to stop.
           #
-          # The height is what makes successive development builds ordered.
-          # Stamping the commit hash alone was tried first, and dpkg compares
-          # those lexically - so roughly half the time a newer build sorted
-          # below its predecessor and apt refused it as a downgrade.
-          if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+          # The signal is the manifest being ahead of the tags. A version with
+          # no tag yet, on main, is what is about to become that release.
+          if [ "${{ github.event_name }}" = "push" ] \
+            && [ "${{ github.ref }}" = "refs/heads/main" ] \
+            && [ -z "$(git ls-remote --tags origin "refs/tags/v$version")" ]; then
+            # A release: a plain `1`, and it calls itself by its version
+            # rather than by its distance from the last one.
             revision=1
+            build_id="v$version"
+          elif git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+            # Re-running CI on a commit that is already tagged. Same answer,
+            # so a rebuild of a release produces the same package as before.
+            revision=1
+            build_id=$(git describe --exact-match --tags HEAD)
           else
+            # After a release. The height is what makes successive builds
+            # ordered: stamping the commit hash alone was tried first, and
+            # dpkg compares those lexically, so roughly half the time a newer
+            # build sorted below its predecessor and apt refused it as a
+            # downgrade.
             height=$(git rev-list --count "$(git describe --tags --abbrev=0 --match 'v*')..HEAD" \
                      2>/dev/null || git rev-list --count HEAD)
             revision="1+${height}.g$(git rev-parse --short HEAD)"
+            build_id=$(git describe --tags --always --match 'v*' || echo unknown)
           fi
           echo "revision=$revision" >> $GITHUB_OUTPUT
+          echo "build_id=$build_id" >> $GITHUB_OUTPUT
           echo "::notice title=build (${{ matrix.arch }})::${build_id} packaged as ${version}-${revision}"
 
       - name: Install cross and cargo-deb
