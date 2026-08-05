@@ -139,8 +139,8 @@ WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 sway
 ```
 
 `provision.sh` sets this for you. The `direct-scanout` health check warns
-whenever an app has `spanOutputs: true` while the running compositor was
-started without it:
+whenever an application is spanning a non-overlapping layout while the running
+compositor was started without it:
 
 ```bash
 curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="direct-scanout"])'

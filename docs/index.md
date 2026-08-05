@@ -12,7 +12,7 @@ You describe the state you want — which displays are on, at what mode and posi
 
 -   :material-web:{ .lg .middle } **Kiosk browser supervision**
 
-    Chromium or Firefox per output with battle-tested kiosk arguments, automatic per-instance profiles, fullscreen placement, and crash-restart with backoff.
+    One application at a time covering every display as a single canvas, with battle-tested kiosk arguments, per-app browser profiles, readiness gating, and crash-restart with backoff.
 
 -   :material-volume-high:{ .lg .middle } **Audio routing**
 

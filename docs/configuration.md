@@ -226,11 +226,7 @@ window manager.
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `id` | string | required | Unique, stable; also used as a profile directory name |
-| `enabled` | bool | `true` | Disabling terminates a running instance |
 | `launcher` | object | required | See below |
-| `output` | object \| null | null | Output to place the window on |
-| `fullscreen` | bool | `true` | Fill the target output |
-| `spanOutputs` | bool | `false` | Stretch one window across **every** output |
 | `readiness` | object \| null | null | Wait for a URL to answer before launching |
 | `env` | object | `{}` | Extra environment variables for the process |
 | `audio` | object \| null | null | Absent leaves routing alone; see below |
@@ -238,11 +234,22 @@ window manager.
 | `restart` | object | always/1s/30s | Restart policy and backoff |
 | `persistProfile` | bool | `false` | Keep the browser profile between launches |
 
+!!! info "There is no per-app placement"
+    An application does not choose an output, a workspace, or whether to go
+    fullscreen. The active one always covers the whole canvas, and which one
+    that is comes from `activeApp`. Placement is Suede's job, and it changes
+    depending on whether the layout overlaps — see
+    [projection](#projection-edge-blending). Documents written for an earlier
+    version may carry `enabled`, `output`, `fullscreen` or `spanOutputs` on an
+    app; those fields are ignored, not rejected, so check `activeApp` if
+    nothing launches.
+
 #### Driving a multi-display installation
 
-Setting `spanOutputs: true` stretches a single window across the whole layout
-rather than filling one output — sway's `fullscreen enable global`. This is how
-one browser drives several displays as a single canvas:
+One application covers every display as a single canvas. With a plain
+edge-to-edge layout that is sway's `fullscreen enable global`; with an
+overlapping layout Suede renders to a headless canvas and slices it. Either
+way the configuration is the same:
 
 ```json
 {
@@ -253,9 +260,10 @@ one browser drives several displays as a single canvas:
     {"match":{"name":"HDMI-A-4"},"enable":true,"mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":5760,"y":0}}
   ],
   "apps": [
-    {"id":"wall","enabled":true,"spanOutputs":true,
-     "launcher":{"kind":"chromium-kiosk","uri":"http://control.local/wall"}}
-  ]
+    {"id":"renderer",
+     "launcher":{"kind":"chromium-kiosk","uri":"http://control.local/render"}}
+  ],
+  "activeApp": "renderer"
 }
 ```
 
@@ -264,7 +272,8 @@ canvas you want; Suede performs no layout arithmetic, so the geometry is
 entirely yours.
 
 !!! warning "Start sway with direct scanout disabled"
-    Spanning needs `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` on the compositor.
+    Spanning a non-overlapping layout needs
+    `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` on the compositor.
     Without it, some drivers show the same part of the window on every display
     instead of spanning — see
     [troubleshooting](troubleshooting.md#a-spanned-window-mirrors-instead-of-spanning).

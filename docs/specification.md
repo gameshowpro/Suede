@@ -14,7 +14,7 @@ A rack-mounted media server drives 4 HDMI outputs. An operator on another machin
 
 - Enumerate the connected displays, their EDID identity (make/model/serial), and supported modes.
 - Set each output's mode, position, scale, and options (adaptive sync, tearing, max render time).
-- Launch one Chromium instance per output in kiosk mode, each loading a specified URI.
+- Launch a kiosk browser covering every display as a single canvas, loading a specified URI, with one application active at a time.
 - Have all of the above survive a reboot with no operator intervention: the machine boots, Sway starts, Suede starts, and the last-applied configuration is restored automatically.
 
 ## Design principles
@@ -154,15 +154,12 @@ The desired-state document:
   "apps": [
     {
       "id": "renderer-1",                           // client-chosen, unique, stable
-      "enabled": true,
       "launcher": {
         "kind": "chromium-kiosk",                   // chromium-kiosk | firefox-kiosk | exec
         "uri": "http://media-server.local/render/1",
         "showFpsCounter": false,
         "extraArgs": []                             // appended after the preset's arguments
       },
-      "output": { "name": "HDMI-A-1" },             // window is moved here and fullscreened
-      "fullscreen": true,
       "audio": { "output": "alsa_output.pci-0000_01_00.1.hdmi-stereo" },
                                                     // omit = don't touch routing; "output": null = route to the null sink
       "heartbeat": { "enabled": true, "timeoutSeconds": 25, "startupGraceSeconds": 60 },
@@ -182,9 +179,9 @@ Notes:
 - **Output matching.** Matching by connector `name` (`HDMI-A-1`) is the default and suits fixed installations. Matching by EDID (`make`/`model`/`serial`) is supported for cases where connector enumeration is unstable. A desired output with no currently matching connector is a reported divergence, not an error.
 - **Layout is the client's job.** Positions are always explicit; Suede does no layout arithmetic (no "row" auto-layout). The reference UI offers left-to-right arrangement as a client-side convenience that simply computes `position` values, and any other client can do the same.
 - **URI placeholders.** Launcher URIs may contain the tokens `{appId}` and `{heartbeatUrl}` (a loopback URL to this app's heartbeat endpoint), substituted at launch. This is how rendered content learns where to post its watchdog heartbeats without hard-coding host details.
-- **Launcher presets.** `chromium-kiosk` expands to the battle-tested argument set from the prior .NET implementation (`--kiosk --password-store=basic --no-first-run --disable-infobars --disable-session-crashed-bubble --ozone-platform=wayland --force-device-scale-factor=1 --enable-features=VaapiVideoDecoder,… --ignore-gpu-blocklist --enable-zero-copy` etc.) plus the URI. `firefox-kiosk` expands to `--kiosk --new-instance --private-window <uri>`. `exec` is fully generic: `{ "kind": "exec", "command": "...", "args": [...] }`.
+- **Launcher presets.** `chromium-kiosk` expands to the battle-tested argument set from the prior .NET implementation (`--kiosk --password-store=basic --no-first-run --disable-infobars --disable-session-crashed-bubble --ozone-platform=wayland --force-device-scale-factor=1 --enable-features=VaapiVideoDecoder,… --ignore-gpu-blocklist --enable-zero-copy` etc.) plus the URI. `firefox-kiosk` expands to `--kiosk --new-instance --private-window <uri>`; note that it has never been run and cannot have its autoplay policy relaxed the way `chromium-kiosk` can. `exec` is fully generic: `{ "kind": "exec", "command": "...", "args": [...] }`.
 - **Multiple Chromium instances.** Chromium refuses a second instance sharing a profile, so Suede automatically assigns each `chromium-kiosk` app a private `--user-data-dir` under its state directory (e.g. `…/suede/profiles/renderer-1`). Profiles are wiped on launch by default (kiosk sessions should be stateless); a `persistProfile: true` flag opts out.
-- **Window placement.** After launch, Suede waits for a window whose `pid` matches the spawned process (timeout: 15 s, then the app is `crashed`), moves it to the workspace pinned to the target output, and applies fullscreen. One dedicated workspace per output (`1` on the first output, `2` on the second, …) keeps placement deterministic.
+- **Window placement.** After launch, Suede waits for a window whose `pid` matches the spawned process (timeout: 15 s, then the app is `crashed`) and places it to cover the whole canvas: `fullscreen enable global` across a tiled layout, or fullscreen on the headless canvas output when the layout overlaps and the slicer is driving the projectors. Placement is never a per-app setting.
 
 ## Daemon configuration
 

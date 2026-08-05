@@ -8,7 +8,18 @@
 | Architecture | x86-64 or aarch64 |
 | Compositor | Sway 1.7 or newer (tearing control needs 1.10) |
 | Audio | PipeWire with `pipewire-pulse` |
-| Privileges | The daemon runs as the session user; provisioning needs sudo once |
+| Privileges | The daemon runs as the session user, in the `audio`, `video` and `render` groups; provisioning needs sudo once and arranges all of this |
+
+!!! warning "What has actually been tested"
+    That table is what Suede is *built* for. What it has been *run* on is one
+    machine: Ubuntu 26.04 on x86-64, Sway 1.11, an NVIDIA GPU with the
+    proprietary driver, two DisplayPort outputs, and Chromium.
+
+    Not yet exercised anywhere: aarch64 and Raspberry Pi hardware, Debian
+    itself, Sway older than 1.11, more than two displays, the `.deb` package,
+    this provisioning script end to end, and the `firefox-kiosk` launcher.
+    None of that is expected to be broken; none of it is known to work.
+    Reports from any of those are the most useful thing you could send.
 
 ## Install
 
@@ -56,7 +67,7 @@ It is idempotent, so re-running it after an upgrade is safe. It will:
 7. Open port 9088 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
 
 !!! note "Raspberry Pi OS"
-    Pi OS ships `labwc`, which will fight Sway for the displays. The provisioning script disables it, including its autostart entry.
+    Pi OS ships `labwc`, which will fight Sway for the displays. The provisioning script disables it, including its autostart entry. This path is written but untested — see the warning above.
 
 Reboot when it finishes. The machine will log in, start Sway, and start Suede.
 

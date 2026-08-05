@@ -11,7 +11,7 @@
 <!-- md-exclude-end -->
 
 ## Inspiration
-Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, and scoreboard displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand. The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs — precise output control and scriptable window management on minimal hardware — but no friendly way to drive it from across the network or to keep its state across reboots. The idea came from a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket. Suede is a fresh implementation of that idea as a standalone, well-documented service; it shares no code with that system.
+Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, and scoreboard displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand. The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs — precise output control and scriptable window management on minimal hardware — but no friendly way to drive it from across the network or to keep its state across reboots. The idea came from a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket.
 
 ## Summary
 Suede turns a Linux box running Sway into a remotely manageable display appliance. It exposes a well-documented REST + SSE API (and a bundled reference web UI) for configuring video outputs, routing audio, and launching kiosk-mode browsers — and it persists everything, so the machine boots straight back into its configured state with no operator intervention. Configuration is declarative: you describe the state you want, and Suede's reconciler keeps reality matching it through reboots, display hotplugs, and application crashes.
@@ -20,7 +20,7 @@ Suede turns a Linux box running Sway into a remotely manageable display applianc
 
 - **Declarative desired state** - write config through the API; a reconciler continuously drives Sway toward it at boot, after edits, and after hardware events.
 - **Full output control** - per-display mode, position, scale, transform, adaptive sync, tearing, and max render time, with live enumeration of connected displays and their EDID identities.
-- **Kiosk browser supervision** - launch Chromium or Firefox per output with battle-tested kiosk arguments, automatic per-instance profiles, fullscreen placement, and crash-restart policies with backoff.
+- **Kiosk browser supervision** - one active application at a time, covering every display as a single canvas, with battle-tested kiosk arguments, per-app browser profiles, readiness gating, and crash-restart policies with backoff.
 - **Audio routing** - enumerate PipeWire sinks with stable identifiers, route each app's audio to a chosen sink, or null-route it to silence.
 - **Content watchdog** - pages can post heartbeats; a frozen page gets its browser killed and relaunched automatically.
 - **Environment health checks** - Suede verifies its surroundings (Sway, browsers, PipeWire, its own service) and offers one-click fixes for what it can safely repair, with documentation links for the rest.
@@ -30,15 +30,31 @@ Suede turns a Linux box running Sway into a remotely manageable display applianc
 
 ## Supported environments
 
-| Component | Requirement |
-|---|---|
-| OS | Debian-family Linux (Debian 12+, Raspberry Pi OS) |
-| Architecture | x86-64 or aarch64 |
-| Compositor | Sway ≥ 1.7 (tearing control requires ≥ 1.10) |
-| Audio | PipeWire with `pipewire-pulse` |
-| Privileges | Runs as the session user; one-time provisioning requires sudo |
+Suede is new. The table below separates what has actually been run from what
+is expected to work but has not been tried, because a requirements list that
+quietly mixes the two is worth very little to somebody deciding whether to
+deploy this.
 
-Windows and macOS are not supported - the project is intentionally Sway-specific.
+| | Verified | Expected to work, but untested |
+|---|---|---|
+| OS | Ubuntu 26.04 LTS | Debian 12+, Raspberry Pi OS Bookworm+, other systemd Debian-family distributions |
+| Architecture | x86-64 | aarch64 — cross-compiled and packaged by CI, but that binary has never been executed |
+| Compositor | Sway 1.11 | Sway 1.7–1.10. Tearing control is gated on ≥ 1.10, and the gate has never met a version without it |
+| GPU | NVIDIA Quadro RTX 6000, proprietary driver — sway needs `--unsupported-gpu` | Intel, AMD, Raspberry Pi VideoCore |
+| Displays | 2 × DisplayPort, including an overlapping edge-blended canvas | 3–4 outputs. The projection code is written for up to four and has only ever run on two |
+| Audio | PipeWire, WirePlumber and `pipewire-pulse`; HDMI and USB sinks | Onboard analog sinks, Bluetooth |
+| Browser | Google Chrome 151 via `chromium-kiosk` | Chromium proper. **`firefox-kiosk` has never been run at all** |
+| Install | Binary copied into place, run as a systemd user service | The `.deb` and `provision.sh` are built and shell-checked by CI, but neither has been installed or run end to end on a real machine |
+| Privileges | Session user, with `audio`, `video` and `render` group membership | — |
+
+Windows and macOS are not supported and will not be: the project is
+deliberately Sway-specific.
+
+Two gaps are worth stating on their own. **`firefox-kiosk` is implemented but
+unexercised**, and Firefox is separately subject to an autoplay policy Suede
+cannot switch off for it, so `chromium-kiosk` is the path to use where sound
+matters. **Nothing has ever run on aarch64 or a Raspberry Pi**, despite the
+packaging targeting both.
 
 ## Quick start
 
@@ -82,10 +98,13 @@ scripts/dev-check.sh           # fmt, clippy, tests, end-to-end smoke test
 
 ## Sample configuration
 
-Drive four HDMI outputs, each showing its own kiosk Chromium, with all audio following output 1 - the entire appliance in one API call:
+Four outputs tiled edge to edge as one 7680x1080 canvas, with a single kiosk
+Chromium covering the lot and its audio locked to the HDMI sink - the entire
+appliance in one API call:
 
 ```bash
 curl -X PUT http://media-server:9088/api/v1/config -H "Content-Type: application/json" -d '{
+  "committed": true,
   "outputs": [
     { "match": { "name": "HDMI-A-1" }, "enable": true, "mode": { "width": 1920, "height": 1080, "refreshHz": 60 }, "position": { "x": 0, "y": 0 } },
     { "match": { "name": "HDMI-A-2" }, "enable": true, "mode": { "width": 1920, "height": 1080, "refreshHz": 60 }, "position": { "x": 1920, "y": 0 } },
@@ -93,13 +112,24 @@ curl -X PUT http://media-server:9088/api/v1/config -H "Content-Type: application
     { "match": { "name": "HDMI-A-4" }, "enable": true, "mode": { "width": 1920, "height": 1080, "refreshHz": 60 }, "position": { "x": 5760, "y": 0 } }
   ],
   "apps": [
-    { "id": "renderer-1", "enabled": true, "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/render/1" }, "output": { "name": "HDMI-A-1" }, "audio": { "output": "alsa_output.platform-hdmi-sound.stereo-fallback" } },
-    { "id": "renderer-2", "enabled": true, "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/render/2" }, "output": { "name": "HDMI-A-2" }, "audio": { "output": null } },
-    { "id": "renderer-3", "enabled": true, "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/render/3" }, "output": { "name": "HDMI-A-3" }, "audio": { "output": null } },
-    { "id": "renderer-4", "enabled": true, "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/render/4" }, "output": { "name": "HDMI-A-4" }, "audio": { "output": null } }
-  ]
+    { "id": "renderer", "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/render" }, "audio": { "output": "alsa_output.platform-hdmi-sound.stereo-fallback" } },
+    { "id": "standby",  "launcher": { "kind": "chromium-kiosk", "uri": "http://control.local/standby" } }
+  ],
+  "activeApp": "renderer"
 }'
 ```
+
+One application is active at a time and it always covers the whole canvas;
+the rest of the list is a library to switch between, atomically:
+
+```bash
+curl -X POST http://media-server:9088/api/v1/apps/standby/activate
+```
+
+Overlap the outputs instead of tiling them - `"x": 1760` rather than `1920`,
+say - and Suede switches to projection mode automatically: it renders the app
+once into a headless canvas and slices it per projector, blending the seams.
+See [projection and edge blending](https://suede.gameshow.pro/configuration/#projection-edge-blending).
 
 The configuration is persisted immediately: reboot the machine and it comes back exactly like this, no operator required. Watch it happen live:
 
@@ -123,7 +153,7 @@ Suede is also built to make it easy for your LLM of choice to help you operate i
 
 ## Authors
 
-Hi, I'm Hamish Barjonas. I provide custom solutions for the broadcast production, live entertainment, and sports industries. Yes, including game shows. See more details [here](https://www.barjonas.com). As a keen FOSS advocate, I try to keep as much non-customer-specific code open for the wider community as possible, under the Game Show Pro umbrella. If you're in a related industry, I'd love to collaborate! You can contact me [here](https://barjonas.com/contact).
+Hi, I'm Hamish Barjonas. I provide custom solutions for the broadcast production, live entertainment, and sports industries. Yes, including game shows. See more details [here](https://www.barjonas.com). As a keen FOSS advocate, I try to keep as much non-customer-specific code open for the wider community as possible, under the Game Show Pro umbrella. If you're in a related industry, I'd love to collaborate! You can contact me [here](https://barjonas.com/#contact).
 
 ## License
 
