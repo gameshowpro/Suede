@@ -150,15 +150,21 @@ jobs:
           cargo install cross --locked || true
           cargo install cargo-deb --locked
 
-      # `cross` gives a working aarch64 linker without a hand-built sysroot.
-      # Suede has no native library dependencies, which is what keeps this easy.
+      # Both architectures go through `cross`, not just aarch64.
+      #
+      # Building natively on the runner links against the runner's glibc, and
+      # cargo-deb turns that into `Depends: libc6 (>= X)` - so the runner
+      # decides the oldest system the package installs on. Measured on
+      # ubuntu-24.04 that came out at 2.39, which excludes Debian 12,
+      # Raspberry Pi OS Bookworm and Ubuntu 22.04: three of the platforms the
+      # README names. cross builds in its own older image, so the floor comes
+      # from a container we pin rather than from whatever GitHub last
+      # upgraded, and both architectures get the same one.
+      #
+      # Suede has no native library dependencies, which is what keeps this
+      # possible at all.
       - name: Build release binary
-        run: |
-          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ]; then
-            cargo build --release --target ${{ matrix.target }}
-          else
-            cross build --release --target ${{ matrix.target }}
-          fi
+        run: cross build --release --target ${{ matrix.target }}
 
       - name: Verify the binary is self-contained
         if: matrix.target == 'x86_64-unknown-linux-gnu'
@@ -177,13 +183,20 @@ jobs:
             suede_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
 
       # The oldest system this package will install on, printed where it can
-      # be seen. Ubuntu 24.04 and Debian 12 are 2.39 and 2.36 respectively.
+      # be seen rather than found by digging. Debian 12 and Raspberry Pi OS
+      # Bookworm are 2.36; Ubuntu 22.04 is 2.35.
+      #
+      # Reporting must never be the thing that fails a build: the first time
+      # this ran, the cross-built package carried no versioned libc6 at all,
+      # grep found nothing, and `bash -e` failed a job whose build and
+      # package had both succeeded - throwing away the artifact.
       - name: Report the libc floor
         run: |
           deb=$(ls suede_*_${{ matrix.arch }}.deb)
-          floor=$(dpkg-deb -f "$deb" Depends | grep -o 'libc6 ([^)]*)')
+          depends=$(dpkg-deb -f "$deb" Depends)
+          floor=$(echo "$depends" | grep -o 'libc6[^,]*' || echo "libc6 unversioned")
           echo "::notice title=libc floor (${{ matrix.arch }})::$floor"
-          echo "$deb depends on $floor"
+          echo "$deb depends on: $depends"
 
       - name: Upload package
         uses: actions/upload-artifact@v5

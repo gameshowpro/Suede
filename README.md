@@ -38,7 +38,7 @@ deploy this.
 | | Verified | Expected to work, but untested |
 |---|---|---|
 | OS | Ubuntu 26.04 LTS | Debian 12+, Raspberry Pi OS Bookworm+, other systemd Debian-family distributions |
-| Architecture | x86-64 | aarch64 — cross-compiled and packaged by CI, but that binary has never been executed |
+| Architecture | x86-64 | aarch64 — cross-compiled and packaged by CI, but that binary has never been executed on real hardware |
 | Compositor | Sway 1.11 | Sway 1.7–1.10. Tearing control is gated on ≥ 1.10, and the gate has never met a version without it |
 | GPU | NVIDIA Quadro RTX 6000, proprietary driver — sway needs `--unsupported-gpu` | Intel, AMD, Raspberry Pi VideoCore |
 | Displays | 2 × DisplayPort, including an overlapping edge-blended canvas | 3–4 outputs. The projection code is written for up to four and has only ever run on two |
