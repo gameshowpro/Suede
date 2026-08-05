@@ -104,9 +104,52 @@ pub fn expand_uri(uri: &str, app_id: &str, context: &LaunchContext) -> String {
         .replace("{heartbeatUrl}", &context.heartbeat_url(app_id))
 }
 
+/// Which program this application would search for, in order.
+pub fn candidates_for(app: &AppConfig) -> Vec<String> {
+    match &app.launcher {
+        Launcher::ChromiumKiosk { program, .. } => {
+            program_list(program.as_deref(), CHROMIUM_PROGRAMS)
+        }
+        Launcher::FirefoxKiosk { program, .. } => {
+            program_list(program.as_deref(), FIREFOX_PROGRAMS)
+        }
+        Launcher::Exec { command, .. } => vec![command.clone()],
+    }
+}
+
+/// Which program would actually run, resolved against this machine.
+///
+/// A preset search passes over snaps; a program named explicitly is taken as
+/// named. Separate from [`build`] because it touches the filesystem and
+/// [`build`] must not: a builder whose output depends on what happens to be
+/// installed cannot be tested, and CI proved the point by disagreeing with a
+/// developer machine about whether `chromium` exists.
+pub fn choose_program(app: &AppConfig) -> Option<PathBuf> {
+    let candidates = candidates_for(app);
+    let explicit = matches!(
+        &app.launcher,
+        Launcher::ChromiumKiosk {
+            program: Some(_),
+            ..
+        } | Launcher::FirefoxKiosk {
+            program: Some(_),
+            ..
+        } | Launcher::Exec { .. }
+    );
+    if explicit {
+        resolve_program(&candidates)
+    } else {
+        resolve_preset_program(&candidates)
+    }
+}
+
 /// Build the invocation for `app`.
-pub fn build(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
-    let mut spec = build_preset(app, context);
+///
+/// `chosen` is the program resolution settled on, or `None` to describe the
+/// launch without one — which is what a test does, and what happens when
+/// nothing is installed.
+pub fn build(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>) -> LaunchSpec {
+    let mut spec = build_preset(app, context, chosen);
     // The app's own variables go last, so an operator can override anything a
     // preset chose — including the audio sink.
     spec.env
@@ -114,7 +157,7 @@ pub fn build(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
     spec
 }
 
-fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
+fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>) -> LaunchSpec {
     let mut env: Vec<(String, String)> = Vec::new();
     if let Some(sink) = resolve_pulse_sink(app.audio.as_ref()) {
         env.push(("PULSE_SINK".to_string(), sink));
@@ -133,21 +176,16 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             // anywhere in $HOME except a hidden directory, and Suede's state
             // lives under `.local`, so the profile moves rather than the
             // browser aborting on its own lock file.
-            let chosen = if program.is_some() {
-                resolve_program(&programs)
-            } else {
-                resolve_preset_program(&programs)
-            };
-            let profile_dir = match &chosen {
+            let profile_dir = match chosen {
                 Some(found) if is_snap(found) => snap_profile_dir(found, &app.id)
                     .unwrap_or_else(|| profile_dir_for(&context.profiles_root, &app.id)),
                 _ => profile_dir_for(&context.profiles_root, &app.id),
             };
             // Hand the spawner the one that was chosen, so it cannot resolve
             // differently and land on a snap the search deliberately skipped.
-            // With nothing found, the candidate list goes through unchanged
+            // With nothing chosen, the candidate list goes through unchanged
             // so the failure still names everything that was looked for.
-            let programs = match &chosen {
+            let programs = match chosen {
                 Some(found) => vec![found.display().to_string()],
                 None => programs,
             };
@@ -181,11 +219,6 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             env.push(("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string()));
 
             let candidates = program_list(program.as_deref(), FIREFOX_PROGRAMS);
-            let chosen = if program.is_some() {
-                resolve_program(&candidates)
-            } else {
-                resolve_preset_program(&candidates)
-            };
 
             LaunchSpec {
                 programs: match chosen {
@@ -514,18 +547,20 @@ exec /opt/google/chrome/chrome \"$@\"
 
     #[test]
     fn an_explicit_program_settles_the_search() {
-        let spec = build(
-            &app(
-                "r1",
-                Launcher::ChromiumKiosk {
-                    uri: "http://example.com".into(),
-                    show_fps_counter: false,
-                    extra_args: vec![],
-                    program: Some("/opt/google/chrome/chrome".into()),
-                },
-            ),
-            &context(),
+        let app = app(
+            "r1",
+            Launcher::ChromiumKiosk {
+                uri: "http://example.com".into(),
+                show_fps_counter: false,
+                extra_args: vec![],
+                program: Some("/opt/google/chrome/chrome".into()),
+            },
         );
+        assert_eq!(
+            candidates_for(&app),
+            vec!["/opt/google/chrome/chrome".to_string()]
+        );
+        let spec = build(&app, &context(), None);
         assert_eq!(spec.programs, vec!["/opt/google/chrome/chrome".to_string()]);
     }
 
@@ -544,8 +579,40 @@ exec /opt/google/chrome/chrome \"$@\"
     }
 
     #[test]
+    fn building_does_not_depend_on_what_is_installed() {
+        // This function used to resolve the program itself, so its output
+        // differed between a machine with chromium and one without - which
+        // is how it passed locally and failed on CI. Resolution is now the
+        // caller's business, and with none supplied the candidate list goes
+        // through untouched, whatever this machine happens to have.
+        let spec = build(&app("r1", chromium("http://example.com")), &context(), None);
+        assert_eq!(spec.programs, CHROMIUM_PROGRAMS.to_vec());
+        assert!(spec.args.iter().any(|a| a.contains("/state/profiles/r1")));
+    }
+
+    #[test]
+    fn a_chosen_snap_moves_the_profile_out_of_the_state_directory() {
+        // The same call with a snap settled on: only the profile changes, and
+        // it leaves the hidden directory a confined snap cannot write to.
+        let spec = build(
+            &app("r1", chromium("http://example.com")),
+            &context(),
+            Some(Path::new("/snap/bin/chromium")),
+        );
+        assert_eq!(spec.programs, vec!["/snap/bin/chromium".to_string()]);
+        let profile = spec
+            .profile_dir
+            .unwrap()
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        assert!(profile.contains("/snap/chromium/common/"), "{profile}");
+        assert!(!profile.contains("/state/profiles/"), "{profile}");
+    }
+
+    #[test]
     fn chromium_preset_is_kiosk_and_wayland() {
-        let spec = build(&app("r1", chromium("http://example.com")), &context());
+        let spec = build(&app("r1", chromium("http://example.com")), &context(), None);
         assert_eq!(spec.programs[0], "chromium");
         assert!(spec.programs.iter().any(|p| p == "google-chrome-stable"));
         assert!(spec.args.iter().any(|a| a == "--kiosk"));
@@ -560,7 +627,7 @@ exec /opt/google/chrome/chrome \"$@\"
 
     #[test]
     fn no_flag_conflicts_with_wayland() {
-        let spec = build(&app("r1", chromium("http://example.com")), &context());
+        let spec = build(&app("r1", chromium("http://example.com")), &context(), None);
         let features = spec
             .args
             .iter()
@@ -576,14 +643,18 @@ exec /opt/google/chrome/chrome \"$@\"
 
     #[test]
     fn uri_is_the_last_argument() {
-        let spec = build(&app("r1", chromium("http://example.com/page")), &context());
+        let spec = build(
+            &app("r1", chromium("http://example.com/page")),
+            &context(),
+            None,
+        );
         assert_eq!(spec.args.last().unwrap(), "http://example.com/page");
     }
 
     #[test]
     fn each_app_gets_its_own_profile() {
-        let first = build(&app("r1", chromium("http://a")), &context());
-        let second = build(&app("r2", chromium("http://a")), &context());
+        let first = build(&app("r1", chromium("http://a")), &context(), None);
+        let second = build(&app("r2", chromium("http://a")), &context(), None);
         assert_ne!(first.profile_dir, second.profile_dir);
         assert!(first
             .args
@@ -596,14 +667,14 @@ exec /opt/google/chrome/chrome \"$@\"
     fn persist_profile_opts_out_of_wiping() {
         let mut config = app("r1", chromium("http://a"));
         config.persist_profile = true;
-        let spec = build(&config, &context());
+        let spec = build(&config, &context(), None);
         assert!(!spec.wipe_profile);
         assert!(spec.profile_dir.is_some());
     }
 
     #[test]
     fn fps_counter_is_opt_in() {
-        let without = build(&app("r1", chromium("http://a")), &context());
+        let without = build(&app("r1", chromium("http://a")), &context(), None);
         assert!(!without.args.iter().any(|a| a == "--show-fps-counter"));
 
         let with = build(
@@ -617,6 +688,7 @@ exec /opt/google/chrome/chrome \"$@\"
                 },
             ),
             &context(),
+            None,
         );
         assert!(with.args.iter().any(|a| a == "--show-fps-counter"));
     }
@@ -634,6 +706,7 @@ exec /opt/google/chrome/chrome \"$@\"
                 },
             ),
             &context(),
+            None,
         );
         let mute = spec.args.iter().position(|a| a == "--mute-audio").unwrap();
         let uri = spec.args.iter().position(|a| a == "http://a").unwrap();
@@ -652,6 +725,7 @@ exec /opt/google/chrome/chrome \"$@\"
                 },
             ),
             &context(),
+            None,
         );
         assert_eq!(spec.programs[0], "firefox");
         assert!(spec.args.iter().any(|a| a == "--kiosk"));
@@ -673,6 +747,7 @@ exec /opt/google/chrome/chrome \"$@\"
                 },
             ),
             &context(),
+            None,
         );
         assert_eq!(spec.programs, vec!["/usr/bin/mpv"]);
         assert_eq!(spec.args, vec!["--fullscreen", "video.mp4"]);
@@ -733,6 +808,7 @@ exec /opt/google/chrome/chrome \"$@\"
                 chromium("http://host/r?id={appId}&hb={heartbeatUrl}"),
             ),
             &context(),
+            None,
         );
         let uri = spec.args.last().unwrap();
         assert!(uri.contains("id=renderer-3"));
@@ -747,7 +823,7 @@ exec /opt/google/chrome/chrome \"$@\"
             .env
             .insert("LIBVA_DRIVER_NAME".into(), "nvidia".into());
         config.env.insert("NVD_BACKEND".into(), "direct".into());
-        let spec = build(&config, &context());
+        let spec = build(&config, &context(), None);
         assert!(spec
             .env
             .iter()
@@ -771,7 +847,7 @@ exec /opt/google/chrome/chrome \"$@\"
             },
         );
         config.env.insert("MOZ_ENABLE_WAYLAND".into(), "0".into());
-        let spec = build(&config, &context());
+        let spec = build(&config, &context(), None);
         let last = spec
             .env
             .iter()
@@ -786,7 +862,7 @@ exec /opt/google/chrome/chrome \"$@\"
         config.audio = Some(AudioConfig {
             output: Some("alsa_output.hdmi".into()),
         });
-        let spec = build(&config, &context());
+        let spec = build(&config, &context(), None);
         assert!(spec
             .env
             .iter()
@@ -795,7 +871,7 @@ exec /opt/google/chrome/chrome \"$@\"
 
     #[test]
     fn absent_audio_config_sets_no_sink() {
-        let spec = build(&app("r1", chromium("http://a")), &context());
+        let spec = build(&app("r1", chromium("http://a")), &context(), None);
         assert!(!spec.env.iter().any(|(key, _)| key == "PULSE_SINK"));
     }
 
@@ -803,7 +879,7 @@ exec /opt/google/chrome/chrome \"$@\"
     fn null_audio_routes_to_the_null_sink() {
         let mut config = app("r1", chromium("http://a"));
         config.audio = Some(AudioConfig { output: None });
-        let spec = build(&config, &context());
+        let spec = build(&config, &context(), None);
         assert!(spec
             .env
             .iter()

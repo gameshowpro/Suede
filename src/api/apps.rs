@@ -62,7 +62,8 @@ pub async fn preview_app(
 ) -> Json<LaunchPreview> {
     use crate::supervisor::launcher;
     let context = state.supervisor.launch_context();
-    let spec = launcher::build(&app, context);
+    let chosen = launcher::choose_program(&app);
+    let spec = launcher::build(&app, context, chosen.as_deref());
 
     // Provenance is worked out by comparing the built specification against
     // what the document asked for, rather than threading tags through the
@@ -112,8 +113,8 @@ pub async fn preview_app(
         .collect();
 
     Json(LaunchPreview {
-        program: launcher::resolve_program(&spec.programs).map(|p| p.display().to_string()),
-        searched: spec.programs.clone(),
+        program: chosen.map(|p| p.display().to_string()),
+        searched: launcher::candidates_for(&app),
         args,
         env,
         profile_dir: spec.profile_dir.map(|p| p.display().to_string()),

@@ -591,7 +591,10 @@ impl Supervisor {
     }
 
     async fn spawn(&self, managed: &mut ManagedApp) -> std::io::Result<()> {
-        let spec = launcher::build(&managed.config, &self.context);
+        // Resolve first, then describe: the profile directory depends on
+        // which program won, and only one of the two touches the disk.
+        let chosen = launcher::choose_program(&managed.config);
+        let spec = launcher::build(&managed.config, &self.context, chosen.as_deref());
 
         if let Some(profile) = &spec.profile_dir {
             if spec.wipe_profile {
