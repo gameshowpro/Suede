@@ -1,0 +1,13 @@
+# `cross` runs the compiler inside a container, and passes only a fixed set of
+# variables into it. Anything else set on the host is simply absent there.
+#
+# `SUEDE_BUILD_ID` is how CI tells the build script which commit it is
+# building. Without this passthrough the variable vanished at the container
+# boundary and `build.rs` fell back to `git describe` on the mounted source -
+# which, because the release tag is created after the build, produced a v0.1.1
+# binary that reported itself as eighteen commits past v0.1.0.
+#
+# It went unnoticed for several builds because both routes agreed until the
+# first real release, when they finally had to differ.
+[build.env]
+passthrough = ["SUEDE_BUILD_ID"]

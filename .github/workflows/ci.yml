@@ -205,10 +205,35 @@ jobs:
       # possible at all.
       - name: Build release binary
         env:
-          # Stated rather than rediscovered: cross builds inside a container
-          # that has neither the git history nor git itself.
+          # Stated rather than rediscovered, because the tag a release is
+          # named for does not exist until the release job creates it, well
+          # after this build has finished.
+          #
+          # Reaching the compiler needs Cross.toml as well: cross runs inside
+          # a container and passes only an allowlist through. Without it this
+          # variable is silently absent and build.rs falls back to git.
           SUEDE_BUILD_ID: ${{ steps.version.outputs.build_id }}
         run: cross build --release --target ${{ matrix.target }}
+
+      - name: Verify the binary says what it is
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          # The failure this catches is silent by nature: the build script
+          # falls back to `git describe` whenever the variable does not reach
+          # it, so the binary still reports *something* plausible. v0.1.1
+          # shipped calling itself eighteen commits past v0.1.0 that way.
+          reported=$(target/${{ matrix.target }}/release/suede --version)
+          echo "reports: $reported"
+          expected_version="${{ steps.version.outputs.version }}"
+          expected_id="${{ steps.version.outputs.build_id }}"
+          case "$reported" in
+            "suede $expected_version"|"suede $expected_version ($expected_id)") ;;
+            *)
+              echo "::error::binary reports '$reported', expected version" \
+                   "$expected_version and build id $expected_id"
+              exit 1
+              ;;
+          esac
 
       - name: Verify the binary is self-contained
         if: matrix.target == 'x86_64-unknown-linux-gnu'
