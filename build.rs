@@ -36,20 +36,29 @@ fn main() {
     // not name its own commit, and both times the build itself looked
     // perfectly healthy - the value was reported correctly by everything
     // except the one process that needed it.
-    if id == "unknown" || std::env::var("SUEDE_BUILD_DEBUG").is_ok() {
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        let file = std::path::Path::new(manifest).join(".build-id");
+    {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let file = manifest.join(".build-id");
+        // Whether the mount carries files git does not track. If `.build-id`
+        // is missing while `.git` is present, the workspace reached the
+        // container by a route that filtered it, and no amount of writing
+        // that file on the host will ever help.
+        let untracked_visible = manifest.join("target").exists();
         println!(
-            "cargo:warning=suede build identity: {id} (env {}, {} {}, cwd {})",
+            "cargo:warning=suede build identity: {id} (env {}, .build-id {}, \
+             .git {}, target/ {}, manifest {})",
             match std::env::var("SUEDE_BUILD_ID") {
                 Ok(value) if !value.trim().is_empty() => format!("set to {value}"),
                 _ => "absent".to_string(),
             },
-            file.display(),
-            if file.exists() { "exists" } else { "absent" },
-            std::env::current_dir()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|_| "?".into()),
+            if file.exists() { "exists" } else { "ABSENT" },
+            if manifest.join(".git").exists() {
+                "exists"
+            } else {
+                "absent"
+            },
+            if untracked_visible { "exists" } else { "absent" },
+            manifest.display(),
         );
     }
 
