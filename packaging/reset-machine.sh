@@ -58,9 +58,21 @@ USER_UID="$(id -u "$APPLIANCE_USER")"
 step() { echo; echo "==> $*"; }
 # Every destructive action goes through these two, so --dry-run is honest by
 # construction rather than by remembering to check a flag each time.
-act() { if ((DRY_RUN)); then echo "    would run: $*"; else "$@" >/dev/null 2>&1 || true; fi; }
+act() {
+  if ((DRY_RUN)); then
+    printf '    would run:'; printf ' %q' "$@"; printf '
+'
+  else
+    "$@" >/dev/null 2>&1 || true
+  fi
+}
 drop() {
-  [[ -e "$1" || -L "$1" ]] || return 0
+  if [[ ! -e "$1" && ! -L "$1" ]]; then
+    # Say so. Otherwise a dry run cannot be read as coverage: "not listed"
+    # looks the same whether the path was absent or never examined.
+    ((DRY_RUN)) && echo "    absent:       $1"
+    return 0
+  fi
   if ((DRY_RUN)); then echo "    would remove: $1"; else rm -rf "$1"; echo "    removed $1"; fi
 }
 as_user() {
@@ -68,7 +80,42 @@ as_user() {
     env "XDG_RUNTIME_DIR=/run/user/$USER_UID" "$@"
 }
 
+# Where the daemon keeps its state is configurable, and a reset that removed
+# only the default would leave the whole configuration behind while reporting
+# success - the next "clean" install would inherit it and the test would be
+# worthless. Ask the running process first, since it is authoritative and
+# accounts for an EnvironmentFile; then the unit files; then the XDG default.
+STATE_DIRS=("$USER_HOME/.local/state/suede")
+add_state_dir() {
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  local existing
+  for existing in "${STATE_DIRS[@]}"; do [[ "$existing" == "$dir" ]] && return 0; done
+  STATE_DIRS+=("$dir")
+}
+# The running process is authoritative: it accounts for an EnvironmentFile,
+# which reading unit files alone would miss.
+while read -r pid; do
+  [[ -r "/proc/$pid/environ" ]] || continue
+  add_state_dir "$(tr '\0' '\n' < "/proc/$pid/environ" |
+    sed -n 's/^SUEDE_STATE_DIR=//p' | head -1)"
+done < <(pgrep -u "$APPLIANCE_USER" -f 'suede run' 2>/dev/null || true)
+for unit in "$USER_HOME/.config/systemd/user/suede.service" \
+            /usr/lib/systemd/user/suede.service /etc/systemd/user/suede.service; do
+  [[ -f "$unit" ]] || continue
+  add_state_dir "$(sed -n 's/.*SUEDE_STATE_DIR=\([^ "]*\).*/\1/p' "$unit" | head -1)"
+done
+if [[ -f "$USER_HOME/.config/suede/suede.toml" ]]; then
+  add_state_dir "$(sed -n 's/^[[:space:]]*state_dir[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$USER_HOME/.config/suede/suede.toml" | head -1)"
+fi
+
 echo "Resetting for user '$APPLIANCE_USER' (home: $USER_HOME)"
+[[ ${#STATE_DIRS[@]} -gt 1 ]] && {
+  echo "State directories found:"
+  printf '  %s
+' "${STATE_DIRS[@]}"
+}
 ((DRY_RUN)) && echo "DRY RUN - nothing will be changed."
 if ((!DRY_RUN)) && ((!ASSUME_YES)); then
   echo
@@ -119,10 +166,13 @@ drop "$USER_HOME/.config/systemd/user/suede.service"
 drop "$USER_HOME/.config/systemd/user/default.target.wants/suede.service"
 drop "$USER_HOME/.config/suede"
 if ((KEEP_STATE)); then
-  echo "    keeping $USER_HOME/.local/state/suede (--keep-state)"
+  printf '    keeping (--keep-state): %s
+' "${STATE_DIRS[@]}"
 else
-  # Desired state, browser profiles, uploaded wallpapers, app logs.
-  drop "$USER_HOME/.local/state/suede"
+  # Desired state, browser profiles, uploaded wallpapers, app logs. One of
+  # these may sit inside a rig of your own; it is still Suede's state, and
+  # leaving it is what makes the next install not a clean one.
+  for dir in "${STATE_DIRS[@]}"; do drop "$dir"; done
 fi
 
 # --- 4. What provisioning changed ----------------------------------------
