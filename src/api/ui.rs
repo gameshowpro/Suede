@@ -134,10 +134,6 @@ mod tests {
                 "expectStatus",
                 "readiness offers the URL and timings, not the status code",
             ),
-            (
-                "extraArgs",
-                "raw browser arguments; the raw-config tab is the place for those",
-            ),
             ("showFpsCounter", "a diagnostic, not a configuration choice"),
             ("persistProfile", "kiosk sessions are stateless by design"),
         ];

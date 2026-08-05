@@ -36,6 +36,36 @@
         }
       }
     },
+    "/api/v1/apps/preview": {
+      "post": {
+        "tags": [
+          "apps"
+        ],
+        "operationId": "preview_app",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "What this application would be launched as, resolved                        against this machine. Nothing is started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LaunchPreview"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/apps/{id}/activate": {
       "post": {
         "tags": [
@@ -1910,6 +1940,55 @@
         },
         "additionalProperties": false
       },
+      "LaunchPreview": {
+        "type": "object",
+        "description": "Exactly what an application would be launched as.",
+        "required": [
+          "searched",
+          "args",
+          "env",
+          "wipeProfile"
+        ],
+        "properties": {
+          "args": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PreviewItem"
+            }
+          },
+          "env": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PreviewItem"
+            }
+          },
+          "profileDir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Browser profile directory, when the launcher manages one."
+          },
+          "program": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The binary that would run, resolved on this machine. `null` when none\nof the candidates is installed."
+          },
+          "searched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What was looked for, in order. A single entry when the application\nnames its own program."
+          },
+          "wipeProfile": {
+            "type": "boolean",
+            "description": "Whether that directory is emptied before each launch."
+          }
+        }
+      },
       "Launcher": {
         "oneOf": [
           {
@@ -2283,6 +2362,31 @@
           "y": {
             "type": "integer",
             "format": "int32"
+          }
+        }
+      },
+      "PreviewItem": {
+        "type": "object",
+        "description": "One argument or variable, and where it came from.\n\nThe distinction is the point of the preview: a preset contributes most of\nwhat is launched, and an operator needs to see which parts are theirs to\nchange and which arrive automatically.",
+        "required": [
+          "value",
+          "source"
+        ],
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Variable name. Absent for arguments."
+          },
+          "source": {
+            "type": "string",
+            "description": "`preset`, `app`, or `uri` — the expanded URI the preset appends last."
+          },
+          "value": {
+            "type": "string",
+            "description": "For an argument this is the argument; for a variable, its value."
           }
         }
       },

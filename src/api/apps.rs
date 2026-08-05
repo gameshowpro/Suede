@@ -10,6 +10,117 @@ use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::AppStatus;
 
+/// One argument or variable, and where it came from.
+///
+/// The distinction is the point of the preview: a preset contributes most of
+/// what is launched, and an operator needs to see which parts are theirs to
+/// change and which arrive automatically.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewItem {
+    /// For an argument this is the argument; for a variable, its value.
+    pub value: String,
+    /// Variable name. Absent for arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `preset`, `app`, or `uri` — the expanded URI the preset appends last.
+    pub source: &'static str,
+}
+
+/// Exactly what an application would be launched as.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchPreview {
+    /// The binary that would run, resolved on this machine. `null` when none
+    /// of the candidates is installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub program: Option<String>,
+    /// What was looked for, in order. A single entry when the application
+    /// names its own program.
+    pub searched: Vec<String>,
+    pub args: Vec<PreviewItem>,
+    pub env: Vec<PreviewItem>,
+    /// Browser profile directory, when the launcher manages one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<String>,
+    /// Whether that directory is emptied before each launch.
+    pub wipe_profile: bool,
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/apps/preview", tag = "apps",
+    request_body = crate::model::AppConfig,
+    responses((
+        status = 200,
+        description = "What this application would be launched as, resolved                        against this machine. Nothing is started.",
+        body = LaunchPreview,
+    ))
+)]
+pub async fn preview_app(
+    State(state): State<ApiState>,
+    Json(app): Json<crate::model::AppConfig>,
+) -> Json<LaunchPreview> {
+    use crate::supervisor::launcher;
+    let context = state.supervisor.launch_context();
+    let spec = launcher::build(&app, context);
+
+    // Provenance is worked out by comparing the built specification against
+    // what the document asked for, rather than threading tags through the
+    // builder: the specification stays the single source of truth, and the
+    // preview cannot drift from what would actually be spawned.
+    let extra: Vec<String> = match &app.launcher {
+        crate::model::Launcher::ChromiumKiosk { extra_args, .. }
+        | crate::model::Launcher::FirefoxKiosk { extra_args, .. } => extra_args.clone(),
+        crate::model::Launcher::Exec { args, .. } => args.clone(),
+    };
+    let uri = match &app.launcher {
+        crate::model::Launcher::ChromiumKiosk { uri, .. }
+        | crate::model::Launcher::FirefoxKiosk { uri, .. } => {
+            Some(launcher::expand_uri(uri, &app.id, context))
+        }
+        crate::model::Launcher::Exec { .. } => None,
+    };
+
+    let args = spec
+        .args
+        .iter()
+        .map(|arg| PreviewItem {
+            value: arg.clone(),
+            name: None,
+            source: if uri.as_deref() == Some(arg.as_str()) {
+                "uri"
+            } else if extra.contains(arg) {
+                "app"
+            } else {
+                "preset"
+            },
+        })
+        .collect();
+
+    let env = spec
+        .env
+        .iter()
+        .map(|(name, value)| PreviewItem {
+            value: value.clone(),
+            name: Some(name.clone()),
+            source: if app.env.contains_key(name) {
+                "app"
+            } else {
+                "preset"
+            },
+        })
+        .collect();
+
+    Json(LaunchPreview {
+        program: launcher::resolve_program(&spec.programs).map(|p| p.display().to_string()),
+        searched: spec.programs.clone(),
+        args,
+        env,
+        profile_dir: spec.profile_dir.map(|p| p.display().to_string()),
+        wipe_profile: spec.wipe_profile,
+    })
+}
+
 #[utoipa::path(
     get, path = "/api/v1/apps", tag = "apps",
     responses((status = 200, description = "Status of every managed app", body = Vec<AppStatus>))

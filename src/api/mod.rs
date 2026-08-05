@@ -126,6 +126,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/system/checks/{id}/fix", post(observed::fix_check))
         // Applications.
         .route("/apps", get(apps::list_apps))
+        .route("/apps/preview", post(apps::preview_app))
         .route("/apps/{id}/status", get(apps::get_app_status))
         .route("/apps/{id}/restart", post(apps::restart_app))
         .route("/apps/{id}/activate", post(apps::activate_app))

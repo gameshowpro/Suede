@@ -83,6 +83,16 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    /// The deployment facts a launch is built from.
+    ///
+    /// Exposed so the API can show an operator exactly what an application
+    /// would run without running it - the resolved binary, the arguments and
+    /// the environment are all decided here, and a UI that reconstructed
+    /// them would be guessing.
+    pub fn launch_context(&self) -> &LaunchContext {
+        &self.context
+    }
+
     pub fn new(sway: Arc<dyn SwayClient>, events: EventHub, context: LaunchContext) -> Self {
         Self {
             sway,

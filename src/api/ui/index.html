@@ -55,6 +55,16 @@ dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--p
 dialog::backdrop { background: rgba(0,0,0,.45); }
 dialog .dialog-body { padding: 18px; max-height: calc(100vh - 170px); overflow-y: auto; }
 dialog .dialog-body > h2 { margin-top: 0; }
+.invocation { background: var(--sunken); border: 1px solid var(--line); border-radius: 7px;
+  padding: 9px 11px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+  line-height: 1.55; overflow-x: auto; }
+.invocation .preset { color: var(--muted); }
+.invocation .app { color: var(--accent); font-weight: 600; }
+.invocation .uri { color: var(--ok); }
+.invocation .none { color: var(--bad); }
+.invocation div { white-space: nowrap; }
+.legend-key { font-size: 11px; color: var(--muted); margin: 6px 0 0; }
+.legend-key b { font-weight: 600; }
 dialog .dialog-foot { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
   padding: 12px 18px; border-top: 1px solid var(--line); background: var(--sunken);
   border-radius: 0 0 12px 12px; }
@@ -327,12 +337,36 @@ window.addEventListener("error", (event) => {
       </fieldset>
 
       <fieldset>
+        <legend>Command</legend>
+        <p class="hint">What this application would actually be launched as,
+          resolved on this machine. Nothing here is a reconstruction — the
+          daemon reports it, so a preset can never differ from what runs.</p>
+        <div class="invocation" id="a-preview-command">—</div>
+        <p class="hint" id="a-preview-profile"></p>
+      </fieldset>
+
+      <fieldset>
+        <legend>Arguments</legend>
+        <div class="invocation" id="a-preview-args">—</div>
+        <p class="legend-key"><span class="preset">grey</span> from the preset,
+          <b class="app">blue</b> yours, <span class="uri">green</span> the expanded URI.</p>
+        <label for="a-extra-args" style="margin-top:10px">Add your own</label>
+        <textarea id="a-extra-args" rows="3" spellcheck="false"
+          placeholder="--force-dark-mode&#10;--lang=en-GB"></textarea>
+        <p class="hint">One per line, appended after the preset and before the
+          URI. A preset argument can be countermanded by repeating it here with
+          a different value, since the later one wins.</p>
+      </fieldset>
+
+      <fieldset>
         <legend>Environment</legend>
-        <p class="hint">One <span class="mono">NAME=value</span> per line. Applied last,
-          so these override anything the launcher preset sets — this is where
-          graphics acceleration is usually configured.</p>
-        <textarea id="a-env" rows="4" spellcheck="false"
+        <div class="invocation" id="a-preview-env">—</div>
+        <label for="a-env" style="margin-top:10px">Add your own</label>
+        <textarea id="a-env" rows="3" spellcheck="false"
           placeholder="LIBVA_DRIVER_NAME=nvidia&#10;NVD_BACKEND=direct"></textarea>
+        <p class="hint">One <span class="mono">NAME=value</span> per line.
+          Applied last, so these override anything the preset sets — this is
+          where graphics acceleration is usually configured.</p>
       </fieldset>
 
       </div>
@@ -1088,6 +1122,7 @@ function renderApps() {
 function openAppDialog() {
   const dialog = $("app-dialog");
   if (!dialog.open) dialog.showModal();
+  refreshLaunchPreview();
 }
 
 function editApp(app) {
@@ -1099,6 +1134,7 @@ function editApp(app) {
   $("a-id").value = app.id;
   $("a-kind").value = app.launcher.kind;
   $("a-program").value = app.launcher.program ?? "";
+  $("a-extra-args").value = (app.launcher.extraArgs ?? []).join("\n");
   updateProgramRow();
   $("a-uri").value = app.launcher.kind === "exec"
     ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
@@ -1117,8 +1153,8 @@ function clearAppForm() {
   editingApp = null;
   $("a-heading").textContent = "Add an application";
   $("a-id").disabled = false;
-  for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env", "a-program"])
-    $(id).value = "";
+  for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env",
+                    "a-program", "a-extra-args"]) $(id).value = "";
   $("a-heartbeat").value = "false";
   $("a-kind").value = "chromium-kiosk";
   updateProgramRow();
@@ -1144,15 +1180,18 @@ $("a-cancel").onclick = closeAppDialog;
 // not haunted by the abandoned one.
 $("app-dialog").addEventListener("close", clearAppForm);
 
-$("a-save").onclick = () => run(async () => {
+// One reading of the form, used both to save and to preview. Two would
+// drift, and the whole point of the preview is that it cannot.
+function appFromForm() {
   const id = $("a-id").value.trim();
-  if (!id) throw new Error("an id is required");
   const kind = $("a-kind").value;
   const value = $("a-uri").value.trim();
   const program = $("a-program").value.trim();
+  const extraArgs = $("a-extra-args").value.split("\n")
+    .map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
   const launcher = kind === "exec"
     ? { kind, command: value.split(" ")[0], args: value.split(" ").slice(1) }
-    : { kind, uri: value, ...(program ? { program } : {}) };
+    : { kind, uri: value, extraArgs, ...(program ? { program } : {}) };
 
   const env = {};
   for (const line of $("a-env").value.split("\n")) {
@@ -1167,7 +1206,7 @@ $("a-save").onclick = () => run(async () => {
   const giveUp = $("a-ready-giveup").value.trim();
   const audio = $("a-audio").value;
 
-  await save(`/config/apps/${encodeURIComponent(id)}`, {
+  return {
     id, launcher,
     env,
     audio: audio === "" ? null : { output: audio === "__null__" ? null : audio },
@@ -1179,11 +1218,68 @@ $("a-save").onclick = () => run(async () => {
     } : null,
     heartbeat: $("a-heartbeat").value === "true"
       ? { enabled: true, timeoutSeconds: 25, startupGraceSeconds: 60 } : null,
-  });
+  };
+}
+
+$("a-save").onclick = () => run(async () => {
+  const app = appFromForm();
+  if (!app.id) throw new Error("an id is required");
+  await save(`/config/apps/${encodeURIComponent(app.id)}`, app);
   // Only on success: a rejected write leaves the dialog open with the values
   // still in it, so the operator can correct them rather than retype them.
   closeAppDialog();
 }, "saved application");
+
+// --- what this application would actually run -----------------------------
+//
+// Asked of the daemon rather than assembled here. The preset arguments live
+// in the binary, and the parts that matter most - which browser resolved,
+// where the profile landed, what PULSE_SINK became - depend on the machine
+// and cannot be known by a page.
+let previewTimerApp = null;
+
+function refreshLaunchPreview() {
+  clearTimeout(previewTimerApp);
+  previewTimerApp = setTimeout(async () => {
+    let app;
+    try { app = appFromForm(); } catch { return; }   // mid-typing, not an error
+    if (!app.id) app.id = "preview";
+    try {
+      const p = await api("/apps/preview", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(app),
+      });
+      paintLaunchPreview(p);
+    } catch (error) {
+      $("a-preview-command").innerHTML =
+        `<span class="none">${escape(error.message)}</span>`;
+    }
+  }, 250);
+}
+
+function paintLaunchPreview(p) {
+  $("a-preview-command").innerHTML = p.program
+    ? escape(p.program)
+    : `<span class="none">none of these is installed: ${escape(p.searched.join(", "))}</span>`;
+
+  $("a-preview-profile").textContent = p.profileDir
+    ? `Profile: ${p.profileDir}${p.wipeProfile ? " (emptied before each launch)" : ""}`
+    : "";
+
+  const line = (items, render) => items.length
+    ? items.map(render).join("")
+    : '<span class="preset">none</span>';
+  $("a-preview-args").innerHTML = line(p.args,
+    (a) => `<div class="${a.source}">${escape(a.value)}</div>`);
+  $("a-preview-env").innerHTML = line(p.env,
+    (e) => `<div class="${e.source}">${escape(e.name)}=${escape(e.value)}</div>`);
+}
+
+for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-audio", "a-id"]) {
+  $(id).addEventListener("input", refreshLaunchPreview);
+  $(id).addEventListener("change", refreshLaunchPreview);
+}
 
 // --- projection ----------------------------------------------------------
 
