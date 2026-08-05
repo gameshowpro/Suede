@@ -234,7 +234,15 @@ jobs:
           # ran. Every layer outside it has reported the right value while the
           # binary came out anonymous.
           SUEDE_BUILD_DEBUG: "1"
-        run: cross build --release --target ${{ matrix.target }}
+        run: |
+          # The final artifact must never be a cache survivor. rust-cache
+          # restores target/ wholesale, so a stale suede binary from an
+          # earlier commit sits at exactly the path the checks below inspect
+          # - built from the right source it would pass everything except the
+          # identity grep, which is the failure we kept chasing into the
+          # container when the hand-off had already been fixed.
+          cargo clean --release -p suede --target ${{ matrix.target }} || true
+          cross build --release --target ${{ matrix.target }}
 
       - name: Verify the binary says what it is
         run: |
@@ -247,6 +255,18 @@ jobs:
           # an identity of `unknown` while CI logged the right answer.
           binary=target/${{ matrix.target }}/release/suede
           expected_id="${{ steps.version.outputs.build_id }}"
+          # Age before contents: a binary older than the .build-id written
+          # earlier in this job was restored from cache, not built here, and
+          # no amount of debugging the build will explain its contents.
+          echo "binary written:    $(stat -c '%y' "$binary" 2>/dev/null || echo missing)"
+          echo ".build-id written: $(stat -c '%y' .build-id 2>/dev/null || echo missing)"
+          if [ "$binary" -ot .build-id ]; then
+            echo "::error::$binary predates this job's .build-id - it is a" \
+                 "cache survivor, not this build's output"
+            exit 1
+          fi
+          echo "identity-shaped strings inside:"
+          grep -oa "${{ steps.version.outputs.version }} ([^)]\{1,80\})" "$binary" | sort -u | head -5 || true
           case "$expected_id" in
             ""|unknown)
               echo "::error::the build id was not worked out; refusing to" \
