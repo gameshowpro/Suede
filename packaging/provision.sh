@@ -182,6 +182,7 @@ if [[ -n "$RIVALS" ]]; then
   echo "$RIVALS" | sed 's/^/           /'
   echo "           Two compositors cannot share the graphics card. Disable"
   echo "           either those units or the auto-login above before rebooting."
+  RIVAL_SWAY=1
 fi
 
 # --- 4. Sway configuration ----------------------------------------------
@@ -306,6 +307,19 @@ if [[ -n "${GROUPS_CHANGED:-}" ]]; then
   started with, so restarting the user services is not enough - the machine
   must be rebooted (or the user session fully terminated) before PipeWire
   can open the sound devices.
+EOF
+fi
+
+if [[ -n "${RIVAL_SWAY:-}" ]]; then
+  cat <<'EOF'
+
+  UNRESOLVED: something else on this machine also starts sway, and both
+  are now armed. On the next boot they will contend for the graphics
+  card: one wins, the other fails, and whichever of them happens to
+  publish SWAYSOCK last is the one Suede will attach to - which may be
+  the one with no displays on it. Disable one before rebooting:
+
+    systemctl --user disable --now <that unit>
 EOF
 fi
 
