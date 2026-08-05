@@ -176,9 +176,9 @@ jobs:
       - name: Report the libc floor
         run: |
           deb=$(ls suede_*_${{ matrix.arch }}.deb)
-          echo "::notice title=libc floor (${{ matrix.arch }})::$(dpkg-deb -f "$deb" Depends)"
-          dpkg-deb -f "$deb" Depends | tr ',' '
-' | grep libc6 || true
+          floor=$(dpkg-deb -f "$deb" Depends | grep -o 'libc6 ([^)]*)')
+          echo "::notice title=libc floor (${{ matrix.arch }})::$floor"
+          echo "$deb depends on $floor"
 
       - name: Upload package
         uses: actions/upload-artifact@v5
