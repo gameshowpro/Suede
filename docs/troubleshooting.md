@@ -56,6 +56,29 @@ swaymsg -t get_outputs
 
 If Sway itself is not starting, check `~/.sway.log` and confirm auto-login is landing on `tty1`.
 
+### A compositor restart strands the daemon {: #compositor-restart }
+
+Sway's IPC socket path contains its process id, so a compositor that restarts
+comes back on a different path. A running daemon captured `SWAYSOCK` from its
+environment at launch and cannot follow, so it holds a socket that no longer
+exists: `healthz` reports `"sway": false`, and reconciliation raises a
+`sway_unreachable` divergence rather than claiming to be synced, because a
+pass that cannot reach the compositor has verified nothing — the outputs it
+lists are simply the last ones it saw.
+
+The fix is to restart the daemon:
+
+```bash
+systemctl --user restart suede.service
+```
+
+On a correctly provisioned appliance this is automatic: `suede.service` is
+`PartOf=graphical-session.target`, so a compositor going away stops it, and
+starting the session starts it again with the new environment. It is worth
+knowing about anyway, because a machine running a second compositor by hand
+breaks that chain — whichever one publishes `SWAYSOCK` last is the one the
+daemon inherits, and it may not be the one with the screens on it.
+
 ## A display stays dark
 
 Check what Sway actually sees:

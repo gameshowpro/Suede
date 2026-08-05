@@ -282,6 +282,7 @@ impl Divergence {
     /// Listed so a test can prove each one leads the operator somewhere; a new
     /// kind without documentation is a dead end in the UI.
     pub const KINDS: &'static [&'static str] = &[
+        "sway_unreachable",
         "output_not_connected",
         "mode_unsupported",
         "command_failed",
@@ -302,6 +303,7 @@ impl Divergence {
     /// Documentation page for a divergence kind, relative to the docs root.
     pub fn docs_path(kind: &str) -> Option<&'static str> {
         Some(match kind {
+            "sway_unreachable" => "troubleshooting/#no-sway-ipc-socket-found",
             "output_not_connected" | "mode_unsupported" | "command_failed" => {
                 "troubleshooting/#a-display-stays-dark"
             }

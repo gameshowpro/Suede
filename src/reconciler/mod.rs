@@ -307,6 +307,22 @@ impl Reconciler {
         let windows = self.refresh_windows().await;
         self.supervisor.tick(&windows).await;
 
+        // A pass that could not reach sway has not verified anything: the
+        // outputs it reports are whatever was last seen, the commands it
+        // planned went nowhere, and finding no divergences means only that
+        // it could not look. Reporting that as "synced" is the worst answer
+        // available - healthz already says the connection is down, so the
+        // two would disagree, and the operator watching sync state would be
+        // told the appliance was fine while it was blind.
+        if !self.sway.is_connected() {
+            divergences.push(Divergence::new(
+                "sway_unreachable",
+                "sway",
+                "the compositor's IPC socket is not answering, so this pass                  verified nothing and the outputs below are the last ones                  seen. A compositor that restarted has a new socket path,                  which a running daemon cannot pick up: restart Suede."
+                    .to_string(),
+            ));
+        }
+
         // Every divergence gains a documentation link here, so the pure
         // planner stays free of deployment concerns and no producer can forget.
         for divergence in &mut divergences {
@@ -1009,6 +1025,34 @@ mod tests {
             .unwrap();
         harness.reconciler.reconcile().await;
         assert!(!harness.sway.ran_command_containing("hide_cursor"));
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_cannot_reach_sway_is_not_synced() {
+        // The pass finds nothing wrong because it cannot look. Reporting
+        // that as healthy is how an operator ends up trusting a dashboard
+        // while the screens show something else entirely.
+        let harness = harness();
+        harness.sway.set_connected(false);
+
+        let status = harness.reconciler.reconcile().await;
+        assert_eq!(status.state, SyncState::Degraded);
+        let found = status
+            .divergences
+            .iter()
+            .find(|d| d.kind == "sway_unreachable")
+            .expect("must say the compositor is unreachable");
+        assert!(found.detail.contains("restart"), "{}", found.detail);
+        assert!(found.docs_url.is_some(), "and lead somewhere");
+
+        // And it clears by itself once the socket answers again.
+        harness.sway.set_connected(true);
+        let status = harness.reconciler.reconcile().await;
+        assert!(!status
+            .divergences
+            .iter()
+            .any(|d| d.kind == "sway_unreachable"));
+        harness.supervisor.shutdown().await;
     }
 
     #[tokio::test]
