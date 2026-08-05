@@ -298,6 +298,13 @@ window.addEventListener("error", (event) => {
           <option value="exec">Command</option></select></div>
         <div class="span2"><label for="a-uri">URI or command</label>
           <input id="a-uri" placeholder="http://media-server.local/render/1"></div>
+        <div class="span2" id="a-program-row"><label for="a-program">Browser binary</label>
+          <input id="a-program" placeholder="leave empty to search for one">
+          <p class="hint">Empty searches for a browser and ignores any that is
+            a snap. Name one to settle it — a bare name is looked up on
+            <span class="mono">PATH</span>, a path is used as given. Naming a
+            snap is honoured; Suede then puts the profile where a confined
+            snap can write.</p></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div><label for="a-heartbeat">Content watchdog</label>
           <select id="a-heartbeat"><option value="false">Off</option><option value="true">On</option></select></div>
@@ -1091,6 +1098,8 @@ function editApp(app) {
   $("a-id").disabled = true;
   $("a-id").value = app.id;
   $("a-kind").value = app.launcher.kind;
+  $("a-program").value = app.launcher.program ?? "";
+  updateProgramRow();
   $("a-uri").value = app.launcher.kind === "exec"
     ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
     : app.launcher.uri;
@@ -1108,9 +1117,11 @@ function clearAppForm() {
   editingApp = null;
   $("a-heading").textContent = "Add an application";
   $("a-id").disabled = false;
-  for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env"]) $(id).value = "";
+  for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env", "a-program"])
+    $(id).value = "";
   $("a-heartbeat").value = "false";
   $("a-kind").value = "chromium-kiosk";
+  updateProgramRow();
   $("a-audio").value = "";
   $("a-ready-interval").value = 2; $("a-ready-timeout").value = 5;
 }
@@ -1120,6 +1131,12 @@ function closeAppDialog() {
   if (dialog.open) dialog.close();
   clearAppForm();
 }
+
+// An exec app names its own command, so there is nothing to override.
+function updateProgramRow() {
+  $("a-program-row").classList.toggle("hidden", $("a-kind").value === "exec");
+}
+$("a-kind").addEventListener("change", updateProgramRow);
 
 $("a-new").onclick = () => { clearAppForm(); openAppDialog(); $("a-id").focus(); };
 $("a-cancel").onclick = closeAppDialog;
@@ -1132,9 +1149,10 @@ $("a-save").onclick = () => run(async () => {
   if (!id) throw new Error("an id is required");
   const kind = $("a-kind").value;
   const value = $("a-uri").value.trim();
+  const program = $("a-program").value.trim();
   const launcher = kind === "exec"
     ? { kind, command: value.split(" ")[0], args: value.split(" ").slice(1) }
-    : { kind, uri: value };
+    : { kind, uri: value, ...(program ? { program } : {}) };
 
   const env = {};
   for (const line of $("a-env").value.split("\n")) {

@@ -102,20 +102,90 @@ mod tests {
     fn the_page_covers_every_configurable_field() {
         // The UI is the reference client; a field it cannot reach is a field
         // an operator can only set by hand-editing the raw document.
-        for field in [
-            "activeApp",
-            "readiness",
-            "background",
-            "allowTearing",
-            "maxRenderTimeMs",
-            "adaptiveSync",
-            "heartbeat",
-            "env",
-            "gamma",
-            "testPattern",
-        ] {
-            assert!(INDEX.contains(field), "the UI never sets {field}");
+        //
+        // The field list is taken from the API schema rather than written out
+        // here, because a hand-maintained list only checks what somebody
+        // remembered to add to it. `launcher.program` was added to the model,
+        // the docs and the OpenAPI document, and this test went on passing
+        // while the UI had no way to set it - which is exactly the failure it
+        // is supposed to catch.
+        //
+        // Anything deliberately not offered goes in the list below, with the
+        // reason. A new field appears in neither place and fails the test,
+        // which turns forgetting into a decision.
+        const NOT_OFFERED: &[(&str, &str)] = &[
+            ("schemaVersion", "server-managed"),
+            ("revision", "server-managed"),
+            ("model", "EDID matching; the UI matches by connector name"),
+            ("serial", "EDID matching; the UI matches by connector name"),
+            ("hideCursor", "no settings tab yet"),
+            ("outputPollIntervalSeconds", "no settings tab yet"),
+            ("allowRawSwayCommands", "no settings tab yet; a debugging escape hatch"),
+            ("policy", "restart policy is not exposed; the default suits an appliance"),
+            ("delayMs", "restart policy is not exposed"),
+            ("maxDelayMs", "restart policy is not exposed"),
+            ("expectStatus", "readiness offers the URL and timings, not the status code"),
+            ("extraArgs", "raw browser arguments; the raw-config tab is the place for those"),
+            ("showFpsCounter", "a diagnostic, not a configuration choice"),
+            ("persistProfile", "kiosk sessions are stateless by design"),
+        ];
+
+        let document: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/openapi.snapshot.json"))
+                .expect("the committed OpenAPI snapshot must parse");
+        let schemas = &document["components"]["schemas"];
+
+        fn collect(node: &serde_json::Value, into: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(map) => {
+                    for (key, value) in map {
+                        if key == "properties" {
+                            if let Some(fields) = value.as_object() {
+                                into.extend(fields.keys().cloned());
+                            }
+                        } else {
+                            collect(value, into);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|i| collect(i, into)),
+                _ => {}
+            }
         }
+
+        let mut fields = Vec::new();
+        // The desired-state types only: observed state is reported, not set.
+        for schema in [
+            "DesiredState",
+            "OutputConfig",
+            "AppConfig",
+            "Launcher",
+            "ProjectionConfig",
+            "Settings",
+            "AudioConfig",
+            "HeartbeatConfig",
+            "ReadinessConfig",
+            "RestartPolicy",
+            "BackgroundPreset",
+            "Background",
+            "Mode",
+            "Position",
+            "OutputMatch",
+        ] {
+            let node = &schemas[schema];
+            assert!(!node.is_null(), "{schema} is missing from the snapshot");
+            collect(node, &mut fields);
+        }
+
+        let missing: Vec<&String> = fields
+            .iter()
+            .filter(|field| !INDEX.contains(field.as_str()))
+            .filter(|field| !NOT_OFFERED.iter().any(|(name, _)| name == field))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the UI cannot set: {missing:?} - offer them, or list them in              NOT_OFFERED with the reason"
+        );
     }
 
     #[test]
