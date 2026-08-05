@@ -67,9 +67,24 @@ else
   echo "All required packages are present."
 fi
 
-if ! command -v chromium >/dev/null 2>&1 && ! command -v firefox >/dev/null 2>&1; then
-  echo "WARNING: neither chromium nor firefox is installed."
-  echo "         Install one before configuring a kiosk app:  apt install chromium"
+# The same candidates the launcher presets try, so this cannot disagree with
+# what would actually be launched. `chromium` alone reported "no browser" on a
+# machine running Google Chrome quite happily.
+BROWSER=""
+for candidate in chromium chromium-browser google-chrome-stable google-chrome firefox firefox-esr; do
+  if command -v "$candidate" >/dev/null 2>&1; then BROWSER="$candidate"; break; fi
+done
+if [[ -z "$BROWSER" ]]; then
+  echo "WARNING: no supported browser found."
+  echo "         Suede looks for: chromium, chromium-browser, google-chrome-stable,"
+  echo "         google-chrome, firefox, firefox-esr."
+  echo "         On Debian:  apt install chromium"
+  echo "         On Ubuntu the 'chromium' package is a snap wrapper, which is a poor"
+  echo "         fit for an appliance; installing Google Chrome's .deb is usually"
+  echo "         better. Chromium is also the only one whose autoplay policy Suede"
+  echo "         can relax, so prefer it where sound matters."
+else
+  echo "Browser found: $BROWSER"
 fi
 
 # --- 1b. Device group membership ----------------------------------------
@@ -90,10 +105,16 @@ for group in audio video render; do
     echo "  $group: already a member"
   else
     usermod -aG "$group" "$APPLIANCE_USER"
-    echo "  $group: added (takes effect at the next login)"
+    echo "  $group: added"
     GROUPS_CHANGED=1
   fi
 done
+if [[ -n "${GROUPS_CHANGED:-}" ]]; then
+  echo
+  echo "  NOTE: a running session keeps the groups it started with, so this"
+  echo "        machine must be REBOOTED before PipeWire can open the sound"
+  echo "        devices. Restarting the services is not enough."
+fi
 
 # --- 2. Auto-login on tty1 ----------------------------------------------
 step "Configuring auto-login on tty1"

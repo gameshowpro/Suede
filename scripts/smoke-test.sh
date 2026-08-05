@@ -140,8 +140,16 @@ check "unknown app heartbeat is 404" "404" \
 
 echo "  ...killing the app process to prove it is relaunched"
 kill -9 "$APP_PID" 2>/dev/null
-sleep 3
-NEW_PID="$(json_of "${BASE}/api/v1/apps/renderer-1/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["pid"])')"
+# Relaunching takes up to a second to notice the exit, then the restart delay,
+# then up to a second more for the next housekeeping tick — so a fixed three
+# second sleep is exactly the budget and fails whenever the machine is busy.
+# Wait for the outcome instead.
+NEW_PID="$APP_PID"
+for _ in $(seq 1 20); do
+  sleep 0.5
+  NEW_PID="$(json_of "${BASE}/api/v1/apps/renderer-1/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["pid"])')"
+  [[ -n "$NEW_PID" && "$NEW_PID" != "None" && "$NEW_PID" != "$APP_PID" ]] && break
+done
 check "app was relaunched with a new pid" "true" \
   "$([[ -n "$NEW_PID" && "$NEW_PID" != "None" && "$NEW_PID" != "$APP_PID" ]] && echo true || echo false)"
 
