@@ -31,6 +31,28 @@ fn main() {
         .or_else(describe)
         .unwrap_or_else(|| "unknown".to_string());
 
+    // When the identity is not handed to us, say so at build time and say
+    // what was looked for. Twice now a build has produced a binary that could
+    // not name its own commit, and both times the build itself looked
+    // perfectly healthy - the value was reported correctly by everything
+    // except the one process that needed it.
+    if id == "unknown" || std::env::var("SUEDE_BUILD_DEBUG").is_ok() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let file = std::path::Path::new(manifest).join(".build-id");
+        println!(
+            "cargo:warning=suede build identity: {id} (env {}, {} {}, cwd {})",
+            match std::env::var("SUEDE_BUILD_ID") {
+                Ok(value) if !value.trim().is_empty() => format!("set to {value}"),
+                _ => "absent".to_string(),
+            },
+            file.display(),
+            if file.exists() { "exists" } else { "absent" },
+            std::env::current_dir()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|_| "?".into()),
+        );
+    }
+
     println!("cargo:rustc-env=SUEDE_BUILD_ID={id}");
 
     // Composed here rather than at runtime so it can be a `&'static str`,

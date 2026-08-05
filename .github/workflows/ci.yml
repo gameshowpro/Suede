@@ -220,6 +220,14 @@ jobs:
           # git, so when this does not arrive the fallback finds nothing to
           # describe and the binary ends up calling itself `unknown`.
           SUEDE_BUILD_ID: ${{ steps.version.outputs.build_id }}
+          # Handed to the container directly. Cross.toml's passthrough should
+          # already do this and demonstrably did not, so this states it in the
+          # one place cross cannot ignore: the docker arguments themselves.
+          CROSS_CONTAINER_OPTS: -e SUEDE_BUILD_ID=${{ steps.version.outputs.build_id }}
+          # Say what the build script actually saw, from inside wherever it
+          # ran. Every layer outside it has reported the right value while the
+          # binary came out anonymous.
+          SUEDE_BUILD_DEBUG: "1"
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Verify the binary says what it is
