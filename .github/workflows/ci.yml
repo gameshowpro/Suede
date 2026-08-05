@@ -45,6 +45,12 @@ jobs:
               - 'scripts/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              # The build script decides what the binary says it is, and how
+              # it is compiled for another architecture. Neither was listed,
+              # so a commit changing only build.rs skipped every job and the
+              # run reported success having compiled nothing.
+              - 'build.rs'
+              - 'Cross.toml'
               # A change to how the application is built and packaged has to
               # run that build, or the only way to test a workflow edit is to
               # push an unrelated source change alongside it. The docs filter
