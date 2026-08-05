@@ -256,7 +256,39 @@ pub fn is_snap(path: &Path) -> bool {
     // distinguishes Ubuntu's `chromium` shim from Debian's real binary of
     // the same name.
     let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    resolved.starts_with("/snap/") || path.starts_with("/snap/")
+    if resolved.starts_with("/snap/") || path.starts_with("/snap/") {
+        return true;
+    }
+    // Path alone is not enough. Ubuntu's `chromium-browser` package installs
+    // /usr/bin/chromium-browser as a shell script that execs the snap and
+    // prints installation instructions when it is absent. It lives in
+    // /usr/bin and looks like an ordinary browser, so skipping only /snap
+    // paths chose it as the alternative and launched the same confined snap
+    // - failing on the profile lock exactly as before.
+    std::fs::File::open(&resolved)
+        .ok()
+        .map(|mut file| {
+            use std::io::Read;
+            // A script's shebang is in the first line, and the exec it hides
+            // behind is within a few hundred bytes. Reading a bounded prefix
+            // keeps this from slurping a 200 MB browser binary.
+            let mut head = [0u8; 4096];
+            let read = file.read(&mut head).unwrap_or(0);
+            launches_a_snap(&head[..read])
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a program's opening bytes are a script that runs a snap.
+///
+/// Split out so the judgement can be tested without a filesystem: the
+/// interesting cases are wrapper scripts that differ only in wording.
+fn launches_a_snap(head: &[u8]) -> bool {
+    if !head.starts_with(b"#!") {
+        return false;
+    }
+    let text = String::from_utf8_lossy(head);
+    text.contains("/snap/bin/") || text.contains("snap run ")
 }
 
 /// The first candidate that exists, searching `$PATH` for bare names.
@@ -421,6 +453,39 @@ mod tests {
             path.to_str() == Some("/snap/bin/chromium")
         });
         assert_eq!(found, None);
+    }
+
+    #[test]
+    fn a_wrapper_script_that_execs_a_snap_is_a_snap() {
+        // Verbatim from Ubuntu's chromium-browser transitional package: a
+        // shell script in /usr/bin, which no path check would catch.
+        let wrapper = b"#!/bin/sh
+if ! [ -x /snap/bin/chromium ]; then
+  echo needs snap
+fi
+exec /snap/bin/chromium \"$@\"
+";
+        assert!(launches_a_snap(wrapper));
+
+        // The other spelling snapd generates.
+        assert!(launches_a_snap(
+            b"#!/bin/sh
+exec snap run chromium \"$@\"
+"
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_browser_launcher_is_not_mistaken_for_one() {
+        // Google Chrome ships a real bash wrapper. It must survive.
+        let chrome = b"#!/bin/bash
+# Copyright 2011 The Chromium Authors
+exec /opt/google/chrome/chrome \"$@\"
+";
+        assert!(!launches_a_snap(chrome));
+        // And an actual binary is never even considered.
+        assert!(!launches_a_snap(b"ELF"));
+        assert!(!launches_a_snap(b""));
     }
 
     #[test]
