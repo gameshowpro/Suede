@@ -162,7 +162,26 @@ done
 
 # --- 3. Per-user configuration and state ---------------------------------
 step "Removing Suede's own files"
-drop "$USER_HOME/.config/systemd/user/suede.service"
+# `systemctl --user enable` leaves a symlink; a regular file here was written
+# by hand, and on a test rig it usually carries the only copy of a custom
+# state directory, an EnvironmentFile, or a binary path. It still has to go,
+# or it would shadow the packaged unit and the next install would not be a
+# clean one - but taking it without a copy is the sort of thing that loses
+# somebody an afternoon.
+UNIT="$USER_HOME/.config/systemd/user/suede.service"
+if [[ -f "$UNIT" && ! -L "$UNIT" ]]; then
+  BACKUP="$USER_HOME/suede-reset-backup"
+  echo "    $UNIT was written by hand, not by systemctl enable"
+  if ((DRY_RUN)); then
+    echo "    would copy it to $BACKUP/ before removing it"
+  else
+    mkdir -p "$BACKUP"
+    cp -a "$UNIT" "$BACKUP/suede.service"
+    chown -R "$APPLIANCE_USER:$APPLIANCE_USER" "$BACKUP"
+    echo "    copied it to $BACKUP/suede.service"
+  fi
+fi
+drop "$UNIT"
 drop "$USER_HOME/.config/systemd/user/default.target.wants/suede.service"
 drop "$USER_HOME/.config/suede"
 if ((KEEP_STATE)); then
