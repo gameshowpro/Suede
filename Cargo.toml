@@ -84,7 +84,12 @@ state without operator intervention."""
 section = "video"
 priority = "optional"
 depends = "$auto, sway, pipewire, pipewire-pulse"
-recommends = "chromium | firefox"
+# Suggests, not Recommends: on Ubuntu `chromium` is a transitional package
+# that installs a snap, and apt installs Recommends by default - so a plain
+# `apt install ./suede.deb` pulled snapd onto an appliance that already had
+# Google Chrome. Provisioning and the browsers health check both say plainly
+# when no browser is present, which is the better place for that.
+suggests = "chromium | chromium-browser | google-chrome-stable | firefox"
 maintainer-scripts = "packaging"
 assets = [
     ["target/release/suede", "usr/bin/", "755"],

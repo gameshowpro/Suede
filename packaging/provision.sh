@@ -129,6 +129,20 @@ EOF
 
 # --- 3. Start sway at login ---------------------------------------------
 step "Configuring sway to start at login"
+
+# Sway refuses to run on the NVIDIA proprietary driver unless told to, so a
+# machine provisioned without this simply never comes up. Detected from the
+# loaded module rather than from lspci, because what matters is the driver
+# actually bound to the card.
+SWAY_FLAGS=""
+if [[ -d /sys/module/nvidia_drm ]]; then
+  SWAY_FLAGS=" --unsupported-gpu"
+  echo "  NVIDIA proprietary driver detected: adding --unsupported-gpu"
+  if [[ "$(cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null)" != "Y" ]]; then
+    echo "  WARNING: nvidia_drm modeset is off, and sway needs it. Add"
+    echo "           nvidia_drm.modeset=1 to the kernel command line and reboot."
+  fi
+fi
 BEGIN="# BEGIN SUEDE_PROVISION"
 END="# END SUEDE_PROVISION"
 PROFILE="$USER_HOME/.bash_profile"
@@ -153,11 +167,22 @@ if [ "\$(tty)" = "/dev/tty1" ] && [ -z "\${WAYLAND_DISPLAY:-}" ]; then
   # output the app renders into, which the slicer cuts up per projector.
   export WLR_BACKENDS=drm,libinput,headless
   clear
-  exec sway > "\$HOME/.sway.log" 2>&1
+  exec sway${SWAY_FLAGS} > "\$HOME/.sway.log" 2>&1
 fi
 $END
 EOF
 chown "$APPLIANCE_USER:$APPLIANCE_USER" "$PROFILE"
+
+# A machine that already starts sway some other way now has two, and they
+# will fight over the graphics card at the next boot.
+RIVALS="$(grep -rlE '^ExecStart=.*sway'   "$USER_HOME/.config/systemd/user" 2>/dev/null || true)"
+if [[ -n "$RIVALS" ]]; then
+  echo
+  echo "  WARNING: these user units also start sway:"
+  echo "$RIVALS" | sed 's/^/           /'
+  echo "           Two compositors cannot share the graphics card. Disable"
+  echo "           either those units or the auto-login above before rebooting."
+fi
 
 # --- 4. Sway configuration ----------------------------------------------
 step "Preparing the sway configuration"
@@ -271,7 +296,7 @@ cat <<EOF
   Service:      suede.service (systemd user unit)
 
   After a reboot the machine will log in, start sway, and start Suede.
-  Open http://\$(hostname):9088/ from another computer to configure it.
+  Open http://$(hostname):9088/ from another computer to configure it.
 EOF
 
 if [[ -n "${GROUPS_CHANGED:-}" ]]; then
