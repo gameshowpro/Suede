@@ -42,3 +42,16 @@ pub const BUILD_ID: &str = env!("SUEDE_BUILD_ID");
 /// the command-line parser needs for `--version`. Falls back to the bare
 /// version when there is no build to name.
 pub const VERSION_STRING: &str = env!("SUEDE_VERSION_STRING");
+
+/// [`BUILD_ID`] again, for things that inspect the binary without running it:
+/// `grep -a "suede build id" suede` answers from a file, which is all CI can
+/// do with an architecture it cannot execute.
+///
+/// This has to be a separate, longer value because greppability is not
+/// guaranteed for what the code actually uses: a release's id collapses to
+/// six bytes, short enough for the optimiser to materialise as
+/// store-immediates instead of data, and CI's identity check spent an evening
+/// failing against correct binaries that way. `#[used]` keeps the stamp in
+/// the emitted file despite nothing reading it.
+#[used]
+pub static BUILD_STAMP: &str = env!("SUEDE_BUILD_STAMP");

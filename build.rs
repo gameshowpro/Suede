@@ -67,6 +67,12 @@ fn main() {
     }
 
     println!("cargo:rustc-env=SUEDE_BUILD_ID={id}");
+    // A greppable copy for anything that inspects the artifact rather than
+    // running it. Deliberately long and bracketed: a six-byte string used at
+    // runtime is materialised as store-immediates under optimisation and
+    // never appears contiguously in the file, which made an identity check
+    // grepping for the bare id fail against perfectly correct binaries.
+    println!("cargo:rustc-env=SUEDE_BUILD_STAMP=[suede build id: {id}]");
 
     // Composed here rather than at runtime so it can be a `&'static str`,
     // which is what a command-line parser wants for `--version`.

@@ -265,8 +265,6 @@ jobs:
                  "cache survivor, not this build's output"
             exit 1
           fi
-          echo "identity-shaped strings inside:"
-          grep -oa "${{ steps.version.outputs.version }} ([^)]\{1,80\})" "$binary" | sort -u | head -5 || true
           case "$expected_id" in
             ""|unknown)
               echo "::error::the build id was not worked out; refusing to" \
@@ -274,12 +272,20 @@ jobs:
               exit 1
               ;;
           esac
-          if grep -qa -- "$expected_id" "$binary"; then
-            echo "contains: $expected_id"
+          # The stamp, not the bare id: a release id is six bytes, and the
+          # optimiser materialises strings that short as store-immediates, so
+          # they never appear contiguously in the file. The grep failed
+          # against correct binaries for a whole evening that way. The stamp
+          # is long enough to live in rodata and kept there by #[used].
+          stamp="[suede build id: $expected_id]"
+          if grep -qaF -- "$stamp" "$binary"; then
+            echo "contains: $stamp"
           else
-            echo "::error::$binary does not carry the build id $expected_id." \
-                 "The build script did not receive it - check that .build-id" \
-                 "reached the container."
+            echo "stamps actually present:"
+            grep -oa "\[suede build id: [^]]\{1,80\}\]" "$binary" | sort -u | head -3 || echo "  none"
+            echo "::error::$binary does not carry \"$stamp\" - the id the" \
+                 "build script baked in differs from the one this job asked" \
+                 "for (its own report is in the build log above)"
             exit 1
           fi
 
