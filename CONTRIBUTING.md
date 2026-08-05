@@ -30,6 +30,17 @@ offered under two licences at once; point 3 means you lose nothing.
 
 Add a `Signed-off-by:` line (`git commit -s`) to confirm it.
 
+## Versioning
+
+Ordinary commits do not touch the version — push as often as you like. Bump
+`Cargo.toml` only when you mean to release, which is what makes CI tag and
+publish one. Everything else about a build is derived from git and never
+typed by anyone.
+
+The rule for which digit to move is about whether a saved configuration
+survives the upgrade, not about how much code changed. See
+[Versioning](https://suede.gameshow.pro/developer/versioning/).
+
 ## Before opening a pull request
 
 Run the full check. It formats, lints, regenerates the OpenAPI snapshot,

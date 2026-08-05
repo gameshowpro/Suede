@@ -2660,12 +2660,17 @@
         "description": "Daemon and environment information, as served by `GET /system`.",
         "required": [
           "suedeVersion",
+          "buildId",
           "uptimeSeconds",
           "packages",
           "supportsTearing",
           "webUiEnabled"
         ],
         "properties": {
+          "buildId": {
+            "type": "string",
+            "description": "Which build is running: `git describe` output, e.g.\n`v0.1.0-12-g81226ee`. `suedeVersion` names the release this is meant\nto be; this names the commit it was actually built from, which is the\nquestion when a fix appears not to have landed."
+          },
           "hostname": {
             "type": [
               "string",

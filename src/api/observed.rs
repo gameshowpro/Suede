@@ -83,6 +83,7 @@ pub async fn get_system(State(state): State<ApiState>) -> Json<SystemInfo> {
     let version = state.sway.get_version().await.ok();
     Json(SystemInfo {
         suede_version: crate::VERSION.to_string(),
+        build_id: crate::BUILD_ID.to_string(),
         sway_version: version.as_ref().map(|v| v.display()),
         hostname: hostname(),
         uptime_seconds: state.started_at.elapsed().as_secs(),

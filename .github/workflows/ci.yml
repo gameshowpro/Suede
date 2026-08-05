@@ -131,19 +131,45 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             arch: arm64
     steps:
+      # Tags and full history, because the build identity comes from
+      # `git describe`. A shallow clone would silently produce "unknown".
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
 
-      - name: Read version from Cargo.toml
+      - name: Work out what this build is
         id: version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
           echo "version=$version" >> $GITHUB_OUTPUT
           echo "tag=v$version" >> $GITHUB_OUTPUT
+
+          # The identity the binary will report.
+          build_id=$(git describe --tags --always --match 'v*' || echo unknown)
+          echo "build_id=$build_id" >> $GITHUB_OUTPUT
+
+          # The Debian revision. A build sitting exactly on its tag is the
+          # release and takes a plain `1`; anything after it takes
+          # `1+<height>.g<sha>`, the height being commits since that tag.
+          #
+          # The height is what makes successive development builds ordered.
+          # Stamping the commit hash alone was tried first, and dpkg compares
+          # those lexically - so roughly half the time a newer build sorted
+          # below its predecessor and apt refused it as a downgrade.
+          if git describe --exact-match --tags HEAD >/dev/null 2>&1; then
+            revision=1
+          else
+            height=$(git rev-list --count "$(git describe --tags --abbrev=0 --match 'v*')..HEAD" \
+                     2>/dev/null || git rev-list --count HEAD)
+            revision="1+${height}.g$(git rev-parse --short HEAD)"
+          fi
+          echo "revision=$revision" >> $GITHUB_OUTPUT
+          echo "::notice title=build (${{ matrix.arch }})::${build_id} packaged as ${version}-${revision}"
 
       - name: Install cross and cargo-deb
         run: |
@@ -164,6 +190,10 @@ jobs:
       # Suede has no native library dependencies, which is what keeps this
       # possible at all.
       - name: Build release binary
+        env:
+          # Stated rather than rediscovered: cross builds inside a container
+          # that has neither the git history nor git itself.
+          SUEDE_BUILD_ID: ${{ steps.version.outputs.build_id }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Verify the binary is self-contained
@@ -179,7 +209,8 @@ jobs:
 
       - name: Build .deb
         run: |
-          cargo deb --no-build --target ${{ matrix.target }} --output \
+          cargo deb --no-build --target ${{ matrix.target }} \
+            --deb-revision "${{ steps.version.outputs.revision }}" --output \
             suede_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
 
       # The oldest system this package will install on, printed where it can

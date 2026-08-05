@@ -351,6 +351,11 @@ pub struct PackageVersion {
 #[serde(rename_all = "camelCase")]
 pub struct SystemInfo {
     pub suede_version: String,
+    /// Which build is running: `git describe` output, e.g.
+    /// `v0.1.0-12-g81226ee`. `suedeVersion` names the release this is meant
+    /// to be; this names the commit it was actually built from, which is the
+    /// question when a fix appears not to have landed.
+    pub build_id: String,
     pub sway_version: Option<String>,
     pub hostname: Option<String>,
     /// Seconds since the daemon started.

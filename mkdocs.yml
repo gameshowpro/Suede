@@ -51,6 +51,7 @@ nav:
   - Developer:
       - Architecture: developer/architecture.md
       - Deployment: developer/deployment.md
+      - Versioning: developer/versioning.md
       - Specification: specification.md
 
 markdown_extensions:

@@ -27,7 +27,9 @@ const CHECK_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500)
 #[derive(Parser)]
 #[command(
     name = "suede",
-    version,
+    // The build identity, not just the release number: "0.1.0" cannot
+    // distinguish the build that has a fix in it from the one that does not.
+    version = suede::VERSION_STRING,
     about = "Remote management daemon for Sway-based display appliances"
 )]
 struct Cli {
@@ -158,7 +160,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     let bootstrap = Arc::new(bootstrap);
 
     tracing::info!(
-        version = suede::VERSION,
+        version = suede::VERSION_STRING,
         bind = %bootstrap.bind,
         state_dir = %bootstrap.state_dir.display(),
         mock = args.mock,
