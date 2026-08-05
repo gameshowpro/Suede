@@ -1554,14 +1554,33 @@ mod tests {
         let runner = runner(dir.path().to_path_buf());
         let mut receiver = runner.events.subscribe();
 
-        runner.run_all().await;
+        let first = runner.run_all().await;
         assert!(receiver.try_recv().is_ok(), "first run should publish");
 
-        runner.run_all().await;
-        assert!(
-            receiver.try_recv().is_err(),
-            "an unchanged second run should stay quiet"
-        );
+        let second = runner.run_all().await;
+        if receiver.try_recv().is_ok() {
+            // Naming the culprit, because "something changed" is not a lead.
+            // A check that answers differently on two consecutive runs would
+            // also republish forever on a real appliance, so this failing is
+            // a genuine finding rather than a flaky test to be retried.
+            let mut moved = Vec::new();
+            for (before, after) in first.iter().zip(second.iter()) {
+                if before != after {
+                    moved.push(format!(
+                        "{}: {:?}/{:?} -> {:?}/{:?}",
+                        after.id, before.status, before.detail, after.status, after.detail
+                    ));
+                }
+            }
+            if first.len() != second.len() {
+                moved.push(format!(
+                    "the number of checks changed: {} -> {}",
+                    first.len(),
+                    second.len()
+                ));
+            }
+            panic!("an unchanged second run should stay quiet; these moved: {moved:#?}");
+        }
     }
 
     #[test]
