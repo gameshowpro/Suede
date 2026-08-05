@@ -21,6 +21,8 @@ use suede::sway::{mock::MockSway, SwayClient};
 
 /// How often the environment health checks are re-evaluated.
 const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long to let a configuration write settle before re-running the checks.
+const CHECK_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 #[derive(Parser)]
 #[command(
@@ -232,7 +234,11 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         shutdown_rx.clone(),
     ));
     tokio::spawn(reconciler.clone().run(trigger_rx, shutdown_rx.clone()));
-    tokio::spawn(run_checks(checks.clone(), shutdown_rx.clone()));
+    tokio::spawn(run_checks(
+        checks.clone(),
+        events.clone(),
+        shutdown_rx.clone(),
+    ));
 
     // --- server ---
     let state = ApiState {
@@ -275,14 +281,45 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     Ok(())
 }
 
-async fn run_checks(checks: Arc<CheckRunner>, mut shutdown: watch::Receiver<bool>) {
+async fn run_checks(
+    checks: Arc<CheckRunner>,
+    events: suede::events::EventHub,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut interval = tokio::time::interval(CHECK_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Several checks are judgements about the configuration - whether the
+    // apps that are configured can actually be launched, whether an output
+    // asking for a background can get one - so a write can settle or provoke
+    // one instantly. On the timer alone the operator fixes the problem and
+    // then goes on looking at the warning for up to a minute, which reads as
+    // the fix not having worked.
+    let mut changes = events.subscribe();
     loop {
         tokio::select! {
             _ = shutdown.changed() => return,
             _ = interval.tick() => {
                 checks.run_all().await;
+            }
+            event = changes.recv() => {
+                match event {
+                    Ok(suede::events::ServerEvent::ConfigChanged(_)) => {
+                        // Let the write settle, and coalesce a burst: a client
+                        // saving several sections sends several. The checks
+                        // shell out to other programs, so running them once
+                        // per write in a burst is worth avoiding.
+                        tokio::time::sleep(CHECK_SETTLE).await;
+                        while changes.try_recv().is_ok() {}
+                        checks.run_all().await;
+                    }
+                    // Everything else, including this task's own ChecksChanged.
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        // Missed events may have included a config write.
+                        checks.run_all().await;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
             }
         }
     }

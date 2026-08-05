@@ -49,6 +49,15 @@ button.action.ghost { background: transparent; color: var(--accent); border: 1px
 button.action.danger { background: transparent; color: var(--bad); border: 1px solid var(--line); }
 button.action:disabled { opacity: .5; cursor: not-allowed; }
 input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
+  color: var(--ink); padding: 0; width: min(760px, calc(100vw - 32px)); max-width: none;
+  box-shadow: 0 14px 44px rgba(0,0,0,.3); }
+dialog::backdrop { background: rgba(0,0,0,.45); }
+dialog .dialog-body { padding: 18px; max-height: calc(100vh - 170px); overflow-y: auto; }
+dialog .dialog-body > h2 { margin-top: 0; }
+dialog .dialog-foot { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  padding: 12px 18px; border-top: 1px solid var(--line); background: var(--sunken);
+  border-radius: 0 0 12px 12px; }
 a { color: var(--accent); }
 
 /* --- alerts: the operator's first stop ------------------------------- */
@@ -273,9 +282,13 @@ window.addEventListener("error", (event) => {
         <th>Id</th><th>State</th><th>PID</th><th>Restarts</th><th>Detail</th><th></th>
       </tr></thead><tbody></tbody></table>
       <p class="hint" id="apps-empty">No applications configured yet.</p>
+      <div class="row" style="margin-top:12px">
+        <button class="action" id="a-new">Add application</button>
+      </div>
     </div>
 
-    <div class="panel">
+    <dialog id="app-dialog" aria-labelledby="a-heading">
+      <div class="dialog-body">
       <h2 id="a-heading">Add an application</h2>
       <div class="fields">
         <div><label for="a-id">Id</label><input id="a-id" placeholder="renderer-1"></div>
@@ -315,13 +328,14 @@ window.addEventListener("error", (event) => {
           placeholder="LIBVA_DRIVER_NAME=nvidia&#10;NVD_BACKEND=direct"></textarea>
       </fieldset>
 
-      <div class="row" style="margin-top:14px">
+      </div>
+      <div class="dialog-foot">
         <button class="action" id="a-save">Save application</button>
-        <button class="action ghost hidden" id="a-clear">Clear form</button>
+        <button class="action ghost" id="a-cancel">Cancel</button>
         <span class="hint">Placeholders <span class="mono">{appId}</span> and
           <span class="mono">{heartbeatUrl}</span> are expanded at launch.</span>
       </div>
-    </div>
+    </dialog>
   </section>
 
   <!-- Backgrounds -->
@@ -390,8 +404,19 @@ window.addEventListener("error", (event) => {
   <section id="tab-audio" class="hidden">
     <div class="panel">
       <h2>Audio sinks</h2>
+      <p class="hint">The outputs PipeWire can play to. Each application picks
+        one on the <a href="#" id="sinks-apps-link">Apps</a> tab; this list is what
+        it picks from.</p>
       <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
       <p class="hint" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
+      <p class="hint"><b>default</b> marks the sink an application gets when
+        its audio is set to &ldquo;leave untouched&rdquo; — Suede sets no
+        routing for it, so PipeWire chooses. That choice belongs to PipeWire
+        rather than to Suede, so it is shown here but cannot be changed here;
+        WirePlumber remembers it across reboots. Set it from the machine with
+        <span class="mono">wpctl set-default &lt;id&gt;</span>, or avoid the
+        question entirely by naming a sink on each application.
+        <b>silent</b> marks a sink that discards whatever reaches it.</p>
     </div>
   </section>
 
@@ -1048,10 +1073,20 @@ function renderApps() {
   }
 }
 
+// One dialog serves both jobs. Editing differs from adding only in what it
+// starts from and whether the id can still be chosen, so they share a form
+// rather than drifting apart into two that must be kept in step.
+function openAppDialog() {
+  const dialog = $("app-dialog");
+  if (!dialog.open) dialog.showModal();
+}
+
 function editApp(app) {
   editingApp = app.id;
   $("a-heading").textContent = `Edit ${app.id}`;
-  $("a-clear").classList.remove("hidden");
+  // The id is the app's identity: changing it here would create a second
+  // app rather than rename this one.
+  $("a-id").disabled = true;
   $("a-id").value = app.id;
   $("a-kind").value = app.launcher.kind;
   $("a-uri").value = app.launcher.kind === "exec"
@@ -1064,18 +1099,31 @@ function editApp(app) {
   $("a-ready-timeout").value = app.readiness?.timeoutSeconds ?? 5;
   $("a-ready-giveup").value = app.readiness?.giveUpAfterSeconds ?? "";
   $("a-env").value = Object.entries(app.env ?? {}).map(([k, v]) => `${k}=${v}`).join("\n");
-  window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+  openAppDialog();
 }
 
 function clearAppForm() {
   editingApp = null;
   $("a-heading").textContent = "Add an application";
-  $("a-clear").classList.add("hidden");
+  $("a-id").disabled = false;
   for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env"]) $(id).value = "";
   $("a-heartbeat").value = "false";
+  $("a-kind").value = "chromium-kiosk";
+  $("a-audio").value = "";
   $("a-ready-interval").value = 2; $("a-ready-timeout").value = 5;
 }
-$("a-clear").onclick = clearAppForm;
+
+function closeAppDialog() {
+  const dialog = $("app-dialog");
+  if (dialog.open) dialog.close();
+  clearAppForm();
+}
+
+$("a-new").onclick = () => { clearAppForm(); openAppDialog(); $("a-id").focus(); };
+$("a-cancel").onclick = closeAppDialog;
+// Esc closes a native dialog by itself; clear the form so the next open is
+// not haunted by the abandoned one.
+$("app-dialog").addEventListener("close", clearAppForm);
 
 $("a-save").onclick = () => run(async () => {
   const id = $("a-id").value.trim();
@@ -1112,7 +1160,9 @@ $("a-save").onclick = () => run(async () => {
     heartbeat: $("a-heartbeat").value === "true"
       ? { enabled: true, timeoutSeconds: 25, startupGraceSeconds: 60 } : null,
   });
-  clearAppForm();
+  // Only on success: a rejected write leaves the dialog open with the values
+  // still in it, so the operator can correct them rather than retype them.
+  closeAppDialog();
 }, "saved application");
 
 // --- projection ----------------------------------------------------------
@@ -1354,6 +1404,10 @@ $("o-bg").onchange = updateOutputBackgroundSummary;
 $("o-bg-link").onclick = (event) => {
   event.preventDefault();
   document.querySelector('nav button[data-tab="wallpapers"]').click();
+};
+$("sinks-apps-link").onclick = (event) => {
+  event.preventDefault();
+  document.querySelector('nav button[data-tab="apps"]').click();
 };
 
 // --- images --------------------------------------------------------------
