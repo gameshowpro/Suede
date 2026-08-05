@@ -68,6 +68,18 @@ The Debian revision carries the same information, in a form dpkg can order:
 follows, and `0.2.0-1` still supersedes both. The **height** is what makes
 successive development builds ordered.
 
+The suffix does order, and that is not an accident of formatting. dpkg
+compares a version by splitting it into alternating runs of non-digits and
+digits, comparing the digit runs **numerically**. So `+9.` and `+12.` are
+compared as 9 against 12, not as the strings `9` and `12`:
+
+```
+0.1.0-1+9.gaaaaaaa   <  0.1.0-1+12.gbbbbbbb
+0.1.0-1+12.gbbbbbbb  <  0.1.0-1+100.gccccccc
+0.1.0-1              <  0.1.0-1+1.gaaaaaaa     the release, then builds after it
+0.1.0-1+99.gzzzzzzz  <  0.2.0-1                and the next release beats them all
+```
+
 !!! warning "Why not the commit hash alone"
     Stamping `1+g81226ee` was tried first and is subtly broken: dpkg compares
     those suffixes lexically, so ordering follows the alphabet rather than
@@ -79,6 +91,41 @@ successive development builds ordered.
 
     Roughly half of upgrades between development builds would be refused as
     downgrades. The height fixes it because it only ever increases.
+
+## Why the height goes after the hyphen, not in the third digit
+
+The obvious alternative is to let commit height *be* the third digit —
+`0.1.12` for twelve commits past `0.1` — which is what Nerdbank.GitVersioning
+does. It does not fit here, for one reason of meaning and one of mechanism.
+
+The third digit is **patch**, not a build counter. It is a claim that a
+release happened. Spending it on height means `0.1.12` asserts twelve patch
+releases that nobody made, and — worse — leaves no digit to say *this is a
+bug-fix release of 0.1.0*, because the position that would have said it is
+already occupied by an accident of how many commits were on the branch.
+
+The .NET pattern works because assembly versions are
+`Major.Minor.Build.Revision`: four fields, no semver contract, and the third
+is literally named Build. Cargo has three fields and a contract about what
+they mean.
+
+Debian already has the field for this. A package version is
+`upstream_version-debian_revision`, and the revision means *which build of
+that upstream version this is*. That is exactly what commit height is, so it
+goes there:
+
+```
+0.1.0    -    1+12.g81226ee
+└─ the release       └─ which build of it
+   this aims at
+```
+
+Both parts then say something true at once: the release this is working
+towards, and how far past it this particular build sits. Neither has to lie
+about the other.
+
+The mechanical reason is smaller but decides it anyway — see
+[below](#why-not-commit-height-in-cargotoml).
 
 ## Building one by hand
 
