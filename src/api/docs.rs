@@ -40,7 +40,10 @@ impl Modify for SecurityAddon {
         description = "Remote management for Sway-based display appliances. \
                        Clients write desired state; a reconciler drives the live \
                        session toward it.",
-        license(name = "MIT", url = "https://github.com/gameshowpro/Suede/blob/main/LICENSE"),
+        license(
+            name = "PolyForm-Small-Business-1.0.0",
+            url = "https://github.com/gameshowpro/Suede/blob/main/LICENSE"
+        ),
     ),
     paths(
         super::observed::list_outputs,

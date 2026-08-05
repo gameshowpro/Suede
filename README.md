@@ -2,7 +2,7 @@
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/gameshowpro/Suede/ci.yml?branch=main&logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/actions)
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/releases)
-[![License](https://img.shields.io/github/license/gameshowpro/Suede?style=flat-square)](https://github.com/gameshowpro/Suede/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-PolyForm%20Small%20Business%201.0.0-blue?style=flat-square)](LICENSE)
 [![Sponsor on GitHub](https://img.shields.io/badge/sponsor-GitHub-EA4AAA?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/gameshowpro)
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&logo=paypal)](https://paypal.me/barjonas)
 
@@ -11,7 +11,7 @@
 <!-- md-exclude-end -->
 
 ## Inspiration
-Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, and scoreboard displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand. The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs — precise output control and scriptable window management on minimal hardware — but no friendly way to drive it from across the network or to keep its state across reboots. Suede grew out of a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket. This project generalizes that idea into a standalone, well-documented service.
+Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, and scoreboard displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand. The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs — precise output control and scriptable window management on minimal hardware — but no friendly way to drive it from across the network or to keep its state across reboots. The idea came from a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket. Suede is a fresh implementation of that idea as a standalone, well-documented service; it shares no code with that system.
 
 ## Summary
 Suede turns a Linux box running Sway into a remotely manageable display appliance. It exposes a well-documented REST + SSE API (and a bundled reference web UI) for configuring video outputs, routing audio, and launching kiosk-mode browsers — and it persists everything, so the machine boots straight back into its configured state with no operator intervention. Configuration is declarative: you describe the state you want, and Suede's reconciler keeps reality matching it through reboots, display hotplugs, and application crashes.
@@ -127,4 +127,23 @@ Hi, I'm Hamish Barjonas. I provide custom solutions for the broadcast production
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Suede is **source available**, not open source, and the distinction is worth
+stating plainly: the [PolyForm Small Business License 1.0.0](LICENSE) permits
+use for the benefit of a company with fewer than 100 people and under
+USD 1,000,000 of revenue in the prior tax year. Individuals, hobbyists,
+schools, charities and small production companies are inside that and owe
+nothing. Larger organisations need a
+[commercial licence](COMMERCIAL.md) — same code, nothing withheld.
+
+Forks inherit these terms, because they are derivative works.
+
+"Suede" is a trademark; the licence covers copyright and patents, not the
+name. See [TRADEMARKS.md](TRADEMARKS.md) for what that does and does not
+allow, which is more permissive than people usually expect.
+
+Contributions are welcome and are asked for under a grant that allows both
+licences — see [CONTRIBUTING.md](CONTRIBUTING.md) for why.
+
+Copyright © 2026 Barjonas LLC. Commercial enquiries:
+<https://barjonas.com/#contact>
+
