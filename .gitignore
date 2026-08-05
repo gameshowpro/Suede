@@ -4,3 +4,7 @@
 
 # Binaries built for deployment to a test machine
 /suede-x86_64
+
+# Written by CI to carry the build identity across the cross container
+# boundary; never committed, because it describes one build.
+.build-id

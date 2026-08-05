@@ -14,6 +14,7 @@ fn main() {
     // A source tarball has no git, and CI would rather state the answer than
     // have it rediscovered; both go through this variable.
     println!("cargo:rerun-if-env-changed=SUEDE_BUILD_ID");
+    println!("cargo:rerun-if-changed=.build-id");
     // Without these, the recorded identity would be whatever it was when the
     // build script last ran, which is worse than not recording one at all.
     for path in [".git/HEAD", ".git/refs/heads", ".git/packed-refs"] {
@@ -26,6 +27,7 @@ fn main() {
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or_else(build_id_file)
         .or_else(describe)
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -44,6 +46,25 @@ fn main() {
         format!("{version} ({id})")
     };
     println!("cargo:rustc-env=SUEDE_VERSION_STRING={shown}");
+}
+
+/// The id from `.build-id`, or `None` when nobody wrote one.
+///
+/// An environment variable is the obvious way to tell a build script
+/// something, and it is the wrong one when `cross` is involved: the compiler
+/// runs inside a container that receives only an allowlist of variables, and
+/// what does not arrive fails silently - the script simply falls back and
+/// produces a plausible answer. That shipped a release whose binary reported
+/// its identity as `unknown` while CI logged the correct value.
+///
+/// A file does not have that problem. The workspace is mounted into the
+/// container because that is where the source is, so anything written here
+/// arrives by the same route the code does.
+fn build_id_file() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".build-id");
+    let contents = std::fs::read_to_string(path).ok()?;
+    let trimmed = contents.trim().to_string();
+    (!trimmed.is_empty()).then_some(trimmed)
 }
 
 /// `git describe`, or `None` when this is not a checkout.

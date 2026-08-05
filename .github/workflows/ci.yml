@@ -183,6 +183,11 @@ jobs:
           fi
           echo "revision=$revision" >> $GITHUB_OUTPUT
           echo "build_id=$build_id" >> $GITHUB_OUTPUT
+
+          # How the build script actually receives this. An env var does not
+          # survive the cross container boundary; the workspace does, because
+          # that is where the source it compiles comes from.
+          printf '%s\n' "$build_id" > .build-id
           echo "::notice title=build (${{ matrix.arch }})::${build_id} packaged as ${version}-${revision}"
 
       - name: Install cross and cargo-deb
@@ -209,25 +214,25 @@ jobs:
           # named for does not exist until the release job creates it, well
           # after this build has finished.
           #
-          # Reaching the compiler needs Cross.toml as well: cross runs inside
-          # a container and passes only an allowlist through. Without it this
-          # variable is silently absent and build.rs falls back to git.
+          # This variable is the belt; .build-id, written above, is the
+          # braces and the one that actually works. cross compiles inside a
+          # container that receives only an allowlist of variables and has no
+          # git, so when this does not arrive the fallback finds nothing to
+          # describe and the binary ends up calling itself `unknown`.
           SUEDE_BUILD_ID: ${{ steps.version.outputs.build_id }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Verify the binary says what it is
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          # The failure this catches is silent by nature: the build script
-          # falls back to `git describe` whenever the variable does not reach
-          # it, so the binary still reports *something* plausible. v0.1.1
-          # shipped calling itself eighteen commits past v0.1.0 that way.
-          reported=$(target/${{ matrix.target }}/release/suede --version)
-          echo "reports: $reported"
-          expected_version="${{ steps.version.outputs.version }}"
+          # Read out of the binary rather than asked of it, and done for every
+          # architecture. Running `--version` is not enough on its own: a
+          # release prints a bare version, and so does a binary whose identity
+          # was lost, because the build script drops the suffix when it has
+          # nothing to put there. Those two cases are indistinguishable from
+          # the output, and that false pass let 0.1.2 and 0.1.3 through with
+          # an identity of `unknown` while CI logged the right answer.
+          binary=target/${{ matrix.target }}/release/suede
           expected_id="${{ steps.version.outputs.build_id }}"
-          # An empty or unknown id would make the bare-version form below
-          # match, passing this check while the identity was in fact lost.
           case "$expected_id" in
             ""|unknown)
               echo "::error::the build id was not worked out; refusing to" \
@@ -235,6 +240,24 @@ jobs:
               exit 1
               ;;
           esac
+          if grep -qa -- "$expected_id" "$binary"; then
+            echo "contains: $expected_id"
+          else
+            echo "::error::$binary does not carry the build id $expected_id." \
+                 "The build script did not receive it - check that .build-id" \
+                 "reached the container."
+            exit 1
+          fi
+
+      - name: Verify the binary reports what it is
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          # The one architecture that can be executed here, as a check on what
+          # an operator will actually be shown.
+          reported=$(target/${{ matrix.target }}/release/suede --version)
+          echo "reports: $reported"
+          expected_version="${{ steps.version.outputs.version }}"
+          expected_id="${{ steps.version.outputs.build_id }}"
           case "$reported" in
             "suede $expected_version"|"suede $expected_version ($expected_id)") ;;
             *)
@@ -243,22 +266,6 @@ jobs:
               exit 1
               ;;
           esac
-
-      - name: Verify the cross-built binary carries the same identity
-        if: matrix.target != 'x86_64-unknown-linux-gnu'
-        run: |
-          # This one cannot be run here, but the identity is a static string
-          # compiled into it, so it can still be read without executing.
-          # Without this the arm64 package would be the only artifact nobody
-          # checks, which is where a mislabelled build would next hide.
-          binary=target/${{ matrix.target }}/release/suede
-          expected_id="${{ steps.version.outputs.build_id }}"
-          if grep -qa -- "$expected_id" "$binary"; then
-            echo "contains: $expected_id"
-          else
-            echo "::error::$binary does not contain the build id $expected_id"
-            exit 1
-          fi
 
       - name: Verify the binary is self-contained
         if: matrix.target == 'x86_64-unknown-linux-gnu'
