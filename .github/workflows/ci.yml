@@ -106,7 +106,14 @@ jobs:
     if: |
       github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.changes.outputs.app == 'true'
-    runs-on: ubuntu-latest
+    # Pinned, unlike the jobs above, because this one produces artifacts.
+    # cargo-deb derives `Depends: libc6 (>= X)` from whatever glibc the build
+    # host linked against, so the runner image decides the oldest system the
+    # package will install on. Leaving it floating means GitHub can raise the
+    # minimum supported OS without anyone touching this repository, and the
+    # first sign would be an install failing in the field. Bump this
+    # deliberately, and expect the floor to move when you do.
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
@@ -163,6 +170,15 @@ jobs:
         run: |
           cargo deb --no-build --target ${{ matrix.target }} --output \
             suede_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
+
+      # The oldest system this package will install on, printed where it can
+      # be seen. Ubuntu 24.04 and Debian 12 are 2.39 and 2.36 respectively.
+      - name: Report the libc floor
+        run: |
+          deb=$(ls suede_*_${{ matrix.arch }}.deb)
+          echo "::notice title=libc floor (${{ matrix.arch }})::$(dpkg-deb -f "$deb" Depends)"
+          dpkg-deb -f "$deb" Depends | tr ',' '
+' | grep libc6 || true
 
       - name: Upload package
         uses: actions/upload-artifact@v5
