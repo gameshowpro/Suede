@@ -120,12 +120,24 @@ mod tests {
             ("serial", "EDID matching; the UI matches by connector name"),
             ("hideCursor", "no settings tab yet"),
             ("outputPollIntervalSeconds", "no settings tab yet"),
-            ("allowRawSwayCommands", "no settings tab yet; a debugging escape hatch"),
-            ("policy", "restart policy is not exposed; the default suits an appliance"),
+            (
+                "allowRawSwayCommands",
+                "no settings tab yet; a debugging escape hatch",
+            ),
+            (
+                "policy",
+                "restart policy is not exposed; the default suits an appliance",
+            ),
             ("delayMs", "restart policy is not exposed"),
             ("maxDelayMs", "restart policy is not exposed"),
-            ("expectStatus", "readiness offers the URL and timings, not the status code"),
-            ("extraArgs", "raw browser arguments; the raw-config tab is the place for those"),
+            (
+                "expectStatus",
+                "readiness offers the URL and timings, not the status code",
+            ),
+            (
+                "extraArgs",
+                "raw browser arguments; the raw-config tab is the place for those",
+            ),
             ("showFpsCounter", "a diagnostic, not a configuration choice"),
             ("persistProfile", "kiosk sessions are stateless by design"),
         ];
