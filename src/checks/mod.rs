@@ -742,9 +742,9 @@ impl CheckRunner {
 
         let (status, detail) = if only_snap {
             (
-                CheckStatus::Warn,
+                CheckStatus::Fail,
                 format!(
-                    "the only browser here is a snap ({}). Suede works with                      it - the profile is placed under ~/snap where a confined                      snap may write, since it cannot reach the state                      directory - but a snap updates itself on its own                      schedule and restarts the browser when it does, which on                      an appliance means the screens go blank mid-show. A                      browser from a .deb is the better choice, and                      `launcher.program` names one explicitly.",
+                    "no browser installed. A snap is present ({}) but Suede                      will not use one: a snap updates itself on its own                      schedule and restarts the browser when it does, which on                      an appliance means the screens go blank in the middle of                      a show. Install one from a .deb - on Debian `apt install                      chromium`, on Ubuntu Google Chrome's own package. To use                      the snap anyway, name it:                      \"program\": \"/snap/bin/chromium\" on the application.",
                     snapped.join(", ")
                 ),
             )

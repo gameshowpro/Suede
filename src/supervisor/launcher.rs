@@ -55,7 +55,6 @@ pub const CHROMIUM_PROGRAMS: &[&str] = &[
     "chromium-browser",
     "google-chrome-stable",
     "google-chrome",
-    "/snap/bin/chromium",
 ];
 
 /// Firefox is packaged as `firefox`, or `firefox-esr` on Debian.
@@ -129,14 +128,28 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             program,
         } => {
             let programs = program_list(program.as_deref(), CHROMIUM_PROGRAMS);
-            // Where the profile can live depends on what is going to open it.
-            // A confined snap may write anywhere in $HOME except a hidden
-            // directory, and Suede's state directory is under `.local` - so
-            // the profile has to move rather than the browser be refused.
-            let profile_dir = match resolve_program(&programs) {
-                Some(found) if is_snap(&found) => snap_profile_dir(&found, &app.id)
+            // A snap only ever gets here because somebody named it, and it
+            // still has to work when they did: a confined snap may write
+            // anywhere in $HOME except a hidden directory, and Suede's state
+            // lives under `.local`, so the profile moves rather than the
+            // browser aborting on its own lock file.
+            let chosen = if program.is_some() {
+                resolve_program(&programs)
+            } else {
+                resolve_preset_program(&programs)
+            };
+            let profile_dir = match &chosen {
+                Some(found) if is_snap(found) => snap_profile_dir(found, &app.id)
                     .unwrap_or_else(|| profile_dir_for(&context.profiles_root, &app.id)),
                 _ => profile_dir_for(&context.profiles_root, &app.id),
+            };
+            // Hand the spawner the one that was chosen, so it cannot resolve
+            // differently and land on a snap the search deliberately skipped.
+            // With nothing found, the candidate list goes through unchanged
+            // so the failure still names everything that was looked for.
+            let programs = match &chosen {
+                Some(found) => vec![found.display().to_string()],
+                None => programs,
             };
             let mut args: Vec<String> = CHROMIUM_KIOSK_ARGS.iter().map(|a| a.to_string()).collect();
             // Chromium refuses a second instance sharing a profile, so every
@@ -167,8 +180,18 @@ fn build_preset(app: &AppConfig, context: &LaunchContext) -> LaunchSpec {
             // Firefox needs telling to use Wayland rather than XWayland.
             env.push(("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string()));
 
+            let candidates = program_list(program.as_deref(), FIREFOX_PROGRAMS);
+            let chosen = if program.is_some() {
+                resolve_program(&candidates)
+            } else {
+                resolve_preset_program(&candidates)
+            };
+
             LaunchSpec {
-                programs: program_list(program.as_deref(), FIREFOX_PROGRAMS),
+                programs: match chosen {
+                    Some(found) => vec![found.display().to_string()],
+                    None => candidates,
+                },
                 args,
                 env,
                 profile_dir: None,
@@ -248,7 +271,34 @@ pub fn resolve_program_with<F>(
 where
     F: Fn(&Path) -> bool,
 {
-    let mut snap_fallback = None;
+    resolve_with(candidates, path_var, exists, false)
+}
+
+/// As [`resolve_program_with`], but passing over any snap it finds.
+///
+/// Used for the launcher presets, which search several names. A program
+/// named explicitly is never filtered: naming `/snap/bin/chromium` is a
+/// decision, not an accident.
+pub fn resolve_preset_with<F>(
+    candidates: &[String],
+    path_var: Option<&str>,
+    exists: F,
+) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
+    resolve_with(candidates, path_var, exists, true)
+}
+
+fn resolve_with<F>(
+    candidates: &[String],
+    path_var: Option<&str>,
+    exists: F,
+    skip_snaps: bool,
+) -> Option<PathBuf>
+where
+    F: Fn(&Path) -> bool,
+{
     for candidate in candidates {
         let mut found = None;
         let path = Path::new(candidate);
@@ -270,21 +320,29 @@ where
             }
         }
         let Some(found) = found else { continue };
-        // A snap is remembered but passed over: on Ubuntu, `chromium` is a
-        // shim for one while `chromium-browser` and `google-chrome-stable`
-        // are ordinary binaries that can use the profile directory. On
-        // Debian the same name is a real package and is taken immediately.
-        // Reordering the candidate list could not express that, since which
-        // name is the snap depends on the distribution.
-        if is_snap(&found) {
-            snap_fallback.get_or_insert(found);
+        // Searching never selects a snap, even when nothing else is
+        // installed. A snap updates itself on its own schedule and restarts
+        // the browser when it does, which on an appliance means the screens
+        // go blank in the middle of a show - so it does not meet the point
+        // of the thing, and a browser that fails now is better than one that
+        // fails during a broadcast. The browsers health check reports that a
+        // snap was seen and passed over, so this is never silent.
+        //
+        // Reordering the candidate list could not express this, because
+        // which name is a snap depends on the distribution: Ubuntu's
+        // `chromium` is a shim, Debian's is a real package.
+        if skip_snaps && is_snap(&found) {
             continue;
         }
         return Some(found);
     }
-    // Nothing else is installed. Better a browser that may fail loudly than
-    // no browser at all, and the health check explains what to expect.
-    snap_fallback
+    None
+}
+
+/// The first preset candidate present on this machine that is not a snap.
+pub fn resolve_preset_program(candidates: &[String]) -> Option<PathBuf> {
+    let path_var = std::env::var("PATH").ok();
+    resolve_preset_with(candidates, path_var.as_deref(), |path| path.is_file())
 }
 
 /// The first candidate program actually present on this machine.
@@ -341,7 +399,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let found = resolve_program_with(&candidates, Some("/snap/bin:/usr/bin"), |path| {
+        let found = resolve_preset_with(&candidates, Some("/snap/bin:/usr/bin"), |path| {
             matches!(
                 path.to_str(),
                 Some("/snap/bin/chromium") | Some("/usr/bin/chromium-browser")
@@ -351,14 +409,26 @@ mod tests {
     }
 
     #[test]
-    fn a_snap_is_still_used_when_it_is_all_there_is() {
-        // No browser at all is worse than one that fails loudly, and the
-        // health check explains what will happen.
+    fn a_snap_is_not_used_even_when_it_is_all_there_is() {
+        // Searching treats a snap as absent. The browsers check reports that
+        // one was seen and passed over, so the operator is told why they
+        // appear to have no browser despite having installed something.
         let candidates: Vec<String> = ["chromium", "chromium-browser"]
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let found = resolve_program_with(&candidates, Some("/snap/bin:/usr/bin"), |path| {
+        let found = resolve_preset_with(&candidates, Some("/snap/bin:/usr/bin"), |path| {
+            path.to_str() == Some("/snap/bin/chromium")
+        });
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn naming_a_snap_explicitly_is_honoured() {
+        // Skipping snaps is about not choosing one by accident. Choosing one
+        // on purpose is a decision, and the profile placement makes it work.
+        let candidates = vec!["/snap/bin/chromium".to_string()];
+        let found = resolve_program_with(&candidates, Some("/usr/bin"), |path| {
             path.to_str() == Some("/snap/bin/chromium")
         });
         assert_eq!(found.unwrap(), PathBuf::from("/snap/bin/chromium"));
@@ -578,15 +648,16 @@ mod tests {
 
     #[test]
     fn every_known_chromium_packaging_is_covered() {
-        // Debian/Arch, Raspberry Pi OS and older Ubuntu, Google's own deb, snap.
-        for expected in [
-            "chromium",
-            "chromium-browser",
-            "google-chrome-stable",
-            "/snap/bin/chromium",
-        ] {
+        // Debian and Arch, Raspberry Pi OS and older Ubuntu, Google's own deb.
+        for expected in ["chromium", "chromium-browser", "google-chrome-stable"] {
             assert!(CHROMIUM_PROGRAMS.contains(&expected), "missing {expected}");
         }
+        // Deliberately not a snap path: the search would pass over it, so
+        // listing one would only suggest it might be chosen.
+        assert!(
+            !CHROMIUM_PROGRAMS.iter().any(|p| p.contains("/snap/")),
+            "the preset must not offer a snap"
+        );
     }
 
     #[test]

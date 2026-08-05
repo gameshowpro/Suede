@@ -303,30 +303,40 @@ entirely yours.
 
     Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, `--autoplay-policy=no-user-gesture-required`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
 
-!!! warning "Snap browsers work, but pick a .deb if you can"
-    Ubuntu's `chromium` package is a shim for a snap. Suede runs it: a
-    confined snap may write anywhere in `$HOME` **except a hidden
-    directory**, and Suede's profiles live under `~/.local/state`, so a snap
-    browser gets its profile at `~/snap/<name>/common/suede-profiles/<app>`
-    instead. Without that, Chromium cannot create its `SingletonLock`, aborts
-    with a message about profile corruption, and the app crash-loops.
+!!! warning "A snap browser does not count as installed"
+    Ubuntu's `chromium` package is a shim for a snap, and Suede's search
+    passes over it as though it were not there. A snap updates itself on its
+    own schedule and restarts the browser when it does, which on an appliance
+    means the screens go blank in the middle of a show — so it does not meet
+    the point of the exercise, and a machine with only a snap is reported as
+    having no browser at all:
 
-    It is still the worse choice. A snap updates itself on its own schedule
-    and restarts the browser when it does, which on an appliance means the
-    screens go blank in the middle of whatever you were showing. Suede
-    therefore prefers any non-snap binary it can find, and only falls back to
-    a snap when nothing else is installed — where it says so as a health-check
-    warning rather than failing silently.
+    ```
+    FAIL  no browser installed. A snap is present (/snap/bin/chromium) but
+          Suede will not use one: ... Install one from a .deb - on Debian
+          `apt install chromium`, on Ubuntu Google Chrome's own package.
+    ```
 
-    `launcher.program` settles the question outright:
+    Skipping a snap is about not choosing one by accident. Choosing one on
+    purpose is a decision, and it is honoured — `launcher.program` overrides
+    the search entirely:
 
     ```json
     { "kind": "chromium-kiosk", "uri": "http://…",
-      "program": "/usr/bin/google-chrome-stable" }
+      "program": "/snap/bin/chromium" }
     ```
 
-    A bare name is looked up on `PATH`; a path is used as given. It applies to
-    `firefox-kiosk` too.
+    That works, because Suede then puts the profile somewhere a confined snap
+    can write. Snap's `home` interface covers `$HOME` but excludes hidden
+    directories, and Suede's state lives under `~/.local/state`; a snap
+    browser's profile therefore goes to
+    `~/snap/<name>/common/suede-profiles/<app>`. Without that, Chromium
+    cannot create its `SingletonLock`, aborts with a message about profile
+    corruption, and the application crash-loops.
+
+    `program` takes a bare name (looked up on `PATH`) or a path, and applies
+    to `firefox-kiosk` too. It is the way to pin a specific browser for any
+    reason, not just this one.
 
 !!! info "Pages may make a sound without being clicked"
     Chromium normally suspends every `AudioContext`, `<audio>` and `<video>`
