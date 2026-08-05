@@ -280,6 +280,26 @@ jobs:
           SUEDE_DOCS_VERSION: ${{ steps.version.outputs.tag }}
         run: mkdocs build --strict
 
+      # `--strict` checks links and navigation. It does not check that the
+      # markdown still means anything, and it happily published a site where
+      # a dependency upgrade had stopped ``` fences being recognised: every
+      # code block rendered as prose, and shell comments became headings.
+      # Nothing failed, because nothing was looking.
+      - name: Check the markdown actually rendered
+        run: |
+          blocks=$(grep -ro '<pre' site --include='*.html' | wc -l)
+          stray=$(grep -rho '<p>```</p>' site --include='*.html' | wc -l)
+          icons=$(grep -rho ':material-[a-z-]*:' site --include='*.html' | wc -l)
+          echo "code blocks: $blocks, unrendered fences: $stray, unrendered icons: $icons"
+          if [ "$blocks" -lt 40 ]; then
+            echo "::error::only $blocks code blocks rendered; the markdown pipeline is broken"
+            exit 1
+          fi
+          if [ "$stray" -ne 0 ] || [ "$icons" -ne 0 ]; then
+            echo "::error::literal markdown reached the published page"
+            exit 1
+          fi
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
         with:

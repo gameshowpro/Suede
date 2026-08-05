@@ -4,9 +4,9 @@
 
 | Component | Requirement |
 |---|---|
-| OS | Debian-family Linux (Debian 12+, Raspberry Pi OS Bookworm+) |
+| OS | Debian-family Linux: Ubuntu 22.04 LTS or newer, Debian 13 (Trixie), Raspberry Pi OS Trixie |
 | Architecture | x86-64 or aarch64 |
-| Compositor | Sway 1.7 or newer (tearing control needs 1.10) |
+| Compositor | Sway 1.7 or newer, though only 1.11 has been exercised (tearing control needs 1.10). Debian 12 and Raspberry Pi OS Bookworm ship 1.7 and are out of scope for that reason |
 | Audio | PipeWire with `pipewire-pulse` |
 | Privileges | The daemon runs as the session user, in the `audio`, `video` and `render` groups; provisioning needs sudo once and arranges all of this |
 

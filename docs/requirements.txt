@@ -1,3 +1,15 @@
+# Every version is pinned, including the transitive one that caused the
+# trouble.
+#
+# Markdown was left unpinned and drifted to 3.10, which mkdocs-material
+# 9.5.49 could not cope with: superfences stopped handling ``` fences, so
+# every code block on the site rendered as prose - and a line starting `#`
+# became a heading, giving the documentation a table of contents full of
+# shell comments. `mkdocs build --strict` reported success throughout,
+# because a strict build checks links and navigation, not whether the
+# markdown still means what it says. The CI docs job now asserts that code
+# blocks actually rendered, which is the check that would have caught it.
 mkdocs==1.6.1
-mkdocs-material==9.5.49
-pymdown-extensions==10.14.3
+mkdocs-material==9.7.7
+pymdown-extensions==11.0.1
+Markdown==3.10.3

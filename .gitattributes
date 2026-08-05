@@ -1,0 +1,22 @@
+# Line endings are normalised to LF in the repository and, crucially, in the
+# working tree too.
+#
+# Without this, a checkout on Windows with core.autocrlf=true rewrites every
+# text file with CRLF. Rust and Markdown do not care. Shell scripts do: bash
+# reads `check() {\r` and reports a syntax error on a line that looks
+# perfectly correct, which is a genuinely baffling ten minutes. The same
+# files then ship inside the .deb and run on the appliance.
+#
+# `eol=lf` is deliberate rather than `text=auto`: this project's scripts are
+# executed from WSL and from Linux, never from cmd.exe, so there is nothing
+# that wants CRLF.
+* text=auto eol=lf
+
+# Binary formats, kept out of newline conversion entirely.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.deb binary
+*.woff binary
+*.woff2 binary
