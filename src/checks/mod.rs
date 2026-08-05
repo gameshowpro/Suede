@@ -744,7 +744,16 @@ impl CheckRunner {
             (
                 CheckStatus::Fail,
                 format!(
-                    "no browser installed. A snap is present ({}) but Suede                      will not use one: a snap updates itself on its own                      schedule and restarts the browser when it does, which on                      an appliance means the screens go blank in the middle of                      a show. Install one from a .deb - on Debian `apt install                      chromium`, on Ubuntu Google Chrome's own package. To use                      the snap anyway, name it:                      \"program\": \"/snap/bin/chromium\" on the application.",
+                    concat!(
+                        "no browser installed. What is here only launches a snap ({}), ",
+                        "and Suede will not use one: a snap updates itself on its own ",
+                        "schedule and restarts the browser when it does, which on an ",
+                        "appliance means the screens go blank in the middle of a show. ",
+                        "Install one from a .deb - on Debian `apt install chromium`, on ",
+                        "Ubuntu Google Chrome's own package. To use the snap anyway, ",
+                        "name it explicitly: \"program\": \"/snap/bin/chromium\" on the ",
+                        "application."
+                    ),
                     snapped.join(", ")
                 ),
             )

@@ -318,8 +318,13 @@ impl Reconciler {
             divergences.push(Divergence::new(
                 "sway_unreachable",
                 "sway",
-                "the compositor's IPC socket is not answering, so this pass                  verified nothing and the outputs below are the last ones                  seen. A compositor that restarted has a new socket path,                  which a running daemon cannot pick up: restart Suede."
-                    .to_string(),
+                concat!(
+                    "the compositor's IPC socket is not answering, so this pass ",
+                    "verified nothing and the outputs below are the last ones ",
+                    "seen. A compositor that restarted has a new socket path, ",
+                    "which a running daemon cannot pick up: restart Suede."
+                )
+                .to_string(),
             ));
         }
 
