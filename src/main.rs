@@ -80,6 +80,14 @@ struct RunArgs {
 }
 
 fn main() -> std::process::ExitCode {
+    // Anchors the stamp in the emitted file. `#[used]` alone protects it
+    // from the compiler but not from the linker's section GC, and the cross
+    // container's older toolchain discarded it that way - locally linked
+    // binaries kept it, CI's lost it, and the identity check can only grep
+    // what is actually there. An opaque use is the one thing every layer
+    // must preserve.
+    std::hint::black_box(suede::BUILD_STAMP);
+
     let cli = Cli::parse();
 
     match cli.command {

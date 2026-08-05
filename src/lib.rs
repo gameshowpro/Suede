@@ -51,7 +51,11 @@ pub const VERSION_STRING: &str = env!("SUEDE_VERSION_STRING");
 /// guaranteed for what the code actually uses: a release's id collapses to
 /// six bytes, short enough for the optimiser to materialise as
 /// store-immediates instead of data, and CI's identity check spent an evening
-/// failing against correct binaries that way. `#[used]` keeps the stamp in
-/// the emitted file despite nothing reading it.
+/// failing against correct binaries that way.
+///
+/// `#[used]` protects it from the compiler; the `black_box` in `main`
+/// protects it from the linker, whose section GC is entitled to discard even
+/// a `#[used]` static that nothing references - and the cross container's
+/// linker, unlike a desktop one, actually did.
 #[used]
 pub static BUILD_STAMP: &str = env!("SUEDE_BUILD_STAMP");
