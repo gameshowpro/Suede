@@ -35,6 +35,48 @@ sudo apt install ./suede_1.2.4-1_arm64.deb
 
 `postinst` reloads unit definitions and restarts a running instance; it never enables anything or edits a user's session. Desired state lives in `$XDG_STATE_HOME` and is untouched by package operations, so configuration survives upgrades by construction. Re-running `provision.sh` is safe but only needed when the provisioning itself changed.
 
+The package declares **no relationship to a browser**. Suede resolves whichever
+of `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
+`firefox` or `firefox-esr` it finds when it launches an app, and both
+provisioning and the `browsers` health check say plainly when there is none.
+Declaring them would claim a coupling that does not exist, and the names are
+wrong somewhere whichever list you pick: Debian has a real `chromium` package,
+Ubuntu has a transitional one that installs a snap, and `google-chrome-stable`
+is in no distribution's archive at all. As a `Recommends` it did real harm —
+apt installs those by default, so a plain install pulled snapd and a snap
+Chromium onto an appliance that already had a browser.
+
+## Testing an install honestly
+
+An installer tested on a machine that has already been installed on proves
+very little: the failures worth finding only happen the first time, and they
+hide behind whatever the last run left behind. `scripts/reset-machine.sh`
+returns a machine to the state it was in before it met Suede.
+
+```bash
+sudo ./scripts/reset-machine.sh --user hamish --dry-run   # list, change nothing
+sudo ./scripts/reset-machine.sh --user hamish
+sudo reboot                                               # see below
+```
+
+It removes the package (or a binary built and copied into place), the
+per-user configuration and state, and the changes provisioning made: the
+tty1 auto-login drop-in, its block in `~/.bash_profile`, the daemon's block
+in the sway config, and `sway-session.target`. It stops the daemon, and also
+the slicer, blend overlays and kiosk browsers, which outlive it.
+
+It deliberately leaves alone anything it cannot safely claim as its own:
+sway, PipeWire and browsers are ordinary packages that were probably wanted
+anyway; a compositor unit you wrote yourself is reported rather than deleted;
+and masked display managers stay masked unless `--restore-desktop` is passed,
+because re-enabling one on a machine already running a compositor is its own
+kind of mess. `--keep-state` preserves the desired-state document and browser
+profiles.
+
+**Reboot after resetting.** Group membership and the compositor are
+inherited from login, not re-read, so a session that has already seen Suede
+carries some of it into the next test regardless of what is on disk.
+
 ## Releasing
 
 `Cargo.toml`'s `version` is the single source of truth. On a push to `main`, CI builds both architectures, and if the version is new, tags `v{version}` and creates a GitHub release with both `.deb`s attached.

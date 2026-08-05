@@ -84,12 +84,15 @@ state without operator intervention."""
 section = "video"
 priority = "optional"
 depends = "$auto, sway, pipewire, pipewire-pulse"
-# Suggests, not Recommends: on Ubuntu `chromium` is a transitional package
-# that installs a snap, and apt installs Recommends by default - so a plain
-# `apt install ./suede.deb` pulled snapd onto an appliance that already had
-# Google Chrome. Provisioning and the browsers health check both say plainly
-# when no browser is present, which is the better place for that.
-suggests = "chromium | chromium-browser | google-chrome-stable | firefox"
+# No browser relationship at all. Suede does not link against a browser or
+# name one at build time: it resolves whichever of several binaries it finds
+# at launch, and says plainly when it finds none. Declaring them here only
+# claimed a coupling that does not exist, and cost real damage doing it - as
+# a Recommends it installed a snap Chromium on Ubuntu, where `chromium` is a
+# transitional package, onto a machine that already had a browser. The names
+# differ per distribution anyway (Debian has a real `chromium` deb and no
+# snap; `google-chrome-stable` is in no distribution's archive), so any list
+# here would be wrong somewhere.
 maintainer-scripts = "packaging"
 assets = [
     ["target/release/suede", "usr/bin/", "755"],

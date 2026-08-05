@@ -44,7 +44,7 @@ deploy this.
 | Displays | 2 × DisplayPort, including an overlapping edge-blended canvas | 3–4 outputs. The projection code is written for up to four and has only ever run on two |
 | Audio | PipeWire, WirePlumber and `pipewire-pulse`; HDMI and USB sinks | Onboard analog sinks, Bluetooth |
 | Browser | Google Chrome 151 via `chromium-kiosk` | Chromium proper. **`firefox-kiosk` has never been run at all** |
-| Install | The `.deb` installs, upgrades and removes cleanly on Ubuntu 24.04 amd64, resolving its dependencies; `provision.sh` runs and is idempotent. Both were exercised in a container | Everything in provisioning that needs systemd — enabling the user unit, `sway-session.target` — plus the firewall step, and the whole path on real hardware. The appliance it is developed against still runs a copied binary |
+| Install | The `.deb` and `provision.sh` have both been installed and run on real hardware (Ubuntu 26.04 amd64) and, in a container, upgraded, removed and reset repeatedly | The same on Debian or Raspberry Pi OS, and on aarch64 |
 | Privileges | Session user, with `audio`, `video` and `render` group membership | — |
 
 Windows and macOS are not supported and will not be: the project is
