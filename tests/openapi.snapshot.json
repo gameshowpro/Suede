@@ -1568,14 +1568,14 @@
       },
       "AudioConfig": {
         "type": "object",
-        "description": "Where an application's audio should go.",
+        "description": "Where an application's audio should go.\n\nOmitting this field entirely is the third option and a different one:\nit defers the choice to each launch, so the app follows whatever\nPipeWire's default sink is at the time. Naming a sink here locks the app\nto it however the machine's default moves.",
         "properties": {
           "output": {
             "type": [
               "string",
               "null"
             ],
-            "description": "PipeWire `node.name` of the target sink. `null` routes to silence."
+            "description": "PipeWire `node.name` of the sink to lock this app to. `null` locks it\nto silence."
           }
         }
       },

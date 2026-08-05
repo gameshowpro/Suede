@@ -410,12 +410,14 @@ window.addEventListener("error", (event) => {
       <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
       <p class="hint" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
       <p class="hint"><b>default</b> marks the sink an application gets when
-        its audio is set to &ldquo;leave untouched&rdquo; — Suede sets no
-        routing for it, so PipeWire chooses. That choice belongs to PipeWire
-        rather than to Suede, so it is shown here but cannot be changed here;
-        WirePlumber remembers it across reboots. Set it from the machine with
-        <span class="mono">wpctl set-default &lt;id&gt;</span>, or avoid the
-        question entirely by naming a sink on each application.
+        its audio is set to &ldquo;use default on each launch&rdquo;. That is
+        decided afresh every time the application starts, so an app set that
+        way follows this pill wherever it moves — plug in a headset and it
+        may move. Locking an application to a named sink pins it instead.
+        The choice belongs to PipeWire rather than to Suede, so it is shown
+        here but cannot be changed here; WirePlumber remembers it across
+        reboots. Set it from the machine with
+        <span class="mono">wpctl set-default &lt;id&gt;</span>.
         <b>silent</b> marks a sink that discards whatever reaches it.</p>
     </div>
   </section>
@@ -1485,10 +1487,14 @@ function renderSinks() {
       `${sink.isNullSink ? '<span class="pill muted">silent</span>' : ""}</td>`;
     body.appendChild(row);
   }
-  $("a-audio").innerHTML = `<option value="">Leave untouched</option>` +
-    `<option value="__null__">Silent (null sink)</option>` +
+  // The two real choices are "decide at launch" and "decide now", so the
+  // options say which one they are rather than describing what Suede does
+  // internally. "Lock" is the honest word: naming a sink pins the app to it
+  // whatever the machine's default becomes later.
+  $("a-audio").innerHTML = `<option value="">Use default on each launch</option>` +
+    `<option value="__null__">Lock to silence</option>` +
     sinks.filter((s) => !s.isNullSink)
-      .map((s) => `<option value="${escape(s.id)}">${escape(s.description ?? s.id)}</option>`).join("");
+      .map((s) => `<option value="${escape(s.id)}">Lock to ${escape(s.description ?? s.id)}</option>`).join("");
 }
 
 function renderOutputChoices() {

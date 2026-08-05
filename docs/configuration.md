@@ -415,9 +415,14 @@ The `audio` field distinguishes three cases, and the distinction is deliberate:
 
 | Value | Meaning |
 |---|---|
-| absent | Do not touch routing; the app uses the default sink |
-| `{"output": "alsa_output.…"}` | Route to that sink, by PipeWire `node.name` |
-| `{"output": null}` | Route to Suede's null sink — the app plays silently |
+| absent | Use whatever PipeWire's default sink is **at each launch** |
+| `{"output": "alsa_output.…"}` | Lock to that sink, by PipeWire `node.name` |
+| `{"output": null}` | Lock to silence — Suede's null sink discards the audio |
+
+The first is a decision deferred, not a decision recorded. An app with no
+`audio` field follows the machine's default sink wherever it goes, and the
+default can move on its own — plugging in a USB headset is enough for
+WirePlumber to promote it. Naming a sink pins the app to it regardless.
 
 Get the available identifiers from `GET /api/v1/audio/outputs`. Changing an app's sink relaunches it, because routing is applied at launch through `PULSE_SINK`.
 

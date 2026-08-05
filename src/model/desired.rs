@@ -845,10 +845,16 @@ impl RestartPolicy {
 }
 
 /// Where an application's audio should go.
+///
+/// Omitting this field entirely is the third option and a different one:
+/// it defers the choice to each launch, so the app follows whatever
+/// PipeWire's default sink is at the time. Naming a sink here locks the app
+/// to it however the machine's default moves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AudioConfig {
-    /// PipeWire `node.name` of the target sink. `null` routes to silence.
+    /// PipeWire `node.name` of the sink to lock this app to. `null` locks it
+    /// to silence.
     pub output: Option<String>,
 }
 
