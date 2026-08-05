@@ -50,14 +50,29 @@ Chromium onto an appliance that already had a browser.
 
 An installer tested on a machine that has already been installed on proves
 very little: the failures worth finding only happen the first time, and they
-hide behind whatever the last run left behind. `scripts/reset-machine.sh`
-returns a machine to the state it was in before it met Suede.
+hide behind whatever the last run left behind. `reset-machine.sh` returns a
+machine to the state it was in before it met Suede.
+
+It ships in the package, next to `provision.sh`, so an appliance already has
+it and there is nothing to copy over:
 
 ```bash
-sudo ./scripts/reset-machine.sh --user hamish --dry-run   # list, change nothing
-sudo ./scripts/reset-machine.sh --user hamish
-sudo reboot                                               # see below
+sudo /usr/share/suede/reset-machine.sh --user hamish --dry-run  # change nothing
+sudo /usr/share/suede/reset-machine.sh --user hamish
+sudo reboot                                                     # see below
 ```
+
+From a checkout — on a machine where the package was never installed, or to
+run a version newer than the installed one — it is `packaging/reset-machine.sh`
+relative to the repository root:
+
+```bash
+sudo packaging/reset-machine.sh --user hamish --dry-run
+```
+
+Running the installed copy removes the package underneath itself, which is
+fine: the shell holds the file open and reads it to the end regardless of the
+directory entry disappearing. That is verified rather than assumed.
 
 It removes the package (or a binary built and copied into place), the
 per-user configuration and state, and the changes provisioning made: the

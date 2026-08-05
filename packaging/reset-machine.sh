@@ -7,7 +7,8 @@
 # very little: the interesting failures are the ones that only happen the
 # first time, and they hide behind whatever the last run left lying around.
 #
-#   sudo ./reset-machine.sh --user NAME [options]
+#   sudo /usr/share/suede/reset-machine.sh --user NAME [options]   (installed)
+#   sudo packaging/reset-machine.sh --user NAME [options]          (checkout)
 #
 #   --user NAME      the appliance user (default: $SUDO_USER)
 #   --dry-run        list what would be removed and change nothing

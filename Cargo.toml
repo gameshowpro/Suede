@@ -98,6 +98,7 @@ assets = [
     ["target/release/suede", "usr/bin/", "755"],
     ["packaging/suede.service", "usr/lib/systemd/user/", "644"],
     ["packaging/provision.sh", "usr/share/suede/", "755"],
+    ["packaging/reset-machine.sh", "usr/share/suede/", "755"],
     ["README.md", "usr/share/doc/suede/README.md", "644"],
     ["docs/examples/suede.toml", "usr/share/doc/suede/examples/suede.toml", "644"],
     ["docs/examples/four-output-appliance.json", "usr/share/doc/suede/examples/four-output-appliance.json", "644"],
