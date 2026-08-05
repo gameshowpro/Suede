@@ -57,7 +57,11 @@ fn main() {
             } else {
                 "absent"
             },
-            if untracked_visible { "exists" } else { "absent" },
+            if untracked_visible {
+                "exists"
+            } else {
+                "absent"
+            },
             manifest.display(),
         );
     }
