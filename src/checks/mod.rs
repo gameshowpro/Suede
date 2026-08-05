@@ -6,9 +6,11 @@
 
 pub mod config_block;
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::audio::AudioMonitor;
 use crate::config::BootstrapConfig;
@@ -214,6 +216,17 @@ pub struct CheckRunner {
     ///
     /// [`note_client`]: CheckRunner::note_client
     last_remote_client: RwLock<Option<std::net::IpAddr>>,
+    /// Versions from browser probes that succeeded, keyed by path and mtime.
+    ///
+    /// The probe races whatever else the machine is doing, and a `--version`
+    /// that took over five seconds under load says nothing about the binary.
+    /// Without this memory a busy appliance flapped the browsers check
+    /// between pass and fail, republishing to every client each time - and
+    /// the same race failed CI whenever the runner was slow at the wrong
+    /// moment. The mtime keys the answer to the exact file that gave it, so
+    /// an upgraded browser is probed afresh rather than credited with its
+    /// predecessor's health.
+    probed_versions: RwLock<HashMap<PathBuf, (SystemTime, String)>>,
 }
 
 impl CheckRunner {
@@ -232,6 +245,7 @@ impl CheckRunner {
             events,
             results: RwLock::new(Vec::new()),
             last_remote_client: RwLock::new(None),
+            probed_versions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -686,15 +700,43 @@ impl CheckRunner {
                 continue;
             };
             let program = found.display().to_string();
+            let mtime = std::fs::metadata(&found).and_then(|m| m.modified()).ok();
             match run(&program, &["--version"]).await {
                 Ok(output) if output.success => {
-                    working.push(format!("{program} ({})", first_line(&output.stdout)))
+                    let version = first_line(&output.stdout);
+                    if let Some(mtime) = mtime {
+                        self.probed_versions
+                            .write()
+                            .unwrap()
+                            .insert(found.clone(), (mtime, version.clone()));
+                    }
+                    working.push(format!("{program} ({version})"))
                 }
                 Ok(output) => broken.push(format!(
                     "{program} exited {}: {}",
                     output.code.unwrap_or(-1),
                     first_line(&output.stderr)
                 )),
+                // A timeout is a fact about load, not about the binary: the
+                // probe races whatever else the machine is doing. If this
+                // exact file answered before, believe that answer. An actual
+                // failure - wrong exit, missing library - is still reported,
+                // because a browser saying "no" is evidence; a busy machine
+                // saying nothing is not.
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    let remembered = mtime.and_then(|now| {
+                        self.probed_versions
+                            .read()
+                            .unwrap()
+                            .get(&found)
+                            .filter(|(seen, _)| *seen == now)
+                            .map(|(_, version)| version.clone())
+                    });
+                    match remembered {
+                        Some(version) => working.push(format!("{program} ({version})")),
+                        None => broken.push(format!("{program} could not be run: {error}")),
+                    }
+                }
                 Err(error) => broken.push(format!("{program} could not be run: {error}")),
             }
         }
@@ -1554,8 +1596,18 @@ mod tests {
         let runner = runner(dir.path().to_path_buf());
         let mut receiver = runner.events.subscribe();
 
-        let first = runner.run_all().await;
+        runner.run_all().await;
         assert!(receiver.try_recv().is_ok(), "first run should publish");
+
+        // One settling run before demanding silence. The first pass probes
+        // real programs on a possibly loaded machine, and a probe that raced
+        // the load may answer differently once - CI hit exactly that, with
+        // chromium timing out on the first run and answering on the second.
+        // That flip is a legitimate publish; what may never happen is a
+        // THIRD answer, because from a settled state an unchanged machine
+        // must stay quiet.
+        let first = runner.run_all().await;
+        while receiver.try_recv().is_ok() {}
 
         let second = runner.run_all().await;
         if receiver.try_recv().is_ok() {
