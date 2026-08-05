@@ -45,6 +45,11 @@ jobs:
               - 'scripts/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              # A change to how the application is built and packaged has to
+              # run that build, or the only way to test a workflow edit is to
+              # push an unrelated source change alongside it. The docs filter
+              # already listed this file for the same reason.
+              - '.github/workflows/ci.yml'
             docs:
               - 'docs/**'
               - 'mkdocs.yml'
