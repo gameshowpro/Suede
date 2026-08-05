@@ -266,4 +266,12 @@ else
   echo "  Reboot before testing an install, so no part of the old session"
   echo "  survives into the new one - group membership and the compositor in"
   echo "  particular are inherited from login, not re-read."
+  # Telling somebody to reboot while the package they are about to install
+  # sits on a RAM-backed filesystem is a good way to waste their next ten
+  # minutes.
+  if [[ "$(findmnt -no FSTYPE /tmp 2>/dev/null)" == "tmpfs" ]]; then
+    echo
+    echo "  /tmp on this machine is tmpfs, so it is emptied by that reboot."
+    echo "  Move the package you are about to install somewhere else first."
+  fi
 fi
