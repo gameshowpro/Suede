@@ -4,9 +4,9 @@
 //! them is asynchronous, because reconciliation may take seconds or be
 //! currently impossible; `?wait=<seconds>` opts into blocking until it settles.
 
+use crate::api::json::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::Json;
 use serde::Deserialize;
 use utoipa::IntoParams;
 
@@ -499,7 +499,7 @@ mod tests {
     const OUTPUT: &str = r#"{"match":{"name":"HDMI-A-1"},"enable":true,
         "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":0,"y":0}}"#;
 
-    const APP: &str = r#"{"id":"renderer-1","enabled":true,
+    const APP: &str = r#"{"id":"renderer-1",
         "launcher":{"kind":"chromium-kiosk","uri":"http://example.com"}}"#;
 
     #[tokio::test]
@@ -544,6 +544,39 @@ mod tests {
         let (status, body) = call(&harness, "PUT", "/api/v1/config", Some(&document)).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(body["detail"].as_str().unwrap().contains("not unique"));
+    }
+
+    #[tokio::test]
+    async fn a_field_suede_does_not_know_is_refused_not_ignored() {
+        let harness = harness(None);
+        // The shape apps had before one active app covered the whole canvas.
+        // Silently ignoring it is the worst outcome: the write succeeds and
+        // the appliance runs nothing, with nothing to say why.
+        let stale = r#"{"apps":[{"id":"renderer-1","enabled":true,"output":{"name":"HDMI-A-1"},
+            "launcher":{"kind":"chromium-kiosk","uri":"http://example.com"}}]}"#;
+        let (status, body) = call(&harness, "PUT", "/api/v1/config", Some(stale)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        let detail = body.to_string();
+        assert!(
+            detail.contains("enabled"),
+            "the message must name the field: {detail}"
+        );
+        assert!(harness.state.store.get().apps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_typo_in_a_settings_key_is_refused() {
+        let harness = harness(None);
+        // hideCursor mistyped. Dropping it silently would leave a pointer on
+        // screen with the configuration insisting it had been hidden.
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(r#"{"settings":{"hideCursors":true}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

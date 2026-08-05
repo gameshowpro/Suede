@@ -4,6 +4,7 @@ pub mod apps;
 pub mod config_routes;
 pub mod docs;
 pub mod events;
+pub mod json;
 pub mod observed;
 pub mod ui;
 pub mod wallpapers;

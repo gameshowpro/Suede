@@ -1470,7 +1470,8 @@
           "restart": {
             "$ref": "#/components/schemas/RestartPolicy"
           }
-        }
+        },
+        "additionalProperties": false
       },
       "AppState": {
         "type": "string",
@@ -1577,7 +1578,8 @@
             ],
             "description": "PipeWire `node.name` of the sink to lock this app to. `null` locks it\nto silence."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "AudioSink": {
         "type": "object",
@@ -1834,7 +1836,8 @@
               "outputPollIntervalSeconds": 5
             }
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Divergence": {
         "type": "object",
@@ -1904,7 +1907,8 @@
             "description": "Silence tolerated once armed, before the app is killed and relaunched.",
             "minimum": 0
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Launcher": {
         "oneOf": [
@@ -2177,7 +2181,8 @@
               }
             ]
           }
-        }
+        },
+        "additionalProperties": false
       },
       "OutputMatch": {
         "type": "object",
@@ -2211,7 +2216,8 @@
             ],
             "description": "EDID serial."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "PackageVersion": {
         "type": "object",
@@ -2329,7 +2335,8 @@
             ],
             "default": null
           }
-        }
+        },
+        "additionalProperties": false
       },
       "ReadinessConfig": {
         "type": "object",
@@ -2372,7 +2379,8 @@
             "type": "string",
             "description": "URL to poll. Only `http://` is supported."
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Rect": {
         "type": "object",
@@ -2424,7 +2432,8 @@
           "policy": {
             "$ref": "#/components/schemas/RestartPolicyKind"
           }
-        }
+        },
+        "additionalProperties": false
       },
       "RestartPolicyKind": {
         "type": "string",
@@ -2469,7 +2478,8 @@
             "description": "Backstop poll interval for output changes.",
             "minimum": 0
           }
-        }
+        },
+        "additionalProperties": false
       },
       "Status": {
         "type": "object",

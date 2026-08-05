@@ -1,10 +1,10 @@
 //! Wallpaper upload and retrieval.
 
+use crate::api::json::Json;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};

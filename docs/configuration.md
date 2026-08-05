@@ -239,10 +239,13 @@ window manager.
     fullscreen. The active one always covers the whole canvas, and which one
     that is comes from `activeApp`. Placement is Suede's job, and it changes
     depending on whether the layout overlaps — see
-    [projection](#projection-edge-blending). Documents written for an earlier
-    version may carry `enabled`, `output`, `fullscreen` or `spanOutputs` on an
-    app; those fields are ignored, not rejected, so check `activeApp` if
-    nothing launches.
+    [projection](#projection-edge-blending).
+
+!!! info "Unknown fields are refused"
+    A write naming a field Suede does not recognise is rejected outright
+    rather than partly applied. A typo in a key is otherwise invisible: the
+    write succeeds, the setting is silently dropped, and the appliance
+    quietly does something other than what was asked.
 
 #### Driving a multi-display installation
 

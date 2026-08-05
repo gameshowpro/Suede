@@ -10,7 +10,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// The complete desired-state document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct DesiredState {
     /// Document schema version, managed by Suede.
     pub schema_version: u32,
@@ -64,7 +64,7 @@ pub struct DesiredState {
 /// projector's configured rectangle, duplicating the intersections and
 /// fading them from both sides when `blend` is on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct ProjectionConfig {
     /// Master switch. `false` keeps the configuration but skips the entire
     /// blending chain: no overlays run, nothing is spawned, no divergences.
@@ -379,7 +379,7 @@ impl DesiredState {
 
 /// Rule selecting which physical output a config entry applies to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputMatch {
     /// Connector name, e.g. `HDMI-A-1`. The default and most direct way to match.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -500,7 +500,7 @@ impl Transform {
 
 /// Desired configuration for one output.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputConfig {
     /// Which physical output this entry applies to.
     pub r#match: OutputMatch,
@@ -684,7 +684,7 @@ impl BackgroundRef {
 /// error page and stays there, since nothing reloads it. Gating the launch on
 /// the service answering removes that race entirely.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadinessConfig {
     /// URL to poll. Only `http://` is supported.
     pub url: String,
@@ -808,7 +808,7 @@ pub enum RestartPolicyKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RestartPolicy {
     pub policy: RestartPolicyKind,
     /// Initial delay before relaunching.
@@ -851,7 +851,7 @@ impl RestartPolicy {
 /// PipeWire's default sink is at the time. Naming a sink here locks the app
 /// to it however the machine's default moves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioConfig {
     /// PipeWire `node.name` of the sink to lock this app to. `null` locks it
     /// to silence.
@@ -860,7 +860,7 @@ pub struct AudioConfig {
 
 /// Content-level watchdog settings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct HeartbeatConfig {
     pub enabled: bool,
     /// Silence tolerated once armed, before the app is killed and relaunched.
@@ -883,7 +883,7 @@ impl Default for HeartbeatConfig {
 
 /// A managed application: a launch specification, not a window.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AppConfig {
     /// Client-chosen, unique, stable identifier.
     pub id: String,
@@ -949,7 +949,7 @@ impl AppConfig {
 
 /// Daemon-level settings that belong to desired state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Settings {
     /// Hide the pointer and park it beyond the layout.
     pub hide_cursor: bool,

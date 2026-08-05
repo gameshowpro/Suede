@@ -1,7 +1,7 @@
 //! Read-only endpoints, plus the imperative escape hatches.
 
+use crate::api::json::Json;
 use axum::extract::{Path, State};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
