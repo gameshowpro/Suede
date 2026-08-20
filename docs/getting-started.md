@@ -6,25 +6,24 @@
 |---|---|
 | OS | Debian-family Linux: Ubuntu 22.04 LTS or newer, Debian 13 (Trixie), Raspberry Pi OS Trixie |
 | Architecture | x86-64 or aarch64 |
-| Compositor | Sway 1.7 or newer, though only 1.11 has been exercised (tearing control needs 1.10). Debian 12 and Raspberry Pi OS Bookworm ship 1.7 and are out of scope for that reason |
+| Compositor | Sway 1.7 or newer, though only 1.10 and 1.11 have been exercised (tearing control needs 1.10). Debian 12 and Raspberry Pi OS Bookworm ship 1.7 and are out of scope for that reason |
 | Audio | PipeWire with `pipewire-pulse` |
 | Privileges | The daemon runs as the session user, in the `audio`, `video` and `render` groups; provisioning needs sudo once and arranges all of this |
 
 !!! warning "What has actually been tested"
-    That table is what Suede is *built* for. What it has been *run* on is one
-    machine: Ubuntu 26.04 on x86-64, Sway 1.11, an NVIDIA GPU with the
-    proprietary driver, two DisplayPort outputs, and Chromium.
+    That table is what Suede is *built* for. What it has been *run* on is two
+    machines. Ubuntu 26.04 on x86-64 — Sway 1.11, an NVIDIA GPU with the
+    proprietary driver, two DisplayPort outputs, Chromium — where the package
+    and the provisioning script have been installed from nothing, upgraded in
+    place, and reset back to nothing again. And a Debian 13 (Trixie) x86-64
+    testbench — Sway 1.10.1, also NVIDIA proprietary, Chromium — provisioned
+    from a fresh headless install. The aarch64 package installs and runs
+    under emulation.
 
-    Since then the package and this provisioning script have both been
-    installed and run on that machine from nothing, upgraded in place, and
-    reset back to nothing again. The aarch64 package installs and runs under
-    emulation.
-
-    Not yet exercised anywhere: real aarch64 or Raspberry Pi hardware, Debian
-    itself, Sway older than 1.11, more than two displays, and the
-    `firefox-kiosk` launcher. None of that is expected to be broken; none of
-    it is known to work. Reports from any of those are the most useful thing
-    you could send.
+    Not yet exercised anywhere: real aarch64 or Raspberry Pi hardware, Sway
+    older than 1.10, more than two displays, and the `firefox-kiosk`
+    launcher. None of that is expected to be broken; none of it is known to
+    work. Reports from any of those are the most useful thing you could send.
 
 ## Install
 
@@ -36,7 +35,7 @@
     sudo apt install ./suede_*_arm64.deb
     ```
 
-    `apt` pulls in `sway`, `pipewire`, and `pipewire-pulse` automatically. It does **not** pull in a browser: the package declares no relationship to one, because Suede resolves whichever it finds at launch rather than linking against any. Install one yourself.
+    `apt` pulls in `sway`, `swayidle`, `pipewire`, and `pipewire-pulse` automatically. It does **not** pull in a browser: the package declares no relationship to one, because Suede resolves whichever it finds at launch rather than linking against any. Install one yourself.
 
     ```bash
     sudo apt install chromium        # Debian, Raspberry Pi OS

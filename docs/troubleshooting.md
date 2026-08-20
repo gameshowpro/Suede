@@ -43,6 +43,28 @@ If the service is not running at all, the unit is probably not enabled — that 
 
 Remember the unit is a **user** service, tied to the session. `sudo systemctl status suede` will not find it.
 
+### Enabling the unit fails with "Unit ... does not exist" {: #enable-unit-does-not-exist }
+
+```
+Failed to enable unit: Unit /home/you/.config/systemd/user/sway-session.target.wants/suede.service does not exist
+```
+
+The message (systemd 257, as shipped by Debian 13) is misleading: the unit is
+not missing, the enablement symlink could not be **created** — because
+`~/.config` itself is owned by root, so the user's systemd manager cannot make
+`~/.config/systemd` inside it. A headless machine gets into that state
+easily: no desktop session has ever run, so `~/.config` does not exist until
+the first root-run tool — an editor under sudo, a hand-run `install -d` —
+creates it, owned by root.
+
+```bash
+stat -c '%U' ~/.config          # must print your user, not root
+sudo chown "$USER:$USER" ~/.config
+systemctl --user enable suede.service
+```
+
+Provisioning checks for this and repairs it, whatever created the situation.
+
 ## "no sway IPC socket found"
 
 Suede runs inside the Sway session and finds the socket through `$SWAYSOCK`, `$XDG_RUNTIME_DIR`, or `/run/user/*`. It waits for the socket rather than failing, so this usually means Sway is not running, or the service is running outside the session.

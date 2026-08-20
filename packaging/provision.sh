@@ -54,8 +54,12 @@ step "Provisioning for user '$APPLIANCE_USER' (home: $USER_HOME)"
 
 # --- 1. Packages --------------------------------------------------------
 step "Checking required packages"
+# swayidle is listed because the sway config this script writes relies on it
+# to keep displays from blanking. Ubuntu's sway ends up shipping it anyway,
+# but Debian's only *Suggests* it, so a trixie appliance ran with the
+# `exec_always swayidle` line failing silently.
 MISSING=()
-for package in sway pipewire pipewire-pulse; do
+for package in sway swayidle pipewire pipewire-pulse; do
   dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q "ok installed" || MISSING+=("$package")
 done
 if ((${#MISSING[@]})); then
@@ -187,6 +191,23 @@ fi
 
 # --- 4. Sway configuration ----------------------------------------------
 step "Preparing the sway configuration"
+
+# `install -d` applies ownership only to the directories named on the command
+# line; parents it creates on the way stay root-owned. On a machine where no
+# desktop session has ever run (a headless Debian install administered over
+# SSH), $USER_HOME/.config does not exist yet, so creating the sway directory
+# in one step would leave ~/.config itself owned by root. The user's systemd
+# manager then cannot create ~/.config/systemd, and `systemctl --user enable`
+# fails — with the misleading message "Unit ... does not exist" on systemd
+# 257. Create the parent explicitly, and repair a wrong owner however it got
+# there: the first root-run tool to touch a home directory tends to leave one
+# behind, long before this script is involved.
+if [[ ! -d "$USER_HOME/.config" ]]; then
+  install -d -o "$APPLIANCE_USER" -g "$APPLIANCE_USER" "$USER_HOME/.config"
+elif [[ "$(stat -c %U "$USER_HOME/.config")" != "$APPLIANCE_USER" ]]; then
+  echo "  repairing ownership of $USER_HOME/.config (was $(stat -c %U "$USER_HOME/.config"))"
+  chown "$APPLIANCE_USER:$APPLIANCE_USER" "$USER_HOME/.config"
+fi
 SWAY_DIR="$USER_HOME/.config/sway"
 install -d -o "$APPLIANCE_USER" -g "$APPLIANCE_USER" "$SWAY_DIR"
 SWAY_CONFIG="$SWAY_DIR/config"
@@ -243,9 +264,25 @@ step "Enabling the suede user service"
 loginctl enable-linger "$APPLIANCE_USER" >/dev/null 2>&1 || true
 systemctl daemon-reload
 if [[ -f /usr/lib/systemd/user/suede.service ]]; then
-  runuser -l "$APPLIANCE_USER" -c \
-    "XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user enable suede.service" >/dev/null 2>&1 \
-    || echo "NOTE: enable suede.service after the next login (systemctl --user enable suede.service)"
+  # Show the outcome rather than swallowing it: a service that never got
+  # enabled is invisible until the web UI cannot be reached.
+  if ENABLE_OUT="$(runuser -l "$APPLIANCE_USER" -c \
+      "XDG_RUNTIME_DIR=/run/user/$USER_UID systemctl --user enable suede.service" 2>&1)"; then
+    echo "  suede.service enabled"
+  else
+    echo "  systemctl --user enable failed: ${ENABLE_OUT}"
+    echo "  creating the enablement symlink directly instead"
+    # Exactly what `enable` would have done: link the unit into the target
+    # named by its [Install] section. Done as the user, so every directory
+    # created on the way is owned by the user — and it needs no running user
+    # manager, so it also covers provisioning from a root console before the
+    # appliance user has ever logged in.
+    runuser -u "$APPLIANCE_USER" -- \
+      mkdir -p "$USER_HOME/.config/systemd/user/sway-session.target.wants"
+    runuser -u "$APPLIANCE_USER" -- \
+      ln -sfn /usr/lib/systemd/user/suede.service \
+      "$USER_HOME/.config/systemd/user/sway-session.target.wants/suede.service"
+  fi
 else
   echo "NOTE: /usr/lib/systemd/user/suede.service is missing — install the .deb first."
 fi

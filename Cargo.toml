@@ -83,7 +83,9 @@ that configuration so the machine boots straight back into its configured \
 state without operator intervention."""
 section = "video"
 priority = "optional"
-depends = "$auto, sway, pipewire, pipewire-pulse"
+# swayidle: the daemon never runs it, but the sway config provisioning writes
+# relies on it to keep displays awake, and Debian's sway only Suggests it.
+depends = "$auto, sway, swayidle, pipewire, pipewire-pulse"
 # No browser relationship at all. Suede does not link against a browser or
 # name one at build time: it resolves whichever of several binaries it finds
 # at launch, and says plainly when it finds none. Declaring them here only
