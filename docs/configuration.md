@@ -567,13 +567,38 @@ Slicing engages whenever the configured layout overlaps, with or without
 this section; the section adds the blending. A full overlap (a stacked
 projector, a mirror) is duplicated at full strength and never ramped.
 
+!!! info "`testPattern` needs no overlaps"
+    It is the one field here that is not about blending. Patterns are drawn
+    per output in global layout coordinates, so they work on any layout at
+    all — including a single display with nothing else configured. That is
+    why the web UI puts the control with the **Layout**, not with these
+    settings: the grid labels every tile with its output name and global
+    coordinates, which makes it the quickest answer to "is this display
+    live, which connector is it, and is the whole frame in view". The UI
+    shows it as an uncommitted preview and never saves it; an API client
+    that writes it with `committed: true` gets a machine that boots into a
+    test pattern, which is rarely what anyone wants.
+
 **Blending is a ramp in light, not in signal.** A display raises its input
 signal to a power (its gamma, typically 2.2), so a gradient linear in signal
 leaves a bright band at every seam. Ramps are shaped as `ramp^(1/gamma)`.
 
 **Black-level compensation.** Projector black is not zero light, so seams
-glow on dark scenes. The seam cannot be darkened, so `blackLift` brightens
-everything else to match: `out = lift + (1 - lift) * in` outside the seams.
+glow on dark scenes. The extra light cannot be removed, so `blackLift`
+brightens everything else to match: `out = lift + (1 - lift) * in`. That is a
+linear remap of the *whole* range — black rises to `lift`, white stays white,
+and the contrast lost is spread across the palette rather than clipped off
+the top.
+
+Set it to the lift that adds **one projector's** worth of black; Suede scales
+it to each region. A point lit by `n` projectors sits at `n` times one
+projector's black, so with `N` the most projectors covering any point of the
+layout, each of the `n` applies `lift × (N − n) / n` — the shortfall, shared
+between the projectors that light it. Two projectors give the familiar rule
+(full lift outside the seam, none inside). A 2×2 grid has three floors, and
+all three are matched: the four-way centre gets nothing, the two-way seams
+`lift`, and single-covered regions `3 × lift`.
+
 Show the `black` test pattern and raise it until the projected image is even.
 
 Canvas mode requires sway's headless backend

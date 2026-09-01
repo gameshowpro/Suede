@@ -39,7 +39,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-use super::blend::{pixel_transfer, OverlaySpec, SlicerSpec};
+use super::blend::{pixel_transfer, Coverage, OverlaySpec, SlicerSpec};
 
 /// Consecutive capture failures tolerated before giving up. The daemon
 /// respawns the slicer on its next pass, which is the retry policy.
@@ -196,6 +196,11 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             return Ok(());
         }
     }
+    // How much black each region of the canvas is receiving. Derived from
+    // every slice, because how much a projector must lift depends on how many
+    // *others* light the same pixel — a four-way grid centre needs none while
+    // its two-way seams still do.
+    let coverage = Coverage::new(spec.slices.iter().map(|slice| slice.source));
     for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
         let (width, height) = presenter.configured.unwrap();
         for _ in 0..2 {
@@ -208,13 +213,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         let mut transfer = Vec::with_capacity(width as usize * height as usize);
         for y in 0..height as i32 {
             for x in 0..width as i32 {
-                transfer.push(pixel_transfer(
-                    &slice.ramps,
-                    spec.gamma,
+                // Coverage is a property of the canvas, so the slice-local
+                // pixel is looked up at its place in the layout.
+                let lift = coverage.lift(
                     spec.black_lift,
-                    x,
-                    y,
-                ));
+                    f64::from(slice.source.x + x) + 0.5,
+                    f64::from(slice.source.y + y) + 0.5,
+                );
+                transfer.push(pixel_transfer(&slice.ramps, spec.gamma, lift, x, y));
             }
         }
         presenter.transfer = transfer;

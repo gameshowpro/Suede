@@ -54,8 +54,10 @@ pub struct OverlaySpec {
     pub output: String,
     /// Shapes the ramps' fall-off; see [`crate::model::ProjectionConfig`].
     pub gamma: f64,
-    /// Signal lift applied *outside* the seams, compensating for the doubled
-    /// projector black inside them. `0.0` is off.
+    /// The configured black-level compensation, carried so a change to it
+    /// repaints the overlay. It is not *applied* here: these overlays run
+    /// only where nothing overlaps, so there is no raised black floor to
+    /// match. The canvas path resolves it per pixel through [`Coverage`].
     #[serde(default)]
     pub black_lift: f64,
     /// This output's rectangle in the global layout, so patterns can draw in
@@ -277,32 +279,109 @@ pub fn canvas_plan(
     })
 }
 
+/// How many projectors light each point of the canvas.
+///
+/// Projector black is additive and cannot be subtracted: a region lit by `n`
+/// projectors sits at `n` times one projector's black floor, so the only way
+/// to make an installation *look* even is to raise everywhere else to meet
+/// its worst spot. That makes the shortfall a function of coverage, and
+/// coverage a function of the whole layout — which is why this is derived
+/// from every slice's rectangle rather than from one projector's seams.
+///
+/// A plain two-projector blend has coverage 1 and 2 only, and reduces to the
+/// original rule exactly: lift outside the seam, none inside it. A 2×2 grid
+/// has three regimes — 1, 2 and 4 — and needs all three.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Coverage {
+    rects: Vec<Rect>,
+    max: u32,
+}
+
+fn covering(rects: &[Rect], x: f64, y: f64) -> u32 {
+    rects
+        .iter()
+        .filter(|r| {
+            x >= r.x as f64
+                && x < (r.x + r.width) as f64
+                && y >= r.y as f64
+                && y < (r.y + r.height) as f64
+        })
+        .count() as u32
+}
+
+impl Coverage {
+    /// Every projector's rectangle, in one shared coordinate space.
+    pub fn new(rects: impl IntoIterator<Item = Rect>) -> Self {
+        let rects: Vec<Rect> = rects
+            .into_iter()
+            .filter(|r| r.width > 0 && r.height > 0)
+            .collect();
+        // Coverage only changes where a rectangle begins or ends, so the
+        // true maximum is found by sampling the centre of every cell of the
+        // grid those edges induce — a few dozen probes, not megapixels.
+        let mut xs: Vec<i32> = rects.iter().flat_map(|r| [r.x, r.x + r.width]).collect();
+        let mut ys: Vec<i32> = rects.iter().flat_map(|r| [r.y, r.y + r.height]).collect();
+        xs.sort_unstable();
+        xs.dedup();
+        ys.sort_unstable();
+        ys.dedup();
+        let mut max = 0;
+        for xw in xs.windows(2) {
+            for yw in ys.windows(2) {
+                let x = f64::from(xw[0] + xw[1]) / 2.0;
+                let y = f64::from(yw[0] + yw[1]) / 2.0;
+                max = max.max(covering(&rects, x, y));
+            }
+        }
+        Self { rects, max }
+    }
+
+    /// The highest coverage anywhere — the black floor everything must match.
+    pub fn max(&self) -> u32 {
+        self.max
+    }
+
+    /// How many projectors light this point.
+    pub fn at(&self, x: f64, y: f64) -> u32 {
+        covering(&self.rects, x, y)
+    }
+
+    /// The lift *one* projector applies at this point.
+    ///
+    /// `black_lift` is calibrated as the lift that adds one projector's worth
+    /// of black, so a point short by `max − n` projectors needs that much
+    /// added — divided by `n`, because every projector lighting the point
+    /// applies the overlay and their contributions add just as their black
+    /// does. At full coverage the shortfall is zero and nothing is applied.
+    pub fn lift(&self, black_lift: f64, x: f64, y: f64) -> f64 {
+        let n = self.at(x, y);
+        if n == 0 || n >= self.max {
+            return 0.0;
+        }
+        (black_lift.clamp(0.0, 1.0) * f64::from(self.max - n) / f64::from(n)).clamp(0.0, 1.0)
+    }
+}
+
 /// The signal transfer for one pixel of a slice, as fixed-point `(a, b)`
 /// where `out = (a·in) >> 8 + b`.
 ///
 /// Combines the gamma-shaped ramps (inside seams, multiplied where they
-/// overlap at grid corners) with the black-level rescale (outside), so the
-/// slicer applies one table in one pass.
-pub fn pixel_transfer(
-    ramps: &[RampSpec],
-    gamma: f64,
-    black_lift: f64,
-    x: i32,
-    y: i32,
-) -> (u16, u8) {
-    match ramps_attenuation(ramps, x as f64 + 0.5, y as f64 + 0.5) {
-        Some(transmitted) => {
-            let multiplier = transmitted.clamp(0.0, 1.0).powf(1.0 / gamma);
-            ((multiplier * 256.0).round() as u16, 0)
-        }
-        None => {
-            let lift = black_lift.clamp(0.0, 1.0);
-            (
-                ((1.0 - lift) * 256.0).round() as u16,
-                (lift * 255.0).round() as u8,
-            )
-        }
-    }
+/// overlap at grid corners) with the black-level rescale, so the slicer
+/// applies one table in one pass.
+///
+/// `lift` is the lift *resolved for this pixel* — [`Coverage::lift`] — not
+/// the configured `blackLift`. The two effects are independent: in a grid, a
+/// two-projector seam is both inside a ramp and short of the four-projector
+/// centre's black, so it needs a ramp *and* a lift. Only in the plain
+/// two-projector case do they never coincide.
+pub fn pixel_transfer(ramps: &[RampSpec], gamma: f64, lift: f64, x: i32, y: i32) -> (u16, u8) {
+    let transmitted = ramps_attenuation(ramps, x as f64 + 0.5, y as f64 + 0.5)
+        .map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
+    let lift = lift.clamp(0.0, 1.0);
+    (
+        ((1.0 - lift) * transmitted * 256.0).round() as u16,
+        (lift * 255.0).round() as u8,
+    )
 }
 
 enum Axis {
@@ -397,10 +476,13 @@ pub fn alpha_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
 
 /// The complete overlay image: premultiplied BGRA bytes, row-major.
 ///
-/// Seam pixels are black at the ramp alpha. Everything else is white at
-/// `blackLift` alpha, which composites to `out = lift + (1−lift)·content` —
-/// the standard black-level rescale — matching the un-doubled regions to the
-/// seams' doubled projector black. Lift zero leaves them fully transparent.
+/// Seam pixels are black at the ramp alpha; everything else is transparent.
+///
+/// These overlays are the *no-canvas* path, which the reconciler runs only
+/// when nothing in the layout overlaps. Every pixel is therefore lit by
+/// exactly one projector, no region sits at a doubled black floor, and the
+/// black-level lift is zero by construction — see [`Coverage`], which is
+/// what resolves it wherever seams do exist.
 pub fn pixel_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     match spec.pattern {
         None => transparent_map(width, height, spec),
@@ -410,47 +492,40 @@ pub fn pixel_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
 
 /// The normal overlay: content shows through except in the seams.
 fn transparent_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
-    let lift = (spec.black_lift.clamp(0.0, 1.0) * 255.0).round() as u8;
     let mut pixels = vec![0u8; width as usize * height as usize * 4];
     for y in 0..height {
         for x in 0..width {
             let offset = ((y * width + x) * 4) as usize;
-            match attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
-                // Black: only the alpha byte is nonzero.
-                Some(t) => pixels[offset + 3] = ramp_alpha(t, spec.gamma),
-                // White at the lift alpha; premultiplied, so B=G=R=A.
-                None => {
-                    pixels[offset] = lift;
-                    pixels[offset + 1] = lift;
-                    pixels[offset + 2] = lift;
-                    pixels[offset + 3] = lift;
-                }
+            // Black at the ramp alpha inside a seam; fully transparent
+            // outside, where there is nothing to compensate for.
+            if let Some(t) = attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
+                pixels[offset + 3] = ramp_alpha(t, spec.gamma);
             }
         }
     }
     pixels
 }
 
-/// A test pattern: fully opaque, with the ramps and lift applied to the
-/// pattern itself exactly as they would be to real content — so what the
-/// operator aligns with is what content will experience.
+/// A test pattern: fully opaque, with the ramps applied to the pattern itself
+/// exactly as they would be to real content — so what the operator aligns
+/// with is what content will experience. As above, this path has no seams and
+/// so no lift; the canvas path patterns through [`pixel_transfer`] instead,
+/// which carries both.
 fn pattern_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     let rgb = super::pattern::render(width, height, spec);
-    let lift = spec.black_lift.clamp(0.0, 1.0);
     let mut pixels = vec![0u8; width as usize * height as usize * 4];
     for y in 0..height {
         for x in 0..width {
             let index = (y * width + x) as usize;
             let source = [rgb[index * 3], rgb[index * 3 + 1], rgb[index * 3 + 2]];
+            // In a seam: scale the signal so the *light* is attenuated by t,
+            // exactly as the alpha ramp does to content.
             let shaped: [f64; 3] = match attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
-                // In a seam: scale the signal so the *light* is attenuated
-                // by t, exactly as the alpha ramp does to content.
                 Some(t) => {
                     let scale = t.powf(1.0 / spec.gamma);
                     [0, 1, 2].map(|c| source[c] as f64 * scale)
                 }
-                // Outside: the black-level rescale.
-                None => [0, 1, 2].map(|c| 255.0 * lift + (1.0 - lift) * source[c] as f64),
+                None => [0, 1, 2].map(|c| source[c] as f64),
             };
             let offset = index * 4;
             // Opaque and premultiplied: BGRA from the shaped RGB.
@@ -780,8 +855,25 @@ mod tests {
         assert_eq!(pixel_transfer(&left.ramps, gamma, 0.0, 800, 500), (256, 0));
     }
 
+    /// The lift a slice applies at a global canvas point, as the slicer
+    /// resolves it: coverage over the whole layout, then the local pixel.
+    fn lift_at(plan: &CanvasPlan, slice: &SliceSpec, black_lift: f64, gx: i32, gy: i32) -> u8 {
+        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
+        let lift = coverage.lift(black_lift, f64::from(gx) + 0.5, f64::from(gy) + 0.5);
+        pixel_transfer(
+            &slice.ramps,
+            2.2,
+            lift,
+            gx - slice.source.x,
+            gy - slice.source.y,
+        )
+        .1
+    }
+
     #[test]
     fn black_lift_applies_outside_seams_only() {
+        // Two projectors: coverage is 1 or 2, so the general rule collapses
+        // to the original one — full lift outside, none inside.
         let plan = canvas_plan(
             &[
                 participant("L", 0, 0, 1920, 1080),
@@ -791,13 +883,87 @@ mod tests {
         )
         .unwrap();
         let left = &plan.slices[0];
+        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
+        assert_eq!(coverage.max(), 2);
+
         // Outside: out = lift + (1-lift)*in.
-        let (a, b) = pixel_transfer(&left.ramps, 2.2, 0.1, 800, 500);
+        let lift = coverage.lift(0.1, 800.5, 500.5);
+        let (a, b) = pixel_transfer(&left.ramps, 2.2, lift, 800, 500);
         assert_eq!(b, 26, "lift offset should be 0.1*255");
         assert_eq!(a, 230, "multiplier should be (1-0.1)*256");
         // Inside the seam: no lift, the doubled projector black is the lift.
-        let (_, b) = pixel_transfer(&left.ramps, 2.2, 0.1, 1840, 500);
-        assert_eq!(b, 0);
+        assert_eq!(lift_at(&plan, left, 0.1, 1840, 500), 0);
+    }
+
+    #[test]
+    fn a_grid_lifts_every_region_by_its_own_shortfall() {
+        // A 2×2 with 160px overlaps both ways. Three black floors exist —
+        // one, two and four projectors — and only the four-way centre is
+        // already at the worst of them.
+        let plan = canvas_plan(
+            &[
+                participant("TL", 0, 0, 1920, 1080),
+                participant("TR", 1760, 0, 1920, 1080),
+                participant("BL", 0, 920, 1920, 1080),
+                participant("BR", 1760, 920, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
+        assert_eq!(coverage.max(), 4, "the centre is lit by all four");
+        assert_eq!(coverage.at(500.5, 500.5), 1);
+        assert_eq!(coverage.at(1840.5, 500.5), 2);
+        assert_eq!(coverage.at(1840.5, 1000.5), 4);
+
+        // L·(N−n)/n with L = 0.05: a lone projector makes up three floors on
+        // its own, each of a seam's pair makes up one, the centre none.
+        assert!((coverage.lift(0.05, 500.5, 500.5) - 0.15).abs() < 1e-9);
+        assert!((coverage.lift(0.05, 1840.5, 500.5) - 0.05).abs() < 1e-9);
+        assert_eq!(coverage.lift(0.05, 1840.5, 1000.5), 0.0);
+
+        // And the centre is the one region the old binary rule got wrong: it
+        // sits inside ramps, so it must still receive no lift while the
+        // two-way seams around it — also inside ramps — now do.
+        let tl = &plan.slices[0];
+        assert_eq!(lift_at(&plan, tl, 0.05, 1840, 1000), 0, "four-way centre");
+        assert_eq!(lift_at(&plan, tl, 0.05, 1840, 500), 13, "two-way seam");
+        assert_eq!(lift_at(&plan, tl, 0.05, 500, 500), 38, "single projector");
+    }
+
+    #[test]
+    fn total_black_is_even_across_a_grid() {
+        // The point of the exercise: every region emits the same black.
+        // In units of one projector's black, a point lit by n projectors
+        // emits n, and each of them adds its lift on top.
+        let plan = canvas_plan(
+            &[
+                participant("TL", 0, 0, 1920, 1080),
+                participant("TR", 1760, 0, 1920, 1080),
+                participant("BL", 0, 920, 1920, 1080),
+                participant("BR", 1760, 920, 1920, 1080),
+            ],
+            Some(&blending()),
+        )
+        .unwrap();
+        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
+        let emitted = |x: f64, y: f64| {
+            let n = f64::from(coverage.at(x, y));
+            // Each projector emits its own black plus the lift it applies.
+            n * (1.0 + coverage.lift(0.05, x, y) / 0.05)
+        };
+        let centre = emitted(1840.5, 1000.5);
+        for (x, y, label) in [
+            (500.5, 500.5, "single"),
+            (1840.5, 500.5, "vertical seam"),
+            (500.5, 1000.5, "horizontal seam"),
+        ] {
+            let here = emitted(x, y);
+            assert!(
+                (here - centre).abs() < 1e-9,
+                "{label} emits {here}, centre emits {centre}"
+            );
+        }
     }
 
     #[test]
