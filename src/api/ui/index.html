@@ -94,6 +94,23 @@ label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px
 input, select, textarea { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
   border-radius: 7px; background: var(--sunken); color: var(--ink); font: inherit; }
 input[type=file] { padding: 6px; }
+/* On/off is a switch, not a two-item dropdown: the state is readable without
+   opening anything, and it takes one click to change instead of two. Drawn
+   from the checkbox itself so the control keeps its native semantics —
+   labelling, focus, keyboard, and the form value all still work. */
+input[type=checkbox].switch {
+  appearance: none; -webkit-appearance: none; position: relative; cursor: pointer;
+  width: 42px; height: 24px; flex: 0 0 auto; padding: 0; border-radius: 999px;
+  background: var(--sunken); border: 1px solid var(--line);
+  transition: background .15s, border-color .15s; }
+input[type=checkbox].switch::after {
+  content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+  border-radius: 50%; background: var(--muted);
+  transition: transform .15s, background .15s; }
+input[type=checkbox].switch:checked { background: var(--accent); border-color: var(--accent); }
+input[type=checkbox].switch:checked::after { transform: translateX(18px); background: #fff; }
+input[type=checkbox].switch:disabled { opacity: .45; cursor: not-allowed; }
+input[type=checkbox].switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 textarea { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
 textarea.json { min-height: 420px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 6px; }
@@ -196,12 +213,35 @@ window.addEventListener("error", (event) => {
         <div class="row" id="unused-buttons"></div>
         <p class="hint" id="unused-hint"></p>
       </div>
+      <!-- A test pattern is drawn per output in global coordinates, which
+           needs no overlaps and no canvas: it belongs to the layout, not to
+           projection. It is the fastest way to answer "is this display
+           working, which connector is it, and is the whole frame in view" —
+           every tile is labelled with its output name and global pixel
+           coordinates. -->
+      <div id="pattern-row" style="margin-top:14px">
+        <h3 style="margin:0 0 8px">Test pattern</h3>
+        <div class="row">
+          <select id="tp-pattern">
+            <option value="">None — show content</option>
+            <option value="grid">Grid — geometry, identity and seam alignment</option>
+            <option value="white">White — inspect the blend ramps</option>
+            <option value="black">Black — tune the black-level lift</option>
+            <option value="gamma">Gamma — measure the projector gamma</option>
+          </select>
+        </div>
+        <p class="hint">Shown immediately on every display in the layout;
+          choose <strong>None</strong> to put the content back. It is never
+          written to disk, so a restart clears it too. The grid names each
+          output on screen, so a photo of the wall says exactly which
+          connector drives which display.</p>
+      </div>
     </div>
     <div class="panel hidden" id="output-editor">
       <h2>Configure <span id="output-name" class="mono"></span></h2>
       <div class="fields">
         <div><label for="o-enable">Enabled</label>
-          <select id="o-enable"><option value="true">Yes</option><option value="false">No</option></select></div>
+          <input type="checkbox" role="switch" class="switch" id="o-enable"></div>
         <div><label for="o-mode">Mode</label><select id="o-mode"></select></div>
         <div><label for="o-x">Position X</label><input id="o-x" type="number" step="1"></div>
         <div><label for="o-y">Position Y</label><input id="o-y" type="number" step="1"></div>
@@ -211,9 +251,9 @@ window.addEventListener("error", (event) => {
           <option>flipped</option><option>flipped-90</option><option>flipped-180</option><option>flipped-270</option>
         </select></div>
         <div><label for="o-adaptive">Adaptive sync</label>
-          <select id="o-adaptive"><option value="false">Off</option><option value="true">On</option></select></div>
+          <input type="checkbox" role="switch" class="switch" id="o-adaptive"></div>
         <div><label for="o-tearing">Allow tearing</label>
-          <select id="o-tearing"><option value="false">No</option><option value="true">Yes</option></select></div>
+          <input type="checkbox" role="switch" class="switch" id="o-tearing"></div>
         <div><label for="o-mrt">Max render time (ms)</label>
           <input id="o-mrt" type="number" min="1" placeholder="off"></div>
       </div>
@@ -252,22 +292,16 @@ window.addEventListener("error", (event) => {
         inactive: no displays overlap in the layout above.</strong> With no
         overlaps there is nothing to blend, so the displays are tiled
         directly and none of this applies. Position displays so they overlap
-        — as the projector beams do on the surface — and blending engages.</p>
+        — as the projector beams do on the surface — and blending engages.
+        The test pattern is with the layout above, and works whether or not
+        anything overlaps.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
-          <select id="pj-blend"><option value="off">Off</option><option value="on">On</option></select></div>
+          <input type="checkbox" role="switch" class="switch" id="pj-blend"></div>
         <div><label for="pj-gamma">Projector gamma</label>
           <input id="pj-gamma" type="number" step="0.05" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
           <input id="pj-lift" type="number" step="0.01" min="0" max="0.5" value="0"></div>
-        <div><label for="pj-pattern">Test pattern</label>
-          <select id="pj-pattern">
-            <option value="">None — show content</option>
-            <option value="grid">Grid — geometry and seam alignment</option>
-            <option value="white">White — inspect the blend ramps</option>
-            <option value="black">Black — tune the black-level lift</option>
-            <option value="gamma">Gamma — measure the projector gamma</option>
-          </select></div>
       </div>
       <p class="hint">Gamma shapes the fall-off — the projectors' transfer
         curve, usually 2.2. If seams glow on dark scenes (projector black is
@@ -317,7 +351,7 @@ window.addEventListener("error", (event) => {
             snap can write.</p></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div><label for="a-heartbeat">Content watchdog</label>
-          <select id="a-heartbeat"><option value="false">Off</option><option value="true">On</option></select></div>
+          <input type="checkbox" role="switch" class="switch" id="a-heartbeat"></div>
       </div>
 
       <fieldset>
@@ -965,7 +999,7 @@ function selectOutput(name) {
 
   $("output-editor").classList.remove("hidden");
   $("output-name").textContent = name;
-  $("o-enable").value = String(existing?.enable ?? true);
+  $("o-enable").checked = existing?.enable ?? true;
 
   // An attached display states its own modes. A bare socket cannot, so offer
   // the common ones plus whatever is already configured — the operator picks
@@ -989,8 +1023,8 @@ function selectOutput(name) {
   $("o-y").value = existing?.position?.y ?? output?.rect.y ?? 0;
   $("o-scale").value = existing?.scale ?? output?.scale ?? 1;
   $("o-transform").value = existing?.transform ?? output?.transform ?? "normal";
-  $("o-adaptive").value = String(existing?.adaptiveSync ?? false);
-  $("o-tearing").value = String(existing?.allowTearing ?? false);
+  $("o-adaptive").checked = existing?.adaptiveSync ?? false;
+  $("o-tearing").checked = existing?.allowTearing ?? false;
   $("o-mrt").value = existing?.maxRenderTimeMs ?? "";
 
   renderOutputBackgroundChoices(existing?.background);
@@ -1010,13 +1044,13 @@ function outputEntryFromForm() {
   const mrt = $("o-mrt").value.trim();
   return {
     match: { name },
-    enable: $("o-enable").value === "true",
+    enable: $("o-enable").checked,
     mode: width ? { width, height, refreshHz } : null,
     position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
     scale: Number($("o-scale").value) || 1,
     transform: $("o-transform").value,
-    adaptiveSync: $("o-adaptive").value === "true",
-    allowTearing: $("o-tearing").value === "true",
+    adaptiveSync: $("o-adaptive").checked,
+    allowTearing: $("o-tearing").checked,
     maxRenderTimeMs: mrt ? Number(mrt) : null,
     background,
   };
@@ -1140,7 +1174,7 @@ function editApp(app) {
     ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
     : app.launcher.uri;
   $("a-audio").value = app.audio ? (app.audio.output === null ? "__null__" : app.audio.output) : "";
-  $("a-heartbeat").value = String(!!app.heartbeat?.enabled);
+  $("a-heartbeat").checked = !!app.heartbeat?.enabled;
   $("a-ready-url").value = app.readiness?.url ?? "";
   $("a-ready-interval").value = app.readiness?.intervalSeconds ?? 2;
   $("a-ready-timeout").value = app.readiness?.timeoutSeconds ?? 5;
@@ -1155,7 +1189,7 @@ function clearAppForm() {
   $("a-id").disabled = false;
   for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env",
                     "a-program", "a-extra-args"]) $(id).value = "";
-  $("a-heartbeat").value = "false";
+  $("a-heartbeat").checked = false;
   $("a-kind").value = "chromium-kiosk";
   updateProgramRow();
   $("a-audio").value = "";
@@ -1216,7 +1250,7 @@ function appFromForm() {
       timeoutSeconds: Number($("a-ready-timeout").value) || 5,
       giveUpAfterSeconds: giveUp === "" ? null : Number(giveUp),
     } : null,
-    heartbeat: $("a-heartbeat").value === "true"
+    heartbeat: $("a-heartbeat").checked
       ? { enabled: true, timeoutSeconds: 25, startupGraceSeconds: 60 } : null,
   };
 }
@@ -1283,41 +1317,48 @@ for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-au
 
 // --- projection ----------------------------------------------------------
 
-// Projection settings only do anything when displays overlap: the slicer
-// engages on intersections, and with none the layout tiles directly. Say
-// so instead of presenting live-looking controls that change nothing.
+// Blending only does anything when displays overlap: the slicer engages on
+// intersections, and with none the layout tiles directly. Say so instead of
+// presenting live-looking controls that change nothing.
 // Driven from renderLayoutSize so it tracks every layout edit as it is made.
+//
+// The test pattern is deliberately *not* in this list. It is drawn per
+// output, needs neither overlaps nor a canvas, and is most wanted on the
+// plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
   const idle = overlaps === 0;
-  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-pattern", "pj-save"]) {
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-save"]) {
     $(id).disabled = idle;
   }
   $("pj-idle").hidden = !idle;
 }
 
 function renderProjection() {
-  // Never stomp an edit in progress.
+  // Never stomp an edit in progress. The pattern select lives in the Layout
+  // panel, so it needs its own guard rather than the panel's.
+  if ($("tp-pattern") !== document.activeElement) {
+    $("tp-pattern").value = config?.projection?.testPattern ?? "";
+  }
   const panel = $("projection-panel");
   if (panel.contains(document.activeElement)) return;
 
   const projection = config?.projection;
-  $("pj-blend").value = projection?.blend === false ? "off" : (projection ? "on" : "off");
+  $("pj-blend").checked = !!projection && projection.blend !== false;
   $("pj-gamma").value = projection?.gamma ?? 2.2;
   $("pj-lift").value = projection?.blackLift ?? 0;
-  $("pj-pattern").value = projection?.testPattern ?? "";
 }
 
 function projectionFromForm() {
-  const blend = $("pj-blend").value === "on";
+  const blend = $("pj-blend").checked;
   const gamma = Number($("pj-gamma").value) || 2.2;
   const blackLift = Number($("pj-lift").value) || 0;
-  const testPattern = $("pj-pattern").value || null;
+  const testPattern = $("tp-pattern").value || null;
   // Off with default values: remove the section entirely.
   return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern)
     ? null : { blend, gamma, blackLift, testPattern };
 }
 
-for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-pattern"]) {
+for (const id of ["pj-blend", "pj-gamma", "pj-lift", "tp-pattern"]) {
   $(id).addEventListener("input", () => {
     config.projection = projectionFromForm();
     renderLayoutSize();
@@ -1328,6 +1369,15 @@ for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-pattern"]) {
 $("pj-save").onclick = () => run(async () => {
   document.activeElement?.blur();
   config.projection = projectionFromForm();
+  // Blending settings are saved; the test pattern never is. An appliance
+  // that boots into a test grid because someone left one up is a support
+  // call, and the pattern is presented as a live diagnostic rather than a
+  // setting — so committing here also takes it down.
+  if (config.projection?.testPattern) {
+    const { blend, gamma, blackLift } = config.projection;
+    config.projection = (!blend && gamma === 2.2 && blackLift === 0)
+      ? null : { blend, gamma, blackLift, testPattern: null };
+  }
   clearTimeout(previewTimer);
   await saveCommitted();
 }, "saved projection");
