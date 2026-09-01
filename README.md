@@ -10,8 +10,10 @@
 ---
 <!-- md-exclude-end -->
 
-## Inspiration
-Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, and scoreboard displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand. The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs — precise output control and scriptable window management on minimal hardware — but no friendly way to drive it from across the network or to keep its state across reboots. The idea came from a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket.
+## Introduction
+Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, scoreboard, and public information displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand though a system intended for personal desktop use. How many times have you seen the Windows login screen in an airport, a mouse pointer on a digital sign or an update popup on a billboard? 
+
+The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs: precise output control and scriptable window management on minimal hardware. But it's tricky to configure and doesn't provide a friendly way to drive it from across the network or to keep its state across reboots. After developing multiple custom applications to harness Sway for game shows and arena displays, I created suede as a reusable, general-purpose solution.
 
 ## Summary
 Suede turns a Linux box running Sway into a remotely manageable display appliance. It exposes a well-documented REST + SSE API (and a bundled reference web UI) for configuring video outputs, routing audio, and launching kiosk-mode browsers — and it persists everything, so the machine boots straight back into its configured state with no operator intervention. Configuration is declarative: you describe the state you want, and Suede's reconciler keeps reality matching it through reboots, display hotplugs, and application crashes.
