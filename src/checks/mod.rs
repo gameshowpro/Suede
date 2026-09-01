@@ -565,6 +565,20 @@ impl CheckRunner {
     fn check_video_decode(&self) -> Check {
         let vendors = gpu_vendors();
         if vendors.is_empty() {
+            // Not every GPU is a PCI device. A Raspberry Pi's VideoCore is a
+            // platform device with no vendor ID, and VA-API does not exist on
+            // it at all — its decoders are V4L2 devices, which Raspberry Pi
+            // OS's Chromium build drives directly. The VA-API probe's "unknown
+            // GPU" warning would be one no operator could ever clear.
+            if let Some((status, detail)) = videocore_decode() {
+                return self.check(
+                    ids::VIDEO_DECODE,
+                    "Hardware video decode",
+                    status,
+                    detail,
+                    Some("configuration/#environment-and-hardware-acceleration"),
+                );
+            }
             return self.check(
                 ids::VIDEO_DECODE,
                 "Hardware video decode",
@@ -1350,6 +1364,75 @@ pub fn gpu_vendors() -> Vec<GpuVendor> {
         }
     }
     found
+}
+
+/// Decode status for a Broadcom VideoCore GPU, or `None` on other hardware.
+///
+/// Identified from the driver bound to the DRM device rather than a vendor
+/// ID, because platform devices have none: `v3d` renders and `vc4` scans out,
+/// and either one means a Raspberry Pi (or close relative). What decode
+/// hardware the model actually has is read from the V4L2 nodes — a Pi 5
+/// exposes `rpi-hevc-dec` (stateless, HEVC only; H.264 lost its hardware
+/// path with the 2712), a Pi 4 `bcm2835-codec-decode` (stateful, H.264
+/// included). Verified on a Pi 5 Model B running Raspberry Pi OS Trixie.
+fn videocore_decode() -> Option<(CheckStatus, String)> {
+    let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+    let videocore = entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // Cards only: `card0`, not connectors like `card0-HDMI-A-1`.
+        if !name.starts_with("card") || name.contains('-') {
+            return false;
+        }
+        let Ok(uevent) = std::fs::read_to_string(entry.path().join("device/uevent")) else {
+            return false;
+        };
+        uevent.lines().any(|line| {
+            matches!(
+                line.strip_prefix("DRIVER="),
+                Some("v3d" | "vc4" | "vc4-drm")
+            )
+        })
+    });
+    if !videocore {
+        return None;
+    }
+
+    let mut decoders: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/video4linux") {
+        for entry in entries.flatten() {
+            let Ok(name) = std::fs::read_to_string(entry.path().join("name")) else {
+                continue;
+            };
+            let name = name.trim();
+            // Decoders only; the same SoC also exposes ISP and encoder nodes.
+            if name.contains("dec") && !decoders.iter().any(|d| d == name) {
+                decoders.push(name.to_string());
+            }
+        }
+    }
+    decoders.sort();
+
+    if decoders.is_empty() {
+        return Some((
+            CheckStatus::Warn,
+            "Broadcom VideoCore GPU with no V4L2 decoder exposed — video will \
+             decode on the CPU"
+                .to_string(),
+        ));
+    }
+    let mut detail = format!(
+        "Broadcom VideoCore: decode here is V4L2 ({}), not VA-API, and \
+         Raspberry Pi OS's Chromium uses it directly",
+        decoders.join(", ")
+    );
+    if decoders.iter().all(|d| d.contains("hevc")) {
+        detail.push_str(
+            ". H.264 has no hardware path on this model and decodes in \
+             software — fine at 1080p, marginal above it",
+        );
+    }
+    Some((CheckStatus::Pass, detail))
 }
 
 /// Whether a VA-API driver library is installed.

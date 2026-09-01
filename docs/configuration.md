@@ -421,6 +421,13 @@ environment variables rather than command-line flags:
     generally work without any of this — check the WebGL renderer string is
     your GPU rather than `llvmpipe` or `SwiftShader`.
 
+    On a Raspberry Pi none of the VA-API advice applies: VideoCore has no
+    VA-API at all, and Raspberry Pi OS's Chromium build drives the V4L2
+    decoder directly. A Pi 5 exposes hardware HEVC only — H.264 lost its
+    hardware path with the 2712 and decodes in software, which is fine at
+    1080p and marginal above it. The `video-decode` health check reports
+    which decoders the machine actually exposes.
+
 #### Waiting for a service to be ready
 
 A kiosk browser started before the service it points at is serving shows an

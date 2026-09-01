@@ -11,19 +11,25 @@
 | Privileges | The daemon runs as the session user, in the `audio`, `video` and `render` groups; provisioning needs sudo once and arranges all of this |
 
 !!! warning "What has actually been tested"
-    That table is what Suede is *built* for. What it has been *run* on is two
-    machines. Ubuntu 26.04 on x86-64 — Sway 1.11, an NVIDIA GPU with the
+    That table is what Suede is *built* for. What it has been *run* on is
+    three machines. Ubuntu 26.04 on x86-64 — Sway 1.11, an NVIDIA GPU with the
     proprietary driver, two DisplayPort outputs, Chromium — where the package
     and the provisioning script have been installed from nothing, upgraded in
-    place, and reset back to nothing again. And a Debian 13 (Trixie) x86-64
+    place, and reset back to nothing again. A Debian 13 (Trixie) x86-64
     testbench — Sway 1.10.1, also NVIDIA proprietary, Chromium — provisioned
-    from a fresh headless install. The aarch64 package installs and runs
-    under emulation.
+    from a fresh headless install. And a Raspberry Pi 5 Model B (8 GB, NVMe
+    boot) running Raspberry Pi OS **Lite** Trixie — Sway 1.10.1, VideoCore
+    (vc4/v3d), Pi OS's own Chromium build, one 1080p and one 4K display
+    driven as a spanned pair — provisioned over SSH from a fresh headless
+    install, package and from-source builds both, through to the machine
+    rebooting unattended into its configured kiosk.
 
-    Not yet exercised anywhere: real aarch64 or Raspberry Pi hardware, Sway
-    older than 1.10, more than two displays, and the `firefox-kiosk`
-    launcher. None of that is expected to be broken; none of it is known to
-    work. Reports from any of those are the most useful thing you could send.
+    Not yet exercised anywhere: the desktop Raspberry Pi OS image (the Lite
+    image has no `labwc` to get out of the way, so that path in provisioning
+    is still untested), Sway older than 1.10, more than two displays, and the
+    `firefox-kiosk` launcher. None of that is expected to be broken; none of
+    it is known to work. Reports from any of those are the most useful thing
+    you could send.
 
 ## Install
 
@@ -80,7 +86,7 @@ Suede attaches to — and if it changed your group membership, since that only
 takes effect after a reboot.
 
 !!! note "Raspberry Pi OS"
-    Pi OS ships `labwc`, which will fight Sway for the displays. The provisioning script disables it, including its autostart entry. This path is written but untested — see the warning above.
+    The desktop Pi OS image ships `labwc`, which will fight Sway for the displays. The provisioning script disables it, including its autostart entry — but that path is written and still untested, because what has actually been exercised is the **Lite** image, which ships no compositor at all and provisions cleanly (see the warning above).
 
 Reboot when it finishes. The machine will log in, start Sway, and start Suede.
 

@@ -118,6 +118,27 @@ curl -s http://appliance:9088/api/v1/outputs | python3 -m json.tool
 
 A configured output that is not connected is deliberately **not** an error. Suede keeps the configuration and applies it the moment the display appears.
 
+### Everything reports success and the panel is still dark {: #mode-advertised-but-dark }
+
+A display can advertise a timing in its EDID that it will not actually sync.
+Nothing in the stack can see this: the kernel drives the signal without
+error, Sway reports the output active in the requested mode, every health
+check passes — and the panel shows nothing. It is real, not hypothetical: a
+Samsung U28E510 4K monitor on a Raspberry Pi 5 stayed dark on the
+1920×1080@60 it advertises, because its EDID carries *two* 1080p60 timings —
+a DMT one it rejects (listed first, so that is what a request for `60`
+gets) and the CEA-861 one it accepts.
+
+When a display stays dark on a mode it claims to support:
+
+1. Try the display's **preferred mode** first (the top of its `modes` list) —
+   that one, it syncs.
+2. Then try the neighbouring refresh variant — `59.94` instead of `60` (or
+   `29.97` instead of `30`). The broadcast-rate variants are usually the
+   CEA-861 timings, which HDMI-native displays are built around; an exact
+   fractional refresh selects a single advertised mode instead of letting
+   the compositor pick between identically-numbered ones.
+
 ## A browser will not start
 
 ```bash

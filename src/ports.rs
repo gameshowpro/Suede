@@ -65,11 +65,17 @@ fn enumerate_in(root: &str) -> Vec<Port> {
 /// Entries are `card<N>-<CONNECTOR>`, e.g. `card1-DP-2`; the card index is a
 /// property of the GPU, not of the connector, and sway does not use it.
 /// Anything else in the directory (`version`, `renderD128`, the card nodes
-/// themselves) is not a connector, and `Unknown-*` entries are writeback or
-/// virtual connectors that never become displays.
+/// themselves) is not a connector. Writeback connectors — compositing into
+/// memory, never a display — must also be dropped: older kernels expose them
+/// as `Unknown-*`, but the Raspberry Pi's vc4 names them `Writeback-N`, and
+/// offering one as a socket to put a projector on helps nobody.
 fn connector_name(entry: &str) -> Option<String> {
     let (card, connector) = entry.split_once('-')?;
-    if !card.starts_with("card") || connector.is_empty() || connector.starts_with("Unknown") {
+    if !card.starts_with("card")
+        || connector.is_empty()
+        || connector.starts_with("Unknown")
+        || connector.starts_with("Writeback")
+    {
         return None;
     }
     Some(connector.to_string())
@@ -90,7 +96,15 @@ mod tests {
 
     #[test]
     fn non_connector_entries_are_ignored() {
-        for entry in ["card0", "renderD128", "version", "card1-Unknown-2"] {
+        // `card1-Writeback-1` is how vc4 on a Raspberry Pi names its
+        // writeback connectors; older kernels use `Unknown-*` for the same.
+        for entry in [
+            "card0",
+            "renderD128",
+            "version",
+            "card1-Unknown-2",
+            "card1-Writeback-1",
+        ] {
             assert_eq!(connector_name(entry), None, "{entry}");
         }
     }
