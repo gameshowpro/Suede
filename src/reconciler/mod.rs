@@ -297,6 +297,7 @@ impl Reconciler {
                 ));
             }
         }
+        divergences.extend(self.apply_audio_gains(&apps).await);
         divergences.extend(self.audio_divergences(&apps));
 
         // --- cursor ---
@@ -655,6 +656,67 @@ impl Reconciler {
                 app
             })
             .collect()
+    }
+
+    /// Bring each configured sink to the gain its app asks for.
+    ///
+    /// Level is desired state like anything else here: an appliance whose
+    /// output sits whereever the last session left it is passing signal at a
+    /// level nobody knows, and the symptom — everything works, quietly — is a
+    /// wretched one to chase. Only sinks an app actually names are touched;
+    /// the rest of the machine's audio is not Suede's business.
+    async fn apply_audio_gains(&self, apps: &[crate::model::AppConfig]) -> Vec<Divergence> {
+        let available = self.audio.sinks();
+        if available.is_empty() {
+            return Vec::new();
+        }
+
+        let mut divergences = Vec::new();
+        let mut applied: Vec<&str> = Vec::new();
+        for app in apps.iter().filter(|app| app.enabled) {
+            let Some(audio) = app.audio.as_ref() else {
+                continue;
+            };
+            // A silent app is routed to the null sink, whose level means
+            // nothing: it discards the signal either way.
+            let Some(wanted) = audio.output.as_deref() else {
+                continue;
+            };
+            let Some(sink) = available.iter().find(|sink| sink.id == wanted) else {
+                // audio_divergences reports the missing sink; do not say it twice.
+                continue;
+            };
+            // Two apps naming one sink with different levels is a
+            // contradiction the configuration cannot resolve, so say so
+            // rather than letting the last one to be visited win silently.
+            if applied.contains(&wanted) {
+                continue;
+            }
+
+            // PipeWire's own figure is quantised, and a comparison of floats
+            // that came back through a decibel conversion needs slack: a
+            // hundredth of a dB is far below anything audible or meaningful.
+            if sink
+                .gain_db
+                .is_some_and(|current| (current - audio.gain_db).abs() < 0.01)
+            {
+                applied.push(wanted);
+                continue;
+            }
+
+            match self.audio.set_sink_gain(wanted, audio.gain_db).await {
+                Ok(()) => applied.push(wanted),
+                Err(error) => {
+                    tracing::warn!(%error, sink = wanted, "could not set the sink gain");
+                    divergences.push(Divergence::new(
+                        "audio_gain_not_applied",
+                        wanted,
+                        format!("could not set {wanted} to {} dB: {error}", audio.gain_db),
+                    ));
+                }
+            }
+        }
+        divergences
     }
 
     /// Report apps whose configured audio sink is not currently present.
@@ -1061,6 +1123,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_configured_gain_is_applied_to_its_sink_and_then_left_alone() {
+        // Level is desired state: the pass brings the sink to it, and having
+        // done so stops touching it. A reconciler that re-sets an unchanged
+        // value on every pass is a reconciler that fights the operator.
+        let harness = harness();
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app(
+                    "renderer",
+                    None,
+                    Some(AudioConfig {
+                        output: Some("alsa_output.hdmi-stereo".into()),
+                        gain_db: -6.0,
+                    }),
+                ));
+                state.active_app = Some("renderer".into());
+            })
+            .unwrap();
+
+        harness.reconciler.reconcile().await;
+        assert_eq!(
+            harness.audio.gains_set(),
+            vec![("alsa_output.hdmi-stereo".to_string(), -6.0)]
+        );
+
+        harness.reconciler.reconcile().await;
+        assert_eq!(
+            harness.audio.gains_set().len(),
+            1,
+            "an unchanged level must not be written again"
+        );
+        harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_silent_app_has_no_level_to_set() {
+        // The null sink discards the signal whatever its volume, so setting
+        // one would be theatre.
+        let harness = harness();
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app(
+                    "renderer",
+                    None,
+                    Some(AudioConfig {
+                        output: None,
+                        gain_db: -6.0,
+                    }),
+                ));
+                state.active_app = Some("renderer".into());
+            })
+            .unwrap();
+
+        harness.reconciler.reconcile().await;
+        assert!(harness.audio.gains_set().is_empty());
+        harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn status_carries_the_applied_revision() {
         let harness = harness();
         harness.store.update(|_| {}).unwrap();
@@ -1107,6 +1230,7 @@ mod tests {
                     None,
                     Some(AudioConfig {
                         output: Some("alsa_output.does-not-exist".into()),
+                        gain_db: 0.0,
                     }),
                 ));
                 state.active_app = Some("renderer".into());
@@ -1127,9 +1251,14 @@ mod tests {
         harness
             .store
             .update(|state| {
-                state
-                    .apps
-                    .push(app("silent", None, Some(AudioConfig { output: None })));
+                state.apps.push(app(
+                    "silent",
+                    None,
+                    Some(AudioConfig {
+                        output: None,
+                        gain_db: 0.0,
+                    }),
+                ));
                 state.active_app = Some("silent".into());
             })
             .unwrap();

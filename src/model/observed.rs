@@ -234,6 +234,13 @@ pub struct AudioSink {
     pub is_default: bool,
     /// Video connector this sink is associated with, where derivable.
     pub output_hint: Option<String>,
+    /// Current playback gain in dB, `0.0` being unity. `None` when PipeWire
+    /// reports no volume for this sink at all.
+    ///
+    /// Derived from the linear `channelVolumes` PipeWire holds, so it is the
+    /// gain actually in the signal path rather than the cube-rooted number a
+    /// mixer UI displays.
+    pub gain_db: Option<f64>,
 }
 
 /// Overall reconciliation state.

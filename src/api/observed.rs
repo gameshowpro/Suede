@@ -260,7 +260,7 @@ mod tests {
     async fn runs_health_checks() {
         let (status, body) = get_json("/api/v1/system/checks").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 13);
+        assert_eq!(body.as_array().unwrap().len(), 14);
         assert!(body[0].get("fixAvailable").is_some());
     }
 

@@ -20,13 +20,27 @@ use crate::model::AudioSink;
 
 const DUMP: &str = "pw-dump";
 const CLI: &str = "pw-cli";
+/// WirePlumber's control tool. Preferred for setting a level, because the
+/// session manager keeps its own copy of every sink's volume: write the node
+/// parameter behind its back and the audio does move, but `wpctl` and every
+/// mixer built on it go on reporting the old figure — and may restore it.
+const WPCTL: &str = "wpctl";
 /// Coalescing window for monitor activity, which can be chatty while audio plays.
 const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
 
 pub struct PipeWireMonitor {
     sinks: RwLock<Vec<AudioSink>>,
+    /// Object id and channel count per sink, which setting a level needs and
+    /// the public sink list has no business carrying.
+    nodes: RwLock<HashMap<String, NodeFacts>>,
     available: AtomicBool,
     changes: broadcast::Sender<Vec<AudioSink>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct NodeFacts {
+    id: u32,
+    channels: usize,
 }
 
 impl Default for PipeWireMonitor {
@@ -40,6 +54,7 @@ impl PipeWireMonitor {
         let (changes, _) = broadcast::channel(16);
         Self {
             sinks: RwLock::new(Vec::new()),
+            nodes: RwLock::new(HashMap::new()),
             available: AtomicBool::new(false),
             changes,
         }
@@ -164,7 +179,8 @@ impl AudioMonitor for PipeWireMonitor {
             });
         }
 
-        let sinks = parse_sinks(&output.stdout)?;
+        let (sinks, nodes) = parse_dump(&output.stdout)?;
+        *self.nodes.write().unwrap() = nodes;
         self.available.store(true, Ordering::Relaxed);
 
         let changed = {
@@ -220,6 +236,51 @@ impl AudioMonitor for PipeWireMonitor {
         Ok(())
     }
 
+    async fn set_sink_gain(&self, sink: &str, gain_db: f64) -> AudioResult<()> {
+        let facts = self
+            .nodes
+            .read()
+            .unwrap()
+            .get(sink)
+            .copied()
+            .ok_or_else(|| AudioError::SinkUnknown {
+                sink: sink.to_string(),
+            })?;
+        let linear = super::linear_from_db(gain_db);
+        let id = facts.id.to_string();
+
+        // wpctl's number is the cube root of the amplitude, which is why a
+        // mixer showing 0.40 is 24 dB down rather than 8.
+        let cubic = format!("{:.6}", linear.cbrt());
+        match run(WPCTL, &["set-volume", &id, &cubic]).await {
+            Ok(()) => {
+                tracing::info!(sink, gain_db, "set sink gain");
+                let _ = self.refresh().await;
+                return Ok(());
+            }
+            // No WirePlumber on this machine: fall through to the node itself.
+            Err(AudioError::ToolMissing { .. }) => {}
+            Err(error) => return Err(error),
+        }
+
+        let volumes = std::iter::repeat_n(format!("{linear:.6}"), facts.channels.max(1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        run(
+            CLI,
+            &[
+                "set-param",
+                &id,
+                "Props",
+                &format!("{{ channelVolumes: [ {volumes} ] }}"),
+            ],
+        )
+        .await?;
+        tracing::info!(sink, gain_db, "set sink gain via the node parameter");
+        let _ = self.refresh().await;
+        Ok(())
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<Vec<AudioSink>> {
         self.changes.subscribe()
     }
@@ -229,10 +290,34 @@ impl AudioMonitor for PipeWireMonitor {
     }
 }
 
+/// Run one of the PipeWire tools, mapping its absence and its failures onto
+/// [`AudioError`] so a caller can tell "not installed" from "did not work".
+async fn run(tool: &'static str, args: &[&str]) -> AudioResult<()> {
+    let output = tokio::process::Command::new(tool)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => AudioError::ToolMissing { tool },
+            _ => AudioError::ToolFailed {
+                tool,
+                detail: error.to_string(),
+            },
+        })?;
+    if !output.status.success() {
+        return Err(AudioError::ToolFailed {
+            tool,
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(())
+}
+
 // --- pw-dump JSON shapes -------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct PwObject {
+    id: Option<u32>,
     #[serde(rename = "type")]
     object_type: Option<String>,
     info: Option<PwInfo>,
@@ -243,6 +328,28 @@ struct PwObject {
 #[derive(Debug, Deserialize)]
 struct PwInfo {
     props: Option<HashMap<String, serde_json::Value>>,
+    params: Option<PwParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PwParams {
+    /// The mixer parameters. PipeWire reports a list; the volumes live in
+    /// whichever entry carries them, so take the first that does.
+    #[serde(rename = "Props", default)]
+    props: Vec<serde_json::Value>,
+}
+
+/// Per-channel linear amplitudes, if this node reports any.
+fn channel_volumes(info: &PwInfo) -> Option<Vec<f64>> {
+    let params = info.params.as_ref()?;
+    params.props.iter().find_map(|entry| {
+        let values = entry.get("channelVolumes")?.as_array()?;
+        let volumes: Vec<f64> = values
+            .iter()
+            .filter_map(serde_json::Value::as_f64)
+            .collect();
+        (!volumes.is_empty()).then_some(volumes)
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +364,12 @@ fn property<'a>(props: &'a HashMap<String, serde_json::Value>, key: &str) -> Opt
 
 /// Extract audio sinks, and which one PipeWire currently treats as default.
 pub fn parse_sinks(dump: &[u8]) -> AudioResult<Vec<AudioSink>> {
+    parse_dump(dump).map(|(sinks, _)| sinks)
+}
+
+/// The same walk, also returning what setting a level needs: each sink's
+/// object id and how many channels it carries.
+fn parse_dump(dump: &[u8]) -> AudioResult<(Vec<AudioSink>, HashMap<String, NodeFacts>)> {
     let objects: Vec<PwObject> =
         serde_json::from_slice(dump).map_err(|source| AudioError::Parse { tool: DUMP, source })?;
 
@@ -279,6 +392,7 @@ pub fn parse_sinks(dump: &[u8]) -> AudioResult<Vec<AudioSink>> {
     }
 
     let mut sinks = Vec::new();
+    let mut nodes: HashMap<String, NodeFacts> = HashMap::new();
     for object in &objects {
         if object.object_type.as_deref() != Some("PipeWire:Interface:Node") {
             continue;
@@ -293,6 +407,18 @@ pub fn parse_sinks(dump: &[u8]) -> AudioResult<Vec<AudioSink>> {
             continue;
         };
 
+        let info = object.info.as_ref().expect("props came from info");
+        let volumes = channel_volumes(info);
+        if let Some(id) = object.id {
+            nodes.insert(
+                name.to_string(),
+                NodeFacts {
+                    id,
+                    channels: volumes.as_ref().map_or(2, Vec::len),
+                },
+            );
+        }
+
         sinks.push(AudioSink {
             id: name.to_string(),
             description: property(props, "node.description").map(str::to_string),
@@ -306,12 +432,19 @@ pub fn parse_sinks(dump: &[u8]) -> AudioResult<Vec<AudioSink>> {
             output_hint: property(props, "api.alsa.path")
                 .or_else(|| property(props, "api.alsa.pcm.name"))
                 .map(str::to_string),
+            // One figure for a sink whose channels could in principle differ:
+            // the loudest, because that is the one that will clip.
+            gain_db: volumes.as_ref().map(|v| {
+                super::round_db(super::db_from_linear(
+                    v.iter().copied().fold(0.0_f64, f64::max),
+                ))
+            }),
         });
     }
 
     // Stable ordering keeps change detection meaningful and the API predictable.
     sinks.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(sinks)
+    Ok((sinks, nodes))
 }
 
 #[cfg(test)]

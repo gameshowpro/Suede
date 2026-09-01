@@ -302,7 +302,7 @@ entirely yours.
     }
     ```
 
-    Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, `--autoplay-policy=no-user-gesture-required`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
+    Expands to a kiosk argument set carried over from production use: `--kiosk`, `--password-store=basic` (no keyring prompt on a headless box), `--ozone-platform=wayland`, `--no-first-run`, `--autoplay-policy=no-user-gesture-required`, `--auto-accept-camera-and-microphone-capture`, hardware-decode and zero-copy flags, and a private `--user-data-dir`. `extraArgs` are appended before the URI.
 
     | Field | Meaning |
     |---|---|
@@ -358,6 +358,28 @@ entirely yours.
     preset therefore sets `--autoplay-policy=no-user-gesture-required`. The
     consent the policy exists to obtain was given when the operator chose what
     the machine runs.
+
+!!! info "Pages may use a camera or a microphone without being asked"
+    A capture permission prompt on an appliance is a dialog nobody will ever
+    click, so a page wanting a camera, a microphone or a capture card simply
+    never gets one. The preset therefore sets
+    `--auto-accept-camera-and-microphone-capture`, on the same reasoning as
+    autoplay: the operator chose what the machine runs.
+
+    Note what the flag does **not** do. It waves each request through without
+    *persisting* a grant, and without a persisted grant a page cannot read
+    device labels or ids at all — `enumerateDevices()` returns blank entries.
+    Passing through the first input works; asking for a device *by name* does
+    not, and needs a `VideoCaptureAllowedUrls` / `AudioCaptureAllowedUrls`
+    policy in `/etc/opt/chrome/policies/managed/` instead.
+
+    `getUserMedia` also exists only in a secure context. `https://` and
+    anything on loopback qualify; a plain-HTTP page served from another host
+    does not, and finds the API simply absent — no prompt, no error. So when
+    the configured `uri` is one of those, Suede passes
+    `--unsafely-treat-insecure-origin-as-secure=<that origin>` automatically,
+    naming only the origin the operator configured. HTTPS and loopback URIs get
+    nothing added, and an `extraArgs` entry still overrides it.
 
     **Firefox has no equivalent flag.** Its autoplay control is a preference
     (`media.autoplay.default`), which needs a profile Suede does not currently
@@ -486,12 +508,49 @@ The `audio` field distinguishes three cases, and the distinction is deliberate:
 | `{"output": "alsa_output.…"}` | Lock to that sink, by PipeWire `node.name` |
 | `{"output": null}` | Lock to silence — Suede's null sink discards the audio |
 
+An `audio` object may also carry `gainDb`, the level to hold that sink at:
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `output` | string \| null | — | Sink `node.name`, or `null` for silence |
+| `gainDb` | number | `0.0` | Level for that sink in dB, from `-100.0` to `0.0` |
+
 The first is a decision deferred, not a decision recorded. An app with no
 `audio` field follows the machine's default sink wherever it goes, and the
 default can move on its own — plugging in a USB headset is enough for
 WirePlumber to promote it. Naming a sink pins the app to it regardless.
 
 Get the available identifiers from `GET /api/v1/audio/outputs`. Changing an app's sink relaunches it, because routing is applied at launch through `PULSE_SINK`.
+
+##### Level
+
+`gainDb` is desired state like everything else here, so Suede holds the named
+sink at it and puts it back if something moves it. Only sinks an app names are
+touched; the rest of the machine's audio is not Suede's business, and a sink
+locked to silence has no level worth setting.
+
+**Unity is the default, and usually the answer.** A sink left wherever the last
+session put it passes signal at a level nobody knows, and the symptom —
+everything works, quietly — is a wretched one to chase. On a digital output it
+is worse than inconvenient: every decibel taken here is resolution discarded
+*before* the link, and nothing downstream can put it back. Attenuate at the
+amplifier. That is also why the scale stops at `0.0`: above unity a digital
+sink has no headroom and can only clip.
+
+`-100.0` means silence rather than a very small gain — the true zero of an
+amplitude is minus infinity, which no configuration file can hold — and is
+applied as an exact zero.
+
+!!! warning "A mixer's number is not a level"
+    PipeWire stores `channelVolumes` as linear amplitude, but `wpctl` and the
+    mixer UIs built on it display its **cube root**. A sink showing `0.40` in
+    `wpctl` is at 0.40³ = 0.064, which is **&minus;24 dB**, not &minus;8. Suede
+    states levels in dB everywhere for exactly this reason, and writes them
+    through the session manager so that `wpctl` agrees with what is audible.
+
+    This is not a hypothetical: a sink at `wpctl` 0.40 on each end of a chain
+    is 48 dB of attenuation, arrived at by two people who each thought they had
+    turned it down slightly.
 
 #### Restart policy
 

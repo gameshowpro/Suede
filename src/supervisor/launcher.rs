@@ -32,6 +32,15 @@ const CHROMIUM_KIOSK_ARGS: &[&str] = &[
     // machine runs when they configured it, which is the consent the policy
     // exists to obtain.
     "--autoplay-policy=no-user-gesture-required",
+    // The same argument as autoplay, for the same reason: a capture permission
+    // prompt on an appliance is a dialog nobody will ever click, so a page that
+    // wants a camera or a microphone simply never gets one. The operator chose
+    // what this machine runs; that is the consent the prompt exists to collect.
+    // Note what it does not do: it waves each request through without
+    // *persisting* a grant, and a page cannot read device labels or ids without
+    // one. Passing through the first input works; picking a named device does
+    // not, and needs the `VideoCaptureAllowedUrls` policy instead.
+    "--auto-accept-camera-and-microphone-capture",
     "--ozone-platform=wayland",
     // Vulkan is deliberately absent: Chromium rejects it under
     // `--ozone-platform=wayland` ("not compatible with Vulkan") and logs an
@@ -96,6 +105,55 @@ impl LaunchContext {
     pub fn log_path(&self, app_id: &str) -> PathBuf {
         self.log_root.join(format!("{app_id}.log"))
     }
+}
+
+/// The origin to declare trustworthy, when a page needs it and only then.
+///
+/// Powerful web APIs — `getUserMedia` above all — exist solely in a secure
+/// context. HTTPS and loopback qualify by themselves; a plain-HTTP page served
+/// from any other host does not, and the failure is silent in the worst way:
+/// `navigator.mediaDevices` is simply absent, so the page sees no error, no
+/// prompt and no camera, and the operator sees a black rectangle.
+///
+/// An appliance is routinely pointed at exactly such a page — a local web
+/// server on the production LAN, with no certificate anyone wants to manage.
+/// So the origin the operator configured is declared trustworthy, and nothing
+/// else is: this names one origin, which is a far narrower claim than the
+/// blanket switches otherwise reached for. It also requires the private
+/// `--user-data-dir` the preset already passes.
+///
+/// Returns `None` for HTTPS and for loopback, where the flag would be
+/// meaningless, and for anything unparseable, where a guess would be worse
+/// than nothing.
+pub fn insecure_origin(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("http://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    // `[::1]:8080` keeps its colons inside the brackets; `host:8080` does not.
+    let host = if let Some(end) = authority.find(']') {
+        authority.get(1..end)?
+    } else {
+        authority.split(':').next()?
+    };
+    if is_loopback(host) {
+        return None;
+    }
+    Some(format!("http://{authority}"))
+}
+
+/// Hosts a browser already trusts without a certificate.
+fn is_loopback(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".localhost") {
+        return true;
+    }
+    if host == "::1" {
+        return true;
+    }
+    // The whole of 127.0.0.0/8, not just 127.0.0.1.
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4 && octets[0] == "127" && octets.iter().all(|part| part.parse::<u8>().is_ok())
 }
 
 /// Substitute the placeholders a URI may carry.
@@ -196,8 +254,15 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
             if *show_fps_counter {
                 args.push("--show-fps-counter".to_string());
             }
+            let address = expand_uri(uri, &app.id, context);
+            // Before `extra_args`, so an operator can still override it.
+            if let Some(origin) = insecure_origin(&address) {
+                args.push(format!(
+                    "--unsafely-treat-insecure-origin-as-secure={origin}"
+                ));
+            }
             args.extend(extra_args.iter().cloned());
-            args.push(expand_uri(uri, &app.id, context));
+            args.push(address);
 
             LaunchSpec {
                 programs,
@@ -857,10 +922,47 @@ exec /opt/google/chrome/chrome \"$@\"
     }
 
     #[test]
+    fn only_a_plain_http_page_off_loopback_is_declared_trustworthy() {
+        // https needs nothing, loopback is already trusted, and everything
+        // else would silently lose getUserMedia altogether.
+        assert_eq!(insecure_origin("https://example.com/page"), None);
+        assert_eq!(insecure_origin("http://localhost:8123/x"), None);
+        assert_eq!(insecure_origin("http://127.0.0.1:8123/x"), None);
+        assert_eq!(insecure_origin("http://127.1.2.3/x"), None);
+        assert_eq!(insecure_origin("http://[::1]:8123/x"), None);
+        assert_eq!(insecure_origin("file:///tmp/page.html"), None);
+        assert_eq!(
+            insecure_origin("http://10.0.0.5:8080/passthrough/"),
+            Some("http://10.0.0.5:8080".to_string())
+        );
+        assert_eq!(
+            insecure_origin("http://display.local/page?a=1"),
+            Some("http://display.local".to_string())
+        );
+    }
+
+    #[test]
+    fn a_plain_http_app_is_launched_with_its_origin_trusted() {
+        let config = app("r1", chromium("http://10.0.0.5:8080/passthrough/"));
+        let spec = build(&config, &context(), None);
+        let flag = "--unsafely-treat-insecure-origin-as-secure=http://10.0.0.5:8080";
+        assert!(spec.args.iter().any(|arg| arg == flag), "{:?}", spec.args);
+
+        // And an https app is not given it at all.
+        let secure = app("r2", chromium("https://example.com/"));
+        let spec = build(&secure, &context(), None);
+        assert!(!spec
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--unsafely-treat-insecure-origin-as-secure")));
+    }
+
+    #[test]
     fn audio_routing_is_applied_by_environment() {
         let mut config = app("r1", chromium("http://a"));
         config.audio = Some(AudioConfig {
             output: Some("alsa_output.hdmi".into()),
+            gain_db: 0.0,
         });
         let spec = build(&config, &context(), None);
         assert!(spec
@@ -878,7 +980,10 @@ exec /opt/google/chrome/chrome \"$@\"
     #[test]
     fn null_audio_routes_to_the_null_sink() {
         let mut config = app("r1", chromium("http://a"));
-        config.audio = Some(AudioConfig { output: None });
+        config.audio = Some(AudioConfig {
+            output: None,
+            gain_db: 0.0,
+        });
         let spec = build(&config, &context(), None);
         assert!(spec
             .env

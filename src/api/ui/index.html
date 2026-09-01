@@ -238,7 +238,8 @@ window.addEventListener("error", (event) => {
       </div>
     </div>
     <div class="panel hidden" id="output-editor">
-      <h2>Configure <span id="output-name" class="mono"></span></h2>
+      <h2>Configure <span id="output-name" class="mono"></span>
+        <span id="output-display" class="muted" style="font-size:14px;font-weight:400"></span></h2>
       <div class="fields">
         <div><label for="o-enable">Enabled</label>
           <input type="checkbox" role="switch" class="switch" id="o-enable"></div>
@@ -350,6 +351,13 @@ window.addEventListener("error", (event) => {
             snap is honoured; Suede then puts the profile where a confined
             snap can write.</p></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
+        <div id="a-gain-row"><label for="a-gain">Level (dB)</label>
+          <input id="a-gain" type="number" step="0.5" min="-100" max="0" value="0">
+          <p class="hint">Applied to that sink whenever this app is reconciled.
+            0&nbsp;dB is unity and the sensible answer for a digital output: every
+            decibel taken here is resolution thrown away before the link, which
+            nothing downstream can put back. Attenuate at the amplifier instead.
+            &minus;100&nbsp;dB is silence.</p></div>
         <div><label for="a-heartbeat">Content watchdog</label>
           <input type="checkbox" role="switch" class="switch" id="a-heartbeat"></div>
       </div>
@@ -482,7 +490,7 @@ window.addEventListener("error", (event) => {
       <p class="hint">The outputs PipeWire can play to. Each application picks
         one on the <a href="#" id="sinks-apps-link">Apps</a> tab; this list is what
         it picks from.</p>
-      <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th></th></tr></thead><tbody></tbody></table>
+      <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th>Level</th><th></th></tr></thead><tbody></tbody></table>
       <p class="hint" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
       <p class="hint"><b>default</b> marks the sink an application gets when
         its audio is set to &ldquo;use default on each launch&rdquo;. That is
@@ -770,6 +778,16 @@ function physicalOutputs() {
   return outputs.filter((o) => !/^(HEADLESS|WL|X11)-/.test(o.name));
 }
 
+// What the display calls itself, from its EDID. Sway reports make and model
+// and an `OutputMatch` can select on them, but an operator can only type what
+// they have been shown — so everywhere a connector is named, the display is
+// named beside it. Null for a socket with nothing plugged in, and for a
+// display whose EDID says nothing useful: sway discards "Unknown" already.
+function displayName(known) {
+  if (!known.output) return null;
+  return [known.output.make, known.output.model].filter(Boolean).join(" ") || null;
+}
+
 // Modes offered for a socket with nothing plugged into it, where there is no
 // display to ask. The operator picks; they never type a connector name, and
 // the real mode list replaces this the moment something is attached.
@@ -904,7 +922,9 @@ function renderLayout() {
       el.style.left = `${10 + index * 130}px`;
       el.style.bottom = "10px"; el.style.width = "120px"; el.style.height = "42px";
     }
+    const display = displayName(known);
     el.innerHTML = `<b>${escape(known.name)}</b>` +
+      (display ? `<span class="muted">${escape(display)}</span>` : "") +
       `<span>${r.width}×${r.height}${enabled ? "" : " (disabled)"}</span>` +
       (known.connected ? ""
         : `<span class="offline-mark" title="${escape(OFFLINE_TOOLTIP)}">⚠ not connected</span>`) +
@@ -921,7 +941,8 @@ function renderLayout() {
   for (const { known } of entries) {
     const button = document.createElement("button");
     button.className = "action" + (selected === known.name ? "" : " ghost");
-    button.textContent = "Configure " + known.name;
+    const display = displayName(known);
+    button.textContent = "Configure " + known.name + (display ? ` — ${display}` : "");
     button.onclick = () => selectOutput(known.name);
     buttons.appendChild(button);
   }
@@ -936,7 +957,9 @@ function renderLayout() {
   for (const known of unused) {
     const button = document.createElement("button");
     button.className = "action ghost";
-    button.textContent = `+ ${known.name}` + (known.connected ? "" : " (not connected)");
+    const display = displayName(known);
+    button.textContent = `+ ${known.name}` + (display ? ` — ${display}` : "")
+                       + (known.connected ? "" : " (not connected)");
     button.title = known.connected
       ? `Add ${known.name} to the layout`
       : `Add ${known.name} to the layout. Nothing is plugged into this ` +
@@ -999,6 +1022,7 @@ function selectOutput(name) {
 
   $("output-editor").classList.remove("hidden");
   $("output-name").textContent = name;
+  $("output-display").textContent = displayName(known) ?? "";
   $("o-enable").checked = existing?.enable ?? true;
 
   // An attached display states its own modes. A bare socket cannot, so offer
@@ -1174,6 +1198,8 @@ function editApp(app) {
     ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
     : app.launcher.uri;
   $("a-audio").value = app.audio ? (app.audio.output === null ? "__null__" : app.audio.output) : "";
+  $("a-gain").value = app.audio?.gainDb ?? 0;
+  renderGainRow();
   $("a-heartbeat").checked = !!app.heartbeat?.enabled;
   $("a-ready-url").value = app.readiness?.url ?? "";
   $("a-ready-interval").value = app.readiness?.intervalSeconds ?? 2;
@@ -1193,6 +1219,8 @@ function clearAppForm() {
   $("a-kind").value = "chromium-kiosk";
   updateProgramRow();
   $("a-audio").value = "";
+  $("a-gain").value = 0;
+  renderGainRow();
   $("a-ready-interval").value = 2; $("a-ready-timeout").value = 5;
 }
 
@@ -1243,7 +1271,10 @@ function appFromForm() {
   return {
     id, launcher,
     env,
-    audio: audio === "" ? null : { output: audio === "__null__" ? null : audio },
+    audio: audio === "" ? null : {
+      output: audio === "__null__" ? null : audio,
+      gainDb: clampGain($("a-gain").value),
+    },
     readiness: readinessUrl ? {
       url: readinessUrl,
       intervalSeconds: Number($("a-ready-interval").value) || 2,
@@ -1310,7 +1341,8 @@ function paintLaunchPreview(p) {
     (e) => `<div class="${e.source}">${escape(e.name)}=${escape(e.value)}</div>`);
 }
 
-for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-audio", "a-id"]) {
+$("a-audio").addEventListener("change", renderGainRow);
+for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-audio", "a-gain", "a-id"]) {
   $(id).addEventListener("input", refreshLaunchPreview);
   $(id).addEventListener("change", refreshLaunchPreview);
 }
@@ -1647,6 +1679,9 @@ function renderSinks() {
     const row = document.createElement("tr");
     row.innerHTML = `<td class="mono">${escape(sink.id)}</td>` +
       `<td>${escape(sink.description ?? "")}</td>` +
+      // The level as it is, not as a mixer would draw it: a fader's number is
+      // the cube root of the amplitude, so 0.40 on one reads as -24 dB here.
+      `<td class="mono">${sink.isNullSink ? "—" : escape(gainLabel(sink.gainDb))}</td>` +
       `<td>${sink.isDefault ? '<span class="pill ok">default</span>' : ""}` +
       `${sink.isNullSink ? '<span class="pill muted">silent</span>' : ""}</td>`;
     body.appendChild(row);
@@ -1659,6 +1694,30 @@ function renderSinks() {
     `<option value="__null__">Lock to silence</option>` +
     sinks.filter((s) => !s.isNullSink)
       .map((s) => `<option value="${escape(s.id)}">Lock to ${escape(s.description ?? s.id)}</option>`).join("");
+}
+
+// Levels are stated in dB throughout, so the scale needs a bottom: the true
+// zero of an amplitude is minus infinity, which is not a number anyone can
+// type. -100 dB stands in for it, and the daemon applies it as exact silence.
+const GAIN_FLOOR_DB = -100, GAIN_CEILING_DB = 0;
+
+function clampGain(value) {
+  const db = Number(value);
+  if (!Number.isFinite(db)) return 0;
+  return Math.min(GAIN_CEILING_DB, Math.max(GAIN_FLOOR_DB, db));
+}
+
+function gainLabel(db) {
+  if (db === null || db === undefined) return "—";
+  return db <= GAIN_FLOOR_DB ? "silent" : `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
+}
+
+// A level belongs to a sink, so it only means anything once one is named.
+// "Use default on each launch" leaves the machine's audio alone, and the null
+// sink discards the signal whatever its level.
+function renderGainRow() {
+  const choice = $("a-audio").value;
+  $("a-gain-row").classList.toggle("hidden", choice === "" || choice === "__null__");
 }
 
 function renderOutputChoices() {

@@ -94,6 +94,7 @@ pub mod ids {
     pub const SWAY_CONFIG: &str = "sway-config";
     pub const STATE_DIR: &str = "state-dir";
     pub const API_REACHABILITY: &str = "api-reachability";
+    pub const CAPTURE_DEVICES: &str = "capture-devices";
 }
 
 /// A host packet filter that may be dropping traffic to the API port.
@@ -289,6 +290,7 @@ impl CheckRunner {
             self.check_sway_config(),
             self.check_state_dir(),
             self.check_api_reachability().await,
+            self.check_capture_devices(),
         ];
 
         let changed = {
@@ -1106,6 +1108,86 @@ impl CheckRunner {
 
     // --- remediations -----------------------------------------------------
 
+    /// Whether this user can open the machine's capture devices.
+    ///
+    /// A browser reaches a camera or a capture card through `/dev/videoN`
+    /// itself, so the page's permission is only half the story: with the
+    /// permission granted and the device node unreadable, `getUserMedia`
+    /// fails with `NotReadableError` and the device list comes back empty —
+    /// which looks exactly like a permission that was refused, and sends
+    /// whoever is debugging it to the wrong end of the problem entirely.
+    ///
+    /// The test is an open, not a look at the group list: what matters is
+    /// whether this process can open the node, and only `PermissionDenied`
+    /// answers that. Any other error means the open was allowed and the
+    /// device was merely busy — which, when an app is streaming from it, is
+    /// the healthy case.
+    fn check_capture_devices(&self) -> Check {
+        let nodes = capture_nodes();
+        if nodes.is_empty() {
+            return self.check(
+                ids::CAPTURE_DEVICES,
+                "Capture devices readable",
+                CheckStatus::Pass,
+                "no capture devices are attached".to_string(),
+                None,
+            );
+        }
+
+        let mut denied: Vec<(PathBuf, u32)> = Vec::new();
+        for node in &nodes {
+            if let Err(error) = std::fs::File::open(node) {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    let gid = std::fs::metadata(node)
+                        .map(|meta| std::os::unix::fs::MetadataExt::gid(&meta))
+                        .unwrap_or(0);
+                    denied.push((node.clone(), gid));
+                }
+            }
+        }
+
+        if denied.is_empty() {
+            return self.check(
+                ids::CAPTURE_DEVICES,
+                "Capture devices readable",
+                CheckStatus::Pass,
+                format!(
+                    "{} capture device{} present and readable",
+                    nodes.len(),
+                    if nodes.len() == 1 { "" } else { "s" }
+                ),
+                None,
+            );
+        }
+
+        // Name the group that actually owns the node rather than assuming
+        // `video`: it is `video` nearly everywhere, and the one machine where
+        // it is not is precisely where a guess wastes an afternoon.
+        let group = denied
+            .iter()
+            .find_map(|(_, gid)| group_name(*gid))
+            .unwrap_or_else(|| "video".to_string());
+        let names: Vec<String> = denied
+            .iter()
+            .map(|(path, _)| path.display().to_string())
+            .collect();
+
+        self.check(
+            ids::CAPTURE_DEVICES,
+            "Capture devices readable",
+            CheckStatus::Warn,
+            format!(
+                "cannot open {} — a page asking for a camera will get \
+                 NotReadableError and an empty device list. Add this user to \
+                 the {group} group: `sudo usermod -aG {group} $USER`, then log \
+                 out and back in (or reboot); group membership is fixed when \
+                 the session starts.",
+                names.join(", ")
+            ),
+            Some("troubleshooting/#a-page-cannot-reach-a-camera-or-capture-device"),
+        )
+    }
+
     /// Run the remediation for `id`, returning what was done.
     pub async fn fix(&self, id: &str) -> ApiResult<String> {
         let outcome = match id {
@@ -1483,6 +1565,44 @@ fn compositor_env(key: &str) -> Option<String> {
         .find_map(|entry| entry.strip_prefix(&format!("{key}="))?.to_string().into())
 }
 
+/// Every `/dev/videoN` the kernel is offering, sorted.
+///
+/// A UVC device presents more than one: a capture node and a metadata node.
+/// Both are checked, because both are opened by whatever uses the device and
+/// either can carry the wrong permissions on its own.
+fn capture_nodes() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir("/dev") else {
+        return Vec::new();
+    };
+    let mut nodes: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix("video"))
+                .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        })
+        .collect();
+    nodes.sort();
+    nodes
+}
+
+/// Group name for a gid, from `/etc/group`.
+fn group_name(gid: u32) -> Option<String> {
+    let text = std::fs::read_to_string("/etc/group").ok()?;
+    group_name_in(&text, gid)
+}
+
+fn group_name_in(text: &str, gid: u32) -> Option<String> {
+    text.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?;
+        let _password = fields.next()?;
+        (fields.next()?.parse::<u32>().ok()? == gid).then(|| name.to_string())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1570,7 +1690,7 @@ mod tests {
     async fn every_check_reports_something() {
         let dir = tempfile::tempdir().unwrap();
         let checks = runner(dir.path().to_path_buf()).run_all().await;
-        assert_eq!(checks.len(), 13);
+        assert_eq!(checks.len(), 14);
         for id in [
             ids::SWAY_SOCKET,
             ids::SWAY_VERSION,

@@ -328,6 +328,41 @@ pw-dump | grep -A2 Stream/Output/Audio
 wpctl status          # sinks in state "running" are being fed
 ```
 
+## A page cannot reach a camera or capture device
+
+Three separate things have to be true, and all three fail the same way — a
+black rectangle, or `NotReadableError`, with no clue which one it was. The
+`capture-devices` health check covers the third.
+
+| Requirement | Symptom when missing | Fix |
+|---|---|---|
+| A secure context | `navigator.mediaDevices` is `undefined`; no prompt, no error | Serve over `https://` or from loopback. Suede otherwise passes `--unsafely-treat-insecure-origin-as-secure` for the app's own origin automatically |
+| Permission | `NotAllowedError`, or a prompt nobody can click | The kiosk preset passes `--auto-accept-camera-and-microphone-capture` |
+| Access to the device node | `NotReadableError`, and an empty device list | Add the user to the `video` group |
+
+The third is the one that catches people, because it is invisible from inside
+the browser and looks exactly like a refused permission:
+
+```bash
+ls -l /dev/video*                  # note the owning group
+id                                 # is this user in it?
+sudo usermod -aG video $USER       # then log out and back in
+```
+
+Group membership is fixed when a session starts, so the change does nothing
+until the appliance user logs in again — on an auto-login appliance, reboot.
+
+!!! warning "Permission granted is not device names read"
+    `--auto-accept-camera-and-microphone-capture` waves each request through
+    without *persisting* a grant, and without a persisted grant
+    `enumerateDevices()` returns entries whose `label` and `deviceId` are both
+    empty strings. Passing through the first input still works; selecting a
+    device *by name* cannot, because there is no name to match. For that, grant
+    the permission with a policy instead — a JSON file in
+    `/etc/opt/chrome/policies/managed/` (or `/etc/chromium/policies/managed/`)
+    setting `VideoCaptureAllowedUrls` and `AudioCaptureAllowedUrls` to the app's
+    origin. A live `MediaStreamTrack` always knows its own `label` either way.
+
 ## Configuration was lost
 
 It should not be. Desired state lives in `$XDG_STATE_HOME/suede/state.json`, is written atomically, and keeps a `.bak`. Package upgrades do not touch it.

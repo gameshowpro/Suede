@@ -330,6 +330,22 @@ impl DesiredState {
                     "{prefix}.restart.delayMs must not exceed maxDelayMs"
                 ));
             }
+            if let Some(audio) = &app.audio {
+                // The scale runs from silence to unity: -100 dB stands in
+                // for minus infinity, and there is nothing above 0 dB that a
+                // digital sink can do except clip.
+                if !(audio.gain_db.is_finite()
+                    && (crate::audio::GAIN_FLOOR_DB..=crate::audio::GAIN_CEILING_DB)
+                        .contains(&audio.gain_db))
+                {
+                    errors.push(format!(
+                        "{prefix}.audio.gainDb must be between {} and {}, not {}",
+                        crate::audio::GAIN_FLOOR_DB,
+                        crate::audio::GAIN_CEILING_DB,
+                        audio.gain_db
+                    ));
+                }
+            }
             if let Some(heartbeat) = &app.heartbeat {
                 if heartbeat.enabled && heartbeat.timeout_seconds == 0 {
                     errors.push(format!(
@@ -862,12 +878,31 @@ impl RestartPolicy {
 /// it defers the choice to each launch, so the app follows whatever
 /// PipeWire's default sink is at the time. Naming a sink here locks the app
 /// to it however the machine's default moves.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioConfig {
     /// PipeWire `node.name` of the sink to lock this app to. `null` locks it
     /// to silence.
     pub output: Option<String>,
+    /// Playback gain for that sink, in dB. `0.0` is unity, and the default.
+    ///
+    /// Unity is the default because it is the only level that means the same
+    /// thing on every machine. A sink left wherever some earlier session put
+    /// it passes signal at a level nobody knows, which is a miserable fault to
+    /// chase: everything works, quietly. On a digital output it is worse than
+    /// inconvenient — every dB taken here is resolution discarded before the
+    /// link, and nothing downstream can put it back. Attenuate at the
+    /// amplifier instead, and leave this alone.
+    ///
+    /// The scale runs from `-100.0`, which means silence rather than a very
+    /// small gain, up to `0.0`. There is nothing above unity: a digital sink
+    /// has no headroom above full scale and can only clip.
+    ///
+    /// Mind the scales when comparing with other tools. PipeWire's own
+    /// `channelVolumes` is linear amplitude; the number `wpctl` prints is its
+    /// cube root, so `wpctl`'s 0.40 is -24 dB, not -8.
+    #[serde(default)]
+    pub gain_db: f64,
 }
 
 /// Content-level watchdog settings.
@@ -1301,7 +1336,13 @@ mod tests {
             r#"{"id":"a","launcher":{"kind":"exec","command":"true"},"audio":{"output":null}}"#,
         )
         .unwrap();
-        assert_eq!(silent.audio, Some(AudioConfig { output: None }));
+        assert_eq!(
+            silent.audio,
+            Some(AudioConfig {
+                output: None,
+                gain_db: 0.0
+            })
+        );
     }
 
     // --- background presets ----------------------------------------------

@@ -12,6 +12,9 @@ use crate::model::AudioSink;
 pub struct MockAudio {
     sinks: RwLock<Vec<AudioSink>>,
     null_sink_created: Mutex<u32>,
+    /// Every gain that was asked for, in order, so a test can assert on what
+    /// the reconciler did rather than on what it left behind.
+    gains_set: Mutex<Vec<(String, f64)>>,
     available: AtomicBool,
     changes: broadcast::Sender<Vec<AudioSink>>,
 }
@@ -28,6 +31,7 @@ impl MockAudio {
         Self {
             sinks: RwLock::new(sinks),
             null_sink_created: Mutex::new(0),
+            gains_set: Mutex::new(Vec::new()),
             available: AtomicBool::new(true),
             changes,
         }
@@ -42,6 +46,7 @@ impl MockAudio {
                 is_null_sink: false,
                 is_default: true,
                 output_hint: None,
+                gain_db: Some(0.0),
             },
             AudioSink {
                 id: "alsa_output.hdmi-stereo-extra1".into(),
@@ -49,8 +54,14 @@ impl MockAudio {
                 is_null_sink: false,
                 is_default: false,
                 output_hint: None,
+                gain_db: Some(0.0),
             },
         ])
+    }
+
+    /// Gains requested so far, in order.
+    pub fn gains_set(&self) -> Vec<(String, f64)> {
+        self.gains_set.lock().unwrap().clone()
     }
 
     pub fn set_sinks(&self, sinks: Vec<AudioSink>) {
@@ -78,6 +89,26 @@ impl AudioMonitor for MockAudio {
         Ok(self.sinks())
     }
 
+    async fn set_sink_gain(&self, sink: &str, gain_db: f64) -> AudioResult<()> {
+        if !self.sinks().iter().any(|s| s.id == sink) {
+            return Err(super::AudioError::SinkUnknown {
+                sink: sink.to_string(),
+            });
+        }
+        self.gains_set
+            .lock()
+            .unwrap()
+            .push((sink.to_string(), gain_db));
+        let mut sinks = self.sinks();
+        for entry in &mut sinks {
+            if entry.id == sink {
+                entry.gain_db = Some(gain_db);
+            }
+        }
+        self.set_sinks(sinks);
+        Ok(())
+    }
+
     async fn ensure_null_sink(&self) -> AudioResult<()> {
         if self.sinks().iter().any(|sink| sink.id == NULL_SINK_NAME) {
             return Ok(());
@@ -90,6 +121,7 @@ impl AudioMonitor for MockAudio {
             is_null_sink: true,
             is_default: false,
             output_hint: None,
+            gain_db: Some(0.0),
         });
         self.set_sinks(sinks);
         Ok(())
@@ -127,6 +159,7 @@ mod tests {
             is_null_sink: false,
             is_default: false,
             output_hint: None,
+            gain_db: Some(0.0),
         }]);
         assert_eq!(receiver.recv().await.unwrap().len(), 1);
     }

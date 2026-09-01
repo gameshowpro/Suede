@@ -166,6 +166,11 @@
         "additionalProperties": false,
         "description": "Where an application's audio should go.\n\nOmitting this field entirely is the third option and a different one:\nit defers the choice to each launch, so the app follows whatever\nPipeWire's default sink is at the time. Naming a sink here locks the app\nto it however the machine's default moves.",
         "properties": {
+          "gainDb": {
+            "description": "Playback gain for that sink, in dB. `0.0` is unity, and the default.\n\nUnity is the default because it is the only level that means the same\nthing on every machine. A sink left wherever some earlier session put\nit passes signal at a level nobody knows, which is a miserable fault to\nchase: everything works, quietly. On a digital output it is worse than\ninconvenient — every dB taken here is resolution discarded before the\nlink, and nothing downstream can put it back. Attenuate at the\namplifier instead, and leave this alone.\n\nThe scale runs from `-100.0`, which means silence rather than a very\nsmall gain, up to `0.0`. There is nothing above unity: a digital sink\nhas no headroom above full scale and can only clip.\n\nMind the scales when comparing with other tools. PipeWire's own\n`channelVolumes` is linear amplitude; the number `wpctl` prints is its\ncube root, so `wpctl`'s 0.40 is -24 dB, not -8.",
+            "format": "double",
+            "type": "number"
+          },
           "output": {
             "description": "PipeWire `node.name` of the sink to lock this app to. `null` locks it\nto silence.",
             "type": [
@@ -183,6 +188,14 @@
             "description": "Human-readable `node.description`.",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "gainDb": {
+            "description": "Current playback gain in dB, `0.0` being unity. `None` when PipeWire\nreports no volume for this sink at all.\n\nDerived from the linear `channelVolumes` PipeWire holds, so it is the\ngain actually in the signal path rather than the cube-rooted number a\nmixer UI displays.",
+            "format": "double",
+            "type": [
+              "number",
               "null"
             ]
           },
