@@ -1127,9 +1127,9 @@ impl CheckRunner {
         if nodes.is_empty() {
             return self.check(
                 ids::CAPTURE_DEVICES,
-                "Capture devices readable",
+                "Video devices readable",
                 CheckStatus::Pass,
-                "no capture devices are attached".to_string(),
+                "no video device nodes are present".to_string(),
                 None,
             );
         }
@@ -1149,10 +1149,10 @@ impl CheckRunner {
         if denied.is_empty() {
             return self.check(
                 ids::CAPTURE_DEVICES,
-                "Capture devices readable",
+                "Video devices readable",
                 CheckStatus::Pass,
                 format!(
-                    "{} capture device{} present and readable",
+                    "{} video device node{} present and readable",
                     nodes.len(),
                     if nodes.len() == 1 { "" } else { "s" }
                 ),
@@ -1174,7 +1174,7 @@ impl CheckRunner {
 
         self.check(
             ids::CAPTURE_DEVICES,
-            "Capture devices readable",
+            "Video devices readable",
             CheckStatus::Warn,
             format!(
                 "cannot open {} — a page asking for a camera will get \
@@ -1567,9 +1567,13 @@ fn compositor_env(key: &str) -> Option<String> {
 
 /// Every `/dev/videoN` the kernel is offering, sorted.
 ///
-/// A UVC device presents more than one: a capture node and a metadata node.
-/// Both are checked, because both are opened by whatever uses the device and
-/// either can carry the wrong permissions on its own.
+/// Not all of them are cameras, and the count is deliberately not described as
+/// though they were: a UVC device presents a capture node *and* a metadata
+/// node, and a Raspberry Pi 5 presents seventeen with no camera attached at
+/// all — one HEVC decoder and sixteen ISP nodes. Telling them apart needs a
+/// V4L2 ioctl, which would cost a libc dependency for no gain here, because
+/// every one of them is opened by something and every one can carry the wrong
+/// permissions on its own. So all are checked, and the message says nodes.
 fn capture_nodes() -> Vec<PathBuf> {
     let Ok(entries) = std::fs::read_dir("/dev") else {
         return Vec::new();

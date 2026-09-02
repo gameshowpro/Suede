@@ -340,6 +340,12 @@ black rectangle, or `NotReadableError`, with no clue which one it was. The
 | Permission | `NotAllowedError`, or a prompt nobody can click | The kiosk preset passes `--auto-accept-camera-and-microphone-capture` |
 | Access to the device node | `NotReadableError`, and an empty device list | Add the user to the `video` group |
 
+The `capture-devices` check counts `/dev/videoN` nodes rather than cameras,
+because telling the two apart needs a V4L2 ioctl. Expect a machine with no
+camera at all to report several: a Raspberry Pi 5 presents seventeen — one HEVC
+decoder and sixteen ISP nodes — and a single USB camera presents two, a capture
+node and a metadata node. What matters is that none of them is unreadable.
+
 The third is the one that catches people, because it is invisible from inside
 the browser and looks exactly like a refused permission:
 
