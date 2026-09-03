@@ -8,11 +8,16 @@
 //! test page served by the daemon, let the page ask the media APIs, and have
 //! it post the answers back. The operator sees measurements, not inference.
 //!
-//! The flow is one blocking request: `POST /api/v1/apps/capabilities` holds
-//! the connection while the browser starts, the page reports, and the browser
-//! is terminated again. The page authenticates its report with the one-time
-//! id in its URL — it cannot hold the API token, exactly like heartbeats —
-//! and both page and report are accepted from the local machine only.
+//! Two ways in, one measurement. `POST /api/v1/apps/capabilities` holds the
+//! connection while the browser starts, the page reports, and the browser is
+//! terminated again. [`boot_measure`] runs the same thing once at startup —
+//! but only when the stored measurement no longer describes this machine,
+//! so most boots open no window at all. Either way the result lands in the
+//! [`CapabilityStore`] and the `decode-measured` health check judges it.
+//!
+//! The page authenticates its report with the one-time id in its URL — it
+//! cannot hold the API token, exactly like heartbeats — and both page and
+//! report are accepted from the local machine only.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -26,9 +31,12 @@ use tokio::sync::oneshot;
 
 use super::ApiState;
 use crate::api::json::Json;
+use crate::capabilities::{MeasurementKey, StoredMeasurement};
 use crate::error::{ApiError, ApiResult};
 use crate::model::{AppConfig, Launcher};
 use crate::supervisor::launcher;
+
+pub use crate::model::{CapabilityReport, CodecSupport};
 
 /// The page the launched browser is pointed at.
 const PAGE: &str = include_str!("ui/capability-check.html");
@@ -45,50 +53,9 @@ const EXIT_GRACE: Duration = Duration::from_secs(2);
 /// SIGTERM to SIGKILL escalation, matching the supervisor's manner.
 const TERMINATE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// What the page measured. The page constructs exactly this shape; anything
-/// else is drift between the two halves and is rejected loudly.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CapabilityReport {
-    pub user_agent: String,
-    /// From `WEBGL_debug_renderer_info`. `null` when WebGL is unavailable or
-    /// the browser masks it — itself a finding, since a software rasteriser
-    /// usually announces itself here (`SwiftShader`, `llvmpipe`).
-    #[serde(default)]
-    pub gpu_vendor: Option<String>,
-    #[serde(default)]
-    pub gpu_renderer: Option<String>,
-    /// Whether a WebGPU adapter was obtainable.
-    pub webgpu: bool,
-    /// Whether the WebCodecs `VideoDecoder` API exists at all — without it
-    /// the per-codec `hardware` column cannot be measured.
-    pub video_decoder_api: bool,
-    /// Anything the page could not measure, in its own words.
-    pub notes: Vec<String>,
-    pub codecs: Vec<CodecSupport>,
-}
-
-/// One codec at one resolution, as the media APIs answered.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CodecSupport {
-    /// Human label, e.g. `H.265 Main 2160p60`.
-    pub label: String,
-    /// What was actually asked for, e.g. `video/mp4; codecs="hvc1.1.6.L153.B0"`.
-    pub content_type: String,
-    /// `MediaCapabilities.decodingInfo().supported`.
-    pub supported: bool,
-    #[serde(default)]
-    pub smooth: Option<bool>,
-    /// The classic hardware-decode signal; browsers report it conservatively.
-    #[serde(default)]
-    pub power_efficient: Option<bool>,
-    /// `VideoDecoder.isConfigSupported` with `prefer-hardware`: `true` means
-    /// a hardware decoder accepted the configuration, `false` means only a
-    /// software one did, `null` means the API could not answer.
-    #[serde(default)]
-    pub hardware: Option<bool>,
-}
+/// How long the boot-time measurement waits: longer than the button's
+/// default, because a cold browser on a small machine is slowest at boot.
+const BOOT_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// How a capability check ended.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -181,7 +148,7 @@ impl CapabilityChecks {
     }
 }
 
-/// Releases the slot however the handler leaves — early error or completion.
+/// Releases the slot however the measurement leaves — early error or done.
 struct Slot {
     checks: std::sync::Arc<CapabilityChecks>,
     id: String,
@@ -193,23 +160,17 @@ impl Drop for Slot {
     }
 }
 
-#[utoipa::path(
-    post, path = "/api/v1/apps/capabilities", tag = "apps",
-    request_body = AppConfig,
-    params(CapabilityQuery),
-    responses(
-        (status = 200,
-         description = "The check ran; `completed` says whether the page                         reported before the browser was taken down. A window                         opens on the appliance's displays while it runs.",
-         body = CapabilityOutcome),
-        (status = 400, description = "The launcher is not a browser, or no                         browser is installed"),
-        (status = 409, description = "A capability check is already running"),
-    )
-)]
-pub async fn run_capability_check(
-    State(state): State<ApiState>,
-    Query(query): Query<CapabilityQuery>,
-    Json(app): Json<AppConfig>,
-) -> ApiResult<Json<CapabilityOutcome>> {
+/// The measurement itself, shared by the API handler and the boot check.
+///
+/// Launches `app`'s configuration against the test page, waits for the
+/// page's report, terminates the browser, and remembers the outcome in the
+/// [`crate::capabilities::CapabilityStore`] so the `decode-measured` health
+/// check reflects the newest truth from either path.
+pub async fn measure(
+    state: &ApiState,
+    app: &AppConfig,
+    timeout: Duration,
+) -> ApiResult<CapabilityOutcome> {
     if matches!(app.launcher, Launcher::Exec { .. }) {
         return Err(ApiError::BadRequest(
             "a capability check needs a browser launcher; an exec application \
@@ -217,20 +178,19 @@ pub async fn run_capability_check(
                 .into(),
         ));
     }
-    let timeout = Duration::from_secs(query.timeout_seconds.unwrap_or(30).clamp(5, 120));
 
     let Some((id, mut receiver)) = state.capabilities.begin() else {
         return Err(ApiError::Conflict(
             "a capability check is already running; wait for it to finish".into(),
         ));
     };
-    let slot = Slot {
+    let _slot = Slot {
         checks: state.capabilities.clone(),
         id: id.clone(),
     };
 
     let context = state.supervisor.launch_context();
-    let check_app = check_variant(&app, context, &id);
+    let check_app = check_variant(app, context, &id);
     let chosen = launcher::choose_program(&check_app);
     let Some(chosen) = chosen else {
         return Err(ApiError::BadRequest(format!(
@@ -238,6 +198,7 @@ pub async fn run_capability_check(
             launcher::candidates_for(&check_app).join(", ")
         )));
     };
+    let key = MeasurementKey::new(app, &chosen);
     let spec = launcher::build(&check_app, context, Some(&chosen));
 
     // Its own profile, started clean every time — including for Firefox,
@@ -321,8 +282,149 @@ pub async fn run_capability_check(
     };
 
     terminate(child).await;
-    drop(slot);
-    Ok(Json(outcome))
+
+    // Remembered either way: a report is the newest truth, and a failure is
+    // a fact the health check should state rather than paper over.
+    state.capability_store.record(StoredMeasurement {
+        measured_at: crate::util::unix_now(),
+        app_id: app.id.clone(),
+        key,
+        report: outcome.report.clone(),
+        note: outcome.note.clone(),
+    });
+
+    Ok(outcome)
+}
+
+/// The startup measurement: once, and only when the world changed.
+///
+/// Runs after the server starts accepting (the launched browser fetches its
+/// page from the daemon), concurrently with the reconciler bringing the show
+/// up — at boot the check's brief window is lost in the boot noise, which is
+/// the one moment that is true. A stored measurement whose key still
+/// describes this machine short-circuits the whole thing: no window opens.
+pub async fn boot_measure(state: ApiState) {
+    let desired = state.store.effective();
+    if !desired.settings.measure_capabilities_on_start {
+        return;
+    }
+    let Some(app) = crate::capabilities::subject(&desired) else {
+        tracing::debug!("no browser application configured; capabilities not measured");
+        return;
+    };
+    let Some(program) = launcher::choose_program(&app) else {
+        tracing::debug!("no browser installed; capabilities not measured");
+        return;
+    };
+    if state
+        .capability_store
+        .is_current(&MeasurementKey::new(&app, &program))
+    {
+        tracing::debug!("capability measurement is current; not re-measuring");
+        // The check still needs to reflect the stored report on this boot.
+        state.checks.run_all().await;
+        return;
+    }
+
+    // The browser can only fetch its page once the daemon answers; poll our
+    // own health endpoint rather than guessing at server startup timing.
+    let base = state.supervisor.launch_context().api_base.clone();
+    let healthz = format!(
+        "{}/healthz",
+        base.trim_end_matches('/')
+            .trim_end_matches("/api/v1")
+            .trim_end_matches('/')
+    );
+    for _ in 0..50 {
+        if crate::probe::status_of(&healthz, Duration::from_secs(1))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    tracing::info!(app = %app.id, "measuring browser capabilities (configuration changed)");
+    match measure(&state, &app, BOOT_TIMEOUT).await {
+        Ok(outcome) if outcome.completed => {
+            tracing::info!(elapsed_ms = outcome.elapsed_ms, "capabilities measured");
+        }
+        Ok(outcome) => {
+            tracing::warn!(note = ?outcome.note, "capability measurement did not complete");
+        }
+        Err(error) => {
+            tracing::warn!(%error, "capability measurement could not run");
+        }
+    }
+    // Whatever happened, the decode-measured check now has something to say.
+    state.checks.run_all().await;
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/apps/capabilities", tag = "apps",
+    request_body = AppConfig,
+    params(CapabilityQuery),
+    responses(
+        (status = 200,
+         description = "The check ran; `completed` says whether the page \
+                        reported before the browser was taken down. A window \
+                        opens on the appliance's displays while it runs.",
+         body = CapabilityOutcome),
+        (status = 400, description = "The launcher is not a browser, or no \
+                        browser is installed"),
+        (status = 409, description = "A capability check is already running"),
+    )
+)]
+pub async fn run_capability_check(
+    State(state): State<ApiState>,
+    Query(query): Query<CapabilityQuery>,
+    Json(app): Json<AppConfig>,
+) -> ApiResult<Json<CapabilityOutcome>> {
+    let timeout = Duration::from_secs(query.timeout_seconds.unwrap_or(30).clamp(5, 120));
+    measure(&state, &app, timeout).await.map(Json)
+}
+
+/// The stored measurement, as `GET /apps/capabilities/last` serves it.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LastMeasurement {
+    /// Unix seconds.
+    pub measured_at: u64,
+    /// Which application's configuration was measured.
+    pub app_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<CapabilityReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Whether the measurement still describes this machine: same launcher,
+    /// same browser binary, same driver, same daemon. `false` means the
+    /// startup check will re-measure on the next boot.
+    pub current: bool,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/apps/capabilities/last", tag = "apps",
+    responses(
+        (status = 200, description = "The most recent capability measurement",
+         body = LastMeasurement),
+        (status = 404, description = "Nothing has been measured yet"),
+    )
+)]
+pub async fn get_last(State(state): State<ApiState>) -> ApiResult<Json<LastMeasurement>> {
+    let Some(stored) = state.capability_store.latest() else {
+        return Err(ApiError::NotFound("nothing has been measured yet".into()));
+    };
+    let current = crate::capabilities::subject(&state.store.effective())
+        .and_then(|app| launcher::choose_program(&app).map(|p| MeasurementKey::new(&app, &p)))
+        .is_some_and(|key| key == stored.key);
+    Ok(Json(LastMeasurement {
+        measured_at: stored.measured_at,
+        app_id: stored.app_id,
+        report: stored.report,
+        note: stored.note,
+        current,
+    }))
 }
 
 /// The served test page. Public in token mode — the browser cannot hold the
@@ -622,9 +724,10 @@ mod tests {
     }
 
     /// The full journey, with `/bin/true` standing in for the browser: the
-    /// check launches it, the "page" reports, the outcome carries the report.
+    /// check launches it, the "page" reports, the outcome carries the report
+    /// — and the measurement is remembered for the health check.
     #[tokio::test]
-    async fn a_report_completes_the_check() {
+    async fn a_report_completes_the_check_and_is_remembered() {
         let harness = harness(None);
         let state = harness.state.clone();
         let router = harness.router.clone();
@@ -667,11 +770,30 @@ mod tests {
         assert_eq!(outcome["report"]["gpuRenderer"], "RTX A2000");
         assert_eq!(outcome["report"]["codecs"][0]["hardware"], true);
 
-        // The slot is free again.
+        // The slot is free again, and the store remembers.
         assert!(state.capabilities.pending_id().is_none());
+        let stored = state.capability_store.latest().unwrap();
+        assert_eq!(stored.app_id, "renderer");
+        assert!(stored.report.is_some());
+
+        // And the last-measurement endpoint serves it.
+        let (status, body) = send(
+            &harness,
+            Request::builder()
+                .uri("/api/v1/apps/capabilities/last")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:5",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let last: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(last["appId"], "renderer");
+        assert_eq!(last["report"]["codecs"][0]["hardware"], true);
     }
 
-    /// A browser that dies without reporting is explained, not just timed out.
+    /// A browser that dies without reporting is explained, not just timed
+    /// out — and the failure is remembered too.
     #[tokio::test]
     async fn an_early_exit_is_reported_as_such() {
         let harness = harness(None);
@@ -689,6 +811,25 @@ mod tests {
         assert_eq!(outcome["completed"], false);
         assert!(outcome["note"].as_str().unwrap().contains("exited"));
         assert!(harness.state.capabilities.pending_id().is_none());
+
+        let stored = harness.state.capability_store.latest().unwrap();
+        assert!(stored.report.is_none());
+        assert!(stored.note.unwrap().contains("exited"));
+    }
+
+    #[tokio::test]
+    async fn nothing_measured_yet_is_404() {
+        let harness = harness(None);
+        let (status, _) = send(
+            &harness,
+            Request::builder()
+                .uri("/api/v1/apps/capabilities/last")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:5",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[test]

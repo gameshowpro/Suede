@@ -455,7 +455,19 @@ environment variables rather than command-line flags:
     expected to be smooth and power-efficient (`MediaCapabilities`), and the
     WebGL renderer string — `llvmpipe` or `SwiftShader` there means no GPU
     acceleration at all. The same measurement is available to any client as
-    `POST /api/v1/apps/capabilities`.
+    `POST /api/v1/apps/capabilities`, and the most recent one is served from
+    `GET /api/v1/apps/capabilities/last`.
+
+    The appliance also measures itself. At startup, if the browser, its
+    configuration, the GPU driver, or Suede itself changed since the last
+    measurement, the check runs once automatically — during boot, when its
+    brief window is lost in the noise — and the `decode-measured` health
+    check judges the result: a GPU that is software-decoding everything is a
+    warning (the silent fallback), a software rasteriser is a warning, and a
+    platform with no browser decode path (VideoCore) passes with the facts
+    stated. With nothing changed, nothing is launched: the stored
+    measurement stands. `measureCapabilitiesOnStart` in settings turns the
+    automatic run off.
 
     Independent confirmation, if you want it: watch `nvidia-smi dmon -s u`
     and look at the `dec` column while a video plays.
@@ -764,6 +776,7 @@ build without it still accepts and stores this configuration, and reports a
 | `hideCursor` | `true` | Hide the pointer and park it below the layout |
 | `outputPollIntervalSeconds` | `5` | Backstop poll, in case an event is missed |
 | `allowRawSwayCommands` | `false` | Enable `POST /sway/command` passthrough |
+| `measureCapabilitiesOnStart` | `true` | Measure browser decode capabilities at startup when something changed — see below |
 
 !!! danger "Raw command passthrough"
     `allowRawSwayCommands` permits arbitrary Sway commands, including `exec`. It is off by default and intended for debugging.

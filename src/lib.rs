@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod audio;
+pub mod capabilities;
 pub mod checks;
 pub mod config;
 pub mod error;

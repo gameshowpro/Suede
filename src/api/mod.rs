@@ -48,6 +48,7 @@ pub struct ApiState {
     pub checks: Arc<CheckRunner>,
     pub wallpapers: Arc<crate::wallpapers::WallpaperStore>,
     pub capabilities: Arc<capabilities::CapabilityChecks>,
+    pub capability_store: Arc<crate::capabilities::CapabilityStore>,
     pub started_at: Instant,
 }
 
@@ -133,6 +134,7 @@ pub fn router(state: ApiState) -> Router {
             "/apps/capabilities",
             post(capabilities::run_capability_check),
         )
+        .route("/apps/capabilities/last", get(capabilities::get_last))
         .route(
             "/capability-check/{id}/result",
             post(capabilities::post_result),
@@ -343,12 +345,14 @@ pub mod test_support {
             wallpapers: wallpapers.clone(),
             docs_base_url: bootstrap.docs_base_url.clone(),
         }));
+        let capability_store = Arc::new(crate::capabilities::CapabilityStore::new(dir.path()));
         let checks = Arc::new(CheckRunner::new(
             bootstrap.clone(),
             sway.clone(),
             audio.clone(),
             store.clone(),
             hub.clone(),
+            capability_store.clone(),
         ));
         let (trigger, _receiver) = Reconciler::channel();
 
@@ -365,6 +369,7 @@ pub mod test_support {
             checks,
             wallpapers,
             capabilities: Arc::new(capabilities::CapabilityChecks::default()),
+            capability_store,
             started_at: Instant::now(),
         };
 

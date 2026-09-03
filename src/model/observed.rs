@@ -383,6 +383,56 @@ pub enum CheckStatus {
     Fail,
 }
 
+/// What a browser measured about itself, posted back by the capability page.
+///
+/// Observed state like any other, except the observer is the browser: these
+/// are the media APIs' own answers from inside the operator's exact
+/// configuration, not an inspection from outside it. The page constructs
+/// exactly this shape; anything else is drift between the two halves and is
+/// rejected loudly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CapabilityReport {
+    pub user_agent: String,
+    /// From `WEBGL_debug_renderer_info`. `null` when WebGL is unavailable or
+    /// the browser masks it — itself a finding, since a software rasteriser
+    /// usually announces itself here (`SwiftShader`, `llvmpipe`).
+    #[serde(default)]
+    pub gpu_vendor: Option<String>,
+    #[serde(default)]
+    pub gpu_renderer: Option<String>,
+    /// Whether a WebGPU adapter was obtainable.
+    pub webgpu: bool,
+    /// Whether the WebCodecs `VideoDecoder` API exists at all — without it
+    /// the per-codec `hardware` column cannot be measured.
+    pub video_decoder_api: bool,
+    /// Anything the page could not measure, in its own words.
+    pub notes: Vec<String>,
+    pub codecs: Vec<CodecSupport>,
+}
+
+/// One codec at one resolution, as the media APIs answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodecSupport {
+    /// Human label, e.g. `H.265 Main 2160p60`.
+    pub label: String,
+    /// What was actually asked for, e.g. `video/mp4; codecs="hvc1.1.6.L153.B0"`.
+    pub content_type: String,
+    /// `MediaCapabilities.decodingInfo().supported`.
+    pub supported: bool,
+    #[serde(default)]
+    pub smooth: Option<bool>,
+    /// The classic hardware-decode signal; browsers report it conservatively.
+    #[serde(default)]
+    pub power_efficient: Option<bool>,
+    /// `VideoDecoder.isConfigSupported` with `prefer-hardware`: `true` means
+    /// a hardware decoder accepted the configuration, `false` means only a
+    /// software one did, `null` means the API could not answer.
+    #[serde(default)]
+    pub hardware: Option<bool>,
+}
+
 /// An environment health check, as served by `GET /system/checks`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]

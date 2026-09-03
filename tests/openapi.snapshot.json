@@ -331,7 +331,7 @@
       },
       "CapabilityReport": {
         "additionalProperties": false,
-        "description": "What the page measured. The page constructs exactly this shape; anything\nelse is drift between the two halves and is rejected loudly.",
+        "description": "What a browser measured about itself, posted back by the capability page.\n\nObserved state like any other, except the observer is the browser: these\nare the media APIs' own answers from inside the operator's exact\nconfiguration, not an inspection from outside it. The page constructs\nexactly this shape; anything else is drift between the two halves and is\nrejected loudly.",
         "properties": {
           "codecs": {
             "items": {
@@ -567,6 +567,7 @@
             "default": {
               "allowRawSwayCommands": false,
               "hideCursor": true,
+              "measureCapabilitiesOnStart": true,
               "outputPollIntervalSeconds": 5
             },
             "oneOf": [
@@ -646,6 +647,47 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "LastMeasurement": {
+        "description": "The stored measurement, as `GET /apps/capabilities/last` serves it.",
+        "properties": {
+          "appId": {
+            "description": "Which application's configuration was measured.",
+            "type": "string"
+          },
+          "current": {
+            "description": "Whether the measurement still describes this machine: same launcher,\nsame browser binary, same driver, same daemon. `false` means the\nstartup check will re-measure on the next boot.",
+            "type": "boolean"
+          },
+          "measuredAt": {
+            "description": "Unix seconds.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "report": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CapabilityReport"
+              }
+            ]
+          }
+        },
+        "required": [
+          "measuredAt",
+          "appId",
+          "current"
         ],
         "type": "object"
       },
@@ -1294,6 +1336,10 @@
             "description": "Hide the pointer and park it beyond the layout.",
             "type": "boolean"
           },
+          "measureCapabilitiesOnStart": {
+            "description": "Measure browser decode capabilities at startup when the browser,\nits configuration, or the GPU driver changed since last measured.\nA brief window opens on the displays while it runs; with nothing\nchanged, nothing opens.",
+            "type": "boolean"
+          },
           "outputPollIntervalSeconds": {
             "description": "Backstop poll interval for output changes.",
             "format": "int64",
@@ -1635,13 +1681,36 @@
                 }
               }
             },
-            "description": "The check ran; `completed` says whether the page                         reported before the browser was taken down. A window                         opens on the appliance's displays while it runs."
+            "description": "The check ran; `completed` says whether the page reported before the browser was taken down. A window opens on the appliance's displays while it runs."
           },
           "400": {
-            "description": "The launcher is not a browser, or no                         browser is installed"
+            "description": "The launcher is not a browser, or no browser is installed"
           },
           "409": {
             "description": "A capability check is already running"
+          }
+        },
+        "tags": [
+          "apps"
+        ]
+      }
+    },
+    "/api/v1/apps/capabilities/last": {
+      "get": {
+        "operationId": "get_last",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LastMeasurement"
+                }
+              }
+            },
+            "description": "The most recent capability measurement"
+          },
+          "404": {
+            "description": "Nothing has been measured yet"
           }
         },
         "tags": [

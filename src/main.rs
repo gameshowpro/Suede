@@ -221,12 +221,16 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         wallpapers: wallpapers.clone(),
         docs_base_url: bootstrap.docs_base_url.clone(),
     }));
+    let capability_store = Arc::new(suede::capabilities::CapabilityStore::new(
+        &bootstrap.state_dir,
+    ));
     let checks = Arc::new(CheckRunner::new(
         bootstrap.clone(),
         sway.clone(),
         audio.clone(),
         store.clone(),
         events.clone(),
+        capability_store.clone(),
     ));
     let (trigger, trigger_rx) = Reconciler::channel();
 
@@ -264,8 +268,13 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         checks,
         wallpapers,
         capabilities: std::sync::Arc::new(api::capabilities::CapabilityChecks::default()),
+        capability_store,
         started_at: Instant::now(),
     };
+
+    // Runs once the server below is accepting, and opens a window only when
+    // the stored measurement no longer describes this machine.
+    tokio::spawn(api::capabilities::boot_measure(state.clone()));
 
     let listener = tokio::net::TcpListener::bind(bootstrap.bind).await?;
     tracing::info!(address = %listener.local_addr()?, "listening");

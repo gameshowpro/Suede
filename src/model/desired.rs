@@ -1004,6 +1004,12 @@ pub struct Settings {
     pub output_poll_interval_seconds: u64,
     /// Enable the raw `POST /sway/command` passthrough.
     pub allow_raw_sway_commands: bool,
+    /// Measure browser decode capabilities at startup when the browser,
+    /// its configuration, or the GPU driver changed since last measured.
+    /// A brief window opens on the displays while it runs; with nothing
+    /// changed, nothing opens.
+    #[serde(default = "default_true")]
+    pub measure_capabilities_on_start: bool,
 }
 
 impl Default for Settings {
@@ -1012,6 +1018,7 @@ impl Default for Settings {
             hide_cursor: true,
             output_poll_interval_seconds: 5,
             allow_raw_sway_commands: false,
+            measure_capabilities_on_start: true,
         }
     }
 }

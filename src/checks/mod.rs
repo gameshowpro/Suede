@@ -94,6 +94,7 @@ pub mod ids {
     pub const SWAY_CONFIG: &str = "sway-config";
     pub const STATE_DIR: &str = "state-dir";
     pub const API_REACHABILITY: &str = "api-reachability";
+    pub const DECODE_MEASURED: &str = "decode-measured";
     pub const CAPTURE_DEVICES: &str = "capture-devices";
 }
 
@@ -228,6 +229,8 @@ pub struct CheckRunner {
     /// an upgraded browser is probed afresh rather than credited with its
     /// predecessor's health.
     probed_versions: RwLock<HashMap<PathBuf, (SystemTime, String)>>,
+    /// The last browser capability measurement, judged by `decode-measured`.
+    capabilities: Arc<crate::capabilities::CapabilityStore>,
 }
 
 impl CheckRunner {
@@ -237,6 +240,7 @@ impl CheckRunner {
         audio: Arc<dyn AudioMonitor>,
         store: Arc<crate::state::StateStore>,
         events: EventHub,
+        capabilities: Arc<crate::capabilities::CapabilityStore>,
     ) -> Self {
         Self {
             bootstrap,
@@ -247,6 +251,7 @@ impl CheckRunner {
             results: RwLock::new(Vec::new()),
             last_remote_client: RwLock::new(None),
             probed_versions: RwLock::new(HashMap::new()),
+            capabilities,
         }
     }
 
@@ -291,6 +296,7 @@ impl CheckRunner {
             self.check_state_dir(),
             self.check_api_reachability().await,
             self.check_capture_devices(),
+            self.check_decode_measured(),
         ];
 
         let changed = {
@@ -1188,6 +1194,42 @@ impl CheckRunner {
         )
     }
 
+    /// What the browser measured about itself, judged.
+    ///
+    /// Every other check inspects from outside; this one reads the browser's
+    /// own report — taken at startup when the configuration changed, or from
+    /// the application dialog's button — and says whether it is the report
+    /// this hardware should be giving. It never launches anything itself:
+    /// checks re-run on a schedule and the measurement opens a window on the
+    /// displays, which is a thing a schedule must never do.
+    fn check_decode_measured(&self) -> Check {
+        let (status, detail) = match self.capabilities.latest() {
+            None => (
+                CheckStatus::Pass,
+                "not measured yet: measured at startup once a browser \
+                 application is configured, or from the application dialog"
+                    .to_string(),
+            ),
+            Some(measurement) => match &measurement.report {
+                Some(report) => judge_report(report),
+                None => (
+                    CheckStatus::Warn,
+                    format!(
+                        "the last capability measurement failed: {}",
+                        measurement.note.as_deref().unwrap_or("no reason recorded")
+                    ),
+                ),
+            },
+        };
+        self.check(
+            ids::DECODE_MEASURED,
+            "Measured decode capabilities",
+            status,
+            detail,
+            Some("configuration/#environment-and-hardware-acceleration"),
+        )
+    }
+
     /// Run the remediation for `id`, returning what was done.
     pub async fn fix(&self, id: &str) -> ApiResult<String> {
         let outcome = match id {
@@ -1388,6 +1430,83 @@ async fn run(program: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
 
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// Judge a browser's own capability report against what this hardware
+/// should be saying. Pure, so every verdict is table-testable.
+///
+/// The rules are the ones field measurements taught:
+/// - a software rasteriser in the renderer string means no GPU acceleration
+///   of any kind, which makes every other answer moot — warn;
+/// - a real GPU with zero hardware codecs is the classic silent fallback
+///   (an NVIDIA machine without `VaapiOnNvidiaGPUs` looked exactly like
+///   this) — warn, unless the platform genuinely has no browser decode
+///   path, which VideoCore does not: on a Pi that state is the truth, and
+///   warning about physics forever only teaches people to ignore the check.
+fn judge_report(report: &crate::model::CapabilityReport) -> (CheckStatus, String) {
+    let renderer = report.gpu_renderer.as_deref().unwrap_or("unknown");
+    let lowered = renderer.to_ascii_lowercase();
+
+    if ["llvmpipe", "swiftshader", "softpipe"]
+        .iter()
+        .any(|soft| lowered.contains(soft))
+    {
+        return (
+            CheckStatus::Warn,
+            format!(
+                "the browser is software-rendering ({renderer}): no GPU \
+                 acceleration of any kind — decode, rasterisation or WebGL"
+            ),
+        );
+    }
+
+    // Codec families, first word of the label, order preserved.
+    let mut hardware: Vec<&str> = Vec::new();
+    let mut software: Vec<&str> = Vec::new();
+    for codec in &report.codecs {
+        let family = codec.label.split_whitespace().next().unwrap_or("?");
+        let list = match codec.hardware {
+            Some(true) => &mut hardware,
+            _ if codec.supported => &mut software,
+            _ => continue,
+        };
+        if !list.contains(&family) {
+            list.push(family);
+        }
+    }
+    software.retain(|family| !hardware.contains(family));
+
+    if hardware.is_empty() {
+        let expected_platform = ["videocore", "broadcom", "v3d"]
+            .iter()
+            .any(|pi| lowered.contains(pi));
+        if expected_platform {
+            return (
+                CheckStatus::Pass,
+                format!(
+                    "every codec decodes in software on {renderer}, which is \
+                     expected: no browser reaches VideoCore's decoder yet. \
+                     Prefer H.264 or VP9 at 1080p for this machine"
+                ),
+            );
+        }
+        return (
+            CheckStatus::Warn,
+            format!(
+                "a GPU is present ({renderer}) but every codec decodes in \
+                 software — the silent fallback that looks fine until the \
+                 content is demanding. Re-check from the application dialog \
+                 after changing arguments or drivers"
+            ),
+        );
+    }
+
+    let mut detail = format!("hardware decode: {}", hardware.join(", "));
+    if !software.is_empty() {
+        detail.push_str(&format!("; software only: {}", software.join(", ")));
+    }
+    detail.push_str(&format!(" — measured on {renderer}"));
+    (CheckStatus::Pass, detail)
 }
 
 /// Outputs invented by the compositor rather than driven from a connector.
@@ -1681,20 +1800,138 @@ mod tests {
             state_dir,
             ..BootstrapConfig::default()
         });
+        let capabilities = Arc::new(crate::capabilities::CapabilityStore::new(
+            &bootstrap.state_dir,
+        ));
         CheckRunner::new(
             bootstrap,
             Arc::new(MockSway::with_fixtures()),
             Arc::new(MockAudio::with_sinks()),
             store,
             EventHub::new(),
+            capabilities,
         )
+    }
+
+    fn codec(family: &str, supported: bool, hardware: Option<bool>) -> crate::model::CodecSupport {
+        crate::model::CodecSupport {
+            label: format!("{family} High 1080p60"),
+            content_type: "video/mp4".into(),
+            supported,
+            smooth: Some(supported),
+            power_efficient: hardware,
+            hardware,
+        }
+    }
+
+    fn measured(
+        renderer: &str,
+        codecs: Vec<crate::model::CodecSupport>,
+    ) -> crate::model::CapabilityReport {
+        crate::model::CapabilityReport {
+            user_agent: "test".into(),
+            gpu_vendor: None,
+            gpu_renderer: Some(renderer.into()),
+            webgpu: true,
+            video_decoder_api: true,
+            notes: vec![],
+            codecs,
+        }
+    }
+
+    #[test]
+    fn a_measured_hardware_decoder_passes_and_is_listed() {
+        let (status, detail) = judge_report(&measured(
+            "NVIDIA RTX A1000",
+            vec![
+                codec("H.264", true, Some(true)),
+                codec("AV1", true, Some(false)),
+            ],
+        ));
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("hardware decode: H.264"), "{detail}");
+        assert!(detail.contains("software only: AV1"), "{detail}");
+    }
+
+    #[test]
+    fn a_gpu_with_no_hardware_codecs_warns() {
+        // The exact state a gated NVIDIA machine was measured in.
+        let (status, detail) = judge_report(&measured(
+            "ANGLE (NVIDIA, Quadro RTX 8000, OpenGL ES 3.2)",
+            vec![codec("H.264", true, Some(false))],
+        ));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("silent fallback"), "{detail}");
+    }
+
+    #[test]
+    fn software_only_on_videocore_is_expected_not_warned() {
+        let (status, detail) = judge_report(&measured(
+            "ANGLE (Broadcom, V3D 7.1.7.0, OpenGL ES 3.1)",
+            vec![codec("H.264", true, Some(false))],
+        ));
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("expected"), "{detail}");
+    }
+
+    #[test]
+    fn a_software_rasteriser_warns_regardless_of_codecs() {
+        let (status, detail) = judge_report(&measured(
+            "llvmpipe (LLVM 17.0.6, 256 bits)",
+            vec![codec("H.264", true, Some(true))],
+        ));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("software-rendering"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn an_unmeasured_machine_passes_with_an_explanation() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = runner(dir.path().to_path_buf());
+        let checks = runner.run_all().await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == ids::DECODE_MEASURED)
+            .expect("the check runs");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("not measured"), "{}", check.detail);
+    }
+
+    #[tokio::test]
+    async fn a_failed_measurement_warns_with_its_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = runner(dir.path().to_path_buf());
+        let app: crate::model::AppConfig = serde_json::from_value(serde_json::json!({
+            "id": "renderer",
+            "launcher": { "kind": "chromium-kiosk", "uri": "http://x/" },
+        }))
+        .unwrap();
+        runner
+            .capabilities
+            .record(crate::capabilities::StoredMeasurement {
+                measured_at: 1,
+                app_id: "renderer".into(),
+                key: crate::capabilities::MeasurementKey::new(
+                    &app,
+                    std::path::Path::new("/bin/true"),
+                ),
+                report: None,
+                note: Some("the browser exited (status 1) before reporting".into()),
+            });
+        let checks = runner.run_all().await;
+        let check = checks
+            .iter()
+            .find(|c| c.id == ids::DECODE_MEASURED)
+            .unwrap();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.detail.contains("exited"), "{}", check.detail);
     }
 
     #[tokio::test]
     async fn every_check_reports_something() {
         let dir = tempfile::tempdir().unwrap();
         let checks = runner(dir.path().to_path_buf()).run_all().await;
-        assert_eq!(checks.len(), 14);
+        assert_eq!(checks.len(), 15);
         for id in [
             ids::SWAY_SOCKET,
             ids::SWAY_VERSION,
@@ -1751,6 +1988,7 @@ mod tests {
                 dir.path().to_path_buf(),
             )),
             EventHub::new(),
+            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
         );
         let checks = runner.run_all().await;
         let check = checks.iter().find(|c| c.id == ids::SWAY_VERSION).unwrap();
@@ -1884,6 +2122,7 @@ mod tests {
                 dir.path().to_path_buf(),
             )),
             EventHub::new(),
+            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
         );
         let checks = runner.run_all().await;
         let check = checks

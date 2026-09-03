@@ -121,6 +121,7 @@ mod tests {
             ("serial", "EDID matching; the UI matches by connector name"),
             ("hideCursor", "no settings tab yet"),
             ("outputPollIntervalSeconds", "no settings tab yet"),
+            ("measureCapabilitiesOnStart", "no settings tab yet"),
             (
                 "allowRawSwayCommands",
                 "no settings tab yet; a debugging escape hatch",
