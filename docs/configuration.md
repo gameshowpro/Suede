@@ -430,11 +430,20 @@ environment variables rather than command-line flags:
 ```
 
 !!! warning "Check that hardware video decode is really happening"
-    The `chromium-kiosk` preset asks for `VaapiVideoDecoder`, but that only
-    takes effect if a VA-API driver for your GPU is installed. Without one,
-    Chromium falls back to software decode *silently* — nothing fails, it just
-    uses the CPU. Nvidia cards need `nvidia-vaapi-driver`; Intel needs
+    The `chromium-kiosk` preset asks for VA-API decode, but that only takes
+    effect if a VA-API driver for your GPU is installed. Without one,
+    Chromium falls back to software decode *silently* — nothing fails, it
+    just uses the CPU. Nvidia cards need `nvidia-vaapi-driver`; Intel needs
     `intel-media-va-driver`.
+
+    On NVIDIA, the driver being installed is **still not enough** by itself:
+    Chromium skips nvidia-drm devices outright ("Should skip nVidia device"
+    in its GPU log) unless the `VaapiOnNvidiaGPUs` feature is enabled. The
+    preset now enables it — measured on a Quadro RTX 8000, that one flag
+    took H.264, H.265 and VP9 from software to hardware decode, with no
+    `LIBVA_DRIVER_NAME` or `NVD_BACKEND` needed. If a broken driver ever
+    makes it misbehave, repeat `--enable-features` in `extraArgs` without
+    `VaapiOnNvidiaGPUs` — the later flag wins.
 
     The only honest answer comes from inside the browser, so ask it:
     **Check capabilities** in the application dialog launches this exact

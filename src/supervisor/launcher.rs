@@ -46,7 +46,17 @@ const CHROMIUM_KIOSK_ARGS: &[&str] = &[
     // `--ozone-platform=wayland` ("not compatible with Vulkan") and logs an
     // error on every launch. The .NET service this preset came from carried
     // the flag without it ever taking effect.
-    "--enable-features=VaapiVideoDecoder,CanvasOopRasterization",
+    // `VaapiOnNvidiaGPUs` is the one that matters on NVIDIA: Chromium's
+    // VA-API wrapper skips nvidia-drm devices outright unless it is set
+    // ("Should skip nVidia device" in the GPU log), so an NVIDIA appliance
+    // with a working nvidia-vaapi-driver still decodes on the CPU, silently.
+    // Measured with the capability check on a Quadro RTX 8000 / Chrome 151:
+    // this single flag took H.264, H.265 and VP9 from software to hardware,
+    // and the env vars usually recommended alongside (LIBVA_DRIVER_NAME,
+    // NVD_BACKEND) turned out to be unnecessary. Inert on other GPUs, which
+    // never had the gate. An operator can countermand by repeating
+    // --enable-features in extraArgs without it, since the later flag wins.
+    "--enable-features=VaapiVideoDecoder,CanvasOopRasterization,VaapiOnNvidiaGPUs",
     "--ignore-gpu-blocklist",
     "--enable-zero-copy",
 ];
