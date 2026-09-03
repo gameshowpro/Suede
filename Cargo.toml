@@ -13,6 +13,8 @@ default-run = "suede"
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"
+# Already in the tree transitively; used directly for capability-check ids.
+getrandom = "0.4"
 axum = { version = "0.8", features = ["json", "tokio", "http1"] }
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"

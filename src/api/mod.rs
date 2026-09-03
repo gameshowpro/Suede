@@ -1,6 +1,7 @@
 //! The HTTP API: REST for state, SSE for change notification.
 
 pub mod apps;
+pub mod capabilities;
 pub mod config_routes;
 pub mod docs;
 pub mod events;
@@ -46,6 +47,7 @@ pub struct ApiState {
     pub trigger: ReconcileTrigger,
     pub checks: Arc<CheckRunner>,
     pub wallpapers: Arc<crate::wallpapers::WallpaperStore>,
+    pub capabilities: Arc<capabilities::CapabilityChecks>,
     pub started_at: Instant,
 }
 
@@ -127,6 +129,14 @@ pub fn router(state: ApiState) -> Router {
         // Applications.
         .route("/apps", get(apps::list_apps))
         .route("/apps/preview", post(apps::preview_app))
+        .route(
+            "/apps/capabilities",
+            post(capabilities::run_capability_check),
+        )
+        .route(
+            "/capability-check/{id}/result",
+            post(capabilities::post_result),
+        )
         .route("/apps/{id}/status", get(apps::get_app_status))
         .route("/apps/{id}/restart", post(apps::restart_app))
         .route("/apps/{id}/activate", post(apps::activate_app))
@@ -192,6 +202,9 @@ pub fn router(state: ApiState) -> Router {
     let mut app = Router::new()
         .nest("/api/v1", api)
         .route("/healthz", get(health))
+        // Mounted regardless of token mode: the appliance's own browser is
+        // what fetches it, and that browser cannot hold the token.
+        .route("/capability-check/{id}", get(capabilities::page))
         .route("/api-docs/openapi.json", get(docs::openapi_json));
 
     // A web UI would have to embed the token to work, which would defeat it.
@@ -225,6 +238,11 @@ fn is_public(path: &str) -> bool {
         // Heartbeats come from page content, which cannot hold the API token;
         // that endpoint is restricted to loopback callers instead.
         || (path.starts_with("/api/v1/apps/") && path.ends_with("/heartbeat"))
+        // The capability check's page and report follow the same rule: page
+        // content cannot hold the token, so both are loopback-restricted and
+        // gated on the one-time id instead.
+        || path.starts_with("/capability-check/")
+        || (path.starts_with("/api/v1/capability-check/") && path.ends_with("/result"))
 }
 
 async fn authenticate(
@@ -346,6 +364,7 @@ pub mod test_support {
             trigger,
             checks,
             wallpapers,
+            capabilities: Arc::new(capabilities::CapabilityChecks::default()),
             started_at: Instant::now(),
         };
 
@@ -540,6 +559,16 @@ mod tests {
         assert!(is_public("/healthz"));
         assert!(!is_public("/api/v1/apps/renderer-1/restart"));
         assert!(!is_public("/api/v1/config"));
+    }
+
+    #[test]
+    fn capability_check_paths_are_public_but_starting_one_is_not() {
+        // The page and its report come from the appliance's own browser,
+        // which cannot hold the token; both are loopback-gated instead.
+        assert!(is_public("/capability-check/abc123"));
+        assert!(is_public("/api/v1/capability-check/abc123/result"));
+        // Launching a browser on the displays is an operator action.
+        assert!(!is_public("/api/v1/apps/capabilities"));
     }
 
     #[test]

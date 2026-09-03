@@ -694,7 +694,7 @@ fn describe(code: Option<i32>) -> String {
 }
 
 /// The last meaningful line a failing program wrote to stderr.
-fn last_stderr_line(path: &std::path::Path) -> Option<String> {
+pub(crate) fn last_stderr_line(path: &std::path::Path) -> Option<String> {
     const TAIL: usize = 4096;
     let text = std::fs::read(path).ok()?;
     let tail = &text[text.len().saturating_sub(TAIL)..];
@@ -777,17 +777,20 @@ async fn stop(managed: &mut ManagedApp) {
 }
 
 #[cfg(unix)]
-const TERM_SIGNAL: i32 = libc::SIGTERM;
+pub(crate) const TERM_SIGNAL: i32 = libc::SIGTERM;
 #[cfg(unix)]
-const KILL_SIGNAL: i32 = libc::SIGKILL;
+pub(crate) const KILL_SIGNAL: i32 = libc::SIGKILL;
 #[cfg(not(unix))]
-const TERM_SIGNAL: i32 = 15;
+pub(crate) const TERM_SIGNAL: i32 = 15;
 #[cfg(not(unix))]
-const KILL_SIGNAL: i32 = 9;
+pub(crate) const KILL_SIGNAL: i32 = 9;
 
 /// Signal the whole process group, so a browser's helper processes go too.
+///
+/// Crate-visible because the capability check spawns a browser of its own,
+/// outside the supervisor's managed set, and has the same cleanup problem.
 #[cfg(unix)]
-fn signal_group(pid: u32, signal: i32) {
+pub(crate) fn signal_group(pid: u32, signal: i32) {
     // Safe: `kill` has no memory effects, and a stale pid simply returns ESRCH.
     unsafe {
         libc::kill(-(pid as i32), signal);
@@ -795,7 +798,7 @@ fn signal_group(pid: u32, signal: i32) {
 }
 
 #[cfg(not(unix))]
-fn signal_group(_pid: u32, _signal: i32) {}
+pub(crate) fn signal_group(_pid: u32, _signal: i32) {}
 
 #[cfg(test)]
 mod tests {

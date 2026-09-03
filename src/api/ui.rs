@@ -84,6 +84,7 @@ mod tests {
             "/outputs",
             "/audio/outputs",
             "/apps",
+            "/apps/capabilities",
             "/config",
             "/status",
             "/system",

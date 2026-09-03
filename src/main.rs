@@ -263,6 +263,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         trigger,
         checks,
         wallpapers,
+        capabilities: std::sync::Arc::new(api::capabilities::CapabilityChecks::default()),
         started_at: Instant::now(),
     };
 

@@ -293,6 +293,93 @@
           }
         ]
       },
+      "CapabilityOutcome": {
+        "description": "How a capability check ended.",
+        "properties": {
+          "completed": {
+            "description": "Whether the page reported before the browser was taken down.",
+            "type": "boolean"
+          },
+          "elapsedMs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "note": {
+            "description": "When not completed: what happened instead, including the browser's\nlast words to stderr where it left any.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "report": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CapabilityReport"
+              }
+            ]
+          }
+        },
+        "required": [
+          "completed",
+          "elapsedMs"
+        ],
+        "type": "object"
+      },
+      "CapabilityReport": {
+        "additionalProperties": false,
+        "description": "What the page measured. The page constructs exactly this shape; anything\nelse is drift between the two halves and is rejected loudly.",
+        "properties": {
+          "codecs": {
+            "items": {
+              "$ref": "#/components/schemas/CodecSupport"
+            },
+            "type": "array"
+          },
+          "gpuRenderer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gpuVendor": {
+            "description": "From `WEBGL_debug_renderer_info`. `null` when WebGL is unavailable or\nthe browser masks it — itself a finding, since a software rasteriser\nusually announces itself here (`SwiftShader`, `llvmpipe`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notes": {
+            "description": "Anything the page could not measure, in its own words.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "userAgent": {
+            "type": "string"
+          },
+          "videoDecoderApi": {
+            "description": "Whether the WebCodecs `VideoDecoder` API exists at all — without it\nthe per-codec `hardware` column cannot be measured.",
+            "type": "boolean"
+          },
+          "webgpu": {
+            "description": "Whether a WebGPU adapter was obtainable.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "userAgent",
+          "webgpu",
+          "videoDecoderApi",
+          "notes",
+          "codecs"
+        ],
+        "type": "object"
+      },
       "Check": {
         "description": "An environment health check, as served by `GET /system/checks`.",
         "properties": {
@@ -347,6 +434,50 @@
           "fail"
         ],
         "type": "string"
+      },
+      "CodecSupport": {
+        "additionalProperties": false,
+        "description": "One codec at one resolution, as the media APIs answered.",
+        "properties": {
+          "contentType": {
+            "description": "What was actually asked for, e.g. `video/mp4; codecs=\"hvc1.1.6.L153.B0\"`.",
+            "type": "string"
+          },
+          "hardware": {
+            "description": "`VideoDecoder.isConfigSupported` with `prefer-hardware`: `true` means\na hardware decoder accepted the configuration, `false` means only a\nsoftware one did, `null` means the API could not answer.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "label": {
+            "description": "Human label, e.g. `H.265 Main 2160p60`.",
+            "type": "string"
+          },
+          "powerEfficient": {
+            "description": "The classic hardware-decode signal; browsers report it conservatively.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "smooth": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "supported": {
+            "description": "`MediaCapabilities.decodingInfo().supported`.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "label",
+          "contentType",
+          "supported"
+        ],
+        "type": "object"
       },
       "ConfigChange": {
         "description": "Payload of the `config_changed` event.",
@@ -1466,6 +1597,58 @@
         ]
       }
     },
+    "/api/v1/apps/capabilities": {
+      "post": {
+        "operationId": "run_capability_check",
+        "parameters": [
+          {
+            "description": "How long to wait for the page's report. Clamped to 5–120, default 30.",
+            "in": "query",
+            "name": "timeoutSeconds",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppConfig"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityOutcome"
+                }
+              }
+            },
+            "description": "The check ran; `completed` says whether the page                         reported before the browser was taken down. A window                         opens on the appliance's displays while it runs."
+          },
+          "400": {
+            "description": "The launcher is not a browser, or no                         browser is installed"
+          },
+          "409": {
+            "description": "A capability check is already running"
+          }
+        },
+        "tags": [
+          "apps"
+        ]
+      }
+    },
     "/api/v1/apps/preview": {
       "post": {
         "operationId": "preview_app",
@@ -1685,6 +1868,46 @@
         },
         "tags": [
           "observed"
+        ]
+      }
+    },
+    "/api/v1/capability-check/{id}/result": {
+      "post": {
+        "operationId": "post_result",
+        "parameters": [
+          {
+            "description": "The check id from the page's own URL",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CapabilityReport"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Report accepted"
+          },
+          "403": {
+            "description": "Only the local machine may report"
+          },
+          "404": {
+            "description": "No check with that id is waiting"
+          }
+        },
+        "tags": [
+          "apps"
         ]
       }
     },

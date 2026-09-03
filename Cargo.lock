@@ -796,6 +796,7 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "getrandom",
  "libc",
  "memmap2",
  "serde",

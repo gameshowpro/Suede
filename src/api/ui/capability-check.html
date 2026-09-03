@@ -1,0 +1,155 @@
+<!doctype html>
+<!-- The capability check page. Launched by the daemon in the operator's own
+     browser configuration; measures what the media APIs will really do on
+     this machine and posts the answers back. Served only to the machine's
+     own browser, only while a check is waiting for it. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Suede capability check</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+  body { background: #101014; color: #d8d8e0; display: flex;
+         align-items: center; justify-content: center;
+         font: 16px/1.5 system-ui, sans-serif; }
+  main { text-align: center; max-width: 40em; padding: 2em; }
+  h1 { font-size: 1.2em; font-weight: 600; }
+  #state { color: #8a8a96; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Suede capability check</h1>
+  <p id="state">Measuring media capabilities…</p>
+</main>
+<script>
+"use strict";
+
+// The id in the URL is this page's whole authority to report.
+const id = location.pathname.split("/").pop();
+
+// Every probe is individually fenced: one hung API must not silence the
+// report, and one missing API is a finding rather than a failure.
+function within(ms, promise) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), ms)),
+  ]);
+}
+
+// Label, container, codec string, width, height. Levels match the
+// resolution and 60 fps: H.264 4.2/5.2, H.265 4.1/5.1, VP9 4.1/5.1,
+// AV1 4.1/5.1.
+const CODECS = [
+  ["H.264 High 1080p60", "video/mp4",  'avc1.64002A',        1920, 1080],
+  ["H.264 High 2160p60", "video/mp4",  'avc1.640034',        3840, 2160],
+  ["H.265 Main 1080p60", "video/mp4",  'hvc1.1.6.L123.B0',   1920, 1080],
+  ["H.265 Main 2160p60", "video/mp4",  'hvc1.1.6.L153.B0',   3840, 2160],
+  ["VP9 1080p60",        "video/webm", 'vp09.00.41.08',      1920, 1080],
+  ["VP9 2160p60",        "video/webm", 'vp09.00.51.08',      3840, 2160],
+  ["AV1 1080p60",        "video/mp4",  'av01.0.09M.08',      1920, 1080],
+  ["AV1 2160p60",        "video/mp4",  'av01.0.13M.08',      3840, 2160],
+];
+
+async function measure() {
+  const report = {
+    userAgent: navigator.userAgent,
+    gpuVendor: null,
+    gpuRenderer: null,
+    webgpu: false,
+    videoDecoderApi: "VideoDecoder" in window,
+    notes: [],
+    codecs: [],
+  };
+
+  // The WebGL renderer string is where a software rasteriser announces
+  // itself — "SwiftShader" or "llvmpipe" here means no GPU at all, which
+  // makes every codec answer below suspect.
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2")
+            || document.createElement("canvas").getContext("webgl");
+    if (gl) {
+      const debug = gl.getExtension("WEBGL_debug_renderer_info");
+      report.gpuVendor = String(gl.getParameter(debug ? debug.UNMASKED_VENDOR_WEBGL : gl.VENDOR));
+      report.gpuRenderer = String(gl.getParameter(debug ? debug.UNMASKED_RENDERER_WEBGL : gl.RENDERER));
+      if (!debug) report.notes.push("the browser masks the real GPU name; renderer is generic");
+    } else {
+      report.notes.push("WebGL is unavailable");
+    }
+  } catch (error) {
+    report.notes.push(`WebGL probe failed: ${error.message}`);
+  }
+
+  try {
+    report.webgpu = !!(navigator.gpu && await within(3000, navigator.gpu.requestAdapter()));
+  } catch { /* absence already recorded as false */ }
+
+  let decoderHintBroken = false;
+  for (const [label, container, codec, width, height] of CODECS) {
+    const contentType = `${container}; codecs="${codec}"`;
+    const row = { label, contentType, supported: false,
+                  smooth: null, powerEfficient: null, hardware: null };
+
+    try {
+      const info = await within(3000, navigator.mediaCapabilities.decodingInfo({
+        type: "file",
+        video: { contentType, width, height,
+                 bitrate: height >= 2160 ? 25_000_000 : 8_000_000, framerate: 60 },
+      }));
+      row.supported = info.supported;
+      if (info.supported) { row.smooth = info.smooth; row.powerEfficient = info.powerEfficient; }
+    } catch (error) {
+      report.notes.push(`${label}: MediaCapabilities failed: ${error.message}`);
+    }
+
+    // WebCodecs answers the direct question: does a *hardware* decoder
+    // accept this configuration. `powerEfficient` above is the traditional
+    // proxy; this is the measurement.
+    if (row.supported && report.videoDecoderApi && !decoderHintBroken) {
+      try {
+        const ask = (hint) => within(3000, VideoDecoder.isConfigSupported({
+          codec, codedWidth: width, codedHeight: height, hardwareAcceleration: hint,
+        }));
+        const hardware = (await ask("prefer-hardware")).supported;
+        const software = (await ask("prefer-software")).supported;
+        row.hardware = hardware ? true : (software ? false : null);
+      } catch (error) {
+        decoderHintBroken = true;
+        report.notes.push(`VideoDecoder cannot answer the hardware question: ${error.message}`);
+      }
+    }
+
+    report.codecs.push(row);
+  }
+
+  return report;
+}
+
+(async () => {
+  const state = document.getElementById("state");
+  let report;
+  try {
+    report = await measure();
+  } catch (error) {
+    // Even a broken run reports, so the operator sees the wreckage instead
+    // of a timeout.
+    report = { userAgent: navigator.userAgent, gpuVendor: null, gpuRenderer: null,
+               webgpu: false, videoDecoderApi: false,
+               notes: [`the measurement itself failed: ${error.message}`], codecs: [] };
+  }
+  try {
+    const response = await fetch(`/api/v1/capability-check/${id}/result`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(report),
+    });
+    state.textContent = response.ok
+      ? "Reported. This window will close by itself."
+      : `The daemon refused the report: ${response.status}`;
+  } catch (error) {
+    state.textContent = `Could not reach the daemon: ${error.message}`;
+  }
+})();
+</script>
+</body>
+</html>

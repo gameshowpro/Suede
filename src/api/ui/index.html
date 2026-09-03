@@ -411,6 +411,20 @@ window.addEventListener("error", (event) => {
           where graphics acceleration is usually configured.</p>
       </fieldset>
 
+      <fieldset id="a-cap-fieldset">
+        <legend>Capabilities</legend>
+        <p class="hint">Whether this configuration will hardware-decode is
+          known to nobody but the browser itself, on this machine's GPU, with
+          these exact arguments — so ask it. This launches the browser against
+          a test page; <b>a window appears on the appliance's displays</b> for
+          a few seconds while it measures.</p>
+        <div class="row">
+          <button class="action ghost" id="a-capabilities">Check capabilities</button>
+          <span class="hint" id="a-cap-status"></span>
+        </div>
+        <div id="a-cap-results" class="hidden" style="margin-top:10px"></div>
+      </fieldset>
+
       </div>
       <div class="dialog-foot">
         <button class="action" id="a-save">Save application</button>
@@ -1222,6 +1236,10 @@ function clearAppForm() {
   $("a-gain").value = 0;
   renderGainRow();
   $("a-ready-interval").value = 2; $("a-ready-timeout").value = 5;
+  // Stale measurements describe the last app, not this one.
+  $("a-cap-results").classList.add("hidden");
+  $("a-cap-results").innerHTML = "";
+  $("a-cap-status").textContent = "";
 }
 
 function closeAppDialog() {
@@ -1230,9 +1248,12 @@ function closeAppDialog() {
   clearAppForm();
 }
 
-// An exec app names its own command, so there is nothing to override.
+// An exec app names its own command, so there is nothing to override — and
+// nothing to point at a test page, so no capabilities to check either.
 function updateProgramRow() {
-  $("a-program-row").classList.toggle("hidden", $("a-kind").value === "exec");
+  const isExec = $("a-kind").value === "exec";
+  $("a-program-row").classList.toggle("hidden", isExec);
+  $("a-cap-fieldset").classList.toggle("hidden", isExec);
 }
 $("a-kind").addEventListener("change", updateProgramRow);
 
@@ -1345,6 +1366,80 @@ $("a-audio").addEventListener("change", renderGainRow);
 for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-audio", "a-gain", "a-id"]) {
   $(id).addEventListener("input", refreshLaunchPreview);
   $(id).addEventListener("change", refreshLaunchPreview);
+}
+
+// --- what this configuration can actually decode --------------------------
+//
+// Measured, not inferred: the daemon launches this exact configuration
+// against a page that asks the media APIs and reports back. The request
+// stays open for the whole round trip, so the answer lands here without
+// polling.
+$("a-capabilities").onclick = async () => {
+  const button = $("a-capabilities");
+  const status = $("a-cap-status");
+  const results = $("a-cap-results");
+
+  let app;
+  try { app = appFromForm(); } catch (error) {
+    status.textContent = error.message; return;
+  }
+  if (!app.id) app.id = "capability-check";
+
+  button.disabled = true;
+  results.classList.add("hidden");
+  status.textContent = "Launching the browser on the appliance…";
+  try {
+    const outcome = await api("/apps/capabilities?timeoutSeconds=30", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(app),
+    });
+    if (!outcome.completed) {
+      status.textContent = outcome.note ?? "the check did not complete";
+      return;
+    }
+    status.textContent = `Measured in ${(outcome.elapsedMs / 1000).toFixed(1)}s.`;
+    paintCapabilities(outcome.report);
+    results.classList.remove("hidden");
+  } catch (error) {
+    status.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+};
+
+function paintCapabilities(r) {
+  const pill = (cls, text) => `<span class="pill ${cls}">${escape(text)}</span>`;
+  // The renderer string is the headline: a software rasteriser here means
+  // every green cell below is running on the CPU.
+  const softwareGpu = /swiftshader|llvmpipe|softpipe/i.test(r.gpuRenderer ?? "");
+  const gpu = r.gpuRenderer
+    ? pill(softwareGpu ? "bad" : "ok", r.gpuRenderer) +
+      (softwareGpu ? ' <span class="hint">software rendering — no GPU acceleration at all</span>' : "")
+    : pill("warn", "GPU name unavailable");
+
+  const decode = (c) => {
+    if (!c.supported) return pill("bad", "unsupported");
+    if (c.hardware === true) return pill("ok", "hardware");
+    if (c.hardware === false) return pill("warn", "software");
+    // WebCodecs could not answer; fall back to the traditional proxy.
+    if (c.powerEfficient === true) return pill("ok", "efficient");
+    if (c.powerEfficient === false) return pill("warn", "software?");
+    return pill("muted", "supported");
+  };
+  const mark = (value) => value === true ? "✓" : value === false ? "✗" : "—";
+
+  const rows = r.codecs.map((c) =>
+    `<tr><td>${escape(c.label)}</td><td>${decode(c)}</td>` +
+    `<td>${mark(c.smooth)}</td><td>${mark(c.powerEfficient)}</td></tr>`).join("");
+
+  $("a-cap-results").innerHTML =
+    `<p>GPU: ${gpu} &nbsp; WebGPU: ${pill(r.webgpu ? "ok" : "muted", r.webgpu ? "yes" : "no")}</p>` +
+    `<table><thead><tr><th>Codec</th><th>Decode</th><th>Smooth</th><th>Efficient</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>` +
+    (r.notes.length
+      ? `<p class="hint">${r.notes.map(escape).join("<br>")}</p>` : "") +
+    `<p class="hint">${escape(r.userAgent)}</p>`;
 }
 
 // --- projection ----------------------------------------------------------

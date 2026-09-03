@@ -434,10 +434,22 @@ environment variables rather than command-line flags:
     takes effect if a VA-API driver for your GPU is installed. Without one,
     Chromium falls back to software decode *silently* — nothing fails, it just
     uses the CPU. Nvidia cards need `nvidia-vaapi-driver`; Intel needs
-    `intel-media-va-driver`. Confirm from inside the browser with
-    `navigator.mediaCapabilities.decodingInfo(...)`, whose `powerEfficient`
-    flag is the honest answer, or watch `nvidia-smi dmon -s u` and look at the
-    `dec` column while a video plays.
+    `intel-media-va-driver`.
+
+    The only honest answer comes from inside the browser, so ask it:
+    **Check capabilities** in the application dialog launches this exact
+    configuration — same browser, same arguments, same environment — against
+    a page served by the daemon, which measures what the media APIs really
+    say and reports back. A window opens on the appliance's displays for a
+    few seconds. Per codec and resolution you get whether a *hardware*
+    decoder accepted the configuration (WebCodecs), whether playback is
+    expected to be smooth and power-efficient (`MediaCapabilities`), and the
+    WebGL renderer string — `llvmpipe` or `SwiftShader` there means no GPU
+    acceleration at all. The same measurement is available to any client as
+    `POST /api/v1/apps/capabilities`.
+
+    Independent confirmation, if you want it: watch `nvidia-smi dmon -s u`
+    and look at the `dec` column while a video plays.
 
     Rasterisation, compositing, WebGL and CSS animation are a separate path and
     generally work without any of this — check the WebGL renderer string is
