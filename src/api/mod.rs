@@ -136,6 +136,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/apps/capabilities/last", get(capabilities::get_last))
         .route(
+            "/apps/capabilities/measure",
+            post(capabilities::measure_subject),
+        )
+        .route(
             "/capability-check/{id}/result",
             post(capabilities::post_result),
         )

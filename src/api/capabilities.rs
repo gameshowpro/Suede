@@ -382,7 +382,42 @@ pub async fn run_capability_check(
     Json(app): Json<AppConfig>,
 ) -> ApiResult<Json<CapabilityOutcome>> {
     let timeout = Duration::from_secs(query.timeout_seconds.unwrap_or(30).clamp(5, 120));
-    measure(&state, &app, timeout).await.map(Json)
+    let outcome = measure(&state, &app, timeout).await?;
+    // The checks judge the new measurement immediately, so an alert this
+    // resolves disappears now rather than on the next scheduled pass.
+    state.checks.run_all().await;
+    Ok(Json(outcome))
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/apps/capabilities/measure", tag = "apps",
+    params(CapabilityQuery),
+    responses(
+        (status = 200,
+         description = "Measured the configured application — the active \
+                        browser app, or the first one. A window opens on the \
+                        appliance's displays while it runs.",
+         body = CapabilityOutcome),
+        (status = 400, description = "No browser application is configured"),
+        (status = 409, description = "A capability check is already running"),
+    )
+)]
+/// The trigger a health-check alert can offer: no body to construct, the
+/// subject is whatever this appliance is configured to run — the same choice
+/// the startup measurement makes.
+pub async fn measure_subject(
+    State(state): State<ApiState>,
+    Query(query): Query<CapabilityQuery>,
+) -> ApiResult<Json<CapabilityOutcome>> {
+    let Some(app) = crate::capabilities::subject(&state.store.effective()) else {
+        return Err(ApiError::BadRequest(
+            "no browser application is configured; add one on the Applications tab first".into(),
+        ));
+    };
+    let timeout = Duration::from_secs(query.timeout_seconds.unwrap_or(45).clamp(5, 120));
+    let outcome = measure(&state, &app, timeout).await?;
+    state.checks.run_all().await;
+    Ok(Json(outcome))
 }
 
 /// The stored measurement, as `GET /apps/capabilities/last` serves it.
@@ -815,6 +850,66 @@ mod tests {
         let stored = harness.state.capability_store.latest().unwrap();
         assert!(stored.report.is_none());
         assert!(stored.note.unwrap().contains("exited"));
+    }
+
+    #[tokio::test]
+    async fn measuring_with_nothing_configured_is_refused() {
+        let harness = harness(None);
+        let (status, body) = send(
+            &harness,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/apps/capabilities/measure")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:6",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body).contains("no browser application"));
+    }
+
+    /// The alert-card trigger: no body, the configured app is the subject.
+    #[tokio::test]
+    async fn measure_without_a_body_uses_the_configured_app() {
+        let harness = harness(None);
+        harness
+            .state
+            .store
+            .update(|state| {
+                state.apps.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": "renderer",
+                        "launcher": {
+                            "kind": "chromium-kiosk",
+                            "uri": "http://example.test/",
+                            "program": "/bin/true",
+                        },
+                    }))
+                    .unwrap(),
+                )
+            })
+            .unwrap();
+
+        let (status, body) = send(
+            &harness,
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/apps/capabilities/measure?timeoutSeconds=30")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:6",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let outcome: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // /bin/true exits without reporting; what matters here is that the
+        // subject was resolved, the attempt ran, and the store remembers it.
+        assert_eq!(outcome["completed"], false);
+        assert_eq!(
+            harness.state.capability_store.latest().unwrap().app_id,
+            "renderer"
+        );
     }
 
     #[tokio::test]

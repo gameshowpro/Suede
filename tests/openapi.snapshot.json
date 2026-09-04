@@ -1718,6 +1718,49 @@
         ]
       }
     },
+    "/api/v1/apps/capabilities/measure": {
+      "post": {
+        "operationId": "measure_subject",
+        "parameters": [
+          {
+            "description": "How long to wait for the page's report. Clamped to 5–120, default 30.",
+            "in": "query",
+            "name": "timeoutSeconds",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilityOutcome"
+                }
+              }
+            },
+            "description": "Measured the configured application — the active browser app, or the first one. A window opens on the appliance's displays while it runs."
+          },
+          "400": {
+            "description": "No browser application is configured"
+          },
+          "409": {
+            "description": "A capability check is already running"
+          }
+        },
+        "summary": "The trigger a health-check alert can offer: no body to construct, the\nsubject is whatever this appliance is configured to run — the same choice\nthe startup measurement makes.",
+        "tags": [
+          "apps"
+        ]
+      }
+    },
     "/api/v1/apps/preview": {
       "post": {
         "operationId": "preview_app",

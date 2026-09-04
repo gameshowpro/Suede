@@ -608,18 +608,39 @@ impl CheckRunner {
         let (status, detail) = if missing.is_empty() {
             let mut detail = format!("VA-API driver present for {}", satisfied.join(", "));
             // Hard-won: the driver being installed is not the same as the
-            // browser using it.
+            // browser using it — an NVIDIA machine measured software-only
+            // through a present, working driver. So when a measurement
+            // exists, let it settle the question instead of hedging forever.
             if vendors.iter().any(|v| v.name == "NVIDIA") {
-                detail.push_str(
-                    ". Note that Chromium often still decodes in software on NVIDIA even \
-                     with nvidia-vaapi-driver installed — confirm with \
-                     navigator.mediaCapabilities.decodingInfo(), whose powerEfficient flag \
-                     is the honest answer",
-                );
+                let (status, verdict) = match self.measured_hardware() {
+                    Some(families) if !families.is_empty() => (
+                        CheckStatus::Pass,
+                        format!(
+                            ", and the browser measurably uses it: hardware \
+                             decode for {}",
+                            families.join(", ")
+                        ),
+                    ),
+                    Some(_) => (
+                        CheckStatus::Warn,
+                        ", but the measurement shows the browser is NOT using \
+                         it — every codec decodes in software. Iterate with \
+                         Check capabilities in the application dialog"
+                            .to_string(),
+                    ),
+                    None => (
+                        CheckStatus::Warn,
+                        ". Whether the browser actually uses it is only \
+                         knowable from inside the browser — press Measure now, \
+                         or Check capabilities in the application dialog"
+                            .to_string(),
+                    ),
+                };
+                detail.push_str(&verdict);
                 return self.check(
                     ids::VIDEO_DECODE,
                     "Hardware video decode",
-                    CheckStatus::Warn,
+                    status,
                     detail,
                     Some("configuration/#environment-and-hardware-acceleration"),
                 );
@@ -1192,6 +1213,27 @@ impl CheckRunner {
             ),
             Some("troubleshooting/#a-page-cannot-reach-a-camera-or-capture-device"),
         )
+    }
+
+    /// Codec families the last measurement saw hardware-decode; `None` when
+    /// nothing has been successfully measured yet.
+    fn measured_hardware(&self) -> Option<Vec<String>> {
+        let report = self.capabilities.latest()?.report?;
+        let mut families: Vec<String> = Vec::new();
+        for codec in &report.codecs {
+            if codec.hardware == Some(true) {
+                let family = codec
+                    .label
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("?")
+                    .to_string();
+                if !families.contains(&family) {
+                    families.push(family);
+                }
+            }
+        }
+        Some(families)
     }
 
     /// What the browser measured about itself, judged.
@@ -1895,6 +1937,57 @@ mod tests {
             .expect("the check runs");
         assert_eq!(check.status, CheckStatus::Pass);
         assert!(check.detail.contains("not measured"), "{}", check.detail);
+    }
+
+    #[tokio::test]
+    async fn measured_hardware_reflects_the_stored_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = runner(dir.path().to_path_buf());
+        assert!(runner.measured_hardware().is_none(), "nothing measured");
+
+        let app: crate::model::AppConfig = serde_json::from_value(serde_json::json!({
+            "id": "renderer",
+            "launcher": { "kind": "chromium-kiosk", "uri": "http://x/" },
+        }))
+        .unwrap();
+        let key = crate::capabilities::MeasurementKey::new(&app, std::path::Path::new("/bin/true"));
+
+        // A failed measurement is not a report: the hedge must stay.
+        runner
+            .capabilities
+            .record(crate::capabilities::StoredMeasurement {
+                measured_at: 1,
+                app_id: "renderer".into(),
+                key: key.clone(),
+                report: None,
+                note: Some("exited".into()),
+            });
+        assert!(
+            runner.measured_hardware().is_none(),
+            "a failure proves nothing"
+        );
+
+        runner
+            .capabilities
+            .record(crate::capabilities::StoredMeasurement {
+                measured_at: 2,
+                app_id: "renderer".into(),
+                key,
+                report: Some(measured(
+                    "NVIDIA",
+                    vec![
+                        codec("H.264", true, Some(true)),
+                        codec("H.265", true, Some(true)),
+                        codec("AV1", true, Some(false)),
+                    ],
+                )),
+                note: None,
+            });
+        assert_eq!(
+            runner.measured_hardware().unwrap(),
+            vec!["H.264", "H.265"],
+            "hardware families only, order preserved"
+        );
     }
 
     #[tokio::test]

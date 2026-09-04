@@ -61,6 +61,7 @@ impl Modify for SecurityAddon {
         super::apps::preview_app,
         super::capabilities::run_capability_check,
         super::capabilities::get_last,
+        super::capabilities::measure_subject,
         super::capabilities::post_result,
         super::apps::get_app_status,
         super::apps::restart_app,

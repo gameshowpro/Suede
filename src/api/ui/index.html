@@ -662,6 +662,9 @@ function alerts() {
       detail: check.detail,
       docsUrl: check.docsUrl,
       fix: check.fixAvailable ? { id: check.id, description: check.fixDescription } : null,
+      // Decode doubts are settled by measuring, not by reading advice: these
+      // two checks carry the trigger, and resolve themselves when it lands.
+      measure: check.id === "video-decode" || check.id === "decode-measured",
       key: `check:${check.id}`,
     });
   }
@@ -712,6 +715,24 @@ function renderAlerts() {
       button.className = "action";
       button.textContent = "Fix this";
       button.onclick = () => { pendingFix.add(item.key); renderAlerts(); };
+      actions.appendChild(button);
+    }
+    if (item.measure) {
+      // Launches the configured app against the daemon's test page: a window
+      // appears on the appliance's displays for a few seconds, and the
+      // refreshed verdicts arrive over the event stream — an alert this
+      // resolves removes itself.
+      const button = document.createElement("button");
+      button.className = "action ghost";
+      button.textContent = "Measure now";
+      button.onclick = async () => {
+        button.disabled = true; button.textContent = "Measuring…";
+        try {
+          const outcome = await api("/apps/capabilities/measure", { method: "POST" });
+          toast(outcome.completed ? "capabilities measured" : (outcome.note ?? "measurement did not complete"), !outcome.completed);
+        } catch (error) { toast(error.message, true); }
+        button.disabled = false; button.textContent = "Measure now";
+      };
       actions.appendChild(button);
     }
     if (item.docsUrl) {
