@@ -46,7 +46,10 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Configuration: configuration.md
-  - API reference: api.md
+  # A static file, not a page: Scalar is built to own a viewport, so the
+  # reference is served outside the theme rather than squeezed into its
+  # content column. MkDocs copies it through verbatim.
+  - API reference: api/index.html
   - Troubleshooting: troubleshooting.md
   - Developer:
       - Architecture: developer/architecture.md
