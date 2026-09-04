@@ -3199,6 +3199,22 @@
       }
     }
   },
+  "servers": [
+    {
+      "description": "A Suede appliance",
+      "url": "http://{host}:{port}",
+      "variables": {
+        "host": {
+          "default": "127.0.0.1",
+          "description": "Hostname or address of the appliance"
+        },
+        "port": {
+          "default": "9088",
+          "description": "The API port"
+        }
+      }
+    }
+  ],
   "tags": [
     {
       "description": "Live state reported by sway and PipeWire",

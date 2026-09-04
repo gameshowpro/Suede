@@ -45,6 +45,24 @@ impl Modify for SecurityAddon {
             url = "https://github.com/gameshowpro/Suede/blob/main/LICENSE"
         ),
     ),
+    // A templated server, so the reference is something you can drive rather
+    // than only read: the reader fills in their own appliance and the try-it
+    // requests go there. Without it a client assumes the origin it was
+    // loaded from, which on the published documentation site is the
+    // documentation site — a host that answers none of these paths.
+    //
+    // The default is the loopback address the daemon binds by default, which
+    // is right when browsing from the appliance itself and an obvious thing
+    // to replace when browsing from anywhere else.
+    servers(
+        (url = "http://{host}:{port}", description = "A Suede appliance",
+            variables(
+                ("host" = (default = "127.0.0.1",
+                    description = "Hostname or address of the appliance")),
+                ("port" = (default = "9088", description = "The API port")),
+            )
+        ),
+    ),
     paths(
         super::observed::list_outputs,
         super::observed::list_ports,
