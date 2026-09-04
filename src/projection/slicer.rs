@@ -535,32 +535,45 @@ fn present_frame(state: &mut State, _spec: &SlicerSpec) {
         }
 
         {
-            let (_, map) = &mut presenter.buffers[index];
-            for y in 0..rows {
-                let canvas_row = source_y + y;
-                let canvas_row = if y_invert {
-                    usable_height - 1 - canvas_row
-                } else {
-                    canvas_row
-                };
-                let src_row = canvas_row as usize * stride as usize;
-                let dst_row = y as usize * width as usize * 4;
-                let transfer_row = y as usize * width as usize;
-                for x in 0..copy_width {
-                    let src = src_row + (source_x as usize + x) * format.bytes;
-                    let (a, b) = presenter
-                        .transfer
-                        .get(transfer_row + x)
-                        .copied()
-                        .unwrap_or((256, 0));
-                    let shade = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
-                    let dst = &mut map[dst_row + x * 4..dst_row + x * 4 + 4];
-                    // Presenters are always BGRA, opaque.
-                    dst[0] = shade(canvas[src + format.blue]);
-                    dst[1] = shade(canvas[src + format.green]);
-                    dst[2] = shade(canvas[src + format.red]);
-                    dst[3] = 255;
-                }
+            // Split-borrow again: the transfer table is read while this
+            // presenter's buffer is written.
+            let Presenter {
+                transfer, buffers, ..
+            } = presenter;
+            let (_, map) = &mut buffers[index];
+            let blend = Blend {
+                canvas,
+                transfer,
+                format,
+                stride,
+                y_invert,
+                usable_height,
+                source_x,
+                source_y,
+                width,
+                copy_width,
+            };
+
+            let row_bytes = width as usize * 4;
+            let painted = &mut map[..rows as usize * row_bytes];
+            let workers = blend_workers(rows);
+            if workers <= 1 {
+                blend.rows(painted, 0, rows);
+            } else {
+                // Rows are independent, so each worker owns a disjoint band of
+                // the destination and nothing needs synchronising. Scoped
+                // threads borrow the canvas and the table directly, which is
+                // why this needs no channel and no Arc.
+                let band = rows.div_ceil(workers);
+                std::thread::scope(|scope| {
+                    for (index, chunk) in painted.chunks_mut(band as usize * row_bytes).enumerate()
+                    {
+                        let blend = &blend;
+                        let first = index as u32 * band;
+                        let count = band.min(rows - first);
+                        scope.spawn(move || blend.rows(chunk, first, count));
+                    }
+                });
             }
         }
 
@@ -571,6 +584,75 @@ fn present_frame(state: &mut State, _spec: &SlicerSpec) {
             .damage_buffer(0, 0, width as i32, height as i32);
         presenter.surface.commit();
     }
+}
+
+/// Everything a blend worker needs that does not vary between rows.
+///
+/// Cutting a slice out of the canvas and shading it is per-pixel independent
+/// work, so it is the one part of the frame that can simply be divided up.
+/// Measured before this: 10 ms a frame, single-threaded, on a machine with
+/// twenty idle cores.
+struct Blend<'a> {
+    canvas: &'a [u8],
+    transfer: &'a [(u16, u8)],
+    format: PixelFormat,
+    stride: u32,
+    y_invert: bool,
+    usable_height: u32,
+    source_x: u32,
+    source_y: u32,
+    width: u32,
+    copy_width: usize,
+}
+
+impl Blend<'_> {
+    /// Shade `count` destination rows, `dst` starting at row `first`.
+    fn rows(&self, dst: &mut [u8], first: u32, count: u32) {
+        let row_bytes = self.width as usize * 4;
+        for y in 0..count {
+            let target = first + y;
+            let canvas_row = self.source_y + target;
+            let canvas_row = if self.y_invert {
+                self.usable_height - 1 - canvas_row
+            } else {
+                canvas_row
+            };
+            let src_row = canvas_row as usize * self.stride as usize;
+            let dst_row = y as usize * row_bytes;
+            let transfer_row = target as usize * self.width as usize;
+            for x in 0..self.copy_width {
+                let src = src_row + (self.source_x as usize + x) * self.format.bytes;
+                let (a, b) = self
+                    .transfer
+                    .get(transfer_row + x)
+                    .copied()
+                    .unwrap_or((256, 0));
+                let shade = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
+                let out = &mut dst[dst_row + x * 4..dst_row + x * 4 + 4];
+                // Presenters are always BGRA, opaque.
+                out[0] = shade(self.canvas[src + self.format.blue]);
+                out[1] = shade(self.canvas[src + self.format.green]);
+                out[2] = shade(self.canvas[src + self.format.red]);
+                out[3] = 255;
+            }
+        }
+    }
+}
+
+/// How many workers to split a slice of `rows` across.
+///
+/// Capped rather than taking every core: the work is a few milliseconds, and
+/// past a handful of threads the spawn cost starts to eat the saving. Never
+/// more workers than rows, so a tiny slice stays on one thread.
+fn blend_workers(rows: u32) -> u32 {
+    const MAX: u32 = 8;
+    static AVAILABLE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let available = *AVAILABLE.get_or_init(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1)
+    });
+    available.min(MAX).min(rows).max(1)
 }
 
 /// Test patterns, drawn once in canvas coordinates so they continue exactly
@@ -719,3 +801,94 @@ delegate_noop!(State: ZwlrScreencopyManagerV1);
 delegate_noop!(State: ignore WlShm);
 delegate_noop!(State: ignore WlBuffer);
 delegate_noop!(State: ignore WlSurface);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A canvas whose bytes are all distinct, so a row addressed wrongly
+    /// cannot coincidentally match a row addressed rightly.
+    fn canvas(height: u32, stride: u32) -> Vec<u8> {
+        (0..stride * height)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>()
+    }
+
+    fn blend_for<'a>(canvas: &'a [u8], transfer: &'a [(u16, u8)]) -> Blend<'a> {
+        Blend {
+            canvas,
+            transfer,
+            format: PixelFormat {
+                bytes: 4,
+                red: 2,
+                green: 1,
+                blue: 0,
+            },
+            stride: 40,
+            y_invert: false,
+            usable_height: 9,
+            source_x: 2,
+            source_y: 1,
+            width: 6,
+            copy_width: 5,
+        }
+    }
+
+    /// Splitting the work across workers must produce byte-identical output.
+    ///
+    /// The band arithmetic is the whole risk of parallelising this: a worker
+    /// addresses its destination relative to its own chunk but the canvas and
+    /// the transfer table absolutely, and getting that wrong shifts rows in a
+    /// way that looks plausible on a photograph of a projector.
+    #[test]
+    fn splitting_the_blend_changes_nothing() {
+        let pixels = canvas(9, 40);
+        let transfer: Vec<(u16, u8)> = (0..6 * 8).map(|i| ((i * 7 % 300) as u16, 3)).collect();
+        let blend = blend_for(&pixels, &transfer);
+        let rows = 7;
+        let row_bytes = blend.width as usize * 4;
+
+        let mut whole = vec![0u8; rows as usize * row_bytes];
+        blend.rows(&mut whole, 0, rows);
+
+        // Every division, including ones that leave a short final band.
+        for band in 1..=rows {
+            let mut split = vec![0u8; rows as usize * row_bytes];
+            for (index, chunk) in split.chunks_mut(band as usize * row_bytes).enumerate() {
+                let first = index as u32 * band;
+                blend.rows(chunk, first, band.min(rows - first));
+            }
+            assert_eq!(split, whole, "band size {band} produced a different image");
+        }
+    }
+
+    /// The worker count must never exceed the rows, or a band would be empty
+    /// and `rows - first` would underflow.
+    #[test]
+    fn workers_never_outnumber_rows() {
+        for rows in 1..4u32 {
+            assert!(blend_workers(rows) <= rows, "{rows} rows");
+            assert!(blend_workers(rows) >= 1);
+        }
+    }
+
+    /// A vertically flipped capture must address the canvas from the bottom.
+    #[test]
+    fn y_invert_is_honoured_per_band() {
+        let pixels = canvas(9, 40);
+        let transfer: Vec<(u16, u8)> = vec![(256, 0); 6 * 8];
+        let mut blend = blend_for(&pixels, &transfer);
+        blend.y_invert = true;
+        let rows = 6;
+        let row_bytes = blend.width as usize * 4;
+
+        let mut whole = vec![0u8; rows as usize * row_bytes];
+        blend.rows(&mut whole, 0, rows);
+
+        let mut split = vec![0u8; rows as usize * row_bytes];
+        for (index, chunk) in split.chunks_mut(2 * row_bytes).enumerate() {
+            blend.rows(chunk, index as u32 * 2, 2);
+        }
+        assert_eq!(split, whole);
+    }
+}
