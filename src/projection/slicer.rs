@@ -135,6 +135,57 @@ impl Capture {
     }
 }
 
+/// Where each frame's time went, reported periodically.
+///
+/// Judder on a video wall is a question about frames per second, and it took
+/// an evening of indirect measurement — context-switch counts, CPU time,
+/// arithmetic on both — to establish a number the slicer could simply have
+/// stated. `waiting` against `blending` also says *which* half to attack: a
+/// loop that is mostly waiting is not short of CPU.
+struct FrameStats {
+    since: std::time::Instant,
+    frames: u32,
+    waiting: std::time::Duration,
+    blending: std::time::Duration,
+}
+
+impl FrameStats {
+    /// Long enough that the line is rare, short enough to watch a change land.
+    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            frames: 0,
+            waiting: std::time::Duration::ZERO,
+            blending: std::time::Duration::ZERO,
+        }
+    }
+
+    fn record(&mut self, waiting: std::time::Duration, blending: std::time::Duration) {
+        self.frames += 1;
+        self.waiting += waiting;
+        self.blending += blending;
+    }
+
+    /// Print and reset once the interval has passed.
+    fn report(&mut self) {
+        let elapsed = self.since.elapsed();
+        if elapsed < Self::INTERVAL || self.frames == 0 {
+            return;
+        }
+        let frames = f64::from(self.frames);
+        eprintln!(
+            "slicer: {:.1} fps over {:.0}s (waiting {:.1} ms, blending {:.1} ms per frame)",
+            frames / elapsed.as_secs_f64(),
+            elapsed.as_secs_f64(),
+            self.waiting.as_secs_f64() * 1000.0 / frames,
+            self.blending.as_secs_f64() * 1000.0 / frames,
+        );
+        *self = Self::new();
+    }
+}
+
 struct State {
     outputs: Vec<(WlOutput, Option<String>)>,
     presenters: Vec<Presenter>,
@@ -279,8 +330,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             Some(frame) => frame,
             None => return Ok(()),
         };
+    let mut stats = FrameStats::new();
     loop {
         // Wait for the capture already in flight.
+        let waiting_from = std::time::Instant::now();
         while !state.capture.ready && !state.capture.failed {
             queue.blocking_dispatch(&mut state)?;
             if state.closed {
@@ -288,6 +341,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 return Ok(());
             }
         }
+        let waited = waiting_from.elapsed();
 
         if state.capture.failed {
             frame.destroy();
@@ -308,6 +362,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         // Copy the frame out and hand the buffer straight back, so the
         // compositor is already drawing the next one while this one is being
         // cut into slices and committed.
+        let blending_from = std::time::Instant::now();
         state.capture.take_snapshot();
         frame.destroy();
         frame = match start_capture(&mut state, &mut queue, &screencopy, &source, &shm, &handle)? {
@@ -316,6 +371,9 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         };
 
         present_frame(&mut state, spec);
+
+        stats.record(waited, blending_from.elapsed());
+        stats.report();
     }
 }
 
