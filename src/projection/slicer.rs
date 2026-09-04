@@ -146,6 +146,11 @@ struct FrameStats {
     since: std::time::Instant,
     frames: u32,
     waiting: std::time::Duration,
+    /// Copying the finished canvas out of the shared buffer.
+    snapshot: std::time::Duration,
+    /// The handshake for the next capture.
+    requesting: std::time::Duration,
+    /// Cutting, shading and committing the slices.
     blending: std::time::Duration,
 }
 
@@ -158,13 +163,23 @@ impl FrameStats {
             since: std::time::Instant::now(),
             frames: 0,
             waiting: std::time::Duration::ZERO,
+            snapshot: std::time::Duration::ZERO,
+            requesting: std::time::Duration::ZERO,
             blending: std::time::Duration::ZERO,
         }
     }
 
-    fn record(&mut self, waiting: std::time::Duration, blending: std::time::Duration) {
+    fn record(
+        &mut self,
+        waiting: std::time::Duration,
+        snapshot: std::time::Duration,
+        requesting: std::time::Duration,
+        blending: std::time::Duration,
+    ) {
         self.frames += 1;
         self.waiting += waiting;
+        self.snapshot += snapshot;
+        self.requesting += requesting;
         self.blending += blending;
     }
 
@@ -175,12 +190,16 @@ impl FrameStats {
             return;
         }
         let frames = f64::from(self.frames);
+        let per = |total: std::time::Duration| total.as_secs_f64() * 1000.0 / frames;
         eprintln!(
-            "slicer: {:.1} fps over {:.0}s (waiting {:.1} ms, blending {:.1} ms per frame)",
+            "slicer: {:.1} fps over {:.0}s per frame: waiting {:.1} ms, \
+             snapshot {:.1} ms, requesting {:.1} ms, blending {:.1} ms",
             frames / elapsed.as_secs_f64(),
             elapsed.as_secs_f64(),
-            self.waiting.as_secs_f64() * 1000.0 / frames,
-            self.blending.as_secs_f64() * 1000.0 / frames,
+            per(self.waiting),
+            per(self.snapshot),
+            per(self.requesting),
+            per(self.blending),
         );
         *self = Self::new();
     }
@@ -325,88 +344,118 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // every cycle waited for the one after. Only about 6 ms of each 20 ms
     // cycle was work.
     let mut failures = 0u32;
-    let mut frame =
-        match start_capture(&mut state, &mut queue, &screencopy, &source, &shm, &handle)? {
-            Some(frame) => frame,
-            None => return Ok(()),
-        };
     let mut stats = FrameStats::new();
+
+    // Prime: one capture requested and handed a buffer to fill.
+    let mut current = request_capture(&mut state, &screencopy, &source, &handle);
+    if !arm_copy(&mut state, &mut queue, &shm, &handle, &current)? {
+        return Ok(());
+    }
+
     loop {
-        // Wait for the capture already in flight.
+        // Ask for the next frame *before* blocking on this one. The request is
+        // only answered when the compositor next attends to its clients, which
+        // on a loaded machine is a whole cycle away: measured at 0.2 ms on a
+        // two-projector rig and 20 ms on a four-projector one driving a
+        // 3840x2280 canvas. Issued here, that round trip runs while we are
+        // blocked anyway and costs nothing on either.
+        let next = request_capture(&mut state, &screencopy, &source, &handle);
+
         let waiting_from = std::time::Instant::now();
         while !state.capture.ready && !state.capture.failed {
             queue.blocking_dispatch(&mut state)?;
             if state.closed {
-                frame.destroy();
+                current.destroy();
+                next.destroy();
                 return Ok(());
             }
         }
         let waited = waiting_from.elapsed();
 
         if state.capture.failed {
-            frame.destroy();
+            current.destroy();
+            next.destroy();
             failures += 1;
             if failures >= MAX_FAILURES {
                 anyhow::bail!("screencopy failed {failures} times; giving up");
             }
-            frame =
-                match start_capture(&mut state, &mut queue, &screencopy, &source, &shm, &handle)? {
-                    Some(frame) => frame,
-                    None => return Ok(()),
-                };
+            // Either frame may have been the one that failed, so start over
+            // with a single capture rather than guessing.
+            state.capture.failed = false;
+            state.capture.ready = false;
+            current = request_capture(&mut state, &screencopy, &source, &handle);
+            if !arm_copy(&mut state, &mut queue, &shm, &handle, &current)? {
+                return Ok(());
+            }
             continue;
         }
         failures = 0;
+        state.capture.ready = false;
         state.capture.first_copy_done = true;
 
         // Copy the frame out and hand the buffer straight back, so the
         // compositor is already drawing the next one while this one is being
         // cut into slices and committed.
-        let blending_from = std::time::Instant::now();
+        let snapshot_from = std::time::Instant::now();
         state.capture.take_snapshot();
-        frame.destroy();
-        frame = match start_capture(&mut state, &mut queue, &screencopy, &source, &shm, &handle)? {
-            Some(frame) => frame,
-            None => return Ok(()),
-        };
+        current.destroy();
+        let snapshot_took = snapshot_from.elapsed();
 
+        // Usually already satisfied: the handshake ran during the wait above.
+        let requesting_from = std::time::Instant::now();
+        if !arm_copy(&mut state, &mut queue, &shm, &handle, &next)? {
+            return Ok(());
+        }
+        let requesting_took = requesting_from.elapsed();
+        current = next;
+
+        let blending_from = std::time::Instant::now();
         present_frame(&mut state, spec);
 
-        stats.record(waited, blending_from.elapsed());
+        stats.record(
+            waited,
+            snapshot_took,
+            requesting_took,
+            blending_from.elapsed(),
+        );
         stats.report();
     }
 }
 
-/// Ask for the next canvas frame, returning the in-flight capture.
+/// Ask the compositor for the canvas's next damaged frame.
 ///
-/// Only the format handshake is awaited here — a round trip with the
-/// compositor, not a wait for anything to be drawn. `None` means the
-/// compositor went away.
-fn start_capture(
+/// Sends only. The compositor answers with the buffer layout it wants, which
+/// [`arm_copy`] waits for — deliberately separate, so that round trip can be
+/// left running while the caller gets on with something else.
+fn request_capture(
     state: &mut State,
-    queue: &mut wayland_client::EventQueue<State>,
     screencopy: &ZwlrScreencopyManagerV1,
     source: &WlOutput,
-    shm: &WlShm,
     handle: &QueueHandle<State>,
-) -> anyhow::Result<Option<ZwlrScreencopyFrameV1>> {
+) -> ZwlrScreencopyFrameV1 {
     state.capture.offered = None;
     state.capture.buffer_done = false;
-    state.capture.ready = false;
-    state.capture.failed = false;
+    screencopy.capture_output(0, source, handle, ())
+}
 
-    let frame = screencopy.capture_output(0, source, handle, ());
+/// Give a requested frame the buffer to fill. `false` means the compositor
+/// went away.
+fn arm_copy(
+    state: &mut State,
+    queue: &mut wayland_client::EventQueue<State>,
+    shm: &WlShm,
+    handle: &QueueHandle<State>,
+    frame: &ZwlrScreencopyFrameV1,
+) -> anyhow::Result<bool> {
     while !state.capture.buffer_done && !state.capture.failed {
         queue.blocking_dispatch(state)?;
         if state.closed {
-            frame.destroy();
-            return Ok(None);
+            return Ok(false);
         }
     }
     if state.capture.failed {
-        return Ok(Some(frame));
+        return Ok(true);
     }
-
     if !state.capture.first_copy_done {
         if let Some((format, width, height, stride)) = state.capture.offered {
             eprintln!("slicer: capture offer {width}x{height} stride {stride} format {format:#x}");
@@ -421,7 +470,7 @@ fn start_capture(
     } else {
         frame.copy(buffer);
     }
-    Ok(Some(frame))
+    Ok(true)
 }
 
 fn shm_buffer(
