@@ -348,7 +348,34 @@ pub async fn boot_measure(state: ApiState) {
     tracing::info!(app = %app.id, "measuring browser capabilities (configuration changed)");
     match measure(&state, &app, BOOT_TIMEOUT).await {
         Ok(outcome) if outcome.completed => {
-            tracing::info!(elapsed_ms = outcome.elapsed_ms, "capabilities measured");
+            // The boot measurement runs while the machine is still settling
+            // from the change that triggered it — a fresh install, a driver
+            // swap. A browser launched into a cold GPU can lose the VA-API
+            // race and fall back to software for that one session, and this
+            // being the boot measurement, that wrong answer would then stick
+            // as "current". So a real GPU reporting no hardware decode — the
+            // regression shape — is confirmed once more on a settled machine
+            // before it is believed. A genuinely software machine simply
+            // agrees; the Pi and a broken driver cost one extra launch and
+            // reach the same, correct, answer. Measured on real hardware:
+            // the first post-install boot said software, every settled
+            // measurement since said full hardware.
+            if looks_like_a_transient_miss(outcome.report.as_ref()) {
+                tracing::info!(
+                    "boot measurement saw a GPU but no hardware decode; \
+                    confirming once the machine has settled"
+                );
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                match measure(&state, &app, BOOT_TIMEOUT).await {
+                    Ok(retry) => tracing::info!(
+                        completed = retry.completed,
+                        "capabilities re-measured after settling"
+                    ),
+                    Err(error) => tracing::warn!(%error, "re-measurement could not run"),
+                }
+            } else {
+                tracing::info!(elapsed_ms = outcome.elapsed_ms, "capabilities measured");
+            }
         }
         Ok(outcome) => {
             tracing::warn!(note = ?outcome.note, "capability measurement did not complete");
@@ -559,6 +586,39 @@ fn firefox_profile(app: &AppConfig, context: &launcher::LaunchContext) -> Option
 fn api_root(api_base: &str) -> &str {
     let base = api_base.trim_end_matches('/');
     base.strip_suffix("/api/v1").unwrap_or(base)
+}
+
+/// Whether a report is the shape a settling-race false-negative takes: a real
+/// GPU that nonetheless decoded nothing in hardware. A software rasteriser
+/// (`llvmpipe`) or a platform with no browser decode path (VideoCore) reports
+/// no hardware too, but stably — re-measuring those only wastes a launch, so
+/// they are not treated as suspicious.
+fn looks_like_a_transient_miss(report: Option<&CapabilityReport>) -> bool {
+    let Some(report) = report else {
+        return false;
+    };
+    let renderer = report
+        .gpu_renderer
+        .as_deref()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stable_software = [
+        "llvmpipe",
+        "swiftshader",
+        "softpipe",
+        "videocore",
+        "broadcom",
+        "v3d",
+    ]
+    .iter()
+    .any(|marker| renderer.contains(marker));
+    if renderer.is_empty() || stable_software {
+        return false;
+    }
+    let any_hardware = report.codecs.iter().any(|c| c.hardware == Some(true));
+    let any_supported = report.codecs.iter().any(|c| c.supported);
+    // A real GPU, codecs supported, yet none in hardware.
+    any_supported && !any_hardware
 }
 
 fn finished(report: Option<CapabilityReport>, started: Instant) -> CapabilityOutcome {
@@ -925,6 +985,50 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    fn report_with(renderer: &str, hardware: Option<bool>) -> CapabilityReport {
+        CapabilityReport {
+            user_agent: "t".into(),
+            gpu_vendor: None,
+            gpu_renderer: Some(renderer.into()),
+            webgpu: true,
+            video_decoder_api: true,
+            notes: vec![],
+            codecs: vec![CodecSupport {
+                label: "H.264 High 1080p60".into(),
+                content_type: "video/mp4".into(),
+                supported: true,
+                smooth: Some(true),
+                power_efficient: hardware,
+                hardware,
+            }],
+        }
+    }
+
+    #[test]
+    fn only_a_real_gpu_with_no_hardware_is_worth_re_measuring() {
+        // The race: a real GPU that decoded nothing — confirm it.
+        assert!(looks_like_a_transient_miss(Some(&report_with(
+            "NVIDIA RTX A1000",
+            Some(false)
+        ))));
+        // Already hardware — nothing to confirm.
+        assert!(!looks_like_a_transient_miss(Some(&report_with(
+            "NVIDIA RTX A1000",
+            Some(true)
+        ))));
+        // Stable software platforms: no hardware is the truth, not a race.
+        assert!(!looks_like_a_transient_miss(Some(&report_with(
+            "llvmpipe (LLVM 17)",
+            Some(false)
+        ))));
+        assert!(!looks_like_a_transient_miss(Some(&report_with(
+            "ANGLE (Broadcom, V3D 7.1.7.0)",
+            Some(false)
+        ))));
+        // No report, or no renderer: nothing to go on.
+        assert!(!looks_like_a_transient_miss(None));
     }
 
     #[test]
