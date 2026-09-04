@@ -61,6 +61,15 @@ jobs:
               - 'mkdocs.yml'
               - 'README.md'
               - '.github/workflows/ci.yml'
+              # The published API reference is generated from the binary, so
+              # the code is one of its sources. Watching only docs/ meant a
+              # change to the API document silently did not publish: adding
+              # `servers` to it deployed nothing, because no file under docs/
+              # had moved. The version chip drifted the same way, sitting a
+              # release behind whenever a release touched no documentation.
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'scripts/build-docs.sh'
       - name: Resolve change outputs
         id: resolve
         shell: bash
