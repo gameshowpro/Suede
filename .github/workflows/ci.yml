@@ -327,6 +327,20 @@ jobs:
             echo "unexpected dynamic dependency" && exit 1
           fi
 
+      # Kept before packaging, because packaging strips it. A daemon that
+      # deadlocks reports every frame of every thread as `??` without this,
+      # and one did: the cause could only be guessed at from the shape of the
+      # stacks until a symbolised build was put on the machine by hand. Same
+      # compilation as the shipped binary, so a backtrace from the appliance
+      # resolves against it:
+      #
+      #   gdb -e suede-unstripped -p $(systemctl --user show suede -p MainPID --value)
+      - name: Keep the unstripped binary for post-mortems
+        run: |
+          cp target/${{ matrix.target }}/release/suede \
+             suede-unstripped-${{ matrix.arch }}
+          echo "symbols: $(nm suede-unstripped-${{ matrix.arch }} 2>/dev/null | wc -l)"
+
       - name: Build .deb
         run: |
           cargo deb --no-build --target ${{ matrix.target }} \
@@ -353,7 +367,11 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: suede-${{ matrix.arch }}
-          path: suede_*.deb
+          # The package, and beside it the same binary with its symbols, for
+          # reading a backtrace off an appliance that has stopped answering.
+          path: |
+            suede_*.deb
+            suede-unstripped-${{ matrix.arch }}
           if-no-files-found: error
 
   release:

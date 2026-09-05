@@ -69,12 +69,23 @@ tempfile = "3"
 [profile.release]
 lto = true
 codegen-units = 1
-# Debug info goes, the symbol table stays. Stripping both made a wedged
-# appliance nearly unreadable: every frame of every thread came back as `??`,
-# so a real deadlock could be characterised only by its shape. Keeping the
-# names costs a few hundred kilobytes and is the difference between a
-# backtrace that says what is stuck and one that says nothing.
-strip = "debuginfo"
+# Fully stripped, and the shipped package depends on it: keeping the symbol
+# table sends cargo-deb down a different path that runs dpkg-shlibdeps against
+# the cross-built binary, which cannot resolve arm64 libraries on an amd64
+# host and fails the arm64 package outright. That step is where `Depends:
+# libc6 (>= x)` comes from, so it is not something to skip.
+#
+# Symbols still exist where they are needed: CI keeps the unstripped binary as
+# a build artifact. Stripping happens on the way into the package, so the
+# artifact and the shipped binary are the same compilation and a backtrace
+# taken from one resolves against the other:
+#
+#   gdb -e suede-unstripped -p $(systemctl --user show suede -p MainPID --value)
+#
+# That matters because a stripped daemon in a deadlock reports every frame of
+# every thread as `??`, and this failure could only be characterised by shape
+# until a symbolised build was put on the machine.
+strip = true
 
 # Packaging is driven entirely from here; there is no separate packaging tree
 # to keep in step. Build with `cargo deb`.

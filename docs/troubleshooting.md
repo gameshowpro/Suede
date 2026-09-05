@@ -294,6 +294,19 @@ killed and leaves a core behind. `coredumpctl list suede` will find it, and
 `coredumpctl gdb suede` opens it with the symbols the release build now
 keeps.
 
+The release binary is stripped, so a backtrace taken straight off an
+appliance names nothing. Each CI build keeps an unstripped copy of the same
+compilation beside the package — download `suede-unstripped-amd64` (or
+`-arm64`) from that run's artifacts and point gdb at it:
+
+```bash
+gdb -e suede-unstripped-amd64 -p $(systemctl --user show suede -p MainPID --value)     -batch -ex "thread apply all bt 12"
+```
+
+Threads parked in `park_internal` are idle workers and are not interesting.
+Any thread stopped in `read_contended` or `write_contended` is waiting on a
+lock, and two of those in different call paths is a deadlock.
+
 To check the watchdog is actually armed:
 
 ```bash
