@@ -32,13 +32,29 @@ pub enum StateError {
     UnsupportedSchema { found: u32, supported: u32 },
 }
 
-pub struct StateStore {
-    dir: PathBuf,
-    current: RwLock<DesiredState>,
+/// The saved document and the unsaved one, under a single lock.
+///
+/// They were two locks once, and that deadlocked an appliance. `replace` took
+/// the committed document and then the preview; `effective` read the preview
+/// and then — still holding it, because the temporary guard lives to the end
+/// of the statement — the committed one. Opposite orders, so two requests
+/// crossing was enough to stop the daemon dead, and a client with a slider
+/// bound to a display offset crossed them within seconds.
+///
+/// One lock cannot be taken out of order. That is the whole reason these live
+/// together rather than apart: it is not a tidier arrangement of the same
+/// risk, it is the removal of the risk.
+struct Documents {
+    current: DesiredState,
     /// An unsaved document being tried out live. Never persisted: a daemon
     /// restart or any committed write discards it, so disk state stays the
     /// only durable truth.
-    preview: RwLock<Option<DesiredState>>,
+    preview: Option<DesiredState>,
+}
+
+pub struct StateStore {
+    dir: PathBuf,
+    documents: RwLock<Documents>,
 }
 
 impl StateStore {
@@ -88,13 +104,15 @@ impl StateStore {
 
         Ok(Self {
             dir,
-            preview: RwLock::new(None),
-            current: RwLock::new({
-                let mut state = state;
-                // Whatever we booted from is the committed baseline, even a
-                // pre-flag document or the empty default.
-                state.committed = true;
-                state
+            documents: RwLock::new(Documents {
+                current: {
+                    let mut state = state;
+                    // Whatever we booted from is the committed baseline, even
+                    // a pre-flag document or the empty default.
+                    state.committed = true;
+                    state
+                },
+                preview: None,
             }),
         })
     }
@@ -103,27 +121,32 @@ impl StateStore {
     pub fn ephemeral(dir: PathBuf) -> Self {
         Self {
             dir,
-            preview: RwLock::new(None),
-            current: RwLock::new({
-                let mut state = DesiredState::new();
-                state.committed = true;
-                state
+            documents: RwLock::new(Documents {
+                current: {
+                    let mut state = DesiredState::new();
+                    state.committed = true;
+                    state
+                },
+                preview: None,
             }),
         }
     }
 
     pub fn get(&self) -> DesiredState {
-        self.current.read().unwrap().clone()
+        self.documents.read().unwrap().current.clone()
     }
 
     /// What the reconciler should realize: the preview if one is being tried
     /// out, else the persisted document.
     pub fn effective(&self) -> DesiredState {
-        self.preview
-            .read()
-            .unwrap()
+        // One acquisition, both fields. Reading the preview and then calling
+        // `get()` for the committed one is what deadlocked against `replace`,
+        // because the first guard was still alive when the second was taken.
+        let documents = self.documents.read().unwrap();
+        documents
+            .preview
             .clone()
-            .unwrap_or_else(|| self.get())
+            .unwrap_or_else(|| documents.current.clone())
     }
 
     /// Set or clear the working copy. The caller validates.
@@ -135,30 +158,31 @@ impl StateStore {
             document.revision = self.revision();
             document
         });
-        *self.preview.write().unwrap() = preview;
+        self.documents.write().unwrap().preview = preview;
     }
 
     pub fn has_preview(&self) -> bool {
-        self.preview.read().unwrap().is_some()
+        self.documents.read().unwrap().preview.is_some()
     }
 
     pub fn revision(&self) -> u64 {
-        self.current.read().unwrap().revision
+        self.documents.read().unwrap().current.revision
     }
 
     /// Replace the document, bump its revision, and persist it.
     ///
     /// The caller is responsible for having validated `next`.
     pub fn replace(&self, mut next: DesiredState) -> Result<DesiredState, StateError> {
-        let mut guard = self.current.write().unwrap();
+        let mut documents = self.documents.write().unwrap();
         next.schema_version = SCHEMA_VERSION;
-        next.revision = guard.revision.saturating_add(1);
+        next.revision = documents.current.revision.saturating_add(1);
         // What reaches disk is by definition the committed document.
         next.committed = true;
         self.persist(&next)?;
-        *guard = next.clone();
-        // A committed write supersedes whatever was being previewed.
-        *self.preview.write().unwrap() = None;
+        documents.current = next.clone();
+        // A committed write supersedes whatever was being previewed. Same
+        // guard, so this can no longer race the readers.
+        documents.preview = None;
         Ok(next)
     }
 
