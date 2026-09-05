@@ -6,8 +6,32 @@ PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
+# Deliberately still `simple`, with only the notification channel opened.
+# `notify` would hold the unit "activating" until the daemon reports ready,
+# and the daemon waits for sway's socket before it binds anything — so a
+# compositor slow to appear at boot would blow TimeoutStartSec and turn a
+# delay into a restart loop. The watchdog below needs NotifyAccess, not a
+# change of type.
 Type=simple
+NotifyAccess=main
 ExecStart=/usr/bin/suede run
+# The deadline, and the whole point of this file changing.
+#
+# An appliance was found wedged for eighty minutes: alive, holding its
+# listening socket with a full accept queue, at zero CPU, no panic, nothing in
+# the log. Indistinguishable from a dead machine from outside, and only a
+# person with an SSH key could tell the difference or fix it.
+#
+# Suede pings at half of this from a task on its own async runtime, so a
+# runtime that stops turning stops pinging and systemd restarts the daemon.
+# Generous enough to survive a slow reconciliation pass on a machine driving
+# four projectors.
+WatchdogSec=45s
+# Abort rather than terminate when the watchdog fires, so the stuck process
+# leaves a core behind. A restart that discards the evidence buys uptime at
+# the cost of never learning why - and this took a debugger on a live
+# appliance to characterise the first time.
+WatchdogSignal=SIGABRT
 # Suede waits for the sway socket itself, so a restart loop is not a busy loop.
 Restart=always
 RestartSec=2

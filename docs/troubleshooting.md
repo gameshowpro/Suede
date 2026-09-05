@@ -254,6 +254,56 @@ Without heartbeats there is nothing to detect: from the outside, a frozen page a
 
 If the watchdog is firing when it should not, check that the page is actually posting — `lastHeartbeat` in the app status shows the last one received.
 
+## Suede itself stops answering, but the process is still there
+
+There are two ways a daemon can stop working, and only one of them is
+obvious. If it crashes, systemd restarts it and the log says why. The other
+is quieter: the process stays alive, keeps its listening socket, and stops
+doing anything at all — no reply on the API, no reconciliation, nothing new
+in the log. From the outside that is indistinguishable from a dead machine.
+
+It has happened once, on a four-projector appliance, and it stayed that way
+for eighty minutes until somebody with an SSH key looked. What was found:
+
+```
+$ ss -ltn 'sport = :9088'
+State   Recv-Q  Send-Q  Local Address:Port
+LISTEN  129     128           0.0.0.0:9088     ← queue full, nothing accepting
+```
+
+Zero CPU, zero context switches over twenty-five seconds, every thread parked
+on a futex and none in `epoll_wait` — a stalled runtime rather than a busy
+one. No panic, no OOM, nothing in the journal.
+
+**Suede now reports its own liveness to systemd**, so this recovers by itself
+in under a minute. The ping is sent from a task on the async runtime, which
+is the part that matters: if the runtime stops turning, the ping stops with
+it. `WatchdogSec=45s` in the unit sets the deadline, and the journal names it
+plainly when it fires:
+
+```
+suede.service: Watchdog timeout (limit 45s)!
+suede.service: Failed with result 'watchdog'.
+suede.service: Scheduled restart job, restart counter is at 1.
+```
+
+If you see that line, the daemon stopped responding and was restarted for
+you. It is worth investigating rather than ignoring: the unit sets
+`WatchdogSignal=SIGABRT`, so the stuck process is aborted rather than merely
+killed and leaves a core behind. `coredumpctl list suede` will find it, and
+`coredumpctl gdb suede` opens it with the symbols the release build now
+keeps.
+
+To check the watchdog is actually armed:
+
+```bash
+systemctl --user show suede -p WatchdogUSec --value   # expect 45s
+```
+
+Freezing the daemon with `kill -STOP $(systemctl --user show suede -p MainPID --value)`
+is a fair test — it is what a stalled runtime looks like to systemd, and the
+service should come back on its own within about a minute.
+
 ## Audio goes to the wrong place, or nowhere
 
 ```bash

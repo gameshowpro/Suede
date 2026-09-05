@@ -69,7 +69,12 @@ tempfile = "3"
 [profile.release]
 lto = true
 codegen-units = 1
-strip = true
+# Debug info goes, the symbol table stays. Stripping both made a wedged
+# appliance nearly unreadable: every frame of every thread came back as `??`,
+# so a real deadlock could be characterised only by its shape. Keeping the
+# names costs a few hundred kilobytes and is the difference between a
+# backtrace that says what is stuck and one that says nothing.
+strip = "debuginfo"
 
 # Packaging is driven entirely from here; there is no separate packaging tree
 # to keep in step. Build with `cargo deb`.

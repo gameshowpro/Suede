@@ -23,6 +23,7 @@ pub mod supervisor;
 pub mod sway;
 pub mod util;
 pub mod wallpapers;
+pub mod watchdog;
 
 /// Version of the running daemon, from `Cargo.toml`.
 ///

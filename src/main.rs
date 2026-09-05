@@ -253,6 +253,11 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         events.clone(),
         shutdown_rx.clone(),
     ));
+    // Deliberately a task on this runtime rather than a thread of its own: if
+    // the runtime stops turning, this stops reporting, and systemd restarts
+    // the daemon. A watchdog that could still tick while the thing it vouches
+    // for was dead would be worse than none.
+    tokio::spawn(suede::watchdog::feed(shutdown_rx.clone()));
 
     // --- server ---
     let state = ApiState {
@@ -278,6 +283,10 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
 
     let listener = tokio::net::TcpListener::bind(bootstrap.bind).await?;
     tracing::info!(address = %listener.local_addr()?, "listening");
+    // Once the socket is bound, the daemon is genuinely up. Under
+    // `Type=notify` systemd holds dependent units until this arrives, so it
+    // goes here rather than at the top of main.
+    suede::watchdog::notify_ready();
 
     let server = axum::serve(
         listener,
