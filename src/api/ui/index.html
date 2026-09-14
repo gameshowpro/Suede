@@ -171,11 +171,29 @@ window.addEventListener("error", (event) => {
     banner = document.createElement("div");
     banner.id = "js-error";
     banner.style.cssText = "background:#c92a2a;color:#fff;padding:10px 20px;" +
-      "font:14px system-ui;position:sticky;top:0;z-index:99";
+      "font:14px system-ui;position:sticky;top:0;z-index:99;display:flex;gap:12px";
+    const text = document.createElement("span");
+    text.id = "js-error-text";
+    text.style.cssText = "flex:1";
+    // Dismissable, because this banner used to be immortal: it was created on
+    // the first error and never removed, so one transient fault meant every
+    // later visit opened on a red bar about something long since over. An
+    // alarm that cannot be acknowledged stops being read.
+    const close = document.createElement("button");
+    close.textContent = "Dismiss";
+    close.style.cssText = "background:#fff3;color:#fff;border:0;border-radius:6px;" +
+      "padding:2px 10px;font:600 13px system-ui;cursor:pointer";
+    close.onclick = () => banner.remove();
+    banner.append(text, close);
     document.body.prepend(banner);
   }
-  banner.textContent = "UI script error: " + event.message +
-    " (line " + event.lineno + ")";
+  const text = document.getElementById("js-error-text");
+  const count = Number(banner.dataset.count || 0) + 1;
+  banner.dataset.count = String(count);
+  text.textContent = "UI script error: " + event.message +
+    " (line " + event.lineno + ")" +
+    (count > 1 ? "  · " + count + " errors" : "") +
+    "  · reload the page if the interface misbehaves";
 });
 </script>
 <header>
@@ -580,6 +598,20 @@ const save = (path, body) => api(path, {
 });
 
 let toastTimer;
+// Has the document arrived yet?
+//
+// Every editing control mutates `config`, and until the first load lands it
+// is null. That window is not hypothetical: a machine resuming from sleep
+// restores the page with its form values, and the browser fires `input` for
+// the restored ones — so a projection control could assign through a null
+// config with nobody having touched anything, and the operator would come
+// back to a red banner about a TypeError they did not cause.
+function loaded() {
+  if (config) return true;
+  toast("Still loading from the daemon — nothing to change yet.", true);
+  return false;
+}
+
 function toast(message, isError) {
   const el = $("toast");
   el.textContent = message;
@@ -887,6 +919,7 @@ function unusedOutputs() {
 // Add a socket to the layout, flush against the right of what is already
 // there so the result is contiguous, and open it for editing.
 function addToLayout(name) {
+  if (!loaded()) return;
   const known = knownOutputs().find((k) => k.name === name);
   const entries = layoutEntries().filter(({ r }) => r.width > 0);
   const right = entries.length ? Math.max(...entries.map(({ r }) => r.x + r.width)) : 0;
@@ -910,6 +943,7 @@ function addToLayout(name) {
 }
 
 function removeFromLayout(name) {
+  if (!loaded()) return;
   config.outputs = (config.outputs ?? []).filter((o) => o.match?.name !== name);
   if (selected === name) {
     selected = null;
@@ -1142,7 +1176,7 @@ function outputEntryFromForm() {
 // Every edit lands on the outputs immediately (as an unsaved preview) and
 // redraws the layout, so dragging the numbers shows the displays responding.
 function outputEdited() {
-  if (!selected) return;
+  if (!selected || !loaded()) return;
   const entry = outputEntryFromForm();
   const index = (config.outputs ?? []).findIndex((o) => o.match?.name === selected);
   if (index >= 0) config.outputs[index] = entry;
@@ -1532,6 +1566,10 @@ function projectionFromForm() {
 
 for (const id of ["pj-blend", "pj-gamma", "pj-lift", "tp-pattern"]) {
   $(id).addEventListener("input", () => {
+    // Silently, not with a toast: a restored form value is not a user asking
+    // for anything, and a complaint about it would be the same noise in a
+    // different colour.
+    if (!config) return;
     config.projection = projectionFromForm();
     renderLayoutSize();
     pushPreview();
@@ -1540,6 +1578,7 @@ for (const id of ["pj-blend", "pj-gamma", "pj-lift", "tp-pattern"]) {
 
 $("pj-save").onclick = () => run(async () => {
   document.activeElement?.blur();
+  if (!loaded()) return;
   config.projection = projectionFromForm();
   // Blending settings are saved; the test pattern never is. An appliance
   // that boots into a test grid because someone left one up is a support
@@ -1934,6 +1973,7 @@ async function loadChecks() {
   renderChecks(); renderStatus();
 }
 async function loadAll() {
+  lastLoadAt = Date.now();
   outputs = await api("/outputs");
   // Advisory: an older daemon, or a host without /sys, simply offers fewer
   // choices — never a reason to fail the page.
@@ -1952,6 +1992,23 @@ $("c-save").onclick = () => run(() =>
   "saved configuration");
 $("c-reload").onclick = () => run(async () => $("config-json").blur(), "reloaded from the daemon");
 $("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
+
+// A laptop that slept has a stale page and an EventSource still working its
+// way through reconnect backoff, so the first thing an operator sees on
+// returning is old state. Both of these ask for a fresh one, and both are
+// cheap enough to be unconditional: `loadAll` is what every reconnect runs
+// anyway.
+let lastLoadAt = 0;
+function resync() {
+  // Alt-tabbing should not mean eight requests a keystroke; a page seconds
+  // old is not stale enough to be worth refetching.
+  if (Date.now() - lastLoadAt < 5000) return;
+  loadAll().catch(() => { /* the reconnect will try again */ });
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") resync();
+});
+window.addEventListener("online", resync);
 
 function connect() {
   const source = new EventSource(API + "/events");
