@@ -1469,7 +1469,8 @@
           "grid",
           "white",
           "black",
-          "gamma"
+          "gamma",
+          "identify"
         ],
         "type": "string"
       },

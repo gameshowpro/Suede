@@ -27,9 +27,96 @@ pub fn render(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
         // would corrupt the black-lift comparison it exists for.
         Some(TestPattern::Black) => {}
         Some(TestPattern::Gamma) => gamma_chart(&mut rgb, width, height, spec.gamma),
+        Some(TestPattern::Identify) => identify(&mut rgb, width, height, &spec.rect, &spec.output),
         None => {}
     }
     rgb
+}
+
+// --- output identification -----------------------------------------------
+
+/// The connector's name, as large as this output will carry.
+///
+/// Sized for someone standing at the projector rather than sitting at the
+/// screen: the answer they need is which cable to move, and the two displays
+/// they are choosing between may be metres apart and differently lit. So the
+/// name is scaled to the output rather than set at a fixed size, and the
+/// background is keyed to the name so neighbours never look alike even when
+/// the text is too far away to read.
+fn identify(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
+    let ground = name_colour(output);
+    for pixel in rgb.chunks_exact_mut(3) {
+        pixel.copy_from_slice(&ground);
+    }
+
+    // A border in the same hue but bright: it states where this output ends,
+    // which is the other half of the question when two of them overlap.
+    let edge = name_colour_bright(output);
+    let thickness = (width.min(height) / 60).clamp(2, 12) as i32;
+    for y in 0..height as i32 {
+        for x in 0..width as i32 {
+            if x < thickness
+                || y < thickness
+                || x >= width as i32 - thickness
+                || y >= height as i32 - thickness
+            {
+                put(rgb, width, x, y, edge);
+            }
+        }
+    }
+
+    // The largest scale that leaves a margin, so a long name on a narrow
+    // output shrinks to fit rather than running off the side.
+    let name = output.to_ascii_uppercase();
+    let usable = (width as f64 * 0.82) as i32;
+    let by_width = (usable / (6 * name.len().max(1) as i32)).max(1);
+    let by_height = ((height as f64 * 0.42) as i32 / 7).max(1);
+    let scale = by_width.min(by_height);
+
+    let title_w = text_width(&name, scale);
+    let title_x = (width as i32 - title_w) / 2;
+    let title_y = (height as i32 - 7 * scale) / 2 - height as i32 / 12;
+    text(rgb, width, height, title_x, title_y, scale, &name);
+
+    // Underneath, what the daemon thinks this output is: its size and where
+    // it sits on the canvas. Ordering the cables is the point, and that is
+    // the line which says whether the order came out right.
+    let detail = format!("{}X{} AT {},{}", width, height, rect.x, rect.y);
+    let small = (scale / 4).clamp(1, 6);
+    let detail_w = text_width(&detail, small);
+    text(
+        rgb,
+        width,
+        height,
+        (width as i32 - detail_w) / 2,
+        title_y + 7 * scale + 8 * small,
+        small,
+        &detail,
+    );
+}
+
+/// A dark ground unique to a connector name.
+///
+/// Hashed rather than taken from a list: the names are whatever the hardware
+/// offers, and a list would eventually meet a machine whose outputs all fell
+/// off the end of it and came out the same colour.
+fn name_colour(output: &str) -> [u8; 3] {
+    hsl(name_hue(output), 0.55, 0.22)
+}
+
+fn name_colour_bright(output: &str) -> [u8; 3] {
+    hsl(name_hue(output), 0.75, 0.55)
+}
+
+fn name_hue(output: &str) -> f64 {
+    // FNV-1a, for a spread that separates names differing by one character -
+    // which is exactly what DP-5 and DP-6 are.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in output.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % 360) as f64
 }
 
 // --- the tile grid --------------------------------------------------------
@@ -221,7 +308,12 @@ pub fn text_width(message: &str, scale: i32) -> i32 {
 /// Blit `message` in the 5×7 font, white with a black drop shadow so it
 /// survives any tile colour underneath.
 pub fn text(rgb: &mut [u8], width: u32, height: u32, x: i32, y: i32, scale: i32, message: &str) {
-    for (offset, colour) in [(scale.max(1), [0, 0, 0]), (0, [255, 255, 255])] {
+    // The shadow exists to keep small text legible over the grid's tile
+    // colours. Offsetting it by a whole scale unit is right at scale 1 and
+    // absurd at scale 50, where it stops reading as a shadow and starts
+    // reading as a second, misaligned copy of the letter.
+    let shadow = (scale / 6).max(1);
+    for (offset, colour) in [(shadow, [0, 0, 0]), (0, [255, 255, 255])] {
         let mut pen_x = x + offset;
         let pen_y = y + offset;
         for c in message.chars() {
@@ -283,6 +375,9 @@ fn glyph(c: char) -> [&'static str; 7] {
         ],
         '-' => [
             "     ", "     ", "     ", "#####", "     ", "     ", "     ",
+        ],
+        ',' => [
+            "     ", "     ", "     ", "     ", "  ## ", "  #  ", " #   ",
         ],
         '.' => [
             "     ", "     ", "     ", "     ", "     ", " ##  ", " ##  ",
@@ -512,5 +607,164 @@ mod tests {
         let mut rgb = vec![0u8; 100 * 20 * 3];
         text(&mut rgb, 100, 20, 2, 2, 1, "DP-1");
         assert!(rgb.contains(&255), "glyphs must produce pixels");
+    }
+
+    /// Two connectors must never come out looking the same, or the pattern
+    /// answers the wrong question: a wall of identical rectangles tells you
+    /// nothing about which cable to move.
+    #[test]
+    fn every_output_gets_its_own_ground() {
+        let names = [
+            "DP-1", "DP-2", "DP-5", "DP-6", "DP-7", "DP-8", "HDMI-A-1", "HDMI-A-2", "eDP-1",
+            "DVI-D-1",
+        ];
+        let mut seen = std::collections::HashMap::new();
+        for name in names {
+            let colour = name_colour(name);
+            if let Some(other) = seen.insert(colour, name) {
+                panic!("{name} and {other} share a ground colour {colour:?}");
+            }
+        }
+        // Adjacent numbers are the pair most likely to be confused, so they
+        // are the pair worth being furthest apart.
+        let five = name_hue("DP-5");
+        let six = name_hue("DP-6");
+        assert!(
+            (five - six).abs() > 20.0,
+            "DP-5 and DP-6 hues are only {} apart",
+            (five - six).abs()
+        );
+    }
+
+    /// A long name on a narrow output must shrink rather than run off it.
+    #[test]
+    fn the_name_always_fits_the_output() {
+        for (width, height, name) in [
+            (1920u32, 1080u32, "DP-1"),
+            (1280, 720, "HDMI-A-2"),
+            (640, 480, "DP-1-1"),
+            (3840, 2160, "DVI-D-1"),
+            // Absurd, but the arithmetic should still hold.
+            (800, 600, "DISPLAYPORT-EXTENDED-7"),
+        ] {
+            let rgb = render(
+                width,
+                height,
+                &OverlaySpec {
+                    output: name.into(),
+                    gamma: 2.2,
+                    black_lift: 0.0,
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: width as i32,
+                        height: height as i32,
+                    },
+                    pattern: Some(TestPattern::Identify),
+                    ramps: Vec::new(),
+                },
+            );
+            assert_eq!(rgb.len(), width as usize * height as usize * 3);
+
+            // White is only laid down by the text, so its extent is the
+            // text's. Nothing may touch the outer edge.
+            let mut min_x = width as i32;
+            let mut max_x = -1i32;
+            for y in 0..height as i32 {
+                for x in 0..width as i32 {
+                    if pixel(&rgb, width, x, y) == [255, 255, 255] {
+                        min_x = min_x.min(x);
+                        max_x = max_x.max(x);
+                    }
+                }
+            }
+            assert!(max_x >= 0, "{name} at {width}x{height} drew no text at all");
+            assert!(
+                min_x > 0 && max_x < width as i32 - 1,
+                "{name} at {width}x{height} ran to the edge ({min_x}..{max_x})"
+            );
+        }
+    }
+
+    /// The name has to be legible across a room, which means most of the
+    /// output's height, not a corner of it.
+    #[test]
+    fn the_name_is_drawn_large() {
+        let rgb = render(
+            1920,
+            1080,
+            &spec(
+                TestPattern::Identify,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+        );
+        let mut top = 1080i32;
+        let mut bottom = -1i32;
+        for y in 0..1080 {
+            for x in 0..1920 {
+                if pixel(&rgb, 1920, x, y) == [255, 255, 255] {
+                    top = top.min(y);
+                    bottom = bottom.max(y);
+                }
+            }
+        }
+        let tall = bottom - top;
+        assert!(
+            tall > 1080 / 5,
+            "the name is only {tall}px tall on a 1080p output"
+        );
+    }
+
+    /// Not a test: writes each pattern out as a PPM so it can be looked at.
+    ///
+    ///     SUEDE_WRITE_PATTERN=/tmp/p cargo test -- --ignored write_patterns
+    ///
+    /// These are pictures, and some of their faults are only faults to an
+    /// eye. This caught a drop shadow that was correct at small sizes and
+    /// became a second misaligned copy of every letter at large ones, and a
+    /// comma the font did not have and silently dropped - neither of which
+    /// any assertion here was going to notice.
+    #[test]
+    #[ignore]
+    fn write_patterns() {
+        let Ok(dir) = std::env::var("SUEDE_WRITE_PATTERN") else {
+            return;
+        };
+        let cases = [
+            (TestPattern::Identify, "DP-5", 1920u32, 1200u32),
+            (TestPattern::Identify, "DP-6", 1920, 1200),
+            (TestPattern::Identify, "HDMI-A-1", 1280, 720),
+            (TestPattern::Grid, "DP-5", 1920, 1200),
+            (TestPattern::Gamma, "DP-5", 1920, 1200),
+        ];
+        for (pattern, name, w, h) in cases {
+            let rgb = render(
+                w,
+                h,
+                &OverlaySpec {
+                    output: name.into(),
+                    gamma: 2.2,
+                    black_lift: 0.0,
+                    rect: Rect {
+                        x: 0,
+                        y: 0,
+                        width: w as i32,
+                        height: h as i32,
+                    },
+                    pattern: Some(pattern),
+                    ramps: Vec::new(),
+                },
+            );
+            let mut out = format!("P6 {w} {h} 255 ").into_bytes();
+            out.extend_from_slice(&rgb);
+            let file = format!("{dir}-{pattern:?}-{name}.ppm").to_lowercase();
+            std::fs::write(&file, out).unwrap();
+            eprintln!("wrote {file}");
+        }
     }
 }

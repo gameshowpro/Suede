@@ -653,7 +653,7 @@ with no overlaps skips all of this: sway tiles it directly, at zero cost.
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
-| `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma` - or null for content |
+| `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify` - or null for content |
 
 Slicing engages whenever the configured layout overlaps, with or without
 this section; the section adds the blending. A full overlap (a stacked
@@ -670,6 +670,23 @@ projector, a mirror) is duplicated at full strength and never ramped.
     shows it as an uncommitted preview and never saves it; an API client
     that writes it with `committed: true` gets a machine that boots into a
     test pattern, which is rarely what anyone wants.
+
+#### Sorting the cables out {: #identify }
+
+`identify` puts the connector's name across the whole output, on a colour
+derived from that name, with its size and canvas position underneath.
+
+It exists for the moment when the logical order and the physical order
+disagree — when `DP-5` is throwing the picture that ought to be second from
+the left. Remapping in software is one answer; moving the cable is often the
+better one, because everything downstream then agrees, and for that you need
+to know which socket is lighting which projector while standing at the rack.
+
+The `grid` pattern names each output too, but in five-pixel text in the
+corner of every tile: legible in a photograph, useless from across a room.
+Here the name is scaled to the display, so it can be read at a glance, and
+the background colour means two projectors are never confused even when the
+text is too far away to make out.
 
 **Blending is a ramp in light, not in signal.** A display raises its input
 signal to a power (its gamma, typically 2.2), so a gradient linear in signal

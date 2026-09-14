@@ -125,6 +125,15 @@ pub enum TestPattern {
     /// averages to half light. The patch that matches from a distance names
     /// the projector's gamma; the configured value is marked.
     Gamma,
+    /// The connector's name, as large as the output will carry, on a colour
+    /// unique to that name.
+    ///
+    /// For deciding which cable to move. The grid carries the name too, but
+    /// in 5-pixel text in the corner of every tile: legible in a photograph,
+    /// useless from the back of a room with a cable in your hand. Reading it
+    /// off the wall is the whole job here, so everything else gets out of
+    /// the way.
+    Identify,
 }
 
 impl DesiredState {
