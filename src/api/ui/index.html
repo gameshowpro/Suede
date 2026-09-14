@@ -158,6 +158,28 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
   background: var(--ink); color: var(--bg); padding: 10px 18px; border-radius: 8px;
   font-size: 14px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 50; max-width: 80vw; }
 #toast.show { opacity: 1; }
+
+/* The reconnect overlay, after Blazor Server's: dim everything, say what is
+   happening, and offer the one action that helps. A disconnected page cannot
+   honour a click on anything behind this, and letting it look as though it
+   could is how an operator ends up believing a setting was saved. */
+#offline { position: fixed; inset: 0; z-index: 200; display: none;
+  align-items: center; justify-content: center; padding: 20px;
+  background: color-mix(in srgb, var(--bg) 72%, transparent);
+  backdrop-filter: blur(3px); }
+#offline.show { display: flex; }
+#offline .card { background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.28);
+  padding: 22px 26px; max-width: 34em; text-align: center; }
+#offline h2 { margin: 0 0 8px; font-size: 17px; }
+#offline p { margin: 0 0 6px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+#offline .row { justify-content: center; margin-top: 16px; }
+#offline .spinner { width: 17px; height: 17px; margin: 0 auto 12px;
+  border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 900ms linear infinite; }
+#offline.failed .spinner { display: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { #offline .spinner { animation: none; } }
 </style>
 </head>
 <body>
@@ -568,6 +590,18 @@ window.addEventListener("error", (event) => {
 
 <div id="toast"></div>
 
+<div id="offline" role="alertdialog" aria-modal="true" aria-labelledby="offline-heading">
+  <div class="card">
+    <div class="spinner"></div>
+    <h2 id="offline-heading">Reconnecting to the appliance</h2>
+    <p id="offline-detail">The connection was lost.</p>
+    <p class="hint" id="offline-next"></p>
+    <div class="row">
+      <button class="action" id="offline-retry">Try now</button>
+      <button class="action ghost" id="offline-reload">Reload the page</button>
+    </div>
+  </div>
+</div>
 <script>
 const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
@@ -2000,6 +2034,10 @@ $("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" })
 // anyway.
 let lastLoadAt = 0;
 function resync() {
+  // Returning to a machine that slept is the moment the wait is least
+  // welcome, so a disconnected page reconnects now rather than serving out
+  // whatever remains of its backoff.
+  if (!stream) { attempt = 0; connect(); return; }
   // Alt-tabbing should not mean eight requests a keystroke; a page seconds
   // old is not stale enough to be worth refetching.
   if (Date.now() - lastLoadAt < 5000) return;
@@ -2010,14 +2048,86 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("online", resync);
 
+// --- staying connected ------------------------------------------------
+//
+// Modelled on Blazor Server's reconnect overlay, which is the established
+// answer to this: dim the page, say what is happening, count the attempts,
+// and offer a manual retry. Adopted rather than imported - this page carries
+// no dependencies and is tested for it, because an appliance may have no
+// route to a CDN.
+//
+// EventSource reconnects on its own, but on terms it will not share: no
+// attempt count, no way to ask it to try now, and an interval the page
+// cannot see or set. So the retry is owned here instead, and the browser's
+// is switched off by closing the stream on the first error.
+//
+// One deliberate difference from Blazor, which stops after a fixed number of
+// attempts: this keeps trying. The interval is capped, so an idle dashboard
+// left open costs one request every fifteen seconds, and an appliance that
+// comes back at three in the morning is reconnected to by then rather than
+// waiting for somebody to notice a dead page.
+const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 15000];
+let stream = null, attempt = 0, retryTimer = null, countdownTimer = null;
+
+function showOffline(failed, detail, next) {
+  const el = $("offline");
+  el.classList.add("show");
+  el.classList.toggle("failed", !!failed);
+  $("offline-detail").textContent = detail;
+  $("offline-next").textContent = next ?? "";
+}
+
+function hideOffline() {
+  $("offline").classList.remove("show");
+  clearInterval(countdownTimer);
+}
+
+function scheduleReconnect() {
+  clearTimeout(retryTimer);
+  clearInterval(countdownTimer);
+  const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
+  attempt += 1;
+  let left = Math.round(delay / 1000);
+  const tick = () => {
+    showOffline(false,
+      `The connection to the daemon was lost. Attempt ${attempt}.`,
+      left > 0 ? `Trying again in ${left}s.` : "Trying again now…");
+    left -= 1;
+  };
+  tick();
+  countdownTimer = setInterval(tick, 1000);
+  retryTimer = setTimeout(connect, delay);
+}
+
+$("offline-retry").onclick = () => { attempt = 0; connect(); };
+$("offline-reload").onclick = () => location.reload();
+
 function connect() {
+  clearTimeout(retryTimer);
+  clearInterval(countdownTimer);
+  // Only one stream at a time: a manual retry during a scheduled one would
+  // otherwise leave the old stream delivering events behind the new.
+  if (stream) { stream.close(); stream = null; }
+
   const source = new EventSource(API + "/events");
+  stream = source;
   source.onopen = () => {
+    attempt = 0;
+    hideOffline();
     $("live").textContent = "live"; $("live").className = "pill ok";
     // Events are state-based, not replayed, so resynchronise on every connect.
     loadAll().catch((error) => toast(error.message, true));
   };
-  source.onerror = () => { $("live").textContent = "reconnecting…"; $("live").className = "pill bad"; };
+  source.onerror = () => {
+    $("live").textContent = "reconnecting…"; $("live").className = "pill bad";
+    // Take the retry away from the browser so the page can time it, count it,
+    // and let somebody skip the wait.
+    if (stream === source) {
+      source.close();
+      stream = null;
+      scheduleReconnect();
+    }
+  };
 
   source.addEventListener("outputs_changed", async (e) => {
     outputs = JSON.parse(e.data);
