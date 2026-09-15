@@ -351,6 +351,7 @@ pub mod test_support {
             docs_base_url: bootstrap.docs_base_url.clone(),
         }));
         let capability_store = Arc::new(crate::capabilities::CapabilityStore::new(dir.path()));
+        let (trigger, _receiver) = Reconciler::channel();
         let checks = Arc::new(CheckRunner::new(
             bootstrap.clone(),
             sway.clone(),
@@ -358,8 +359,9 @@ pub mod test_support {
             store.clone(),
             hub.clone(),
             capability_store.clone(),
+            snapshot.clone(),
+            trigger.clone(),
         ));
-        let (trigger, _receiver) = Reconciler::channel();
 
         let state = ApiState {
             bootstrap,

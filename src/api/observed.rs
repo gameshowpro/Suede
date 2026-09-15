@@ -283,7 +283,10 @@ mod tests {
     async fn runs_health_checks() {
         let (status, body) = get_json("/api/v1/system/checks").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 16);
+        assert_eq!(
+            body.as_array().unwrap().len(),
+            crate::checks::ids::ALL.len()
+        );
         assert!(body[0].get("fixAvailable").is_some());
     }
 

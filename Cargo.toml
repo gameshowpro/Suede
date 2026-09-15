@@ -42,6 +42,7 @@ tempfile = { version = "3", optional = true }
 # settings, and reports a divergence if asked to blend.
 default = ["projection"]
 projection = [
+    "dep:ash",
     "dep:memmap2",
     "dep:tempfile",
     "dep:wayland-client",
@@ -59,6 +60,11 @@ memmap2 = { version = "0.9", optional = true }
 wayland-client = { version = "0.31", optional = true }
 wayland-protocols = { version = "0.32", features = ["client"], optional = true }
 wayland-protocols-wlr = { version = "0.3", features = ["client"], optional = true }
+# GPU blend path (src/projection/gpu.rs). Default `loaded` feature dlopens
+# libvulkan.so.1 at runtime via `ash::Entry::load()` rather than linking it,
+# which is what keeps the single self-contained ELF invariant true on a
+# machine with no Vulkan at all: `Gpu::new()` just returns an error there.
+ash = { version = "0.38", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tracing-journald = "0.3"
@@ -104,6 +110,12 @@ priority = "optional"
 # swayidle: the daemon never runs it, but the sway config provisioning writes
 # relies on it to keep displays awake, and Debian's sway only Suggests it.
 depends = "$auto, sway, swayidle, pipewire, pipewire-pulse"
+# setcap, used by postinst to grant the slicer's Vulkan queue realtime
+# priority (cap_sys_nice+ep) instead of the driver's unprivileged default of
+# "medium" - see packaging/postinst. A Recommends, not a Depends: postinst
+# guards the call with `command -v setcap` and does not fail the install
+# without it, so a machine that skips this only loses the priority bump.
+recommends = "libcap2-bin"
 # No browser relationship at all. Suede does not link against a browser or
 # name one at build time: it resolves whichever of several binaries it finds
 # at launch, and says plainly when it finds none. Declaring them here only

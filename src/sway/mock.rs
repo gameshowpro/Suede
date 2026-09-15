@@ -145,6 +145,23 @@ impl SwayClient for MockSway {
         Ok(())
     }
 
+    /// Mirrors `IpcClient::run_commands` end to end: join the same way it
+    /// does, then split back apart, so a plan that would trip over sway's
+    /// separator misbehaves here exactly as it would live, and so a test
+    /// asserting on `commands()` sees the same per-command strings either
+    /// way.
+    async fn run_commands(&self, commands: &[String]) -> Vec<SwayResult<()>> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        let joined = commands.join(", ");
+        let mut results = Vec::with_capacity(commands.len());
+        for command in joined.split(", ") {
+            results.push(self.run_command(command).await);
+        }
+        results
+    }
+
     async fn get_version(&self) -> SwayResult<SwayVersion> {
         Ok(self.version.lock().unwrap().clone())
     }
@@ -389,6 +406,30 @@ mod tests {
             .run_command("output HDMI-A-1 mode 1920x1080@60Hz")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn batched_commands_are_recorded_in_order_and_report_per_command_failures() {
+        let mock = MockSway::empty();
+        mock.fail_commands_containing("bogus");
+        let commands = vec![
+            "output HDMI-A-1 enable".to_string(),
+            "output HDMI-A-1 bogus".to_string(),
+            "output HDMI-A-1 scale 1".to_string(),
+        ];
+
+        let results = mock.run_commands(&commands).await;
+
+        assert_eq!(mock.commands(), commands, "recorded out of order");
+        assert!(results[0].is_ok());
+        assert!(
+            results[1].is_err(),
+            "the failing command must report an error"
+        );
+        assert!(
+            results[2].is_ok(),
+            "a later command must not be poisoned by an earlier failure"
+        );
     }
 
     #[tokio::test]

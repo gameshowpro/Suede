@@ -12,6 +12,10 @@
 //! the configuration schema is not, so every build speaks the same API.
 
 pub mod blend;
+#[cfg(unix)]
+mod dmabuf;
+#[cfg(unix)]
+pub mod gpu;
 pub mod manager;
 #[cfg(unix)]
 pub mod overlay;

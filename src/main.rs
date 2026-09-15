@@ -224,6 +224,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     let capability_store = Arc::new(suede::capabilities::CapabilityStore::new(
         &bootstrap.state_dir,
     ));
+    let (trigger, trigger_rx) = Reconciler::channel();
     let checks = Arc::new(CheckRunner::new(
         bootstrap.clone(),
         sway.clone(),
@@ -231,8 +232,9 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         store.clone(),
         events.clone(),
         capability_store.clone(),
+        snapshot.clone(),
+        trigger.clone(),
     ));
-    let (trigger, trigger_rx) = Reconciler::channel();
 
     // --- background tasks ---
     tokio::spawn(Reconciler::forward_sway_events(
