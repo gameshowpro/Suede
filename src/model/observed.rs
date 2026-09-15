@@ -37,7 +37,11 @@ impl Mode {
     }
 }
 
-fn format_refresh(hz: f64) -> String {
+/// Trim a refresh rate to 3 decimals with trailing zeros dropped, the way
+/// `sway-output(5)` mode strings and the refresh-rate check both want it
+/// formatted. `pub(crate)` rather than private so both can share it instead
+/// of drifting apart with their own rounding.
+pub(crate) fn format_refresh(hz: f64) -> String {
     let rounded = (hz * 1000.0).round() / 1000.0;
     let text = format!("{rounded:.3}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
@@ -468,6 +472,75 @@ pub struct ConfigChange {
     pub revision: u64,
     /// Which part of the document changed: `all`, `outputs`, `apps`, `settings`.
     pub section: String,
+}
+
+/// What the slicer measured over its last reporting interval.
+///
+/// Reported by the slicer subprocess as a JSON line on its stdout every ten
+/// seconds (see `crate::projection::slicer`), read by the manager and served
+/// as `GET /projection/stats` / `projection_stats_changed`. `None` at both of
+/// those means no slicer is currently running — there is nothing configured
+/// to blend, or projection is off.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionStats {
+    /// Unix seconds at the end of the interval.
+    pub measured_at: u64,
+    pub interval_seconds: f64,
+    /// Whether outputs were taking frames at their own pace (see ProjectionConfig.free_run).
+    pub free_run: bool,
+    /// Canvas frames captured per second.
+    pub canvas_fps: f64,
+    /// Present cycles per second. Locked: one per all-output commit. Free: one per
+    /// snapshot that reached at least one output.
+    pub presented_fps: f64,
+    /// Captured frames replaced by a newer one before any output showed them.
+    pub frames_superseded: u32,
+    /// Times an output stopped answering frame callbacks and was dropped from the gate.
+    pub stalls: u32,
+    pub per_frame_ms: FrameCost,
+    /// Whether the compositor offers wp_presentation; without it offset_ms and the
+    /// per-output presented/discarded/refreshHz fields cannot be measured.
+    pub presentation_feedback: bool,
+    /// Spread between the earliest and latest output to present the same frame.
+    /// None when fewer than two outputs reported a frame this interval.
+    pub offset_ms: Option<PresentationOffset>,
+    /// Frames whose outputs presented more than half a refresh period apart —
+    /// i.e. shown on different refreshes, a whole-frame mismatch.
+    pub straddles: u32,
+    pub outputs: Vec<OutputTiming>,
+}
+
+/// Where a captured frame's time went in the slicer, in ms, averaged over
+/// the reporting interval. See `crate::projection::slicer::FrameStats` for
+/// what each phase covers.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameCost {
+    pub waiting: f64,
+    pub snapshot: f64,
+    pub requesting: f64,
+    pub blending: f64,
+}
+
+/// Spread between the earliest and latest output to present the same frame,
+/// from `wp_presentation` feedback, in ms.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentationOffset {
+    pub mean: f64,
+    pub max: f64,
+}
+
+/// One output's presentation tally for the interval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputTiming {
+    pub name: String,
+    pub presented: u32,
+    pub discarded: u32,
+    /// From wp_presentation's refresh field: the output's actual refresh interval, as Hz.
+    pub refresh_hz: Option<f64>,
 }
 
 #[cfg(test)]

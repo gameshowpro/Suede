@@ -16,7 +16,7 @@ use crate::audio::AudioMonitor;
 use crate::config::BootstrapConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::events::{EventHub, ServerEvent};
-use crate::model::{Check, CheckStatus, PackageVersion};
+use crate::model::{format_refresh, Check, CheckStatus, Output, OutputConfig, PackageVersion};
 use crate::sway::SwayClient;
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -96,6 +96,7 @@ pub mod ids {
     pub const API_REACHABILITY: &str = "api-reachability";
     pub const DECODE_MEASURED: &str = "decode-measured";
     pub const CAPTURE_DEVICES: &str = "capture-devices";
+    pub const REFRESH_RATES: &str = "refresh-rates";
 }
 
 /// A host packet filter that may be dropping traffic to the API port.
@@ -287,6 +288,7 @@ impl CheckRunner {
             self.check_wayland_display(),
             self.check_direct_scanout(),
             self.check_real_displays().await,
+            self.check_refresh_rates().await,
             self.check_video_decode(),
             self.check_swaybg().await,
             self.check_browsers().await,
@@ -564,6 +566,22 @@ impl CheckRunner {
             status,
             detail,
             Some("troubleshooting/#a-display-stays-dark"),
+        )
+    }
+
+    /// Outputs mode-set at different rates drift a frame apart over time — see
+    /// [`refresh_rate_verdict`] for the arithmetic and the two projectors this
+    /// was written for (60.000 Hz and 59.939 Hz, both advertising both).
+    async fn check_refresh_rates(&self) -> Check {
+        let outputs = self.sway.get_outputs().await.unwrap_or_default();
+        let configured = self.store.effective().outputs;
+        let (status, detail) = refresh_rate_verdict(&outputs, &configured);
+        self.check(
+            ids::REFRESH_RATES,
+            "Displays share a refresh rate",
+            status,
+            detail,
+            Some("configuration/#refresh-rates"),
         )
     }
 
@@ -1556,6 +1574,172 @@ pub fn is_synthetic_output(name: &str) -> bool {
     name.starts_with("HEADLESS-") || name.starts_with("WL-") || name.starts_with("X11-")
 }
 
+/// Judge whether the active, physical displays are running at the same
+/// refresh rate.
+///
+/// Pure, so every combination is table-testable without a compositor. Found
+/// because a camera filming two projectors showed their frame counters off
+/// by one most of the time: they were mode-set at 60.000 Hz and 59.939 Hz —
+/// both advertised both — which drifts a whole frame apart roughly every 16
+/// seconds. Nothing warned, because each output was individually healthy.
+///
+/// Rates are grouped to 0.001 Hz: tight enough to never conflate genuinely
+/// different rates (50/60/72/75), loose enough that this does not itself
+/// manufacture a mismatch out of floating-point noise in the same rate.
+fn refresh_rate_verdict(outputs: &[Output], configured: &[OutputConfig]) -> (CheckStatus, String) {
+    let active: Vec<&Output> = outputs
+        .iter()
+        .filter(|output| {
+            output.active && !is_synthetic_output(&output.name) && output.current_mode.is_some()
+        })
+        .collect();
+
+    if active.len() < 2 {
+        return match active.first() {
+            None => (CheckStatus::Pass, "no displays attached".to_string()),
+            Some(output) => (
+                CheckStatus::Pass,
+                format!(
+                    "one display attached ({} at {} Hz); nothing to keep in step",
+                    output.name,
+                    format_refresh(output.current_mode.unwrap().refresh_hz)
+                ),
+            ),
+        };
+    }
+
+    let key = |hz: f64| (hz * 1000.0).round() as i64;
+
+    // Groups, in first-seen order — order matters below, both for the
+    // sentence naming the outputs and for which common rate is offered as
+    // the remedy when more than one would do.
+    let mut groups: Vec<(i64, Vec<&Output>)> = Vec::new();
+    for output in &active {
+        let rate_key = key(output.current_mode.unwrap().refresh_hz);
+        match groups.iter_mut().find(|(k, _)| *k == rate_key) {
+            Some((_, members)) => members.push(output),
+            None => groups.push((rate_key, vec![output])),
+        }
+    }
+
+    if groups.len() == 1 {
+        let rate = groups[0].0 as f64 / 1000.0;
+        let names: Vec<&str> = active.iter().map(|output| output.name.as_str()).collect();
+        return (
+            CheckStatus::Pass,
+            format!(
+                "{} all run at {} Hz",
+                names.join(", "),
+                format_refresh(rate)
+            ),
+        );
+    }
+
+    // Name every output with its rate: "DP-1 runs at 60 Hz but DP-3 runs at
+    // 59.939 Hz" for two, "A, B run at 60 Hz but C runs at 50 Hz" grouped by
+    // rate when more share one.
+    let phrase_for = |members: &[&Output]| -> String {
+        let names: Vec<&str> = members.iter().map(|output| output.name.as_str()).collect();
+        let rate = format_refresh(members[0].current_mode.unwrap().refresh_hz);
+        if names.len() == 1 {
+            format!("{} runs at {rate} Hz", names[0])
+        } else {
+            format!("{} run at {rate} Hz", names.join(", "))
+        }
+    };
+    let mut phrases: Vec<String> = groups
+        .iter()
+        .map(|(_, members)| phrase_for(members))
+        .collect();
+    let naming = if phrases.len() == 1 {
+        phrases.remove(0)
+    } else {
+        let last = phrases.pop().expect("more than one group");
+        format!("{} but {last}", phrases.join(", "))
+    };
+
+    // The drift period: how long before the two extremes are a whole frame
+    // apart. `1 / |Δ Hz|` — 60 vs 59.939 drifts a frame every ~16.4 s.
+    let rates: Vec<f64> = groups.iter().map(|(k, _)| *k as f64 / 1000.0).collect();
+    let min_rate = rates.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max_rate = rates.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let drift_seconds = 1.0 / (max_rate - min_rate).abs();
+    let consequence = format!(
+        "At these rates they drift a whole frame apart every {} s, so a camera \
+         catches the displays a frame out of step and one of them repeats a \
+         frame each cycle",
+        drift_seconds.round() as i64
+    );
+
+    // A remedy: is there a rate, advertised at each output's own current
+    // resolution, that every mismatched output offers? Candidates are the
+    // rates already in use (tried in first-seen order, so a tie prefers not
+    // disturbing the output that already leads), because the point is to
+    // change as little as possible, not to invent a new rate nobody is at.
+    let advertises = |output: &Output, rate_key: i64| {
+        let current = output.current_mode.unwrap();
+        output.modes.iter().any(|mode| {
+            mode.width == current.width
+                && mode.height == current.height
+                && key(mode.refresh_hz) == rate_key
+        })
+    };
+    let common = groups
+        .iter()
+        .find(|(rate_key, _)| active.iter().all(|output| advertises(output, *rate_key)))
+        .map(|(rate_key, _)| *rate_key as f64 / 1000.0);
+
+    let remedy = match common {
+        Some(rate) => {
+            let rate_key = key(rate);
+            let already: Vec<&str> = groups
+                .iter()
+                .find(|(k, _)| *k == rate_key)
+                .map(|(_, members)| members.iter().map(|output| output.name.as_str()).collect())
+                .unwrap_or_default();
+            let to_change: Vec<&str> = active
+                .iter()
+                .map(|output| output.name.as_str())
+                .filter(|name| !already.contains(name))
+                .collect();
+            format!(
+                "All of them advertise {} Hz at their current resolution — set that on {} \
+                 in the layout editor",
+                format_refresh(rate),
+                to_change.join(", ")
+            )
+        }
+        None => "They advertise no common rate at their current resolutions; pick the nearest pair"
+            .to_string(),
+    };
+
+    let mut detail = format!("{naming}. {consequence}. {remedy}.");
+
+    // If the configuration itself asked for these differing rates — rather
+    // than sway simply defaulting each output to its own preferred mode —
+    // say so: this was requested, not merely undetected drift.
+    let mut explicit_rate_keys: Vec<i64> = Vec::new();
+    for output in &active {
+        let Some(entry) = configured
+            .iter()
+            .find(|entry| entry.r#match.name.as_deref() == Some(output.name.as_str()))
+        else {
+            continue;
+        };
+        if let Some(mode) = entry.mode {
+            let rate_key = key(mode.refresh_hz);
+            if !explicit_rate_keys.contains(&rate_key) {
+                explicit_rate_keys.push(rate_key);
+            }
+        }
+    }
+    if explicit_rate_keys.len() > 1 {
+        detail.push_str(" The configuration asks for these rates.");
+    }
+
+    (CheckStatus::Warn, detail)
+}
+
 /// A GPU vendor, and what it needs for hardware video decode.
 pub struct GpuVendor {
     pub name: &'static str,
@@ -2024,7 +2208,7 @@ mod tests {
     async fn every_check_reports_something() {
         let dir = tempfile::tempdir().unwrap();
         let checks = runner(dir.path().to_path_buf()).run_all().await;
-        assert_eq!(checks.len(), 15);
+        assert_eq!(checks.len(), 16);
         for id in [
             ids::SWAY_SOCKET,
             ids::SWAY_VERSION,
@@ -2035,6 +2219,7 @@ mod tests {
             ids::STATE_DIR,
             ids::DIRECT_SCANOUT,
             ids::REAL_DISPLAYS,
+            ids::REFRESH_RATES,
             ids::VIDEO_DECODE,
             ids::SWAYBG,
             ids::API_REACHABILITY,
@@ -2182,6 +2367,148 @@ mod tests {
         for name in ["DP-1", "HDMI-A-2", "eDP-1", "DVI-D-1"] {
             assert!(!is_synthetic_output(name), "{name} is a real connector");
         }
+    }
+
+    /// A 1920x1080 output currently at `current`, advertising `modes` (all at
+    /// the same resolution) in addition to `current`.
+    fn output_running_at(name: &str, current: f64, modes: &[f64]) -> Output {
+        let mode = |refresh_hz| crate::model::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz,
+        };
+        Output {
+            name: name.to_string(),
+            active: true,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: Some(mode(current)),
+            modes: std::iter::once(current)
+                .chain(modes.iter().copied())
+                .map(mode)
+                .collect(),
+            rect: crate::model::Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        }
+    }
+
+    #[test]
+    fn no_displays_is_a_pass() {
+        let (status, detail) = refresh_rate_verdict(&[], &[]);
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(detail, "no displays attached");
+    }
+
+    #[test]
+    fn a_single_display_is_a_pass() {
+        let outputs = vec![output_running_at("DP-1", 60.0, &[])];
+        let (status, detail) = refresh_rate_verdict(&outputs, &[]);
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(
+            detail,
+            "one display attached (DP-1 at 60 Hz); nothing to keep in step"
+        );
+    }
+
+    #[test]
+    fn synthetic_outputs_do_not_count_towards_the_pair() {
+        let outputs = vec![
+            output_running_at("DP-1", 60.0, &[]),
+            output_running_at("HEADLESS-1", 59.0, &[]),
+        ];
+        let (status, detail) = refresh_rate_verdict(&outputs, &[]);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("one display attached"), "{detail}");
+    }
+
+    #[test]
+    fn matched_rates_pass() {
+        let outputs = vec![
+            output_running_at("DP-1", 60.0, &[]),
+            output_running_at("DP-3", 60.0, &[]),
+        ];
+        let (status, detail) = refresh_rate_verdict(&outputs, &[]);
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(detail, "DP-1, DP-3 all run at 60 Hz");
+    }
+
+    #[test]
+    fn mismatched_rates_warn_and_name_both_outputs() {
+        // Brain's two projectors, verbatim: both advertise both rates.
+        let outputs = vec![
+            output_running_at("DP-1", 60.0, &[59.939]),
+            output_running_at("DP-3", 59.939, &[60.0]),
+        ];
+        let (status, detail) = refresh_rate_verdict(&outputs, &[]);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(
+            detail.starts_with("DP-1 runs at 60 Hz but DP-3 runs at 59.939 Hz."),
+            "{detail}"
+        );
+        assert!(detail.contains("16 s"), "{detail}");
+        assert!(
+            detail.contains("All of them advertise 60 Hz at their current resolution"),
+            "{detail}"
+        );
+        assert!(detail.contains("set that on DP-3"), "{detail}");
+    }
+
+    #[test]
+    fn no_common_rate_says_so() {
+        let outputs = vec![
+            output_running_at("DP-1", 60.0, &[]),
+            output_running_at("DP-3", 50.0, &[]),
+        ];
+        let (status, detail) = refresh_rate_verdict(&outputs, &[]);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(
+            detail.contains("They advertise no common rate at their current resolutions"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_asks_for_different_rates_is_called_out() {
+        let outputs = vec![
+            output_running_at("DP-1", 60.0, &[59.939]),
+            output_running_at("DP-3", 59.939, &[60.0]),
+        ];
+        let configured = vec![
+            {
+                let mut entry =
+                    crate::model::OutputConfig::new(crate::model::OutputMatch::by_name("DP-1"));
+                entry.mode = Some(crate::model::Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60.0,
+                });
+                entry
+            },
+            {
+                let mut entry =
+                    crate::model::OutputConfig::new(crate::model::OutputMatch::by_name("DP-3"));
+                entry.mode = Some(crate::model::Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 59.939,
+                });
+                entry
+            },
+        ];
+        let (status, detail) = refresh_rate_verdict(&outputs, &configured);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(
+            detail.ends_with("The configuration asks for these rates."),
+            "{detail}"
+        );
     }
 
     #[tokio::test]

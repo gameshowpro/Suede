@@ -124,6 +124,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/windows", get(observed::list_windows))
         .route("/audio/outputs", get(observed::list_audio_outputs))
         .route("/status", get(observed::get_status))
+        .route("/projection/stats", get(observed::get_projection_stats))
         .route("/system", get(observed::get_system))
         .route("/system/checks", get(observed::list_checks))
         .route("/system/checks/{id}/fix", post(observed::fix_check))

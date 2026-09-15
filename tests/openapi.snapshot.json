@@ -625,6 +625,34 @@
         ],
         "type": "object"
       },
+      "FrameCost": {
+        "description": "Where a captured frame's time went in the slicer, in ms, averaged over\nthe reporting interval. See `crate::projection::slicer::FrameStats` for\nwhat each phase covers.",
+        "properties": {
+          "blending": {
+            "format": "double",
+            "type": "number"
+          },
+          "requesting": {
+            "format": "double",
+            "type": "number"
+          },
+          "snapshot": {
+            "format": "double",
+            "type": "number"
+          },
+          "waiting": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "waiting",
+          "snapshot",
+          "requesting",
+          "blending"
+        ],
+        "type": "object"
+      },
       "HeartbeatConfig": {
         "additionalProperties": false,
         "description": "Content-level watchdog settings.",
@@ -1063,6 +1091,38 @@
         },
         "type": "object"
       },
+      "OutputTiming": {
+        "description": "One output's presentation tally for the interval.",
+        "properties": {
+          "discarded": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "presented": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "refreshHz": {
+            "description": "From wp_presentation's refresh field: the output's actual refresh interval, as Hz.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "presented",
+          "discarded"
+        ],
+        "type": "object"
+      },
       "PackageVersion": {
         "description": "Version of a package relevant to Suede's operation.",
         "properties": {
@@ -1113,6 +1173,24 @@
         "required": [
           "x",
           "y"
+        ],
+        "type": "object"
+      },
+      "PresentationOffset": {
+        "description": "Spread between the earliest and latest output to present the same frame,\nfrom `wp_presentation` feedback, in ms.",
+        "properties": {
+          "max": {
+            "format": "double",
+            "type": "number"
+          },
+          "mean": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "mean",
+          "max"
         ],
         "type": "object"
       },
@@ -1186,6 +1264,11 @@
             "description": "Master switch. `false` keeps the configuration but skips the entire\nblending chain: no overlays run, nothing is spawned, no divergences.",
             "type": "boolean"
           },
+          "freeRun": {
+            "default": false,
+            "description": "Let each output take frames at its own pace.\n\nOff (the default), the slicer commits a frame to every output together\nand does not commit the next until all of them have taken it, so the\nsame frame is on every display at once. On, each output is handed the\nnewest frame the moment it is ready for one: displays at different\nrefresh rates each run at their own, and the wall gives up being in\nstep. Only for installations that cannot share a rate.",
+            "type": "boolean"
+          },
           "gamma": {
             "default": 2.2,
             "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\ninstallation — these are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
@@ -1205,6 +1288,91 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "ProjectionStats": {
+        "description": "What the slicer measured over its last reporting interval.\n\nReported by the slicer subprocess as a JSON line on its stdout every ten\nseconds (see `crate::projection::slicer`), read by the manager and served\nas `GET /projection/stats` / `projection_stats_changed`. `None` at both of\nthose means no slicer is currently running — there is nothing configured\nto blend, or projection is off.",
+        "properties": {
+          "canvasFps": {
+            "description": "Canvas frames captured per second.",
+            "format": "double",
+            "type": "number"
+          },
+          "framesSuperseded": {
+            "description": "Captured frames replaced by a newer one before any output showed them.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "freeRun": {
+            "description": "Whether outputs were taking frames at their own pace (see ProjectionConfig.free_run).",
+            "type": "boolean"
+          },
+          "intervalSeconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "measuredAt": {
+            "description": "Unix seconds at the end of the interval.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offsetMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PresentationOffset",
+                "description": "Spread between the earliest and latest output to present the same frame.\nNone when fewer than two outputs reported a frame this interval."
+              }
+            ]
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/OutputTiming"
+            },
+            "type": "array"
+          },
+          "perFrameMs": {
+            "$ref": "#/components/schemas/FrameCost"
+          },
+          "presentationFeedback": {
+            "description": "Whether the compositor offers wp_presentation; without it offset_ms and the\nper-output presented/discarded/refreshHz fields cannot be measured.",
+            "type": "boolean"
+          },
+          "presentedFps": {
+            "description": "Present cycles per second. Locked: one per all-output commit. Free: one per\nsnapshot that reached at least one output.",
+            "format": "double",
+            "type": "number"
+          },
+          "stalls": {
+            "description": "Times an output stopped answering frame callbacks and was dropped from the gate.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "straddles": {
+            "description": "Frames whose outputs presented more than half a refresh period apart —\ni.e. shown on different refreshes, a whole-frame mismatch.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "measuredAt",
+          "intervalSeconds",
+          "freeRun",
+          "canvasFps",
+          "presentedFps",
+          "framesSuperseded",
+          "stalls",
+          "perFrameMs",
+          "presentationFeedback",
+          "straddles",
+          "outputs"
+        ],
         "type": "object"
       },
       "ReadinessConfig": {
@@ -2894,6 +3062,33 @@
               }
             },
             "description": "Every connector on the graphics hardware, attached or not. Offered so a client can let the operator configure a socket before its display arrives; sway remains the authority on what is actually driving a display."
+          }
+        },
+        "tags": [
+          "observed"
+        ]
+      }
+    },
+    "/api/v1/projection/stats": {
+      "get": {
+        "operationId": "get_projection_stats",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ProjectionStats"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "What the slicer measured over its last interval; null when no slicer is running"
           }
         },
         "tags": [

@@ -95,6 +95,15 @@ pub struct ProjectionConfig {
     /// real content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_pattern: Option<TestPattern>,
+    /// Let each output take frames at its own pace.
+    ///
+    /// Off (the default), the slicer commits a frame to every output together
+    /// and does not commit the next until all of them have taken it, so the
+    /// same frame is on every display at once. On, each output is handed the
+    /// newest frame the moment it is ready for one: displays at different
+    /// refresh rates each run at their own, and the wall gives up being in
+    /// step. Only for installations that cannot share a rate.
+    pub free_run: bool,
 }
 
 impl Default for ProjectionConfig {
@@ -104,6 +113,7 @@ impl Default for ProjectionConfig {
             gamma: 2.2,
             black_lift: 0.0,
             test_pattern: None,
+            free_run: false,
         }
     }
 }

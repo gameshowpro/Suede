@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
-use crate::model::{AudioSink, Check, Output, Status, SystemInfo, Window};
+use crate::model::{AudioSink, Check, Output, ProjectionStats, Status, SystemInfo, Window};
 
 #[utoipa::path(
     get, path = "/api/v1/outputs", tag = "observed",
@@ -73,6 +73,19 @@ pub async fn list_audio_outputs(State(state): State<ApiState>) -> Json<Vec<Audio
 )]
 pub async fn get_status(State(state): State<ApiState>) -> Json<Status> {
     Json(state.snapshot.status())
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/projection/stats", tag = "observed",
+    responses((
+        status = 200,
+        description = "What the slicer measured over its last interval; \
+                       null when no slicer is running",
+        body = Option<ProjectionStats>,
+    ))
+)]
+pub async fn get_projection_stats(State(state): State<ApiState>) -> Json<Option<ProjectionStats>> {
+    Json(state.snapshot.projection_stats())
 }
 
 #[utoipa::path(
@@ -248,6 +261,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_stats_are_null_when_no_slicer_is_running() {
+        // The harness never starts a slicer, so this is the "nothing to
+        // report" case a client sees whenever projection is off or the
+        // config has no seams.
+        let (status, body) = get_json("/api/v1/projection/stats").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.is_null());
+    }
+
+    #[tokio::test]
     async fn reports_system_information() {
         let (status, body) = get_json("/api/v1/system").await;
         assert_eq!(status, StatusCode::OK);
@@ -260,7 +283,7 @@ mod tests {
     async fn runs_health_checks() {
         let (status, body) = get_json("/api/v1/system/checks").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 15);
+        assert_eq!(body.as_array().unwrap().len(), 16);
         assert!(body[0].get("fixAvailable").is_some());
     }
 

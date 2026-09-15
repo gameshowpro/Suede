@@ -4,13 +4,17 @@
 
 use std::sync::RwLock;
 
-use crate::model::{Output, Status, Window};
+use crate::model::{Output, ProjectionStats, Status, Window};
 
 #[derive(Default)]
 pub struct Snapshot {
     outputs: RwLock<Vec<Output>>,
     windows: RwLock<Vec<Window>>,
     status: RwLock<Status>,
+    /// What the slicer last reported, if one is running. Set by the manager's
+    /// reader thread from the slicer's stdout; cleared when the slicer stops
+    /// or is found to have exited (see `BlendManager`).
+    projection_stats: RwLock<Option<ProjectionStats>>,
 }
 
 impl Snapshot {
@@ -66,6 +70,20 @@ impl Snapshot {
             return false;
         }
         *guard = status;
+        true
+    }
+
+    pub fn projection_stats(&self) -> Option<ProjectionStats> {
+        self.projection_stats.read().unwrap().clone()
+    }
+
+    /// Replace the projection stats, reporting whether they actually changed.
+    pub fn set_projection_stats(&self, stats: Option<ProjectionStats>) -> bool {
+        let mut guard = self.projection_stats.write().unwrap();
+        if *guard == stats {
+            return false;
+        }
+        *guard = stats;
         true
     }
 
@@ -148,5 +166,46 @@ mod tests {
             state: SyncState::Degraded,
             ..Default::default()
         }));
+    }
+
+    #[test]
+    fn projection_stats_change_detection() {
+        use crate::model::{FrameCost, ProjectionStats};
+
+        let snapshot = Snapshot::new();
+        assert!(snapshot.projection_stats().is_none());
+        assert!(
+            !snapshot.set_projection_stats(None),
+            "None to None is no change"
+        );
+
+        let stats = ProjectionStats {
+            measured_at: 1,
+            interval_seconds: 10.0,
+            free_run: false,
+            canvas_fps: 60.0,
+            presented_fps: 60.0,
+            frames_superseded: 0,
+            stalls: 0,
+            per_frame_ms: FrameCost {
+                waiting: 1.0,
+                snapshot: 1.0,
+                requesting: 1.0,
+                blending: 1.0,
+            },
+            presentation_feedback: true,
+            offset_ms: None,
+            straddles: 0,
+            outputs: Vec::new(),
+        };
+        assert!(snapshot.set_projection_stats(Some(stats.clone())));
+        assert!(
+            !snapshot.set_projection_stats(Some(stats)),
+            "identical stats are no change"
+        );
+        assert!(
+            snapshot.set_projection_stats(None),
+            "clearing after running is a change"
+        );
     }
 }

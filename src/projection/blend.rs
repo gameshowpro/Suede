@@ -112,6 +112,9 @@ pub struct SlicerSpec {
     /// Render this instead of capturing, for alignment and calibration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<TestPattern>,
+    /// Commit to each output as it becomes ready, rather than to all at once.
+    #[serde(default)]
+    pub free_run: bool,
     pub slices: Vec<SliceSpec>,
 }
 
@@ -1068,6 +1071,7 @@ mod tests {
             gamma: 2.2,
             black_lift: 0.04,
             pattern: None,
+            free_run: false,
             slices: vec![SliceSpec {
                 output: "DP-3".into(),
                 source: Rect {

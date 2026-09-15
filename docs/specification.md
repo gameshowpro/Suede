@@ -88,6 +88,7 @@ Status conventions: `400` malformed JSON, `404` unknown resource, `409` revision
 | `GET` | `/audio/outputs` | All audio sinks reported by PipeWire: stable id (`node.name`), human-readable description, availability, and whether it is Suede's null sink. See [Audio routing](#audio-routing). |
 | `GET` | `/apps/{id}/status` | Runtime status of a managed app: `running` \| `starting` \| `stopped` \| `crashed` \| `backoff`, pid, start time, restart count, matched window ids. |
 | `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, plus a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"). |
+| `GET` | `/projection/stats` | What the slicer measured over its last interval: canvas and presented frame rates, per-frame cost, the inter-output presentation offset (mean/max ms), straddles (frames shown on different refreshes), per-output presented/discarded counts and measured refresh. `null` when no slicer is running. |
 | `GET` | `/system` | Suede version, Sway version, relevant package versions (sway, chromium, firefox, …), hostname, uptime. |
 | `GET` | `/system/checks` | Environment health checks: id, status (`pass` \| `warn` \| `fail`), detail, and whether an automated fix is available. See [Environment preparation](#environment-preparation-and-health-checks). |
 | `GET` | `/healthz` | Liveness: 200 when the HTTP server and Sway IPC connection are up. Unversioned, unauthenticated. |
@@ -127,6 +128,7 @@ Imperative escape hatches (not persisted):
 - `checks_changed` — payload: same shape as `GET /system/checks`.
 - `config_changed` — payload: the new desired-state document revision number and which section changed.
 - `status_changed` — payload: same shape as `GET /status`.
+- `projection_stats_changed` — payload: same shape as `GET /projection/stats`, every 10 s while the slicer runs; `null` when it stops.
 - Heartbeat comment every 15 s to keep intermediaries from timing out the connection.
 
 Streams are state-based rather than replayed: on (re)connect a client should re-fetch current state, then apply events. `Last-Event-ID` is therefore not supported.

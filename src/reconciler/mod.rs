@@ -98,6 +98,13 @@ impl Reconciler {
             wallpapers,
             docs_base_url,
         } = deps;
+        // Built before the struct literal below moves `snapshot` and
+        // `events` into their own fields.
+        #[cfg(feature = "projection")]
+        let blend = Mutex::new(crate::projection::BlendManager::new(
+            snapshot.clone(),
+            events.clone(),
+        ));
         Self {
             sway,
             audio,
@@ -112,7 +119,7 @@ impl Reconciler {
             capabilities: Mutex::new(Capabilities::default()),
             cursor_parked_at: Mutex::new(None),
             #[cfg(feature = "projection")]
-            blend: Mutex::new(crate::projection::BlendManager::new()),
+            blend,
         }
     }
 
@@ -379,7 +386,14 @@ impl Reconciler {
                 outputs
                     .iter()
                     .find(|output| output.name.starts_with("HEADLESS-"))
-                    .map(|output| (output.name.clone(), output.rect, output.active))
+                    .map(|output| {
+                        (
+                            output.name.clone(),
+                            output.rect,
+                            output.active,
+                            output.current_mode.map(|mode| mode.refresh_hz),
+                        )
+                    })
             };
             if find_headless(&self.snapshot.outputs()).is_none() {
                 if let Err(error) = self.sway.run_command("create_output").await {
@@ -397,12 +411,52 @@ impl Reconciler {
                      meanwhile"
                         .to_string(),
                 )),
-                Some((name, rect, active)) => {
+                Some((name, rect, active, current_refresh_hz)) => {
                     let (width, height) = (plan.canvas_width, plan.canvas_height);
-                    if !active || rect.width != width || rect.height != height || rect.y != 20000 {
+                    // Give the canvas the rate its participating outputs are
+                    // actually running at, rather than leaving sway's
+                    // headless backend at its own default (which reports 0
+                    // Hz back, and paces requestAnimationFrame at nothing in
+                    // particular). wlroots' headless backend times its
+                    // frames in whole milliseconds (1000 / refresh), so 60
+                    // Hz actually ticks at 16 ms — close enough that it does
+                    // not matter here, but for a 50 Hz wall 20 ms is exact,
+                    // and getting it right is free.
+                    let observed = self.snapshot.outputs();
+                    let participant_rates: Vec<f64> = plan
+                        .sway_positions
+                        .iter()
+                        .filter_map(|(participant, _, _)| {
+                            observed
+                                .iter()
+                                .find(|output| &output.name == participant)
+                                .and_then(|output| output.current_mode)
+                                .map(|mode| mode.refresh_hz)
+                        })
+                        .collect();
+                    let wanted_rate =
+                        crate::reconciler::plan::canvas_refresh_hz(&participant_rates);
+                    let rate_needs_reissue = match (wanted_rate, current_refresh_hz) {
+                        (Some(wanted), Some(current)) => (wanted - current).abs() > 0.01,
+                        (Some(_), None) => true,
+                        (None, _) => false,
+                    };
+                    if !active
+                        || rect.width != width
+                        || rect.height != height
+                        || rect.y != 20000
+                        || rate_needs_reissue
+                    {
+                        let mode_command = match wanted_rate {
+                            Some(rate) => format!(
+                                "output {name} mode --custom {width}x{height}@{}Hz",
+                                crate::model::format_refresh(rate)
+                            ),
+                            None => format!("output {name} mode --custom {width}x{height}"),
+                        };
                         for command in [
                             format!("output {name} enable"),
-                            format!("output {name} mode --custom {width}x{height}"),
+                            mode_command,
                             // An implicit scale would make the canvas's pixel
                             // buffer differ from its logical size, and the
                             // slicer cuts pixels, not logical units.
@@ -446,6 +500,7 @@ impl Reconciler {
                             gamma: projection.gamma,
                             black_lift: projection.black_lift,
                             pattern: projection.test_pattern,
+                            free_run: projection.free_run,
                             slices: plan.slices,
                         });
                     }
@@ -898,7 +953,8 @@ mod tests {
     use super::*;
     use crate::audio::mock::MockAudio;
     use crate::model::{
-        AppConfig, AudioConfig, Launcher, Mode, OutputConfig, OutputMatch, Position, RestartPolicy,
+        AppConfig, AudioConfig, Launcher, Mode, Output, OutputConfig, OutputMatch, Position,
+        RestartPolicy,
     };
     use crate::supervisor::LaunchContext;
     use crate::sway::mock::MockSway;
@@ -1215,6 +1271,52 @@ mod tests {
                 .any(|d| d.kind == "headless_unavailable"),
             "the operator must hear that the canvas is missing: {:?}",
             status.divergences
+        );
+        harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_canvas_is_created_with_the_shared_refresh_rate() {
+        // Both physical outputs run at 60 Hz, so the headless canvas that
+        // carries the overlap between them should be told to run at 60 Hz
+        // too, rather than being left at sway's own default (which reports
+        // back as 0 Hz — the very thing that made this worth fixing).
+        let harness = harness();
+        let mut outputs = harness.sway.get_outputs().await.unwrap();
+        outputs.push(Output {
+            name: "HEADLESS-1".into(),
+            active: false,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: None,
+            modes: vec![],
+            rect: Default::default(),
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        });
+        harness.sway.set_outputs(outputs);
+
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app("renderer", None, None));
+                state.active_app = Some("renderer".into());
+                // Overlapping x-positions, same as a_missing_canvas_is_a_divergence,
+                // so the canvas plan actually needs a headless output.
+                state.outputs.push(configured_output("HDMI-A-1", 0));
+                state.outputs.push(configured_output("HDMI-A-2", 1760));
+            })
+            .unwrap();
+
+        harness.reconciler.reconcile().await;
+        assert!(
+            harness
+                .sway
+                .ran_command_containing("mode --custom 3680x1080@60Hz"),
+            "canvas mode command did not carry the shared rate: {:?}",
+            harness.sway.commands()
         );
         harness.supervisor.shutdown().await;
     }

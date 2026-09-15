@@ -5,7 +5,9 @@
 
 use tokio::sync::broadcast;
 
-use crate::model::{AppStatus, AudioSink, Check, ConfigChange, Output, Status, WindowChange};
+use crate::model::{
+    AppStatus, AudioSink, Check, ConfigChange, Output, ProjectionStats, Status, WindowChange,
+};
 
 const CAPACITY: usize = 256;
 
@@ -19,6 +21,9 @@ pub enum ServerEvent {
     ConfigChanged(ConfigChange),
     StatusChanged(Box<Status>),
     ChecksChanged(Vec<Check>),
+    /// Same shape as `GET /projection/stats`; `None` when the slicer stops
+    /// or none is running.
+    ProjectionStatsChanged(Option<Box<ProjectionStats>>),
 }
 
 impl ServerEvent {
@@ -32,6 +37,7 @@ impl ServerEvent {
             Self::ConfigChanged(_) => "config_changed",
             Self::StatusChanged(_) => "status_changed",
             Self::ChecksChanged(_) => "checks_changed",
+            Self::ProjectionStatsChanged(_) => "projection_stats_changed",
         }
     }
 
@@ -45,6 +51,9 @@ impl ServerEvent {
             Self::ConfigChanged(change) => serde_json::to_value(change),
             Self::StatusChanged(status) => serde_json::to_value(status),
             Self::ChecksChanged(checks) => serde_json::to_value(checks),
+            // `None` must serialise as JSON `null`, not be dropped, so a
+            // client sees the slicer stop rather than seeing nothing.
+            Self::ProjectionStatsChanged(stats) => serde_json::to_value(stats),
         }
         .unwrap_or(serde_json::Value::Null)
     }
@@ -114,5 +123,14 @@ mod tests {
         }));
         assert_eq!(event.name(), "status_changed");
         assert_eq!(event.data()["state"], "degraded");
+    }
+
+    #[test]
+    fn projection_stats_stopping_serialises_as_null() {
+        // The event a client sees when the slicer stops: not omitted, not
+        // absent, but an explicit `null` it can use to blank its display.
+        let event = ServerEvent::ProjectionStatsChanged(None);
+        assert_eq!(event.name(), "projection_stats_changed");
+        assert_eq!(event.data(), serde_json::Value::Null);
     }
 }

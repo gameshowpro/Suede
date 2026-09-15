@@ -654,6 +654,7 @@ with no overlaps skips all of this: sway tiles it directly, at zero cost.
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
 | `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify` - or null for content |
+| `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](#refresh-rates) |
 
 Slicing engages whenever the configured layout overlaps, with or without
 this section; the section adds the blending. A full overlap (a stacked
@@ -687,6 +688,56 @@ corner of every tile: legible in a photograph, useless from across a room.
 Here the name is scaled to the display, so it can be read at a glance, and
 the background colour means two projectors are never confused even when the
 text is too far away to make out.
+
+#### Keeping the displays in step {: #refresh-rates }
+
+Two outputs mode-set at different rates drift apart: at 60.000 Hz and
+59.939 Hz they are a whole frame out of step roughly every 16 seconds, and a
+camera with a fast enough shutter catches it — one display's frame counter
+running one ahead of the other's, for the fraction of a second it takes the
+slower one to catch up. The `refresh-rates` health check warns whenever the
+active displays are not all running at the same rate, and names a rate they
+all advertise when one exists. This is the case it was written for: on the
+rig where it was first noticed, both projectors advertised 60 Hz and
+59.94 Hz, and the configuration had simply picked one of each.
+
+Even with both outputs mode-set to the same rate, a fast shutter always
+catches a window of up to one frame where one output has flipped to the next
+buffer and the other has not. Outputs on a GPU without genlock hardware have
+independent vblank phase, fixed the moment the mode is set, and nothing
+running above the display controller can close that gap — it is inherent to
+any computer driving more than one display, not a bug in this one.
+
+What the slicer does about it: it commits a frame to every output together,
+and does not commit the next one until every output has reported taking the
+previous frame (a `wl_surface.frame` callback), so a commit can never land
+between one output finishing its render and another starting. The canvas
+keeps rendering on its own clock regardless; whatever is newest when the
+gate opens is what gets shown, dropped or repeated identically on every
+output when the two clocks beat against each other. An output that stops
+answering frame callbacks for 300 ms is dropped from the gate, so a display
+that has gone to sleep cannot freeze the rest of the wall — and it counts as
+a stall.
+
+`freeRun` turns the gate off: each output takes the newest available frame
+the moment it is ready, independently of the others. It exists for
+installations that cannot be brought to a shared rate; the trade is that the
+wall stops being in step, in exchange for every output running as smoothly
+as it can on its own.
+
+The canvas output itself is given the participating outputs' refresh rate —
+the fastest of them, when they differ, since a canvas slower than an output
+would starve it.
+
+Measuring it: `GET /projection/stats` (and the `projection_stats_changed`
+event) report the inter-output presentation offset (mean/max milliseconds,
+read from `wp_presentation`), straddles (frames the outputs showed on
+different refreshes), superseded frames, stalls, and per-output
+presented/discarded counts and measured refresh, alongside the canvas and
+presented frame rates and the per-frame cost breakdown. The web UI shows all
+of this in the Projection panel. A steady offset of a few milliseconds with
+zero straddles is what a healthy wall looks like; straddles that rise over
+time mean commits are landing between two outputs' renders.
 
 **Blending is a ramp in light, not in signal.** A display raises its input
 signal to a power (its gamma, typically 2.2), so a gradient linear in signal

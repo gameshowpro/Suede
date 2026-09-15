@@ -203,7 +203,11 @@ fn apply_output_command(outputs: &mut [Output], command: &str) -> bool {
             output.rect = Default::default();
             true
         }
-        ("mode", [spec, ..]) => match parse_mode(spec) {
+        // `mode --custom WxH` and `mode --custom WxH@RHz` both name the spec
+        // after the flag; a plain `mode WxH@RHz` (an advertised mode) names
+        // it first. `parse_mode` already handles the optional `@RHz` suffix
+        // either way.
+        ("mode", ["--custom", spec, ..]) | ("mode", [spec, ..]) => match parse_mode(spec) {
             Some(mode) => {
                 output.current_mode = Some(mode);
                 output.rect.width = mode.width;
@@ -300,6 +304,24 @@ mod tests {
         let output = &mock.get_outputs().await.unwrap()[0];
         assert_eq!(output.current_mode.unwrap().width, 1280);
         assert_eq!((output.rect.x, output.rect.y), (100, 200));
+    }
+
+    #[tokio::test]
+    async fn custom_mode_is_applied_with_and_without_a_rate() {
+        // This is how the reconciler sizes the headless canvas: the flag
+        // comes first, so the mode spec is the second word, not the first.
+        let mock = MockSway::with_fixtures();
+        mock.run_command("output HDMI-A-1 mode --custom 3680x1080")
+            .await
+            .unwrap();
+        let mode = mock.get_outputs().await.unwrap()[0].current_mode.unwrap();
+        assert_eq!((mode.width, mode.height), (3680, 1080));
+
+        mock.run_command("output HDMI-A-1 mode --custom 3680x1080@59.94Hz")
+            .await
+            .unwrap();
+        let output = &mock.get_outputs().await.unwrap()[0];
+        assert_eq!(output.current_mode.unwrap().refresh_hz, 59.94);
     }
 
     #[tokio::test]

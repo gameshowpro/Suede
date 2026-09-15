@@ -453,6 +453,23 @@ pub fn cursor_commands(layout_height: i32) -> Vec<String> {
     ]
 }
 
+/// The refresh rate the canvas should run at, given the participating
+/// outputs' rates.
+///
+/// All agree (within 0.01 Hz, the same tolerance `Mode::matches` uses) → that
+/// rate. Disagree → the fastest: a canvas slower than an output would starve
+/// it, and with the slicer's gating a faster canvas is simply dropped
+/// symmetrically rather than causing anything to wait. Empty → `None`, so the
+/// caller leaves sway to pick a default rather than requesting nonsense.
+pub fn canvas_refresh_hz(rates: &[f64]) -> Option<f64> {
+    let first = *rates.first()?;
+    if rates.iter().all(|rate| (rate - first).abs() <= 0.01) {
+        Some(first)
+    } else {
+        Some(rates.iter().copied().fold(first, f64::max))
+    }
+}
+
 fn format_number(value: f64) -> String {
     let text = format!("{value:.3}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
@@ -1385,5 +1402,22 @@ mod tests {
         assert_eq!(format_number(1.0), "1");
         assert_eq!(format_number(1.5), "1.5");
         assert_eq!(format_number(1.25), "1.25");
+    }
+
+    #[test]
+    fn canvas_rate_is_none_with_no_participants() {
+        assert_eq!(canvas_refresh_hz(&[]), None);
+    }
+
+    #[test]
+    fn canvas_rate_is_the_shared_rate_when_outputs_agree() {
+        assert_eq!(canvas_refresh_hz(&[60.0, 60.0, 60.005]), Some(60.0));
+    }
+
+    #[test]
+    fn canvas_rate_is_the_fastest_when_outputs_disagree() {
+        // A canvas slower than an output would starve it; the slicer's
+        // gating simply drops the faster canvas's extra frames evenly.
+        assert_eq!(canvas_refresh_hz(&[59.939, 60.0]), Some(60.0));
     }
 }

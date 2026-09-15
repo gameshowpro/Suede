@@ -286,7 +286,8 @@ window.addEventListener("error", (event) => {
       <div class="fields">
         <div><label for="o-enable">Enabled</label>
           <input type="checkbox" role="switch" class="switch" id="o-enable"></div>
-        <div><label for="o-mode">Mode</label><select id="o-mode"></select></div>
+        <div><label for="o-mode">Mode</label><select id="o-mode"></select>
+          <span class="hint" id="o-mode-note" hidden></span></div>
         <div><label for="o-x">Position X</label><input id="o-x" type="number" step="1"></div>
         <div><label for="o-y">Position Y</label><input id="o-y" type="number" step="1"></div>
         <div><label for="o-scale">Scale</label><input id="o-scale" type="number" step="0.25" min="0.25"></div>
@@ -346,15 +347,34 @@ window.addEventListener("error", (event) => {
           <input id="pj-gamma" type="number" step="0.05" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
           <input id="pj-lift" type="number" step="0.01" min="0" max="0.5" value="0"></div>
+        <div><label for="pj-free">Free-run displays</label>
+          <input type="checkbox" role="switch" class="switch" id="pj-free"></div>
       </div>
       <p class="hint">Gamma shapes the fall-off — the projectors' transfer
         curve, usually 2.2. If seams glow on dark scenes (projector black is
         not zero light), raise the compensation until the rest of the picture
         matches them.</p>
+      <p class="hint">Off, every display takes each frame together and the
+        next frame waits until all of them have taken it. On, each display
+        takes the newest frame as soon as it is ready — only for displays
+        that cannot be made to share a refresh rate, and the wall stops being
+        in step.</p>
       <div class="row" style="margin-top:10px">
         <button class="action" id="pj-save">Save</button>
         <button class="action ghost" id="pj-cancel">Cancel</button>
         <span class="hint" id="pj-note"></span>
+      </div>
+      <div id="pj-timing" hidden style="margin-top:14px">
+        <h3 style="margin:0 0 8px">Frame timing</h3>
+        <table><tbody id="pj-timing-rows"></tbody></table>
+        <table style="margin-top:8px"><thead><tr>
+          <th>Output</th><th>Presented</th><th>Discarded</th><th>Refresh</th>
+        </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
+        <p class="hint">Measured by the slicer over each 10 s interval from
+          the compositor's presentation timestamps. Offset is how far apart
+          the displays showed the same frame; a straddle is a frame they
+          showed on different refreshes. Healthy: a steady offset of a few
+          milliseconds and no straddles.</p>
       </div>
     </div>
   </section>
@@ -609,7 +629,10 @@ const $ = (id) => document.getElementById(id);
 let outputs = [], config = null, apps = [], sinks = [], checks = [], status = null,
     wallpapers = [], selected = null, editingApp = null, editingBackground = null,
     // The graphics card's connectors, including those with nothing attached.
-    ports = [];
+    ports = [],
+    // What the slicer measured over its last reporting interval; null when no
+    // slicer is running (no projection configured, or nothing overlaps).
+    projectionStats = null;
 
 // Every screen's background comes from here, so the lookup is shared.
 const presets = () => config?.backgrounds ?? [];
@@ -1170,6 +1193,7 @@ function selectOutput(name) {
       `<option value="${m.width}x${m.height}x${m.refreshHz}">${escape(modeLabel(m))}</option>`).join("");
   const wanted = existing?.mode ?? output?.currentMode;
   if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
+  renderModeNote();
 
   $("o-x").value = existing?.position?.x ?? output?.rect.x ?? 0;
   $("o-y").value = existing?.position?.y ?? output?.rect.y ?? 0;
@@ -1186,6 +1210,30 @@ function selectOutput(name) {
     : known.connected ? ""
     : "nothing is plugged into this connector — its place in the canvas is kept";
   renderLayout();
+}
+
+// Two outputs at different refresh rates drift a frame apart every so
+// often under the slicer's frame-gating (see the refresh-rates health
+// check) — flagged here too, at the point of choice, rather than only after
+// Save when the check next runs.
+function renderModeNote() {
+  const note = $("o-mode-note");
+  const [, , refreshHz] = ($("o-mode").value || "").split("x").map(Number);
+  if (!refreshHz) { note.hidden = true; return; }
+  const name = $("output-name").textContent;
+  const mismatched = [];
+  for (const entry of config?.outputs ?? []) {
+    if ((entry.enable ?? true) === false || !entry.match?.name || entry.match.name === name) continue;
+    const observed = outputs.find((o) => o.name === entry.match.name);
+    const rate = entry.mode?.refreshHz ?? observed?.currentMode?.refreshHz;
+    if (rate == null || Math.abs(rate - refreshHz) <= 0.01) continue;
+    mismatched.push({ name: entry.match.name, rate });
+  }
+  note.hidden = mismatched.length === 0;
+  if (mismatched.length === 0) return;
+  note.textContent = mismatched
+    .map((m) => `${m.name} runs at ${Math.round(m.rate * 100) / 100} Hz`).join(", ") +
+    " — pick the same rate so the displays stay in step";
 }
 
 function outputEntryFromForm() {
@@ -1226,6 +1274,8 @@ for (const id of ["o-enable", "o-mode", "o-x", "o-y", "o-scale", "o-transform",
                   "o-adaptive", "o-tearing", "o-mrt", "o-bg"]) {
   $(id).addEventListener("input", outputEdited);
 }
+$("o-mode").addEventListener("input", renderModeNote);
+$("o-mode").addEventListener("change", renderModeNote);
 
 $("o-save").onclick = () => run(async () => {
   outputEdited();
@@ -1568,7 +1618,7 @@ function paintCapabilities(r) {
 // plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
   const idle = overlaps === 0;
-  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-save"]) {
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-save"]) {
     $(id).disabled = idle;
   }
   $("pj-idle").hidden = !idle;
@@ -1580,6 +1630,10 @@ function renderProjection() {
   if ($("tp-pattern") !== document.activeElement) {
     $("tp-pattern").value = config?.projection?.testPattern ?? "";
   }
+  // Measured state, not desired state: redraw it even when the form below is
+  // left alone because an edit is in progress, so a config reload from
+  // another client does not blank it.
+  renderProjectionTiming();
   const panel = $("projection-panel");
   if (panel.contains(document.activeElement)) return;
 
@@ -1587,19 +1641,60 @@ function renderProjection() {
   $("pj-blend").checked = !!projection && projection.blend !== false;
   $("pj-gamma").value = projection?.gamma ?? 2.2;
   $("pj-lift").value = projection?.blackLift ?? 0;
+  $("pj-free").checked = projection?.freeRun ?? false;
 }
 
 function projectionFromForm() {
   const blend = $("pj-blend").checked;
   const gamma = Number($("pj-gamma").value) || 2.2;
   const blackLift = Number($("pj-lift").value) || 0;
+  const freeRun = $("pj-free").checked;
   const testPattern = $("tp-pattern").value || null;
   // Off with default values: remove the section entirely.
-  return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern)
-    ? null : { blend, gamma, blackLift, testPattern };
+  return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern && !freeRun)
+    ? null : { blend, gamma, blackLift, freeRun, testPattern };
 }
 
-for (const id of ["pj-blend", "pj-gamma", "pj-lift", "tp-pattern"]) {
+// --- frame timing ----------------------------------------------------------
+//
+// What the slicer measured, not what was asked for: shown alongside the
+// controls above so a drifting wall is visible without leaving the panel.
+function renderProjectionTiming() {
+  $("pj-timing").hidden = !projectionStats;
+  if (!projectionStats) return;
+  const s = projectionStats;
+  // A value worth a second look is styled like a failing check, not buried
+  // in a sentence — the operator scans for color, not text.
+  const flagged = (n) => n > 0 ? `<span class="pill bad">${n}</span>` : String(n);
+  const offset = s.offsetMs
+    ? `mean ${s.offsetMs.mean.toFixed(1)} ms, max ${s.offsetMs.max.toFixed(1)} ms`
+    : "not measured";
+  const rows = [
+    ["Canvas", `${s.canvasFps.toFixed(1)} fps captured, ${s.presentedFps.toFixed(1)} presented`],
+    ["Mode", s.freeRun ? "free-run" : "locked"],
+    ["Offset between displays", offset +
+      (s.presentationFeedback ? "" : " (no presentation feedback from the compositor)")],
+    ["Straddles", flagged(s.straddles)],
+    ["Superseded frames", flagged(s.framesSuperseded)],
+    ["Stalls", flagged(s.stalls)],
+    ["Per frame", `waiting ${s.perFrameMs.waiting.toFixed(1)} ms · ` +
+      `snapshot ${s.perFrameMs.snapshot.toFixed(1)} ms · ` +
+      `request ${s.perFrameMs.requesting.toFixed(1)} ms · ` +
+      `blend ${s.perFrameMs.blending.toFixed(1)} ms`],
+    ["Measured at", new Date(s.measuredAt * 1000).toLocaleTimeString()],
+  ];
+  $("pj-timing-rows").innerHTML = rows
+    .map(([k, v]) => `<tr><th>${escape(k)}</th><td class="mono">${v}</td></tr>`).join("");
+
+  // Trimmed like format_refresh on the daemon side: 3 decimals, no trailing
+  // zeros, so 60 Hz reads as "60" rather than "60.000".
+  const trimHz = (hz) => hz == null ? "—" : String(Math.round(hz * 1000) / 1000);
+  $("pj-timing-outputs").innerHTML = s.outputs.map((o) =>
+    `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
+    `<td>${o.discarded}</td><td class="mono">${trimHz(o.refreshHz)}</td></tr>`).join("");
+}
+
+for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "tp-pattern"]) {
   $(id).addEventListener("input", () => {
     // Silently, not with a toast: a restored form value is not a user asking
     // for anything, and a complaint about it would be the same noise in a
@@ -1620,9 +1715,9 @@ $("pj-save").onclick = () => run(async () => {
   // call, and the pattern is presented as a live diagnostic rather than a
   // setting — so committing here also takes it down.
   if (config.projection?.testPattern) {
-    const { blend, gamma, blackLift } = config.projection;
-    config.projection = (!blend && gamma === 2.2 && blackLift === 0)
-      ? null : { blend, gamma, blackLift, testPattern: null };
+    const { blend, gamma, blackLift, freeRun } = config.projection;
+    config.projection = (!blend && gamma === 2.2 && blackLift === 0 && !freeRun)
+      ? null : { blend, gamma, blackLift, freeRun, testPattern: null };
   }
   clearTimeout(previewTimer);
   await saveCommitted();
@@ -2016,6 +2111,9 @@ async function loadAll() {
   sinks = await api("/audio/outputs");
   apps = await api("/apps");
   wallpapers = await api("/wallpapers");
+  // Advisory, like ports: an older daemon lacks the route, and no slicer
+  // running is a normal null rather than a failure.
+  projectionStats = await api("/projection/stats").catch(() => null);
   await loadConfig();
   renderSinks(); renderOutputChoices();
   renderSystem(await api("/system"));
@@ -2146,6 +2244,10 @@ function connect() {
   source.addEventListener("status_changed", (e) => { status = JSON.parse(e.data); renderStatus(); });
   source.addEventListener("config_changed", () => loadConfig());
   source.addEventListener("checks_changed", (e) => { checks = JSON.parse(e.data); renderChecks(); renderAlerts(); });
+  source.addEventListener("projection_stats_changed", (e) => {
+    projectionStats = JSON.parse(e.data);
+    renderProjectionTiming();
+  });
 }
 
 window.addEventListener("resize", renderLayout);
