@@ -170,7 +170,7 @@ mod tests {
 
     #[test]
     fn projection_stats_change_detection() {
-        use crate::model::{FrameCost, ProjectionStats};
+        use crate::model::{CaptureIntervals, FrameCost, ProjectionStats};
 
         let snapshot = Snapshot::new();
         assert!(snapshot.projection_stats().is_none());
@@ -192,10 +192,13 @@ mod tests {
                 snapshot: 1.0,
                 requesting: 1.0,
                 blending: 1.0,
+                gpu: 0.0,
             },
             presentation_feedback: true,
             offset_ms: None,
             straddles: 0,
+            renderer: "cpu".to_string(),
+            capture_intervals: CaptureIntervals::default(),
             outputs: Vec::new(),
         };
         assert!(snapshot.set_projection_stats(Some(stats.clone())));

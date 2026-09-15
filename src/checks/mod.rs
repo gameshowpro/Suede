@@ -16,8 +16,14 @@ use crate::audio::AudioMonitor;
 use crate::config::BootstrapConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::events::{EventHub, ServerEvent};
-use crate::model::{format_refresh, Check, CheckStatus, Output, OutputConfig, PackageVersion};
-use crate::sway::SwayClient;
+use crate::model::{
+    format_refresh, Check, CheckStatus, Output, OutputConfig, OutputTiming, PackageVersion,
+    ProjectionStats,
+};
+use crate::reconciler::plan::{plan_outputs, Capabilities};
+use crate::reconciler::ReconcileTrigger;
+use crate::snapshot::Snapshot;
+use crate::sway::{SwayClient, SwayResult};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -77,6 +83,7 @@ pub const FIXABLE: &[&str] = &[
     ids::SWAY_CONFIG,
     ids::PIPEWIRE,
     ids::DIRECT_SCANOUT,
+    ids::OUTPUT_PHASE,
 ];
 
 /// Check identifiers, also used as the `{id}` in the fix endpoint.
@@ -97,6 +104,32 @@ pub mod ids {
     pub const DECODE_MEASURED: &str = "decode-measured";
     pub const CAPTURE_DEVICES: &str = "capture-devices";
     pub const REFRESH_RATES: &str = "refresh-rates";
+    pub const OUTPUT_PHASE: &str = "output-phase";
+
+    /// Every check `run_all` runs, in the order it runs them — kept here so
+    /// the count carried by `every_check_reports_something`,
+    /// `runs_health_checks` and `scripts/smoke-test.sh` has exactly one
+    /// place that can drift from reality (the Rust two check against this
+    /// list directly; the shell script still carries its own number).
+    pub const ALL: &[&str] = &[
+        SWAY_SOCKET,
+        SWAY_VERSION,
+        WAYLAND_DISPLAY,
+        DIRECT_SCANOUT,
+        REAL_DISPLAYS,
+        REFRESH_RATES,
+        OUTPUT_PHASE,
+        VIDEO_DECODE,
+        SWAYBG,
+        BROWSERS,
+        PIPEWIRE,
+        SYSTEMD_UNIT,
+        SWAY_CONFIG,
+        STATE_DIR,
+        API_REACHABILITY,
+        CAPTURE_DEVICES,
+        DECODE_MEASURED,
+    ];
 }
 
 /// A host packet filter that may be dropping traffic to the API port.
@@ -214,6 +247,13 @@ pub struct CheckRunner {
     audio: Arc<dyn AudioMonitor>,
     store: Arc<crate::state::StateStore>,
     events: EventHub,
+    /// Observed state, read by the `output-phase` check (the slicer's own
+    /// `phaseMs` measurement) and by its fix (which outputs are active).
+    snapshot: Arc<Snapshot>,
+    /// Lets the `output-phase` fix ask for a reconciliation pass once it has
+    /// re-enabled the outputs it disabled, so anything downstream of them
+    /// (window placement, the applied-settings cache) catches up.
+    trigger: ReconcileTrigger,
     results: RwLock<Vec<Check>>,
     /// Most recent client that was not on this machine. See [`note_client`].
     ///
@@ -235,6 +275,13 @@ pub struct CheckRunner {
 }
 
 impl CheckRunner {
+    // Eight collaborators, all distinct types (`Arc<dyn Trait>`, `Arc<Store>`,
+    // `EventHub`, two `Arc<...>` stores, `Arc<Snapshot>`, `ReconcileTrigger`):
+    // a transposition would still compile, but wrongly, the same risk
+    // `ReconcilerDeps` exists to close off. Left positional rather than
+    // following that pattern here because every caller already spells out
+    // each argument on its own line; revisit if a ninth collaborator turns up.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         bootstrap: Arc<BootstrapConfig>,
         sway: Arc<dyn SwayClient>,
@@ -242,6 +289,8 @@ impl CheckRunner {
         store: Arc<crate::state::StateStore>,
         events: EventHub,
         capabilities: Arc<crate::capabilities::CapabilityStore>,
+        snapshot: Arc<Snapshot>,
+        trigger: ReconcileTrigger,
     ) -> Self {
         Self {
             bootstrap,
@@ -249,6 +298,8 @@ impl CheckRunner {
             audio,
             store,
             events,
+            snapshot,
+            trigger,
             results: RwLock::new(Vec::new()),
             last_remote_client: RwLock::new(None),
             probed_versions: RwLock::new(HashMap::new()),
@@ -289,6 +340,7 @@ impl CheckRunner {
             self.check_direct_scanout(),
             self.check_real_displays().await,
             self.check_refresh_rates().await,
+            self.check_output_phase().await,
             self.check_video_decode(),
             self.check_swaybg().await,
             self.check_browsers().await,
@@ -583,6 +635,40 @@ impl CheckRunner {
             detail,
             Some("configuration/#refresh-rates"),
         )
+    }
+
+    /// Whether the active displays' vblank rasters share a phase, from the
+    /// slicer's own `wp_presentation` measurement (`phaseMs` on each output
+    /// of `GET /projection/stats`).
+    ///
+    /// Measured on a four-projector NVIDIA rig (RTX A1000, sway 1.10.1,
+    /// 2026-09-15): outputs enabled one `output … enable` at a time left
+    /// the first head 7.1 ms out of phase with the other three, which
+    /// locked to each other — about 145 straddled frames (shown on
+    /// different refreshes) per 330 captured. The same four, disabled then
+    /// re-enabled together in one sway command, landed within 0.03 ms of
+    /// each other — about 20 straddles per 330 at the same rate. The rig's
+    /// original, unmanaged state showed the same signature: 2.2 ms off.
+    /// See [`CheckRunner::fix_output_phase`] for the remedy this offers.
+    async fn check_output_phase(&self) -> Check {
+        let stats = self.snapshot.projection_stats();
+        let (status, detail) = output_phase_verdict(stats.as_ref());
+        let mut check = self.check(
+            ids::OUTPUT_PHASE,
+            "Displays are in phase",
+            status,
+            detail,
+            Some("configuration/#refresh-rates"),
+        );
+        if check.status == CheckStatus::Warn {
+            check.fix_available = true;
+            check.fix_description = Some(
+                "Disable every active display and re-enable them together. \
+                 The wall goes dark for about three seconds."
+                    .to_string(),
+            );
+        }
+        check
     }
 
     /// Hardware video decode fails *silently*: Chromium asks for VA-API, finds
@@ -1297,6 +1383,7 @@ impl CheckRunner {
             ids::SWAY_CONFIG => self.fix_sway_config()?,
             ids::PIPEWIRE => self.fix_pipewire().await?,
             ids::DIRECT_SCANOUT => self.fix_direct_scanout().await?,
+            ids::OUTPUT_PHASE => self.fix_output_phase().await?,
             other => {
                 return Err(ApiError::NotFound(format!(
                     "no automated fix is available for check {other:?}"
@@ -1420,6 +1507,125 @@ impl CheckRunner {
         ))
     }
 
+    /// Disable every active, real display, wait for sway to actually tear
+    /// them down, then re-enable and fully reconfigure them together — see
+    /// [`CheckRunner::check_output_phase`] for the measurement this answers.
+    ///
+    /// A bare `enable` for each output, followed by an ordinary
+    /// reconciliation pass to restore mode/position/etc, would *usually*
+    /// land in phase too: `plan_outputs`'s diff only reissues a field that
+    /// no longer matches. But nothing guarantees every field on every
+    /// output needs reissuing after the same disable/enable cycle, and a
+    /// *partial* re-apply — some outputs' modes resent in a second, later
+    /// IPC message, others left alone because they happened to already
+    /// match — reintroduces exactly the one-commit-per-output signature
+    /// this fix exists to undo. So this builds the whole plan for these
+    /// outputs itself, with an empty `previously_applied` map (which is
+    /// `plan_outputs`'s "never seen this output before" case: every field
+    /// is issued unconditionally, not only the ones that differ), and sends
+    /// it as the one IPC message that carries the `enable`. The trailing
+    /// reconcile is then a no-op for anything this touched — observed
+    /// state already matches what it would apply — and exists only to let
+    /// the ordinary pass record what happened and place windows.
+    async fn fix_output_phase(&self) -> ApiResult<String> {
+        let active: Vec<Output> = self
+            .snapshot
+            .outputs()
+            .into_iter()
+            .filter(|output| output.active && !is_synthetic_output(&output.name))
+            .collect();
+        if active.len() < 2 {
+            return Err(ApiError::Validation(
+                "fewer than two active displays; there is nothing to re-align".into(),
+            ));
+        }
+
+        let disable: Vec<String> = active
+            .iter()
+            .map(|output| format!("output {} disable", output.name))
+            .collect();
+        let disable_results = self.sway.run_commands(&disable).await;
+        let mut failures = command_failures(&disable, disable_results);
+        if failures.len() == disable.len() {
+            return Err(ApiError::Internal(format!(
+                "could not disable any display: {}",
+                failures.join("; ")
+            )));
+        }
+
+        // Give sway time to actually tear the outputs down — matching the
+        // rig's disable/enable cycle above, not the same pass's `enable`,
+        // which must land in the very next IPC message rather than a
+        // separate one.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let capabilities = Capabilities {
+            supports_tearing: self
+                .sway
+                .get_version()
+                .await
+                .map(|version| version.supports_tearing())
+                .unwrap_or(false),
+        };
+        let desired: Vec<OutputConfig> = self
+            .store
+            .effective()
+            .outputs
+            .into_iter()
+            .filter(|config| active.iter().any(|output| config.r#match.matches(output)))
+            .collect();
+
+        // `plan_outputs` reads whether an output is active straight off
+        // `observed`, and issues `enable` only when it is not — so what is
+        // handed in here has to say "disabled", not what the snapshot said
+        // before this function touched anything.
+        let disabled: Vec<Output> = active
+            .iter()
+            .cloned()
+            .map(|mut output| {
+                output.active = false;
+                output.current_mode = None;
+                output.modes = Vec::new();
+                output.rect = Default::default();
+                output
+            })
+            .collect();
+        let plan = plan_outputs(&disabled, &desired, &HashMap::new(), capabilities);
+        let mut enable: Vec<String> = plan.commands;
+        // An output Suede has no configuration entry for (active anyway —
+        // sway auto-arranges anything it is not told to leave alone) is not
+        // in `desired`, so `plan_outputs` never mentions it. It must still
+        // come back: a bare `enable`, appended to the same batch, is the
+        // best this fix can do for a display it has no settings opinion on.
+        for output in &active {
+            if !desired.iter().any(|config| config.r#match.matches(output)) {
+                enable.push(format!("output {} enable", output.name));
+            }
+        }
+        let enable_results = self.sway.run_commands(&enable).await;
+        failures.extend(command_failures(&enable, enable_results));
+
+        // The reconciler re-derives everything downstream of these outputs
+        // (window placement, its own applied-settings cache) on its own
+        // schedule; asking here just avoids waiting for the next trigger.
+        self.trigger.request("output-phase fix");
+
+        let names: Vec<&str> = active.iter().map(|output| output.name.as_str()).collect();
+        let mut outcome = format!(
+            "disabled and re-enabled {} together, in one sway command each; \
+             the check reflects the result on the next slicer interval (10 s)",
+            names.join(", ")
+        );
+        if !failures.is_empty() {
+            outcome.push_str(&format!(
+                ". {} command(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ));
+        }
+        Ok(outcome)
+    }
+
     fn fix_sway_config(&self) -> ApiResult<String> {
         let path = self.bootstrap.sway_config_path.clone();
         if let Some(parent) = path.parent() {
@@ -1445,6 +1651,16 @@ impl CheckRunner {
             path.display()
         ))
     }
+}
+
+/// Pair each command with its result, keeping only the ones that failed, as
+/// `"{command}: {error}"`.
+fn command_failures(commands: &[String], results: Vec<SwayResult<()>>) -> Vec<String> {
+    commands
+        .iter()
+        .zip(results)
+        .filter_map(|(command, result)| result.err().map(|error| format!("{command}: {error}")))
+        .collect()
 }
 
 fn unit_file(executable: &str) -> String {
@@ -1740,6 +1956,114 @@ fn refresh_rate_verdict(outputs: &[Output], configured: &[OutputConfig]) -> (Che
     (CheckStatus::Warn, detail)
 }
 
+/// Judge whether the active displays' vblank phase is aligned, from the
+/// slicer's own presentation-timestamp measurement.
+///
+/// Pure, so every combination is table-testable without a compositor or a
+/// slicer. See [`CheckRunner::check_output_phase`] for the measurement
+/// behind the 1.0 ms threshold and what a batched re-enable does about it.
+fn output_phase_verdict(stats: Option<&ProjectionStats>) -> (CheckStatus, String) {
+    let Some(stats) = stats else {
+        return (
+            CheckStatus::Pass,
+            "not measured: the slicer is not running".to_string(),
+        );
+    };
+    if !stats.presentation_feedback {
+        return (
+            CheckStatus::Pass,
+            "the compositor offers no presentation timing, so phase cannot be measured".to_string(),
+        );
+    }
+
+    let measured: Vec<&OutputTiming> = stats
+        .outputs
+        .iter()
+        .filter(|output| output.phase_ms.is_some())
+        .collect();
+    if measured.len() < 2 {
+        return (
+            CheckStatus::Pass,
+            "fewer than two displays report a phase; nothing to compare".to_string(),
+        );
+    }
+
+    // Index 0 is the slicer's own reference: its phase is 0.0 by
+    // definition, against itself. Anything else more than 1.0 ms away from
+    // that is out of phase with it.
+    let reference = measured[0];
+    let out_of_phase: Vec<&OutputTiming> = measured[1..]
+        .iter()
+        .filter(|output| output.phase_ms.unwrap().abs() > 1.0)
+        .copied()
+        .collect();
+
+    if out_of_phase.is_empty() {
+        let max_abs = measured
+            .iter()
+            .map(|output| output.phase_ms.unwrap().abs())
+            .fold(0.0_f64, f64::max);
+        let names: Vec<&str> = measured.iter().map(|output| output.name.as_str()).collect();
+        return (
+            CheckStatus::Pass,
+            format!("{} within {max_abs:.2} ms", names.join(", ")),
+        );
+    }
+
+    let consequence = "Heads that were enabled one at a time start their rasters at \
+        different moments; the same frame then lands on different refreshes for a \
+        quarter of the time. Re-enabling every output together puts them in phase.";
+
+    // The common case (this is the rig's own signature): every other head
+    // agrees with itself but not with the reference, which makes the
+    // *reference* the odd one out even though its own recorded phase is
+    // 0.0 by construction. Naming the group it disagrees with, and the
+    // size of that disagreement, is what an operator standing at the rack
+    // needs — not which output the measurement happened to be taken from.
+    let in_phase_with_reference = measured[1..]
+        .iter()
+        .any(|output| output.phase_ms.unwrap().abs() <= 1.0);
+    if !in_phase_with_reference {
+        let values: Vec<f64> = out_of_phase
+            .iter()
+            .map(|output| output.phase_ms.unwrap())
+            .collect();
+        let spread = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - values.iter().cloned().fold(f64::INFINITY, f64::min);
+        if spread <= 1.0 {
+            let names: Vec<&str> = out_of_phase
+                .iter()
+                .map(|output| output.name.as_str())
+                .collect();
+            return (
+                CheckStatus::Warn,
+                format!(
+                    "{} is {:.1} ms out of phase with {} (measured from presentation \
+                     timestamps). {consequence}",
+                    reference.name,
+                    values[0],
+                    names.join(", ")
+                ),
+            );
+        }
+    }
+
+    // The general case: whichever outputs disagree with the reference, each
+    // named with its own measured offset.
+    let parts: Vec<String> = out_of_phase
+        .iter()
+        .map(|output| format!("{} {:+.1} ms", output.name, output.phase_ms.unwrap()))
+        .collect();
+    (
+        CheckStatus::Warn,
+        format!(
+            "out of phase with {}: {} (measured from presentation timestamps). {consequence}",
+            reference.name,
+            parts.join(", ")
+        ),
+    )
+}
+
 /// A GPU vendor, and what it needs for hardware video decode.
 pub struct GpuVendor {
     pub name: &'static str,
@@ -2029,6 +2353,7 @@ mod tests {
         let capabilities = Arc::new(crate::capabilities::CapabilityStore::new(
             &bootstrap.state_dir,
         ));
+        let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
         CheckRunner::new(
             bootstrap,
             Arc::new(MockSway::with_fixtures()),
@@ -2036,6 +2361,8 @@ mod tests {
             store,
             EventHub::new(),
             capabilities,
+            Arc::new(Snapshot::new()),
+            trigger,
         )
     }
 
@@ -2208,23 +2535,9 @@ mod tests {
     async fn every_check_reports_something() {
         let dir = tempfile::tempdir().unwrap();
         let checks = runner(dir.path().to_path_buf()).run_all().await;
-        assert_eq!(checks.len(), 16);
-        for id in [
-            ids::SWAY_SOCKET,
-            ids::SWAY_VERSION,
-            ids::BROWSERS,
-            ids::PIPEWIRE,
-            ids::SYSTEMD_UNIT,
-            ids::SWAY_CONFIG,
-            ids::STATE_DIR,
-            ids::DIRECT_SCANOUT,
-            ids::REAL_DISPLAYS,
-            ids::REFRESH_RATES,
-            ids::VIDEO_DECODE,
-            ids::SWAYBG,
-            ids::API_REACHABILITY,
-        ] {
-            assert!(checks.iter().any(|check| check.id == id), "missing {id}");
+        assert_eq!(checks.len(), ids::ALL.len());
+        for id in ids::ALL {
+            assert!(checks.iter().any(|check| check.id == *id), "missing {id}");
         }
     }
 
@@ -2258,6 +2571,7 @@ mod tests {
             patch: 0,
             human_readable: None,
         });
+        let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
         let runner = CheckRunner::new(
             bootstrap,
             sway,
@@ -2267,6 +2581,8 @@ mod tests {
             )),
             EventHub::new(),
             Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            Arc::new(Snapshot::new()),
+            trigger,
         );
         let checks = runner.run_all().await;
         let check = checks.iter().find(|c| c.id == ids::SWAY_VERSION).unwrap();
@@ -2311,6 +2627,115 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn fix_output_phase_disables_then_reenables_together_and_requests_a_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = Arc::new(BootstrapConfig {
+            state_dir: dir.path().to_path_buf(),
+            ..BootstrapConfig::default()
+        });
+        let sway = Arc::new(MockSway::with_fixtures());
+        let store = Arc::new(crate::state::StateStore::ephemeral(
+            dir.path().to_path_buf(),
+        ));
+        store
+            .update(|state| {
+                for name in ["HDMI-A-1", "HDMI-A-2"] {
+                    let mut config = OutputConfig::new(crate::model::OutputMatch::by_name(name));
+                    config.mode = Some(crate::model::Mode {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 60.0,
+                    });
+                    config.position = Some(crate::model::Position { x: 0, y: 0 });
+                    state.outputs.push(config);
+                }
+            })
+            .unwrap();
+        let snapshot = Arc::new(Snapshot::new());
+        snapshot.set_outputs(sway.get_outputs().await.unwrap());
+        let (trigger, mut receiver) = crate::reconciler::Reconciler::channel();
+        let runner = CheckRunner::new(
+            bootstrap,
+            sway.clone(),
+            Arc::new(MockAudio::default()),
+            store,
+            EventHub::new(),
+            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            snapshot,
+            trigger,
+        );
+
+        let detail = runner.fix(ids::OUTPUT_PHASE).await.unwrap();
+        assert!(detail.contains("HDMI-A-1"), "{detail}");
+        assert!(detail.contains("HDMI-A-2"), "{detail}");
+        assert!(detail.contains("10 s"), "{detail}");
+
+        let commands = sway.commands();
+        assert!(
+            commands.iter().any(|c| c == "output HDMI-A-1 disable"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "output HDMI-A-2 disable"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "output HDMI-A-1 enable"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "output HDMI-A-2 enable"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c.contains("mode 1920x1080@60Hz")),
+            "the mode must be reapplied in the same pass as the enable: {commands:?}"
+        );
+
+        let outputs = sway.get_outputs().await.unwrap();
+        assert!(
+            outputs
+                .iter()
+                .filter(|o| o.name == "HDMI-A-1" || o.name == "HDMI-A-2")
+                .all(|o| o.active),
+            "both re-aligned outputs must come back up: {outputs:?}"
+        );
+
+        assert!(
+            receiver.try_recv().is_ok(),
+            "a reconcile must be requested so downstream state catches up"
+        );
+    }
+
+    #[tokio::test]
+    async fn fix_output_phase_needs_at_least_two_active_displays() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = Arc::new(BootstrapConfig {
+            state_dir: dir.path().to_path_buf(),
+            ..BootstrapConfig::default()
+        });
+        let sway = Arc::new(MockSway::empty());
+        let snapshot = Arc::new(Snapshot::new());
+        snapshot.set_outputs(vec![output_running_at("DP-1", 60.0, &[])]);
+        let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
+        let runner = CheckRunner::new(
+            bootstrap,
+            sway,
+            Arc::new(MockAudio::default()),
+            Arc::new(crate::state::StateStore::ephemeral(
+                dir.path().to_path_buf(),
+            )),
+            EventHub::new(),
+            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            snapshot,
+            trigger,
+        );
+
+        let error = runner.fix(ids::OUTPUT_PHASE).await.unwrap_err();
+        assert!(matches!(error, ApiError::Validation(_)));
     }
 
     #[tokio::test]
@@ -2511,6 +2936,130 @@ mod tests {
         );
     }
 
+    // --- output_phase_verdict --------------------------------------------
+
+    fn timing(name: &str, phase_ms: Option<f64>) -> OutputTiming {
+        OutputTiming {
+            name: name.to_string(),
+            presented: 330,
+            discarded: 0,
+            refresh_hz: Some(60.0),
+            phase_ms,
+            phase_spread_ms: Some(0.1),
+        }
+    }
+
+    fn stats_with(presentation_feedback: bool, outputs: Vec<OutputTiming>) -> ProjectionStats {
+        ProjectionStats {
+            measured_at: 1,
+            interval_seconds: 10.0,
+            free_run: false,
+            canvas_fps: 60.0,
+            presented_fps: 60.0,
+            frames_superseded: 0,
+            stalls: 0,
+            per_frame_ms: crate::model::FrameCost {
+                waiting: 1.0,
+                snapshot: 1.0,
+                requesting: 1.0,
+                blending: 1.0,
+                gpu: 0.0,
+            },
+            presentation_feedback,
+            offset_ms: None,
+            straddles: 0,
+            renderer: "cpu".to_string(),
+            capture_intervals: crate::model::CaptureIntervals::default(),
+            outputs,
+        }
+    }
+
+    #[test]
+    fn no_slicer_running_is_a_pass() {
+        let (status, detail) = output_phase_verdict(None);
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(detail, "not measured: the slicer is not running");
+    }
+
+    #[test]
+    fn no_presentation_feedback_is_a_pass() {
+        let stats = stats_with(false, vec![timing("DP-5", None), timing("DP-6", None)]);
+        let (status, detail) = output_phase_verdict(Some(&stats));
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(
+            detail,
+            "the compositor offers no presentation timing, so phase cannot be measured"
+        );
+    }
+
+    #[test]
+    fn fewer_than_two_measured_outputs_is_a_pass() {
+        let stats = stats_with(true, vec![timing("DP-5", Some(0.0))]);
+        let (status, _detail) = output_phase_verdict(Some(&stats));
+        assert_eq!(status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn tightly_locked_outputs_pass() {
+        // The rig's batched-enable result, verbatim.
+        let stats = stats_with(
+            true,
+            vec![
+                timing("DP-5", Some(0.0)),
+                timing("DP-6", Some(0.03)),
+                timing("DP-7", Some(-0.02)),
+                timing("DP-8", Some(0.01)),
+            ],
+        );
+        let (status, detail) = output_phase_verdict(Some(&stats));
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(detail, "DP-5, DP-6, DP-7, DP-8 within 0.03 ms");
+    }
+
+    #[test]
+    fn the_reference_out_of_phase_with_a_locked_group_is_named_as_the_odd_one() {
+        // The rig's one-at-a-time result, verbatim: the first head (the
+        // measurement's own reference, so its own phase reads 0.0) ends up
+        // 7.1 ms from the other three, which lock to each other.
+        let stats = stats_with(
+            true,
+            vec![
+                timing("DP-5", Some(0.0)),
+                timing("DP-6", Some(7.1)),
+                timing("DP-7", Some(7.1)),
+                timing("DP-8", Some(7.1)),
+            ],
+        );
+        let (status, detail) = output_phase_verdict(Some(&stats));
+        assert_eq!(status, CheckStatus::Warn);
+        assert_eq!(
+            detail,
+            "DP-5 is 7.1 ms out of phase with DP-6, DP-7, DP-8 (measured from \
+             presentation timestamps). Heads that were enabled one at a time start \
+             their rasters at different moments; the same frame then lands on \
+             different refreshes for a quarter of the time. Re-enabling every \
+             output together puts them in phase."
+        );
+    }
+
+    #[test]
+    fn a_lone_output_out_of_phase_with_the_reference_is_named_individually() {
+        let stats = stats_with(
+            true,
+            vec![
+                timing("DP-5", Some(0.0)),
+                timing("DP-6", Some(0.02)),
+                timing("DP-7", Some(-3.4)),
+            ],
+        );
+        let (status, detail) = output_phase_verdict(Some(&stats));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(
+            detail.starts_with("out of phase with DP-5: DP-7 -3.4 ms"),
+            "{detail}"
+        );
+    }
+
     #[tokio::test]
     async fn a_headless_compositor_is_flagged() {
         // The fixtures are HDMI connectors, so this passes; swap in a headless
@@ -2534,6 +3083,7 @@ mod tests {
             transform: None,
             adaptive_sync_status: None,
         }]);
+        let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
         let runner = CheckRunner::new(
             bootstrap,
             sway,
@@ -2543,6 +3093,8 @@ mod tests {
             )),
             EventHub::new(),
             Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            Arc::new(Snapshot::new()),
+            trigger,
         );
         let checks = runner.run_all().await;
         let check = checks
@@ -2655,7 +3207,8 @@ mod tests {
                     ids::SYSTEMD_UNIT,
                     ids::SWAY_CONFIG,
                     ids::PIPEWIRE,
-                    ids::DIRECT_SCANOUT
+                    ids::DIRECT_SCANOUT,
+                    ids::OUTPUT_PHASE,
                 ]
                 .contains(id),
                 "{id} is advertised as fixable but not dispatched"

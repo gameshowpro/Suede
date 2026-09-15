@@ -10,6 +10,21 @@ case "$1" in
   configure)
     chmod 0755 /usr/share/suede/provision.sh 2>/dev/null || true
 
+    # The slicer negotiates a Vulkan queue priority (VK_KHR_global_priority):
+    # realtime, then high, then medium, whichever the driver grants. Measured
+    # 2026-09-15 on an RTX A1000 rig: unprivileged, NVIDIA grants only
+    # "medium"; with cap_sys_nice+ep on this binary it grants "realtime".
+    # Under a GPU-heavy app that's the difference between a 40 ms/frame fence
+    # wait (12 fps) and a 13 ms one (20.4 fps, the app itself being the
+    # limit) — steady state (59.95 fps) is unaffected either way. dpkg does
+    # not preserve file capabilities across an upgrade, so this has to run
+    # every configure, not just on first install. libcap2-bin (setcap) is a
+    # Recommends, not a Depends: without it the daemon just degrades to
+    # medium priority, which is not worth failing an install over.
+    if command -v setcap >/dev/null 2>&1; then
+      setcap cap_sys_nice+ep /usr/bin/suede || true
+    fi
+
     # Pick up the new unit definition for every logged-in user.
     systemctl daemon-reload >/dev/null 2>&1 || true
 

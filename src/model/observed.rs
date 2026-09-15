@@ -508,6 +508,12 @@ pub struct ProjectionStats {
     /// Frames whose outputs presented more than half a refresh period apart —
     /// i.e. shown on different refreshes, a whole-frame mismatch.
     pub straddles: u32,
+    /// Which backend this interval's frames were blended on: `"cpu"` or `"gpu"`.
+    pub renderer: String,
+    /// How many canvas periods elapsed between successive captures reaching
+    /// the slicer, bucketed. Says directly whether the capture loop is
+    /// keeping up with every canvas frame or only every second one.
+    pub capture_intervals: CaptureIntervals,
     pub outputs: Vec<OutputTiming>,
 }
 
@@ -521,6 +527,27 @@ pub struct FrameCost {
     pub snapshot: f64,
     pub requesting: f64,
     pub blending: f64,
+    /// GPU fence wait per frame — see `crate::projection::gpu::Gpu::blend`.
+    /// Zero on the CPU path, which never waits on a fence.
+    pub gpu: f64,
+}
+
+/// How many canvas periods elapsed between one capture reaching the slicer
+/// and the previous one, bucketed over the reporting interval. A period is
+/// `1000 / canvas refresh` when the canvas output reports one, else the
+/// 16.667 ms of an assumed 60 Hz. A healthy capture loop that keeps up with
+/// every canvas frame counts almost entirely in `one`; a loop that can only
+/// manage every second frame (the four-projector rig's CPU path before the
+/// GPU one existed — see `crate::projection::gpu`'s module doc) counts
+/// almost entirely in `two`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureIntervals {
+    pub one: u32,
+    pub two: u32,
+    pub three: u32,
+    /// More than 3.5 periods since the previous capture.
+    pub more: u32,
 }
 
 /// Spread between the earliest and latest output to present the same frame,
@@ -541,6 +568,13 @@ pub struct OutputTiming {
     pub discarded: u32,
     /// From wp_presentation's refresh field: the output's actual refresh interval, as Hz.
     pub refresh_hz: Option<f64>,
+    /// This output's vblank phase relative to the first output, in ms, within
+    /// half a refresh period either side. Stable across intervals means the
+    /// heads are locked at a fixed offset; wandering means independent clocks.
+    pub phase_ms: Option<f64>,
+    /// The spread of that phase within the interval (max − min of the
+    /// per-frame value), ms. Near zero means locked; near a period means drifting.
+    pub phase_spread_ms: Option<f64>,
 }
 
 #[cfg(test)]

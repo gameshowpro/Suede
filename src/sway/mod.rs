@@ -83,6 +83,24 @@ pub trait SwayClient: Send + Sync + 'static {
     /// Run a single Sway command, failing if Sway reports it unsuccessful.
     async fn run_command(&self, command: &str) -> SwayResult<()>;
 
+    /// Run several commands as sway would see one IPC message, one result
+    /// per command in order. A transport failure (the connection itself, not
+    /// a single command sway rejects) is reported for every entry, since
+    /// nothing about which of them landed is knowable in that case.
+    ///
+    /// The default loops over [`run_command`](Self::run_command) — correct,
+    /// just not what this exists for: `IpcClient` overrides it to send every
+    /// command in one sway IPC message, which is what lets several output
+    /// commands land in a single compositor backend commit. See the
+    /// reconciler's call site for the measurement that makes that matter.
+    async fn run_commands(&self, commands: &[String]) -> Vec<SwayResult<()>> {
+        let mut results = Vec::with_capacity(commands.len());
+        for command in commands {
+            results.push(self.run_command(command).await);
+        }
+        results
+    }
+
     /// Sway's version, cached after the first successful query.
     async fn get_version(&self) -> SwayResult<SwayVersion>;
 

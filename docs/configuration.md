@@ -655,6 +655,7 @@ with no overlaps skips all of this: sway tiles it directly, at zero cost.
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
 | `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify` - or null for content |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](#refresh-rates) |
+| `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](#renderer) |
 
 Slicing engages whenever the configured layout overlaps, with or without
 this section; the section adds the blending. A full overlap (a stacked
@@ -737,7 +738,86 @@ presented/discarded counts and measured refresh, alongside the canvas and
 presented frame rates and the per-frame cost breakdown. The web UI shows all
 of this in the Projection panel. A steady offset of a few milliseconds with
 zero straddles is what a healthy wall looks like; straddles that rise over
-time mean commits are landing between two outputs' renders.
+time mean commits are landing between two outputs' renders. Each output's
+`phaseMs` is its vblank phase relative to the first output, circular-mean'd
+over the interval: a value that stays put from one report to the next means
+the two heads are locked at a fixed offset (a synchronised mode-set could
+align them), while one that wanders means independent clocks that only
+hardware sync can fix.
+
+The `output-phase` health check reads exactly that field and warns when any
+output is more than 1.0 ms from the first. It was written from a
+measurement on a four-projector NVIDIA rig (RTX A1000, sway 1.10.1): outputs
+enabled one `output … enable` at a time left the first head 7.1 ms out of
+phase with the other three, which locked to each other — about 145
+straddled frames per 330 captured. The same four, disabled and then
+re-enabled together in one sway IPC message, landed within 0.03 ms of each
+other — about 20 straddles per 330 at the same rate. A mode-set delivered in
+one IPC message is applied by sway in one backend commit, which is what
+keeps the heads on the same clock; one command per output, even issued back
+to back, is not. Treat that as NVIDIA behaviour rather than a guarantee: the
+same batched re-enable on a Raspberry Pi 5's Broadcom driver narrowed a
+7.5 ms difference to 4.5 ms without closing it, so on hardware that does not
+lock its heads this way the check can still warn after its own fix has run.
+Suede's reconciler always batches an output plan's commands into one message
+for exactly this reason (including its first application after the daemon
+starts), so a fresh boot should already show the outputs in phase — this
+check exists for the drift a hotplug or a partial reconfiguration can still
+introduce.
+
+Its fix disables every active display, waits about a second and a half for
+sway to actually tear them down, and re-enables and fully reconfigures them
+together in that same single IPC message. The wall goes dark for the
+duration — there is no way to move every output to a new phase without
+letting each one restart its raster, and that means going through
+"nothing showing" — so run it between shows, not during one. The check
+itself only re-measures on the slicer's own ten-second interval, so the
+result shows up on the next report after the fix, not immediately.
+
+#### Where the blend runs {: #renderer }
+
+The slicer can composite two ways. The CPU path — shared-memory screencopy,
+a memcpy snapshot, then the blend on the CPU — is the fallback every
+compositor supports. The GPU path keeps every pixel on the GPU instead: the
+compositor blits the canvas straight into a Vulkan image the slicer exported
+as a dmabuf, a fragment shader blends it into each output's own dmabuf, and
+the results are committed as `wl_buffer`s with nothing ever copied to system
+memory. Measured on a four-projector rig (RTX A1000, 3840x2385 canvas): the
+CPU path ran at 32 fps with the GPU sitting at 38% utilisation — the
+compositor's readback of the canvas plus the CPU blend did not fit in one
+canvas frame, so the loop took every second one; the GPU path removes both
+costs.
+
+`renderer: "auto"` (the default) uses the GPU path when the compositor
+offers dmabuf capture (`zwp_linux_dmabuf_v1` version 4, with
+`get_default_feedback` completing) and a Vulkan 1.3 driver initialises with
+everything the shader needs, falling back to the CPU path — logged, with the
+reason — otherwise. `"cpu"` always uses the fallback path. `"gpu"` forces the
+GPU path and is a startup error if it is not actually available, so a rig
+that must never fall back silently can say so. sway satisfies the GPU path's
+requirements on any Mesa driver and on NVIDIA 550 or newer.
+
+`GET /projection/stats` reports which renderer is active, the GPU fence-wait
+cost per frame (`perFrameMs.gpu`, zero on the CPU path), and a capture
+cadence histogram (`captureIntervals`) counting how many canvas periods
+elapsed between successive captures — the direct answer to whether the loop
+is keeping up with every canvas frame or only every second one. The web UI's
+Projection panel shows all three in the Frame timing block.
+
+The GPU path also negotiates a Vulkan queue priority
+(`VK_KHR_global_priority`) — realtime, then high, then medium, whichever the
+driver grants — so the blend can pre-empt a GPU-heavy app on the same device
+instead of queuing behind it. The package grants the capability this needs
+(`cap_sys_nice+ep` on `/usr/bin/suede`) at install time, reapplied on every
+upgrade. `GET /projection/stats` does not report which tier is active; the
+slicer's startup log line does, as `queue priority realtime|high|medium`. On
+a machine that installed the binary another way, grant it by hand and
+restart the service:
+
+```bash
+sudo setcap cap_sys_nice+ep /usr/bin/suede
+systemctl --user restart suede.service
+```
 
 **Blending is a ramp in light, not in signal.** A display raises its input
 signal to a power (its gamma, typically 2.2), so a gradient linear in signal

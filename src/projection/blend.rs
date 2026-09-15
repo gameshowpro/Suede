@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ProjectionConfig, Rect, TestPattern};
+use crate::model::{ProjectionConfig, Rect, Renderer, TestPattern};
 
 /// An output taking part in seam derivation: its place in the global layout.
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +115,9 @@ pub struct SlicerSpec {
     /// Commit to each output as it becomes ready, rather than to all at once.
     #[serde(default)]
     pub free_run: bool,
+    /// Which pipeline to blend with; see [`crate::model::Renderer`].
+    #[serde(default)]
+    pub renderer: Renderer,
     pub slices: Vec<SliceSpec>,
 }
 
@@ -1072,6 +1075,7 @@ mod tests {
             black_lift: 0.04,
             pattern: None,
             free_run: false,
+            renderer: Renderer::Auto,
             slices: vec![SliceSpec {
                 output: "DP-3".into(),
                 source: Rect {
@@ -1094,6 +1098,7 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains(r#""canvasWidth":3680"#), "{json}");
         assert!(json.contains(r#""fadeTo":"right""#), "{json}");
+        assert!(json.contains(r#""renderer":"auto""#), "{json}");
         let back: SlicerSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
     }

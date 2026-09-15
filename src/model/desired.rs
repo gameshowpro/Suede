@@ -104,6 +104,8 @@ pub struct ProjectionConfig {
     /// refresh rates each run at their own, and the wall gives up being in
     /// step. Only for installations that cannot share a rate.
     pub free_run: bool,
+    /// Which pipeline the slicer composites with; see [`Renderer`].
+    pub renderer: Renderer,
 }
 
 impl Default for ProjectionConfig {
@@ -114,8 +116,30 @@ impl Default for ProjectionConfig {
             black_lift: 0.0,
             test_pattern: None,
             free_run: false,
+            renderer: Renderer::Auto,
         }
     }
+}
+
+/// Which pipeline the slicer uses to composite the canvas onto each output.
+///
+/// `Auto` (the default) prefers the GPU path — the compositor blits the
+/// canvas into a Vulkan image exported as a dmabuf, a fragment shader blends
+/// it straight into each output's own dmabuf, and no pixel ever crosses to
+/// system memory — falling back to the CPU path (shared-memory screencopy,
+/// blended on the CPU) whenever the compositor does not offer dmabuf capture
+/// or Vulkan fails to initialise. `Cpu` forces the fallback path even on
+/// hardware that could do better. `Gpu` forces the GPU path and is a startup
+/// error if the machine cannot actually provide it — the slicer exits and
+/// the daemon respawns it on its next reconcile, rather than silently
+/// running the slower path — for a rig where that would go unnoticed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Renderer {
+    #[default]
+    Auto,
+    Cpu,
+    Gpu,
 }
 
 /// A built-in projection test pattern.

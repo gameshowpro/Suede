@@ -15,6 +15,61 @@
 //! how many projectors consume it. The frame loop is damage-driven — a
 //! static page costs nothing per second.
 //!
+//! ## Two capture/blend backends
+//!
+//! What "captures", "cuts", and "applies... blend ramps" above means depends
+//! on [`crate::model::Renderer`]. The CPU path is what is described above,
+//! literally: screencopy into a shared-memory buffer, a memcpy snapshot so
+//! the next capture can be requested before this one is blended, then the
+//! blend itself on the CPU in [`Blend::rows`]. Measured on the
+//! four-projector rig this task's GPU path was built for: 32 fps, with the
+//! compositor's readback of the 3840x2385 canvas plus the CPU blend not
+//! fitting in one canvas frame, so the loop took every second one.
+//!
+//! The GPU path ([`crate::projection::gpu`]) never leaves the GPU: the
+//! compositor blits the canvas straight into a Vulkan image this process
+//! exported as a dmabuf, a fragment shader blends it into each output's own
+//! dmabuf, and the results are committed as `wl_buffer`s — no pixel crosses
+//! to system memory, and [`Capture::take_snapshot`] is never called
+//! ([`Capture::snapshot`] stays empty). The two matter for how the frame
+//! loop is ordered: on the CPU path the snapshot decouples the buffer from
+//! the canvas the instant it is copied out, so the next capture can be
+//! armed immediately and a free-run straggler can re-blend the same
+//! snapshot later with no risk. On the GPU path there is no snapshot — a
+//! capture image *is* the buffer the compositor writes into — so a single
+//! image forces `arm_copy(next)` to wait for `gpu.blend()`'s fence, which
+//! proves this process is done reading it, before it dares hand that same
+//! image back to the compositor. That fence wait is real and cannot be
+//! shortened — measured on the four-projector rig, 6.8 ms at 45% GPU load
+//! from another app, 40 ms at 99% (the blend shader over 9 Mpixels is
+//! trivial; the wait is this process's turn on a queue shared with
+//! everything else on the GPU — see `gpu.rs`'s "Queue priority" section) —
+//! but with one image it also sits squarely on the serial path, so the
+//! wall's presented fps followed it down to 12 under load, below the old
+//! CPU path's 20. [`GPU_CAPTURE_SLOTS`] is 2 to overlap it instead: two
+//! capture images, alternated, so `arm_copy(next)` can target the *other*
+//! image and run concurrently with `blend()`'s wait on this one —
+//! `ready(A) → arm_copy(next → B) → blend(A) (fence wait) → present →
+//! ready(B) → arm_copy(next → A) → blend(B) → ...`, see `run`'s loop.
+//! Reordering `arm_copy` ahead of `blend` is safe specifically because
+//! arming B never touches the A that `blend` is still reading — the hazard
+//! a single image had no way around. It also means A stays intact for a
+//! whole extra cycle after being blended, not just until the next capture:
+//! a free-run presenter that was not ready when `blend(A)` ran can still
+//! pick A up later, from [`Capture::last_blended_slot`], the moment its own
+//! frame callback clears — see `present_frame_gpu`'s safety-net call —
+//! instead of only ever catching the *next* capture the way one image had
+//! to. The compositor's screencopy `ready` event still carries no fence of
+//! its own for a dmabuf copy, and the NVIDIA driver adds no implicit dmabuf
+//! sync either, so this trusts `ready` at face value for each image exactly
+//! as the single-buffered version did for its one.
+//!
+//! `renderer: auto` (the default) picks the GPU path when the compositor
+//! offers dmabuf capture and Vulkan initialises, falling back to the CPU
+//! path — logged, with the reason — otherwise; `cpu`/`gpu` force one or the
+//! other, `gpu` fatally if it turns out not to be available. See
+//! `decide_backend` and the doc on [`crate::model::Renderer`] itself.
+//!
 //! ## Presentation gating
 //!
 //! Filming two outputs at once with a fast shutter used to show the frame
@@ -33,11 +88,12 @@
 //! completed capture is, dropping or repeating frames symmetrically across
 //! every output when the clocks beat against each other.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use anyhow::Context;
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
@@ -51,6 +107,11 @@ use wayland_client::protocol::{
     wl_surface::WlSurface,
 };
 use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle, WEnum};
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1,
+    zwp_linux_dmabuf_feedback_v1::{self, ZwpLinuxDmabufFeedbackV1},
+    zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+};
 use wayland_protocols::wp::presentation_time::client::{
     wp_presentation::{self, WpPresentation},
     wp_presentation_feedback::{self, WpPresentationFeedback},
@@ -65,7 +126,23 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 };
 
 use super::blend::{pixel_transfer, Coverage, OverlaySpec, SlicerSpec};
-use crate::model::{FrameCost, OutputTiming, PresentationOffset, ProjectionStats};
+use super::{dmabuf, gpu};
+use crate::model::{
+    CaptureIntervals, FrameCost, OutputTiming, PresentationOffset, ProjectionStats, Renderer,
+};
+
+/// DRM fourccs the GPU present path asks for, in preference order — see the
+/// "Present buffers" section this mirrors. Duplicated from `gpu.rs`'s own
+/// (private) constants rather than importing them: that module must not be
+/// edited to export them, and the values are part of the stable DRM fourcc
+/// namespace, not something that can drift between the two files.
+const FOURCC_XR24: u32 = 0x3432_5258; // XRGB8888
+const FOURCC_XB24: u32 = 0x3432_4258; // XBGR8888
+
+/// Capture images kept in flight on the GPU path, alternated by
+/// `Capture.gpu_slot` — see the module doc's paragraph on why two, not the
+/// single image this started as.
+const GPU_CAPTURE_SLOTS: usize = 2;
 
 /// Consecutive capture failures tolerated before giving up. The daemon
 /// respawns the slicer on its next pass, which is the retry policy.
@@ -124,9 +201,16 @@ struct Presenter {
     /// name it without threading the spec through every call.
     name: String,
     /// Two buffers, alternated so we never write one the compositor reads.
+    /// CPU path only — empty on the GPU path, which uses `gpu_buffers`
+    /// instead; the two are never both populated for one presenter.
     buffers: Vec<(WlBuffer, memmap2::MmapMut)>,
-    /// Parallel to `buffers`: true while the compositor holds that buffer,
-    /// from attach+commit until its `wl_buffer.release`.
+    /// The GPU path's equivalent of `buffers`: the shader renders into
+    /// `DmabufImage`, the compositor scans out or samples the `WlBuffer`
+    /// wrapping it. Same rotation semantics, same `busy`/`next_buffer`.
+    gpu_buffers: Vec<(WlBuffer, gpu::DmabufImage)>,
+    /// Parallel to whichever of `buffers`/`gpu_buffers` is in use: true
+    /// while the compositor holds that buffer, from attach+commit until its
+    /// `wl_buffer.release`.
     busy: Vec<bool>,
     next_buffer: usize,
     /// Fixed-point per-pixel transfer `(a, b)`: `out = (a·in)>>8 + b`,
@@ -151,6 +235,23 @@ struct Presenter {
     stale: bool,
 }
 
+/// Which pipeline the running slicer settled on for this process's whole
+/// life — decided once, at the first `arm_copy`, and never revisited (see
+/// `decide_backend`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Cpu,
+    Gpu,
+}
+
+/// One presenter due to take a frame this cycle, and which of its two
+/// buffer slots it will use — gathered by the GPU path's blend phase and
+/// consumed by its present phase; see `gpu_blend_due`/`gpu_present_due`.
+struct Due {
+    index: usize,
+    slot: usize,
+}
+
 #[derive(Default)]
 struct Capture {
     /// Offered shm layout: (format, width, height, stride).
@@ -162,6 +263,32 @@ struct Capture {
     failed: bool,
     y_invert: bool,
     first_copy_done: bool,
+    /// Fixed the first time `ensure_capture_buffer` runs; see
+    /// `decide_backend`.
+    backend: Option<Backend>,
+    /// GPU path's capture images: the ones the compositor blits the canvas
+    /// into and their wl_buffers, indexed by slot. Built up to
+    /// `GPU_CAPTURE_SLOTS` (2) lazily, one slot at a time, the first time
+    /// each is armed — see `ensure_gpu_capture_buffer` — rather than both at
+    /// once, so a mid-run resize touches only the slot currently being
+    /// armed and never the other, which may still be waiting to be blended.
+    gpu_images: Vec<(gpu::DmabufImage, WlBuffer)>,
+    /// The slot `ensure_capture_buffer`/`arm_copy` will next write into —
+    /// flipped, right after `Ready`, to the *other* slot before that arm
+    /// goes out, so the arm never touches the image about to be blended.
+    /// See the module doc.
+    gpu_slot: usize,
+    /// The slot most recently blended successfully, if any — the image
+    /// `present_frame_gpu`'s safety-net call reads from. Always the
+    /// complement of `gpu_slot` from the moment a blend sets it until the
+    /// *next* `Ready`, which is also the only window anything ever reads it
+    /// in: by the time `gpu_slot` is armed to write over this same slot
+    /// again, a fresh `blend()` has already moved this on to the slot it
+    /// just read instead. `None` before the first successful blend.
+    last_blended_slot: Option<usize>,
+    /// Offered linux-dmabuf layout, when the compositor advertises one
+    /// alongside the shm buffer: (format, width, height).
+    dmabuf_offer: Option<(u32, u32, u32)>,
     /// The finished frame, copied out of the shared buffer so the next
     /// capture can be requested before this one has been drawn.
     ///
@@ -225,6 +352,12 @@ struct FrameStats {
     /// forcing a reuse. Should stay zero outside a stall — see the
     /// buffer-selection comment in `present_frame`.
     buffer_reuse: u32,
+    /// GPU path only: `gpu.blend()`'s fence-wait, summed across every call
+    /// this interval. Zero on the CPU path, which never waits on a fence.
+    gpu: Duration,
+    /// How many canvas periods separated each capture from the previous
+    /// one, bucketed — see `crate::model::CaptureIntervals`.
+    capture_intervals: CaptureIntervals,
 }
 
 impl FrameStats {
@@ -243,6 +376,8 @@ impl FrameStats {
             superseded: 0,
             stalls: 0,
             buffer_reuse: 0,
+            gpu: Duration::ZERO,
+            capture_intervals: CaptureIntervals::default(),
         }
     }
 
@@ -275,6 +410,10 @@ struct Timing {
     offset_max_ms: f64,
     offset_count: u32,
     straddles: u32,
+    /// One accumulator per output, indexed the same as `per_output`; index 0
+    /// (output 0 relative to itself) is never fed and always empty — its
+    /// phase is reported separately, as a trivial 0.0, from `per_output[0]`.
+    phase: Vec<PhaseAccum>,
 }
 
 /// One presenter's answer for one snapshot.
@@ -316,6 +455,12 @@ struct Settled {
     /// refreshes rather than merely at different points in the same one.
     /// `false` whenever no presenting output reported a non-zero refresh.
     straddle: bool,
+    /// One entry per non-zero output that presented alongside output 0:
+    /// `(index, reduced_d_ns, period_ns)`, where `reduced_d_ns` is already
+    /// folded into `(-period/2, period/2]` by `reduce_phase`. Empty whenever
+    /// output 0 itself did not present this snapshot, since there is nothing
+    /// to measure the others against.
+    phase_samples: Vec<(usize, i64, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -324,12 +469,93 @@ enum SettledOutcome {
     Discarded,
 }
 
+/// Reduce a signed nanosecond difference into `(-period/2, period/2]` — the
+/// representative closest to zero for a value that really lives on a circle
+/// of length `period_ns` (a vblank phase, not a linear duration: an output 15
+/// ms behind at 60 Hz is 1.67 ms *ahead* on the next vblank, not 15 ms
+/// behind). Pure so the wrap arithmetic can be tested without a compositor.
+fn reduce_phase(d_ns: i64, period_ns: i64) -> i64 {
+    if period_ns <= 0 {
+        return d_ns;
+    }
+    // rem_euclid always lands in [0, period_ns); fold the top half back
+    // negative so the result sits either side of zero, whichever is closer.
+    let wrapped = d_ns.rem_euclid(period_ns);
+    if wrapped * 2 > period_ns {
+        wrapped - period_ns
+    } else {
+        wrapped
+    }
+}
+
+/// Circular mean of one output's per-frame vblank phase relative to output
+/// 0, accumulated over a report interval by `Timing::finalize`.
+///
+/// A plain mean of the reduced offsets fails exactly where this matters: two
+/// outputs sitting right at the wrap boundary report values near +period/2
+/// and -period/2 on alternating frames, and a linear average of those
+/// collapses toward zero — reporting "locked in phase" for a pair that is
+/// actually locked at the far edge. The circular mean (average the unit
+/// vectors at angle `2π·d/period`, then take the angle back) does not have
+/// that failure: see `circular_mean_of_a_symmetric_pair_does_not_cancel_to_zero`.
+#[derive(Debug, Clone, Copy, Default)]
+struct PhaseAccum {
+    sum_cos: f64,
+    sum_sin: f64,
+    count: u32,
+    min_ms: f64,
+    max_ms: f64,
+    /// The period the most recent sample was reduced against, in ns, reused
+    /// to turn the circular mean's angle back into milliseconds. Refresh
+    /// barely moves frame to frame on real hardware, so one interval's
+    /// samples share close enough to the same period for this to matter.
+    period_ns: u32,
+}
+
+impl PhaseAccum {
+    fn add(&mut self, reduced_ns: i64, period_ns: u32) {
+        let fraction = reduced_ns as f64 / f64::from(period_ns);
+        let angle = std::f64::consts::TAU * fraction;
+        self.sum_cos += angle.cos();
+        self.sum_sin += angle.sin();
+        let ms = reduced_ns as f64 / 1_000_000.0;
+        if self.count == 0 {
+            self.min_ms = ms;
+            self.max_ms = ms;
+        } else {
+            self.min_ms = self.min_ms.min(ms);
+            self.max_ms = self.max_ms.max(ms);
+        }
+        self.count += 1;
+        self.period_ns = period_ns;
+    }
+
+    /// The interval's circular-mean phase in ms, `None` until at least one
+    /// sample has landed.
+    fn phase_ms(&self) -> Option<f64> {
+        (self.count > 0).then(|| {
+            let angle = self.sum_sin.atan2(self.sum_cos);
+            angle / std::f64::consts::TAU * (f64::from(self.period_ns) / 1_000_000.0)
+        })
+    }
+
+    /// Max minus min of the per-frame reduced value, ms — near zero for a
+    /// locked pair, near a period for one that is wandering across it.
+    fn spread_ms(&self) -> Option<f64> {
+        (self.count > 0).then_some(self.max_ms - self.min_ms)
+    }
+}
+
 /// Work out what a snapshot's fully-answered slots mean, in isolation from
 /// how they got there.
 fn settle(slots: &[Slot]) -> Settled {
     let mut outcomes = Vec::new();
     let mut presented_at: Vec<u64> = Vec::new();
     let mut known_refreshes: Vec<u32> = Vec::new();
+    // Kept alongside `outcomes` (which erases the at_ns/refresh once turned
+    // into an outcome) because the phase pass below needs to find output 0
+    // specifically and compare every other presenter's timestamp against it.
+    let mut presented: Vec<(usize, u64, Option<u32>)> = Vec::new();
 
     for (index, slot) in slots.iter().enumerate() {
         match *slot {
@@ -340,6 +566,7 @@ fn settle(slots: &[Slot]) -> Settled {
                 if let Some(refresh_ns) = refresh_ns {
                     known_refreshes.push(refresh_ns);
                 }
+                presented.push((index, at_ns, refresh_ns));
             }
             Slot::Discarded => outcomes.push((index, SettledOutcome::Discarded)),
             Slot::NotCommitted | Slot::Waiting => {}
@@ -356,10 +583,37 @@ fn settle(slots: &[Slot]) -> Settled {
         _ => false,
     };
 
+    // Per-output vblank phase relative to output 0 (see the module docs on
+    // stable-versus-drifting phase). Nothing to measure when output 0 itself
+    // did not present this snapshot.
+    let mut phase_samples = Vec::new();
+    if let Some(&(_, at0, refresh0)) = presented.iter().find(|&&(index, ..)| index == 0) {
+        for &(index, at_ns, refresh_ns) in &presented {
+            if index == 0 {
+                continue;
+            }
+            // The smaller of the two known refreshes: reducing against the
+            // faster output's period is the more conservative choice when
+            // they disagree, and it is the only one either side actually
+            // measured.
+            let period_ns = match (refresh_ns, refresh0) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            if let Some(period_ns) = period_ns {
+                let d_ns = at_ns as i64 - at0 as i64;
+                let reduced = reduce_phase(d_ns, i64::from(period_ns));
+                phase_samples.push((index, reduced, period_ns));
+            }
+        }
+    }
+
     Settled {
         outcomes,
         offset_ns,
         straddle,
+        phase_samples,
     }
 }
 
@@ -371,6 +625,8 @@ struct IntervalTiming {
     straddles: u32,
     /// Same order as `State::presenters`.
     outputs: Vec<OutputAccum>,
+    /// Same order as `outputs`: `(phase_ms, phase_spread_ms)`.
+    phases: Vec<(Option<f64>, Option<f64>)>,
 }
 
 impl Timing {
@@ -383,6 +639,7 @@ impl Timing {
             offset_max_ms: 0.0,
             offset_count: 0,
             straddles: 0,
+            phase: vec![PhaseAccum::default(); presenter_count],
         }
     }
 
@@ -464,6 +721,11 @@ impl Timing {
         if settled.straddle {
             self.straddles += 1;
         }
+        for (index, reduced_ns, period_ns) in settled.phase_samples {
+            if let Some(accum) = self.phase.get_mut(index) {
+                accum.add(reduced_ns, period_ns);
+            }
+        }
     }
 
     /// Snapshot the interval's figures and reset the counters (but not the
@@ -477,6 +739,23 @@ impl Timing {
         });
         let outputs = self.per_output.clone();
         let straddles = self.straddles;
+        // Output 0's phase relative to itself is trivially zero, and never
+        // fed into `self.phase[0]` — report it as 0.0 whenever it presented
+        // at all this interval, `None` otherwise, rather than via the
+        // (always-empty) accumulator.
+        let phases: Vec<(Option<f64>, Option<f64>)> = outputs
+            .iter()
+            .enumerate()
+            .map(|(index, accum)| {
+                if index == 0 {
+                    let presented = accum.presented > 0;
+                    (presented.then_some(0.0), presented.then_some(0.0))
+                } else {
+                    let accum = &self.phase[index];
+                    (accum.phase_ms(), accum.spread_ms())
+                }
+            })
+            .collect();
 
         for accum in &mut self.per_output {
             accum.presented = 0;
@@ -486,28 +765,64 @@ impl Timing {
         self.offset_max_ms = 0.0;
         self.offset_count = 0;
         self.straddles = 0;
+        for accum in &mut self.phase {
+            *accum = PhaseAccum::default();
+        }
 
         IntervalTiming {
             offset,
             straddles,
             outputs,
+            phases,
         }
     }
 }
 
 struct State {
-    outputs: Vec<(WlOutput, Option<String>)>,
+    /// Third element: this output's current-mode refresh in mHz, from
+    /// `wl_output`'s `Mode` event — used only to size the canvas period for
+    /// the capture-interval histogram (see `report_stats_if_due`).
+    outputs: Vec<(WlOutput, Option<String>, Option<i32>)>,
     presenters: Vec<Presenter>,
     capture: Capture,
     closed: bool,
     /// From `SlicerSpec.free_run`; see the type it lives on for the tradeoff.
     free_run: bool,
+    /// From `SlicerSpec.renderer`; see `decide_backend` for how this turns
+    /// into `Capture.backend`.
+    renderer: Renderer,
     /// `None` when the compositor does not offer `wp_presentation` — the
     /// gating logic works identically either way, only the measurements it
     /// is possible to report differ.
     presentation: Option<WpPresentation>,
     timing: Timing,
     stats: FrameStats,
+    /// Set once at startup by `negotiate_gpu`, when `renderer != Cpu` and
+    /// dmabuf feedback completed and `Gpu::new` succeeded. `None` either
+    /// because the renderer is forced to `Cpu`, or because something in
+    /// that chain failed — `gpu_error` says what, for `decide_backend`'s
+    /// fallback message.
+    gpu: Option<gpu::Gpu>,
+    /// fourcc -> modifiers advertised by the compositor's main-device
+    /// tranche; empty until `negotiate_gpu` runs (or if it never does).
+    gpu_formats: HashMap<u32, Vec<u64>>,
+    /// Why `gpu` is `None`, when it is — the step `negotiate_gpu` gave up at.
+    gpu_error: Option<String>,
+    /// Fourcc and modifiers `create_present_buffers` settled on for every
+    /// output's Present images (every output shares one format — see
+    /// `gpu.rs`'s note on `ensure_pipeline`), reused if a presenter's
+    /// surface is reconfigured to a new size mid-run.
+    present_format: Option<(u32, Vec<u64>)>,
+    /// Staging area for one `zwp_linux_dmabuf_feedback_v1` exchange; see
+    /// `negotiate_gpu` and the `Dispatch` impl below.
+    dmabuf_feedback: Option<dmabuf::FeedbackCollector>,
+    /// `1000 / canvas refresh`, or an assumed 60 Hz's 16.667 ms when the
+    /// canvas output reports no refresh — the bucket width for
+    /// `FrameStats.capture_intervals`.
+    canvas_period_ms: f64,
+    /// When the previous capture's `Ready` was handled, for the interval
+    /// histogram.
+    last_capture_at: Option<Instant>,
 }
 
 impl State {
@@ -587,11 +902,63 @@ impl State {
             (true, None) => "n/a".to_string(),
             (true, Some((mean, max))) => format!("mean {mean:.1} ms max {max:.1} ms"),
         };
+
+        // Built once, then reused for both the human-readable line below and
+        // the JSON `outputs` field, so the two never drift apart.
+        let outputs: Vec<OutputTiming> = self
+            .presenters
+            .iter()
+            .zip(interval.outputs.iter())
+            .zip(interval.phases.iter())
+            .map(
+                |((presenter, accum), &(phase_ms, phase_spread_ms))| OutputTiming {
+                    name: presenter.name.clone(),
+                    presented: accum.presented,
+                    discarded: accum.discarded,
+                    refresh_hz: accum.refresh_ns.map(|ns| 1_000_000_000.0 / f64::from(ns)),
+                    phase_ms,
+                    phase_spread_ms,
+                },
+            )
+            .collect();
+
+        // Per-output vblank phase, name and value only — see the `phase_ms`
+        // doc on `OutputTiming` for what stable versus wandering looks like
+        // here. The half-spread is folded in only when it is non-zero, which
+        // is why output 0 (always exactly 0.0 against itself) prints with no
+        // `±` at all.
+        let phase_parts: Vec<String> = outputs
+            .iter()
+            .filter_map(|o| {
+                o.phase_ms.map(|phase| {
+                    let sign = if phase > 0.0 { "+" } else { "" };
+                    match o.phase_spread_ms {
+                        Some(spread) if spread > 0.0 => {
+                            format!("{} {sign}{phase:.1}±{:.1}", o.name, spread / 2.0)
+                        }
+                        _ => format!("{} {sign}{phase:.1}", o.name),
+                    }
+                })
+            })
+            .collect();
+        let phase_text = match (presentation_feedback, phase_parts.is_empty()) {
+            (false, _) => "n/a (no wp_presentation)".to_string(),
+            (true, true) => "n/a".to_string(),
+            (true, false) => format!("[{}]", phase_parts.join(", ")),
+        };
+
+        let renderer_name = match self.capture.backend {
+            Some(Backend::Gpu) => "gpu",
+            _ => "cpu",
+        };
+        let ci = self.stats.capture_intervals;
+
         eprintln!(
             "slicer: {canvas_fps:.1} fps captured, {presented_fps:.1} fps presented, over \
              {:.0}s per frame: waiting {:.1} ms, snapshot {:.1} ms, requesting {:.1} ms, \
              blending {:.1} ms; superseded {}, stalls {}, straddles {}, buffer reuse {}, \
-             offset {offset_text}",
+             offset {offset_text}, phase {phase_text}, renderer {renderer_name}, gpu {:.1} ms, \
+             intervals 1:{} 2:{} 3:{} 4+:{}",
             elapsed.as_secs_f64(),
             per_ms(self.stats.waiting),
             per_ms(self.stats.snapshot),
@@ -601,6 +968,11 @@ impl State {
             self.stats.stalls,
             interval.straddles,
             self.stats.buffer_reuse,
+            per_ms(self.stats.gpu),
+            ci.one,
+            ci.two,
+            ci.three,
+            ci.more,
         );
 
         let measured_at = SystemTime::now()
@@ -620,23 +992,16 @@ impl State {
                 snapshot: per_ms(self.stats.snapshot),
                 requesting: per_ms(self.stats.requesting),
                 blending: per_ms(self.stats.blending),
+                gpu: per_ms(self.stats.gpu),
             },
             presentation_feedback,
             offset_ms: interval
                 .offset
                 .map(|(mean, max)| PresentationOffset { mean, max }),
             straddles: interval.straddles,
-            outputs: self
-                .presenters
-                .iter()
-                .zip(interval.outputs.iter())
-                .map(|(presenter, accum)| OutputTiming {
-                    name: presenter.name.clone(),
-                    presented: accum.presented,
-                    discarded: accum.discarded,
-                    refresh_hz: accum.refresh_ns.map(|ns| 1_000_000_000.0 / f64::from(ns)),
-                })
-                .collect(),
+            renderer: renderer_name.to_string(),
+            capture_intervals: ci,
+            outputs,
         };
         // Rust's stdout is line-buffered, so this flushes on the newline
         // `println!` appends — the manager's reader thread sees it promptly
@@ -660,6 +1025,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // never depended on presentation feedback), only `offset_ms` and the
     // per-output presented/discarded/refreshHz figures cannot be measured.
     let presentation: Option<WpPresentation> = globals.bind(&handle, 1..=1, ()).ok();
+    // Optional: version 4 is what carries `get_default_feedback` (see the
+    // module doc); absent, or an older version, means the GPU path is
+    // simply never available and `negotiate_gpu` says so.
+    let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&handle, 4..=4, ()).ok();
 
     let mut state = State {
         outputs: Vec::new(),
@@ -667,14 +1036,22 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         capture: Capture::default(),
         closed: false,
         free_run: spec.free_run,
+        renderer: spec.renderer,
         presentation,
         timing: Timing::new(spec.slices.len()),
         stats: FrameStats::new(),
+        gpu: None,
+        gpu_formats: HashMap::new(),
+        gpu_error: None,
+        present_format: None,
+        dmabuf_feedback: None,
+        canvas_period_ms: 1000.0 / 60.0,
+        last_capture_at: None,
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
             let output: WlOutput = globals.registry().bind(global.name, 4, &handle, ());
-            state.outputs.push((output, None));
+            state.outputs.push((output, None, None));
         }
     }
     queue.roundtrip(&mut state)?;
@@ -683,11 +1060,44 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         state
             .outputs
             .iter()
-            .find(|(_, n)| n.as_deref() == Some(name))
-            .map(|(o, _)| o.clone())
+            .find(|(_, n, _)| n.as_deref() == Some(name))
+            .map(|(o, ..)| o.clone())
     };
     let source = find(&state, &spec.source)
         .ok_or_else(|| anyhow::anyhow!("no output named {} to capture", spec.source))?;
+
+    // The canvas's own refresh, for the capture-interval histogram's bucket
+    // width (see `FrameStats.capture_intervals`); an assumed 60 Hz stands in
+    // when the compositor never reported one (a virtual/headless output can
+    // report zero — see wl_output's own doc on that).
+    let canvas_refresh_mhz = state
+        .outputs
+        .iter()
+        .find(|(o, ..)| *o == source)
+        .and_then(|(_, _, refresh)| *refresh);
+    state.canvas_period_ms = canvas_refresh_mhz
+        .filter(|&mhz| mhz > 0)
+        .map(|mhz| 1_000_000.0 / f64::from(mhz))
+        .unwrap_or(1000.0 / 60.0);
+
+    // GPU/dmabuf negotiation, once, before anything else needs to know the
+    // backend — see the module doc's negotiation notes. Skipped entirely
+    // for a test pattern, which never captures at all and draws straight
+    // into shm-backed presenter buffers regardless of `renderer`.
+    if spec.pattern.is_none() && spec.renderer != Renderer::Cpu {
+        match negotiate_gpu(dmabuf.as_ref(), &mut state, &mut queue, &handle) {
+            Ok((gpu, formats)) => {
+                state.gpu = Some(gpu);
+                state.gpu_formats = formats;
+            }
+            Err(reason) => {
+                if spec.renderer == Renderer::Gpu {
+                    anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
+                }
+                state.gpu_error = Some(reason);
+            }
+        }
+    }
 
     // One presenter per slice, covering its physical output entirely.
     for (index, slice) in spec.slices.iter().enumerate() {
@@ -716,6 +1126,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             configured: None,
             name: slice.output.clone(),
             buffers: Vec::new(),
+            gpu_buffers: Vec::new(),
             busy: Vec::new(),
             next_buffer: 0,
             transfer: Vec::new(),
@@ -738,19 +1149,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // *others* light the same pixel — a four-way grid centre needs none while
     // its two-way seams still do.
     let coverage = Coverage::new(spec.slices.iter().map(|slice| slice.source));
-    for (index, (presenter, slice)) in state
-        .presenters
-        .iter_mut()
-        .zip(spec.slices.iter())
-        .enumerate()
-    {
+    for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
         let (width, height) = presenter.configured.unwrap();
-        for slot in 0..2 {
-            presenter
-                .buffers
-                .push(shm_buffer(&shm, &handle, width, height, (index, slot))?);
-        }
-        presenter.busy = vec![false; presenter.buffers.len()];
         // Built at the *presented* size: ramps are defined against the
         // slice, and any mismatch shows up as identity pixels, not a panic.
         let mut transfer = Vec::with_capacity(width as usize * height as usize);
@@ -770,6 +1170,19 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     }
 
     if let Some(pattern) = spec.pattern {
+        // A test pattern is drawn by poking pixels directly (see
+        // `present_pattern`), so it always needs a CPU-mapped buffer — the
+        // GPU path never enters into it regardless of `renderer` (and
+        // `negotiate_gpu` was skipped above for exactly this reason).
+        for (index, presenter) in state.presenters.iter_mut().enumerate() {
+            let (width, height) = presenter.configured.unwrap();
+            for slot in 0..2 {
+                presenter
+                    .buffers
+                    .push(shm_buffer(&shm, &handle, width, height, (index, slot))?);
+            }
+            presenter.busy = vec![false; presenter.buffers.len()];
+        }
         present_pattern(&mut state, spec, pattern);
         // Static image: nothing further to do but stay alive.
         loop {
@@ -805,9 +1218,20 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // concurrently with the first wait, exactly as it does every loop
     // iteration below.
     let mut current = request_capture(&mut state, &screencopy, &source, &handle);
-    if !arm_copy(&mut state, &mut queue, &shm, &handle, &current)? {
+    if !arm_copy(
+        &mut state,
+        &mut queue,
+        &shm,
+        dmabuf.as_ref(),
+        &handle,
+        &current,
+    )? {
         return Ok(());
     }
+    // The backend (and, on the GPU path, the capture image) is decided as
+    // of the `arm_copy` above — now create presenter buffers of the right
+    // kind for it, before the first capture can possibly complete.
+    create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
     let mut next = request_capture(&mut state, &screencopy, &source, &handle);
 
     loop {
@@ -834,7 +1258,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             state.capture.failed = false;
             state.capture.ready = false;
             current = request_capture(&mut state, &screencopy, &source, &handle);
-            if !arm_copy(&mut state, &mut queue, &shm, &handle, &current)? {
+            if !arm_copy(
+                &mut state,
+                &mut queue,
+                &shm,
+                dmabuf.as_ref(),
+                &handle,
+                &current,
+            )? {
                 return Ok(());
             }
             next = request_capture(&mut state, &screencopy, &source, &handle);
@@ -845,26 +1276,80 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         if state.capture.ready {
             state.capture.ready = false;
             state.capture.first_copy_done = true;
-
-            // Copy the frame out and hand the buffer straight back, so the
-            // compositor is already drawing the next one while this one is
-            // being cut into slices and committed.
-            let snapshot_from = Instant::now();
-            state.capture.take_snapshot();
-            current.destroy();
-            state.stats.snapshot += snapshot_from.elapsed();
-
-            // Usually already satisfied: the handshake ran during the wait above.
-            let requesting_from = Instant::now();
-            if !arm_copy(&mut state, &mut queue, &shm, &handle, &next)? {
-                return Ok(());
-            }
-            state.stats.requesting += requesting_from.elapsed();
-            current = next;
-            next = request_capture(&mut state, &screencopy, &source, &handle);
-
-            state.new_snapshot();
+            record_capture_interval(&mut state);
             state.stats.captured += 1;
+            // Marks every presenter `stale` (both backends' due-presenter
+            // selection reads this) and runs the stall-callback timeout
+            // check — needed on the GPU path too, not just CPU.
+            state.new_snapshot();
+
+            if state.capture.backend == Some(Backend::Gpu) {
+                // Two capture images, alternated — see the module doc. This
+                // `Ready` filled `gpu_slot` (call it image A); flip the slot
+                // to the *other* image (B) and arm the next capture into it
+                // *before* blending A, so the compositor's copy into B runs
+                // concurrently with `blend()`'s fence wait on A instead of
+                // waiting for that wait to finish first. Safe specifically
+                // because B is a different image than the one `blend` is
+                // about to read — arming it can never race that read the
+                // way re-arming a single shared image used to. The
+                // present-side fence wait inside `blend()` is unavoidable
+                // either way (the compositor samples the Present buffers
+                // the moment we commit, and NVIDIA gives dmabufs no
+                // implicit sync), but it no longer sits ahead of the next
+                // capture — that capture is already in flight by the time
+                // this call blocks on it.
+                current.destroy();
+                let filled_slot = state.capture.gpu_slot;
+                state.capture.gpu_slot = (filled_slot + 1) % GPU_CAPTURE_SLOTS;
+
+                let requesting_from = Instant::now();
+                if !arm_copy(
+                    &mut state,
+                    &mut queue,
+                    &shm,
+                    dmabuf.as_ref(),
+                    &handle,
+                    &next,
+                )? {
+                    return Ok(());
+                }
+                state.stats.requesting += requesting_from.elapsed();
+                current = next;
+                next = request_capture(&mut state, &screencopy, &source, &handle);
+
+                let blending_from = Instant::now();
+                let due = gpu_blend_due(&mut state, filled_slot, dmabuf.as_ref(), &handle);
+                state.stats.blending += blending_from.elapsed();
+
+                if !due.is_empty() {
+                    gpu_present_due(&mut state, &handle, &due);
+                }
+            } else {
+                // Copy the frame out and hand the buffer straight back, so the
+                // compositor is already drawing the next one while this one is
+                // being cut into slices and committed.
+                let snapshot_from = Instant::now();
+                state.capture.take_snapshot();
+                current.destroy();
+                state.stats.snapshot += snapshot_from.elapsed();
+
+                // Usually already satisfied: the handshake ran during the wait above.
+                let requesting_from = Instant::now();
+                if !arm_copy(
+                    &mut state,
+                    &mut queue,
+                    &shm,
+                    dmabuf.as_ref(),
+                    &handle,
+                    &next,
+                )? {
+                    return Ok(());
+                }
+                state.stats.requesting += requesting_from.elapsed();
+                current = next;
+                next = request_capture(&mut state, &screencopy, &source, &handle);
+            }
         }
 
         if state.can_present() {
@@ -899,6 +1384,7 @@ fn arm_copy(
     state: &mut State,
     queue: &mut wayland_client::EventQueue<State>,
     shm: &WlShm,
+    dmabuf: Option<&ZwpLinuxDmabufV1>,
     handle: &QueueHandle<State>,
     frame: &ZwlrScreencopyFrameV1,
 ) -> anyhow::Result<bool> {
@@ -915,15 +1401,37 @@ fn arm_copy(
         if let Some((format, width, height, stride)) = state.capture.offered {
             eprintln!("slicer: capture offer {width}x{height} stride {stride} format {format:#x}");
         }
+        if let Some((format, width, height)) = state.capture.dmabuf_offer {
+            eprintln!("slicer: dmabuf offer {width}x{height} format {format:#x}");
+        }
     }
-    ensure_capture_buffer(&mut state.capture, shm, handle)?;
-    let buffer = &state.capture.buffer.as_ref().unwrap().0;
-    // Damage is reported against the previous copy into this buffer, which is
-    // why the same buffer is reused every time.
-    if state.capture.first_copy_done {
-        frame.copy_with_damage(buffer);
-    } else {
-        frame.copy(buffer);
+    ensure_capture_buffer(state, shm, dmabuf, handle)?;
+    let first_copy_done = state.capture.first_copy_done;
+    if !first_copy_done {
+        print_renderer_decision(state);
+    }
+    match state.capture.backend {
+        Some(Backend::Gpu) => {
+            let (_, buffer) = &state.capture.gpu_images[state.capture.gpu_slot];
+            // Damage is reported against the previous copy into this
+            // buffer, which is why the same (single, today) capture image
+            // is reused every time — see `Capture.gpu_images`'s doc.
+            if first_copy_done {
+                frame.copy_with_damage(buffer);
+            } else {
+                frame.copy(buffer);
+            }
+        }
+        _ => {
+            let buffer = &state.capture.buffer.as_ref().unwrap().0;
+            // Damage is reported against the previous copy into this buffer,
+            // which is why the same buffer is reused every time.
+            if first_copy_done {
+                frame.copy_with_damage(buffer);
+            } else {
+                frame.copy(buffer);
+            }
+        }
     }
     Ok(true)
 }
@@ -964,7 +1472,122 @@ where
     Ok((buffer, map))
 }
 
+/// Decide the capture backend, once, and ensure this frame has a buffer of
+/// the right kind. `Capture.backend` is fixed after the first call — see
+/// `decide_backend`.
 fn ensure_capture_buffer(
+    state: &mut State,
+    shm: &WlShm,
+    dmabuf: Option<&ZwpLinuxDmabufV1>,
+    handle: &QueueHandle<State>,
+) -> anyhow::Result<()> {
+    if state.capture.backend.is_none() {
+        state.capture.backend = Some(decide_backend(state, dmabuf)?);
+    }
+    match state.capture.backend {
+        Some(Backend::Gpu) => {
+            let dmabuf =
+                dmabuf.expect("decide_backend only ever returns Backend::Gpu when dmabuf is Some");
+            ensure_gpu_capture_buffer(state, dmabuf, handle)
+        }
+        _ => ensure_shm_capture_buffer(&mut state.capture, shm, handle),
+    }
+}
+
+/// The backend decision itself, run once at the first `arm_copy` — see the
+/// module doc's negotiation notes. `Ok` names the winner; `Err` is only
+/// possible when `Renderer::Gpu` was forced and the GPU path turns out not
+/// to be available, which is fatal (the slicer exits, the daemon respawns
+/// it on its next reconcile).
+fn decide_backend(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> anyhow::Result<Backend> {
+    if state.renderer == Renderer::Cpu {
+        return Ok(Backend::Cpu);
+    }
+    match gpu_availability(state, dmabuf) {
+        Ok(()) => Ok(Backend::Gpu),
+        Err(reason) => {
+            if state.renderer == Renderer::Gpu {
+                anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
+            }
+            eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
+            Ok(Backend::Cpu)
+        }
+    }
+}
+
+/// `Ok` when every condition for the GPU path holds this frame; `Err` names
+/// the first one that does not, reused for both `decide_backend`'s
+/// `Auto`-fallback log line and its `Gpu`-forced fatal error. The present
+/// format check is folded in here — rather than left until presenter
+/// buffers are actually created — deliberately: by the time this function
+/// returns `Ok`, `arm_copy` is about to tell the compositor to copy into a
+/// GPU capture image, and backing out of that after the fact (the
+/// compositor already mid-write) is not something to attempt. Checking
+/// every requirement up front means a missing Present format can only ever
+/// produce a clean `Cpu` fallback, never a half-committed GPU capture.
+fn gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Result<(), String> {
+    if dmabuf.is_none() {
+        return Err("compositor does not offer zwp_linux_dmabuf_v1 version 4".to_string());
+    }
+    let Some((format, ..)) = state.capture.dmabuf_offer else {
+        return Err(
+            "compositor's screencopy offer for this frame carried no dmabuf option".to_string(),
+        );
+    };
+    let Some(gpu) = state.gpu.as_ref() else {
+        return Err(state
+            .gpu_error
+            .clone()
+            .unwrap_or_else(|| "no Vulkan device available".to_string()));
+    };
+    let capture_modifiers = state.gpu_formats.get(&format).cloned().unwrap_or_default();
+    if gpu
+        .supported_modifiers(format, &capture_modifiers, gpu::Usage::Capture)
+        .is_empty()
+    {
+        return Err(format!(
+            "capture format {format:#010x} has no Vulkan-importable modifier"
+        ));
+    }
+    let present_ok = [FOURCC_XR24, FOURCC_XB24].into_iter().any(|fourcc| {
+        let modifiers = state.gpu_formats.get(&fourcc).cloned().unwrap_or_default();
+        !gpu.supported_modifiers(fourcc, &modifiers, gpu::Usage::Present)
+            .is_empty()
+    });
+    if !present_ok {
+        return Err("neither XR24 nor XB24 is importable as a Present image".to_string());
+    }
+    Ok(())
+}
+
+/// Print, once, which renderer this run settled on — the summary line the
+/// coordinator's note on debugging the first on-hardware run is asking for.
+/// Gated by the same `!first_copy_done` the offer-diagnostics lines above it
+/// use, so it prints exactly once, right after the decision is final.
+fn print_renderer_decision(state: &State) {
+    match state.capture.backend {
+        Some(Backend::Gpu) => {
+            let (image, _) = &state.capture.gpu_images[state.capture.gpu_slot];
+            let gpu = state
+                .gpu
+                .as_ref()
+                .expect("Backend::Gpu implies state.gpu is Some");
+            eprintln!(
+                "slicer: renderer gpu ({}), capture {}x{} {:#010x} modifier {:#x}",
+                gpu.describe(),
+                image.width,
+                image.height,
+                image.fourcc,
+                image.modifier,
+            );
+        }
+        Some(Backend::Cpu) | None => {
+            eprintln!("slicer: renderer cpu (shm)");
+        }
+    }
+}
+
+fn ensure_shm_capture_buffer(
     capture: &mut Capture,
     shm: &WlShm,
     handle: &QueueHandle<State>,
@@ -1006,6 +1629,465 @@ fn ensure_capture_buffer(
     Ok(())
 }
 
+/// GPU path's `ensure_capture_buffer`: create (or, on a mid-run resize
+/// offer, recreate) `Capture.gpu_slot`'s capture image and its wl_buffer at
+/// whatever size/format screencopy most recently offered. Only ever touches
+/// that one slot — never the other, which may still hold an image nothing
+/// has blended yet (the primary blend later this cycle, or a straggler's
+/// safety-net one) — see `Capture.gpu_images`'s doc.
+fn ensure_gpu_capture_buffer(
+    state: &mut State,
+    dmabuf_proxy: &ZwpLinuxDmabufV1,
+    handle: &QueueHandle<State>,
+) -> anyhow::Result<()> {
+    let State {
+        gpu,
+        gpu_formats,
+        capture,
+        ..
+    } = state;
+    let gpu = gpu
+        .as_ref()
+        .expect("Backend::Gpu implies state.gpu is Some");
+    let (format, width, height) = capture
+        .dmabuf_offer
+        .ok_or_else(|| anyhow::anyhow!("screencopy offered no dmabuf buffer"))?;
+    let slot = capture.gpu_slot;
+    let stale = match capture.gpu_images.get(slot) {
+        Some((image, _)) => (image.width, image.height, image.fourcc) != (width, height, format),
+        None => true,
+    };
+    if stale {
+        let modifiers = gpu_formats.get(&format).cloned().unwrap_or_default();
+        let supported = gpu.supported_modifiers(format, &modifiers, gpu::Usage::Capture);
+        if supported.is_empty() {
+            anyhow::bail!(
+                "no Vulkan-importable modifier for capture format {format:#010x} \
+                 (mid-run resize to a format the device cannot import?)"
+            );
+        }
+        let image = gpu
+            .create_image(width, height, format, &supported, gpu::Usage::Capture)
+            .context("gpu.create_image (capture)")?;
+        let buffer = dmabuf::dmabuf_wl_buffer(dmabuf_proxy, &image, handle, ());
+        if slot < capture.gpu_images.len() {
+            let (_old_image, old_buffer) =
+                std::mem::replace(&mut capture.gpu_images[slot], (image, buffer));
+            old_buffer.destroy();
+        } else {
+            debug_assert_eq!(
+                slot,
+                capture.gpu_images.len(),
+                "gpu_slot alternates 0, 1, 0, 1, ...; each slot's first use must be the next \
+                 index in order"
+            );
+            capture.gpu_images.push((image, buffer));
+        }
+        debug_assert!(capture.gpu_images.len() <= GPU_CAPTURE_SLOTS);
+    }
+    Ok(())
+}
+
+/// Once the backend is decided (right after the first `arm_copy`), create
+/// each presenter's pair of Present buffers — shm as always, or a Vulkan
+/// image exported as a dmabuf and wrapped as a wl_buffer on the GPU path,
+/// picking XR24 and falling back to XB24 (see the module doc's "Present
+/// buffers" section) — and, on the GPU path, upload every output's transfer
+/// table.
+fn create_present_buffers(
+    state: &mut State,
+    shm: &WlShm,
+    dmabuf_proxy: Option<&ZwpLinuxDmabufV1>,
+    handle: &QueueHandle<State>,
+) -> anyhow::Result<()> {
+    match state.capture.backend {
+        Some(Backend::Gpu) => {
+            let dmabuf_proxy = dmabuf_proxy
+                .expect("Backend::Gpu implies decide_backend already confirmed dmabuf is Some");
+            let (fourcc, modifiers) = {
+                let State {
+                    gpu, gpu_formats, ..
+                } = state;
+                let gpu = gpu
+                    .as_ref()
+                    .expect("Backend::Gpu implies state.gpu is Some");
+                [FOURCC_XR24, FOURCC_XB24]
+                    .into_iter()
+                    .find_map(|fourcc| {
+                        let candidates = gpu_formats.get(&fourcc)?;
+                        let supported =
+                            gpu.supported_modifiers(fourcc, candidates, gpu::Usage::Present);
+                        (!supported.is_empty()).then_some((fourcc, supported))
+                    })
+                    // `decide_backend`/`gpu_availability` already confirmed
+                    // one of these works before committing to Backend::Gpu.
+                    .expect("gpu_availability already confirmed a Present format is importable")
+            };
+            state.present_format = Some((fourcc, modifiers.clone()));
+
+            let State {
+                presenters, gpu, ..
+            } = state;
+            let gpu = gpu
+                .as_mut()
+                .expect("Backend::Gpu implies state.gpu is Some");
+            for (index, presenter) in presenters.iter_mut().enumerate() {
+                let (width, height) = presenter.configured.unwrap();
+                for slot in 0..2 {
+                    let image = gpu
+                        .create_image(width, height, fourcc, &modifiers, gpu::Usage::Present)
+                        .with_context(|| format!("gpu.create_image (present, output {index})"))?;
+                    let buffer =
+                        dmabuf::dmabuf_wl_buffer(dmabuf_proxy, &image, handle, (index, slot));
+                    presenter.gpu_buffers.push((buffer, image));
+                }
+                presenter.busy = vec![false; presenter.gpu_buffers.len()];
+                gpu.set_transfer(index, width, height, &presenter.transfer)
+                    .with_context(|| format!("gpu.set_transfer (output {index})"))?;
+            }
+            Ok(())
+        }
+        _ => {
+            for (index, presenter) in state.presenters.iter_mut().enumerate() {
+                let (width, height) = presenter.configured.unwrap();
+                for slot in 0..2 {
+                    presenter
+                        .buffers
+                        .push(shm_buffer(shm, handle, width, height, (index, slot))?);
+                }
+                presenter.busy = vec![false; presenter.buffers.len()];
+            }
+            Ok(())
+        }
+    }
+}
+
+/// GPU path only: recreate presenter `index`'s pair of Present images if its
+/// surface's configured size no longer matches them — a mid-run resize (a
+/// changed output mode) rather than the initial configure `create_present_buffers`
+/// already handled. Best-effort: any failure is logged (naming the output
+/// and the step) and leaves the previous, still-valid buffers in place
+/// rather than leaving the presenter with none at all.
+fn ensure_gpu_present_buffers(
+    state: &mut State,
+    dmabuf_proxy: &ZwpLinuxDmabufV1,
+    handle: &QueueHandle<State>,
+    index: usize,
+) {
+    let Some((fourcc, modifiers)) = state.present_format.clone() else {
+        return;
+    };
+    let Some(presenter) = state.presenters.get(index) else {
+        return;
+    };
+    let Some((width, height)) = presenter.configured else {
+        return;
+    };
+    let stale = match presenter.gpu_buffers.first() {
+        Some((_, image)) => (image.width, image.height) != (width, height),
+        None => true,
+    };
+    if !stale {
+        return;
+    }
+    let name = presenter.name.clone();
+    let old_transfer_matches = presenter.transfer.len() == width as usize * height as usize;
+
+    let State {
+        presenters, gpu, ..
+    } = state;
+    let Some(gpu) = gpu.as_mut() else { return };
+    let presenter = &mut presenters[index];
+    let mut rebuilt = Vec::with_capacity(2);
+    let mut failed = false;
+    for _ in 0..2 {
+        match gpu.create_image(width, height, fourcc, &modifiers, gpu::Usage::Present) {
+            Ok(image) => {
+                let buffer =
+                    dmabuf::dmabuf_wl_buffer(dmabuf_proxy, &image, handle, (index, rebuilt.len()));
+                rebuilt.push((buffer, image));
+            }
+            Err(error) => {
+                eprintln!(
+                    "slicer: output {name} resized but its GPU present buffers could not be \
+                     recreated ({error:#}); keeping the previous size until the slicer restarts"
+                );
+                failed = true;
+                break;
+            }
+        }
+    }
+    if failed {
+        for (buffer, _) in rebuilt {
+            buffer.destroy();
+        }
+        return;
+    }
+    for (old_buffer, _) in presenter.gpu_buffers.drain(..) {
+        old_buffer.destroy();
+    }
+    presenter.gpu_buffers = rebuilt;
+    presenter.busy = vec![false; presenter.gpu_buffers.len()];
+    presenter.next_buffer = 0;
+    if old_transfer_matches {
+        if let Err(error) = gpu.set_transfer(index, width, height, &presenter.transfer) {
+            eprintln!("slicer: output {name}: set_transfer after resize failed: {error:#}");
+        }
+    } else {
+        eprintln!(
+            "slicer: output {name} resized to {width}x{height} but its blend ramps were \
+             computed for a different size; the picture will be untransformed until the slicer \
+             restarts"
+        );
+    }
+}
+
+/// Negotiate the GPU path once at startup: bind dmabuf feedback, wait for it
+/// to complete, and open a Vulkan device on the compositor's preferred
+/// device. `Err` names the step that failed, for `Auto`'s log line and
+/// `Gpu`'s fatal error alike — see `run`'s call site.
+fn negotiate_gpu(
+    dmabuf: Option<&ZwpLinuxDmabufV1>,
+    state: &mut State,
+    queue: &mut wayland_client::EventQueue<State>,
+    handle: &QueueHandle<State>,
+) -> Result<(gpu::Gpu, HashMap<u32, Vec<u64>>), String> {
+    let Some(dmabuf) = dmabuf else {
+        return Err("compositor does not offer zwp_linux_dmabuf_v1 version 4".to_string());
+    };
+    state.dmabuf_feedback = Some(dmabuf::FeedbackCollector::default());
+    let feedback = dmabuf.get_default_feedback(handle, ());
+    // The compositor processes requests in order, so every event this
+    // feedback object will ever send for this exchange — including `done`
+    // — is already queued behind our own `get_default_feedback` and ahead
+    // of whatever the roundtrip's sync reply waits on; one roundtrip is
+    // enough to have seen `done` by the time it returns.
+    let roundtrip = queue
+        .roundtrip(state)
+        .map_err(|error| format!("dmabuf feedback roundtrip: {error}"));
+    feedback.destroy();
+    roundtrip?;
+    let collected = state.dmabuf_feedback.take().unwrap_or_default();
+    if !collected.done {
+        return Err("compositor never sent zwp_linux_dmabuf_feedback_v1.done".to_string());
+    }
+    gpu::Gpu::new(collected.main_device)
+        .map(|gpu| (gpu, collected.formats))
+        .map_err(|error| format!("Gpu::new: {error:#}"))
+}
+
+/// Bump `FrameStats.capture_intervals` for the gap since the previous
+/// capture reached the slicer — both backends call this, right after
+/// detecting `Ready`. See `crate::model::CaptureIntervals`'s doc for the
+/// bucket edges.
+fn record_capture_interval(state: &mut State) {
+    let now = Instant::now();
+    if let Some(previous) = state.last_capture_at {
+        let elapsed_ms = now.duration_since(previous).as_secs_f64() * 1000.0;
+        let periods = elapsed_ms / state.canvas_period_ms;
+        let bucket = if periods <= 1.5 {
+            &mut state.stats.capture_intervals.one
+        } else if periods <= 2.5 {
+            &mut state.stats.capture_intervals.two
+        } else if periods <= 3.5 {
+            &mut state.stats.capture_intervals.three
+        } else {
+            &mut state.stats.capture_intervals.more
+        };
+        *bucket += 1;
+    }
+    state.last_capture_at = Some(now);
+}
+
+/// Backend dispatch for the two present_frame implementations below. Called
+/// from the generic `can_present()`-driven sites in `run`'s loop; the GPU
+/// path's own primary call sites (inside the `Ready` handling) call
+/// `gpu_blend_due`/`gpu_present_due` directly instead, so on that path this
+/// is specifically the free-run safety net described on `gpu_blend_due`'s
+/// and `present_frame_gpu`'s own docs: a straggler whose frame callback
+/// cleared after the primary blend already ran this cycle.
+fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
+    match state.capture.backend {
+        Some(Backend::Gpu) => present_frame_gpu(state, handle),
+        _ => present_frame_cpu(state, handle),
+    }
+}
+
+/// The free-run safety net `gpu_blend_due` leaves `stale` set for: reads
+/// `Capture.last_blended_slot`, the one capture image guaranteed not to be
+/// what the compositor is currently writing into (that is always the
+/// *other* slot — see `Capture.gpu_slot`'s doc), and blends whichever
+/// presenter(s) are now ready from it.
+fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
+    let Some(slot) = state.capture.last_blended_slot else {
+        // Nothing has been blended yet this run: clear `stale` the same way
+        // `gpu_blend_due` would, so a presenter that somehow raced ahead of
+        // the very first capture cannot spin `can_present()` forever.
+        for presenter in &mut state.presenters {
+            presenter.stale = false;
+        }
+        return;
+    };
+    let due = gpu_blend_due(state, slot, None, handle);
+    if !due.is_empty() {
+        gpu_present_due(state, handle, &due);
+    }
+}
+
+/// GPU path, blend phase: build the jobs for whichever presenters are due
+/// right now and hand them to `gpu.blend()` in one call, which blocks until
+/// the GPU is done reading `capture_slot`'s image — see the module's
+/// frame-loop comment on why the caller must arm the *other* slot, not this
+/// one, before calling this.
+///
+/// A free-run presenter that is not yet ready (still holding an outstanding
+/// `wl_surface.frame` callback) is left `stale`, not cleared: `capture_slot`
+/// stays intact for a whole extra cycle after this call returns (see
+/// `Capture.last_blended_slot`), so `present_frame_gpu`'s safety-net call
+/// can still pick it up the moment that presenter's callback clears,
+/// instead of only ever catching the *next* capture the way a single image
+/// had to. Every other presenter's `stale` is cleared here, due or not —
+/// locked mode only ever calls this once every presenter is ready (see
+/// `can_present`), so a configured presenter that was not due simply had
+/// nothing new to show and is not owed a re-blend later.
+///
+/// `dmabuf_proxy`, when given, also resizes any presenter whose surface was
+/// reconfigured to a new size since its GPU buffers were created — `None`
+/// (from `present_frame_gpu`'s safety-net call) simply skips that, since by
+/// then the primary call from `run`'s loop has already had the chance to.
+fn gpu_blend_due(
+    state: &mut State,
+    capture_slot: usize,
+    dmabuf_proxy: Option<&ZwpLinuxDmabufV1>,
+    handle: &QueueHandle<State>,
+) -> Vec<Due> {
+    if let Some(dmabuf_proxy) = dmabuf_proxy {
+        for index in 0..state.presenters.len() {
+            ensure_gpu_present_buffers(state, dmabuf_proxy, handle, index);
+        }
+    }
+
+    let State {
+        capture,
+        presenters,
+        free_run,
+        stats,
+        gpu,
+        ..
+    } = state;
+    let Some((canvas_image, _)) = capture.gpu_images.get(capture_slot) else {
+        for presenter in presenters.iter_mut() {
+            presenter.stale = false;
+        }
+        return Vec::new();
+    };
+    let y_invert = capture.y_invert;
+
+    let mut due = Vec::new();
+    for (index, presenter) in presenters.iter_mut().enumerate() {
+        let was_stale = presenter.stale;
+        if presenter.configured.is_none() || !was_stale {
+            presenter.stale = false;
+            continue;
+        }
+        let ready = !presenter.frame_pending || presenter.stalled;
+        if *free_run && !ready {
+            // Left `stale` — see the doc above.
+            continue;
+        }
+        presenter.stale = false;
+        let len = presenter.gpu_buffers.len();
+        if len == 0 {
+            continue;
+        }
+        let slot = (0..len)
+            .map(|step| (presenter.next_buffer + step) % len)
+            .find(|&candidate| !presenter.busy[candidate])
+            .unwrap_or_else(|| {
+                stats.buffer_reuse += 1;
+                presenter.next_buffer % len
+            });
+        presenter.next_buffer = (slot + 1) % len;
+        presenter.busy[slot] = true;
+        due.push(Due { index, slot });
+    }
+    if due.is_empty() {
+        return due;
+    }
+
+    let jobs: Vec<gpu::BlendJob<'_>> = due
+        .iter()
+        .map(|d| {
+            let presenter = &presenters[d.index];
+            let (_, image) = &presenter.gpu_buffers[d.slot];
+            gpu::BlendJob {
+                target: image,
+                output: d.index,
+                source_x: presenter.source.x.max(0) as u32,
+                source_y: presenter.source.y.max(0) as u32,
+            }
+        })
+        .collect();
+
+    let gpu = gpu
+        .as_mut()
+        .expect("Backend::Gpu implies state.gpu is Some");
+    match gpu.blend(canvas_image, y_invert, &jobs) {
+        Ok(duration) => {
+            stats.gpu += duration;
+            capture.last_blended_slot = Some(capture_slot);
+            due
+        }
+        Err(error) => {
+            eprintln!("slicer: gpu.blend failed: {error:#}");
+            for d in &due {
+                presenters[d.index].busy[d.slot] = false;
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// GPU path, present phase: attach each blended image, damage, request the
+/// frame callback, ask for presentation feedback, and commit — the same
+/// per-presenter tail `present_frame_cpu` ends with, just reading the GPU
+/// buffer/image `gpu_blend_due` just wrote instead of a `MmapMut`.
+fn gpu_present_due(state: &mut State, handle: &QueueHandle<State>, due: &[Due]) {
+    let State {
+        presenters,
+        timing,
+        presentation,
+        stats,
+        ..
+    } = state;
+    let snapshot_id = timing.snapshot_id;
+    let mut committed_any = false;
+    for d in due {
+        let presenter = &mut presenters[d.index];
+        let (buffer, image) = &presenter.gpu_buffers[d.slot];
+        let (width, height) = (image.width, image.height);
+        presenter.surface.attach(Some(buffer), 0, 0);
+        presenter
+            .surface
+            .damage_buffer(0, 0, width as i32, height as i32);
+        // Requested before `commit`, per wl_surface.frame: the callback
+        // fires no earlier than the *next* commit's contents are shown, so
+        // asking after commit would describe the wrong frame.
+        presenter.surface.frame(handle, d.index);
+        presenter.frame_pending = true;
+        presenter.pending_since = Some(Instant::now());
+        if let Some(presentation) = presentation.as_ref() {
+            timing.request(snapshot_id, d.index);
+            presentation.feedback(&presenter.surface, handle, (d.index, snapshot_id));
+        }
+        presenter.surface.commit();
+        committed_any = true;
+    }
+    if committed_any {
+        stats.presented += 1;
+    }
+}
+
 /// Cut the captured canvas into slices, apply each column's transfer, and
 /// commit whichever presenters the gating policy says are due a frame.
 ///
@@ -1014,8 +2096,9 @@ fn ensure_capture_buffer(
 /// the whole point being that no output can show a newer frame than its
 /// neighbours. Free-run commits presenter by presenter as each becomes
 /// ready, which is exactly what makes a wall that cannot share a rate keep
-/// moving at all.
-fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
+/// moving at all. CPU path only — see `present_frame_gpu` for the GPU path's
+/// equivalent.
+fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
     // Split-borrow: the canvas is read while presenter buffers are written,
     // and the presentation bookkeeping is independent of both.
     let State {
@@ -1302,13 +2385,32 @@ impl Dispatch<WlOutput, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_output::Event::Name { name } = event {
-            for (candidate, stored) in &mut state.outputs {
-                if candidate == output {
-                    *stored = Some(name);
-                    break;
+        match event {
+            wl_output::Event::Name { name } => {
+                for (candidate, stored, _) in &mut state.outputs {
+                    if candidate == output {
+                        *stored = Some(name);
+                        break;
+                    }
                 }
             }
+            wl_output::Event::Mode { flags, refresh, .. } => {
+                // Only the current mode — a compositor may still advertise
+                // deprecated non-current ones (see wl_output's own doc).
+                let current = flags
+                    .into_result()
+                    .map(|f| f.contains(wl_output::Mode::Current))
+                    .unwrap_or(false);
+                if current {
+                    for (candidate, _, stored_refresh) in &mut state.outputs {
+                        if candidate == output {
+                            *stored_refresh = Some(refresh);
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -1363,6 +2465,13 @@ impl Dispatch<ZwlrScreencopyFrameV1, ()> for State {
                 };
                 state.capture.offered = Some((raw, width, height, stride));
             }
+            zwlr_screencopy_frame_v1::Event::LinuxDmabuf {
+                format,
+                width,
+                height,
+            } => {
+                state.capture.dmabuf_offer = Some((format, width, height));
+            }
             zwlr_screencopy_frame_v1::Event::BufferDone => state.capture.buffer_done = true,
             zwlr_screencopy_frame_v1::Event::Flags { flags } => {
                 state.capture.y_invert = flags
@@ -1400,9 +2509,11 @@ impl Dispatch<WlCallback, usize> for State {
     }
 }
 
-/// Presenter buffers only — the capture buffer keeps the `()` behaviour
-/// below via `delegate_noop!`, since nothing needs to know which capture
-/// buffer was released (there is only ever one in play).
+/// Presenter buffers only — every capture buffer (both GPU-path capture
+/// images and the shm capture buffer) keeps the `()` behaviour below via
+/// `delegate_noop!`: nothing needs to know which one a `wl_buffer.release`
+/// belongs to, since a capture buffer's readiness is learned from
+/// screencopy's own `Ready`/`Failed` events, not from `wl_buffer.release`.
 impl Dispatch<WlBuffer, (usize, usize)> for State {
     fn event(
         state: &mut Self,
@@ -1473,6 +2584,43 @@ impl Dispatch<WpPresentationFeedback, (usize, u64)> for State {
     }
 }
 
+/// The only place `zwp_linux_dmabuf_feedback_v1`'s events land — forwarded
+/// into whichever `dmabuf::FeedbackCollector` `negotiate_gpu` is currently
+/// running (`None` once that call has already taken it and moved on, in
+/// which case a late event is simply dropped: harmless, since the decision
+/// this feedback informs is made once and not revisited).
+impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwpLinuxDmabufFeedbackV1,
+        event: zwp_linux_dmabuf_feedback_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let Some(feedback) = state.dmabuf_feedback.as_mut() else {
+            return;
+        };
+        match event {
+            zwp_linux_dmabuf_feedback_v1::Event::MainDevice { device } => {
+                feedback.main_device(&device);
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::FormatTable { fd, size } => {
+                feedback.format_table(fd, size);
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheTargetDevice { device } => {
+                feedback.tranche_target_device(&device);
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
+                feedback.tranche_formats(&indices);
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheDone => feedback.tranche_done(),
+            zwp_linux_dmabuf_feedback_v1::Event::Done => feedback.done(),
+            _ => {}
+        }
+    }
+}
+
 delegate_noop!(State: WlCompositor);
 delegate_noop!(State: WlShmPool);
 delegate_noop!(State: WlRegion);
@@ -1481,6 +2629,15 @@ delegate_noop!(State: ZwlrScreencopyManagerV1);
 delegate_noop!(State: ignore WlShm);
 delegate_noop!(State: ignore WlBuffer);
 delegate_noop!(State: ignore WlSurface);
+// The deprecated-since-4 `format`/`modifier` events are the only ones this
+// interface itself can send, and a compositor must not send them once we
+// bind version 4 (see the protocol doc) — nothing to react to either way.
+delegate_noop!(State: ignore ZwpLinuxDmabufV1);
+// `create_params` objects are always finished with `create_immed`, which
+// sends no event of its own on success (see `dmabuf.rs`'s doc on
+// `dmabuf_wl_buffer`) — `created`/`failed` only fire for the non-immediate
+// `create` request, which this module never uses.
+delegate_noop!(State: ignore ZwpLinuxBufferParamsV1);
 
 #[cfg(test)]
 mod tests {
@@ -1642,5 +2799,77 @@ mod tests {
         let settled = settle(&[presented(1000, 60.0)]);
         assert_eq!(settled.offset_ns, None);
         assert!(!settled.straddle);
+    }
+
+    // --- per-output vblank phase ----------------------------------------
+
+    /// 60 Hz's refresh period as `presented()` above rounds it, ns.
+    const REFRESH_60HZ_NS: i64 = 16_666_667;
+
+    #[test]
+    fn reduce_phase_keeps_a_value_already_within_half_a_period() {
+        assert_eq!(reduce_phase(3_000_000, REFRESH_60HZ_NS), 3_000_000);
+    }
+
+    #[test]
+    fn reduce_phase_wraps_a_value_past_half_a_period() {
+        // 15 ms is on the far side of half a 60 Hz period (8.33 ms), so the
+        // representative closer to zero is one period earlier: -1.67 ms.
+        let reduced = reduce_phase(15_000_000, REFRESH_60HZ_NS);
+        assert!(
+            (reduced as f64 / 1_000_000.0 - (-1.666_667)).abs() < 0.001,
+            "got {reduced} ns"
+        );
+    }
+
+    #[test]
+    fn circular_mean_of_a_symmetric_pair_does_not_cancel_to_zero() {
+        let period_ns = REFRESH_60HZ_NS as u32;
+        let mut accum = PhaseAccum::default();
+        accum.add(reduce_phase(8_000_000, REFRESH_60HZ_NS), period_ns);
+        accum.add(reduce_phase(-8_000_000, REFRESH_60HZ_NS), period_ns);
+        let phase = accum.phase_ms().expect("two samples were added");
+        // A plain mean of +8.0 and -8.0 would report 0.0 ms - dead in phase.
+        // The pair actually sits right at the wrap boundary, on the far edge
+        // from zero, so the circular mean must land near +-8.33 ms instead.
+        assert!(
+            (phase.abs() - 8.333).abs() < 0.05,
+            "wrap-around pair averaged to {phase} ms, not +-8.33 ms"
+        );
+    }
+
+    #[test]
+    fn a_consistent_offset_over_many_frames_reports_cleanly() {
+        let period_ns = REFRESH_60HZ_NS as u32;
+        let mut accum = PhaseAccum::default();
+        for _ in 0..100 {
+            accum.add(reduce_phase(5_000_000, REFRESH_60HZ_NS), period_ns);
+        }
+        let phase = accum.phase_ms().expect("100 samples were added");
+        assert!((phase - 5.0).abs() < 0.01, "got {phase} ms");
+        assert_eq!(accum.spread_ms(), Some(0.0));
+    }
+
+    #[test]
+    fn an_accumulator_with_no_samples_reports_nothing() {
+        let accum = PhaseAccum::default();
+        assert_eq!(accum.phase_ms(), None);
+        assert_eq!(accum.spread_ms(), None);
+    }
+
+    #[test]
+    fn settle_reports_phase_relative_to_output_zero() {
+        let settled = settle(&[presented(1000, 60.0), presented(1003, 60.0)]);
+        assert_eq!(
+            settled.phase_samples,
+            vec![(1, 3_000_000, REFRESH_60HZ_NS as u32)]
+        );
+    }
+
+    #[test]
+    fn settle_has_no_phase_samples_when_output_zero_did_not_present() {
+        // Only presenter 1 presented; there is nothing to measure it against.
+        let settled = settle(&[Slot::Discarded, presented(1003, 60.0)]);
+        assert!(settled.phase_samples.is_empty());
     }
 }

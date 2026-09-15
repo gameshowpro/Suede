@@ -380,6 +380,39 @@
         ],
         "type": "object"
       },
+      "CaptureIntervals": {
+        "description": "How many canvas periods elapsed between one capture reaching the slicer\nand the previous one, bucketed over the reporting interval. A period is\n`1000 / canvas refresh` when the canvas output reports one, else the\n16.667 ms of an assumed 60 Hz. A healthy capture loop that keeps up with\nevery canvas frame counts almost entirely in `one`; a loop that can only\nmanage every second frame (the four-projector rig's CPU path before the\nGPU one existed — see `crate::projection::gpu`'s module doc) counts\nalmost entirely in `two`.",
+        "properties": {
+          "more": {
+            "description": "More than 3.5 periods since the previous capture.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "one": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "three": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "two": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "one",
+          "two",
+          "three",
+          "more"
+        ],
+        "type": "object"
+      },
       "Check": {
         "description": "An environment health check, as served by `GET /system/checks`.",
         "properties": {
@@ -632,6 +665,11 @@
             "format": "double",
             "type": "number"
           },
+          "gpu": {
+            "description": "GPU fence wait per frame — see `crate::projection::gpu::Gpu::blend`.\nZero on the CPU path, which never waits on a fence.",
+            "format": "double",
+            "type": "number"
+          },
           "requesting": {
             "format": "double",
             "type": "number"
@@ -649,7 +687,8 @@
           "waiting",
           "snapshot",
           "requesting",
-          "blending"
+          "blending",
+          "gpu"
         ],
         "type": "object"
       },
@@ -1102,6 +1141,22 @@
           "name": {
             "type": "string"
           },
+          "phaseMs": {
+            "description": "This output's vblank phase relative to the first output, in ms, within\nhalf a refresh period either side. Stable across intervals means the\nheads are locked at a fixed offset; wandering means independent clocks.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "phaseSpreadMs": {
+            "description": "The spread of that phase within the interval (max − min of the\nper-frame value), ms. Near zero means locked; near a period means drifting.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "presented": {
             "format": "int32",
             "minimum": 0,
@@ -1275,6 +1330,15 @@
             "format": "double",
             "type": "number"
           },
+          "renderer": {
+            "default": "auto",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Renderer",
+                "description": "Which pipeline the slicer composites with; see [`Renderer`]."
+              }
+            ]
+          },
           "testPattern": {
             "default": null,
             "oneOf": [
@@ -1297,6 +1361,10 @@
             "description": "Canvas frames captured per second.",
             "format": "double",
             "type": "number"
+          },
+          "captureIntervals": {
+            "$ref": "#/components/schemas/CaptureIntervals",
+            "description": "How many canvas periods elapsed between successive captures reaching\nthe slicer, bucketed. Says directly whether the capture loop is\nkeeping up with every canvas frame or only every second one."
           },
           "framesSuperseded": {
             "description": "Captured frames replaced by a newer one before any output showed them.",
@@ -1347,6 +1415,10 @@
             "format": "double",
             "type": "number"
           },
+          "renderer": {
+            "description": "Which backend this interval's frames were blended on: `\"cpu\"` or `\"gpu\"`.",
+            "type": "string"
+          },
           "stalls": {
             "description": "Times an output stopped answering frame callbacks and was dropped from the gate.",
             "format": "int32",
@@ -1371,6 +1443,8 @@
           "perFrameMs",
           "presentationFeedback",
           "straddles",
+          "renderer",
+          "captureIntervals",
           "outputs"
         ],
         "type": "object"
@@ -1445,6 +1519,15 @@
           "height"
         ],
         "type": "object"
+      },
+      "Renderer": {
+        "description": "Which pipeline the slicer uses to composite the canvas onto each output.\n\n`Auto` (the default) prefers the GPU path — the compositor blits the\ncanvas into a Vulkan image exported as a dmabuf, a fragment shader blends\nit straight into each output's own dmabuf, and no pixel ever crosses to\nsystem memory — falling back to the CPU path (shared-memory screencopy,\nblended on the CPU) whenever the compositor does not offer dmabuf capture\nor Vulkan fails to initialise. `Cpu` forces the fallback path even on\nhardware that could do better. `Gpu` forces the GPU path and is a startup\nerror if the machine cannot actually provide it — the slicer exits and\nthe daemon respawns it on its next reconcile, rather than silently\nrunning the slower path — for a rig where that would go unnoticed.",
+        "enum": [
+          "auto",
+          "cpu",
+          "gpu"
+        ],
+        "type": "string"
       },
       "RestartPolicy": {
         "additionalProperties": false,

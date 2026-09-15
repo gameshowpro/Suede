@@ -243,8 +243,26 @@ impl Reconciler {
         };
         divergences.extend(output_plan.divergences.iter().cloned());
 
-        for command in &output_plan.commands {
-            if let Err(error) = self.sway.run_command(command).await {
+        // Sent as one sway IPC message, not one `run_command` per line: on a
+        // four-projector NVIDIA rig (RTX A1000, sway 1.10.1, 2026-09-15),
+        // outputs enabled one command at a time left the first head 7.1 ms
+        // out of phase with the other three, which locked to each other —
+        // about 145 straddled frames (shown on different refreshes) per 330
+        // captured. The same four, disabled then re-enabled together in one
+        // sway command, landed within 0.03 ms of each other — about 20
+        // straddles per 330 at the same rate. A mode-set delivered in one
+        // IPC message is applied by sway in one backend commit, which is
+        // what keeps the heads on the same clock; issuing it one command at
+        // a time, as this loop did before, is precisely the case that
+        // measured 2-7 ms out of phase. This also makes the very first
+        // application after the daemon starts batched, since every pass
+        // goes through here.
+        for (command, result) in output_plan
+            .commands
+            .iter()
+            .zip(self.sway.run_commands(&output_plan.commands).await)
+        {
+            if let Err(error) = result {
                 tracing::warn!(%command, %error, "output command failed");
                 divergences.push(Divergence::new(
                     "command_failed",
@@ -454,7 +472,7 @@ impl Reconciler {
                             ),
                             None => format!("output {name} mode --custom {width}x{height}"),
                         };
-                        for command in [
+                        let canvas_commands = vec![
                             format!("output {name} enable"),
                             mode_command,
                             // An implicit scale would make the canvas's pixel
@@ -462,8 +480,15 @@ impl Reconciler {
                             // slicer cuts pixels, not logical units.
                             format!("output {name} scale 1"),
                             format!("output {name} pos 0 20000"),
-                        ] {
-                            if let Err(error) = self.sway.run_command(&command).await {
+                        ];
+                        // One output, but batching costs nothing here and
+                        // keeps this in step with the same one-commit
+                        // reasoning as the output plan above.
+                        for (command, result) in canvas_commands
+                            .iter()
+                            .zip(self.sway.run_commands(&canvas_commands).await)
+                        {
+                            if let Err(error) = result {
                                 divergences.push(Divergence::new(
                                     "command_failed",
                                     command.clone(),
@@ -501,6 +526,7 @@ impl Reconciler {
                             black_lift: projection.black_lift,
                             pattern: projection.test_pattern,
                             free_run: projection.free_run,
+                            renderer: projection.renderer,
                             slices: plan.slices,
                         });
                     }

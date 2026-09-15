@@ -349,6 +349,12 @@ window.addEventListener("error", (event) => {
           <input id="pj-lift" type="number" step="0.01" min="0" max="0.5" value="0"></div>
         <div><label for="pj-free">Free-run displays</label>
           <input type="checkbox" role="switch" class="switch" id="pj-free"></div>
+        <div><label for="pj-renderer">Renderer</label>
+          <select id="pj-renderer">
+            <option value="auto">Auto</option>
+            <option value="cpu">CPU</option>
+            <option value="gpu">GPU</option>
+          </select></div>
       </div>
       <p class="hint">Gamma shapes the fall-off — the projectors' transfer
         curve, usually 2.2. If seams glow on dark scenes (projector black is
@@ -359,6 +365,11 @@ window.addEventListener("error", (event) => {
         takes the newest frame as soon as it is ready — only for displays
         that cannot be made to share a refresh rate, and the wall stops being
         in step.</p>
+      <p class="hint">Auto blends on the GPU when the compositor and driver
+        support it, and falls back to the CPU otherwise — the slicer logs
+        which it picked and why. CPU always uses the fallback path. GPU
+        forces the GPU path and refuses to start if it is unavailable,
+        rather than silently running slower.</p>
       <div class="row" style="margin-top:10px">
         <button class="action" id="pj-save">Save</button>
         <button class="action ghost" id="pj-cancel">Cancel</button>
@@ -368,7 +379,7 @@ window.addEventListener("error", (event) => {
         <h3 style="margin:0 0 8px">Frame timing</h3>
         <table><tbody id="pj-timing-rows"></tbody></table>
         <table style="margin-top:8px"><thead><tr>
-          <th>Output</th><th>Presented</th><th>Discarded</th><th>Refresh</th>
+          <th>Output</th><th>Presented</th><th>Discarded</th><th>Refresh</th><th>Phase</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
         <p class="hint">Measured by the slicer over each 10 s interval from
           the compositor's presentation timestamps. Offset is how far apart
@@ -1626,7 +1637,7 @@ function paintCapabilities(r) {
 // plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
   const idle = overlaps === 0;
-  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-save"]) {
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-renderer", "pj-save"]) {
     $(id).disabled = idle;
   }
   $("pj-idle").hidden = !idle;
@@ -1650,6 +1661,7 @@ function renderProjection() {
   $("pj-gamma").value = projection?.gamma ?? 2.2;
   $("pj-lift").value = projection?.blackLift ?? 0;
   $("pj-free").checked = projection?.freeRun ?? false;
+  $("pj-renderer").value = projection?.renderer ?? "auto";
 }
 
 function projectionFromForm() {
@@ -1657,10 +1669,12 @@ function projectionFromForm() {
   const gamma = Number($("pj-gamma").value) || 2.2;
   const blackLift = Number($("pj-lift").value) || 0;
   const freeRun = $("pj-free").checked;
+  const renderer = $("pj-renderer").value || "auto";
   const testPattern = $("tp-pattern").value || null;
-  // Off with default values: remove the section entirely.
-  return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern && !freeRun)
-    ? null : { blend, gamma, blackLift, freeRun, testPattern };
+  // Off with default values: remove the section entirely. "auto" is the
+  // renderer's default, exactly like the other fields here.
+  return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern && !freeRun && renderer === "auto")
+    ? null : { blend, gamma, blackLift, freeRun, renderer, testPattern };
 }
 
 // --- frame timing ----------------------------------------------------------
@@ -1677,9 +1691,23 @@ function renderProjectionTiming() {
   const offset = s.offsetMs
     ? `mean ${num(s.offsetMs.mean)} ms, max ${num(s.offsetMs.max)} ms`
     : "not measured";
+  // "598 every frame, 2 every 2nd, ..." — only intervals that actually
+  // occurred are listed, so a healthy GPU-path wall reads as one clause
+  // instead of four, most of them zero.
+  const ci = s.captureIntervals;
+  const cadenceParts = [
+    [ci.one, "every frame"],
+    [ci.two, "every 2nd"],
+    [ci.three, "every 3rd"],
+    [ci.more, "later"],
+  ].filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`);
+  const cadence = cadenceParts.length ? cadenceParts.join(", ") : "—";
+
   const rows = [
     ["Canvas", `${num(s.canvasFps)} fps captured, ${num(s.presentedFps)} presented`],
     ["Mode", s.freeRun ? "free-run" : "locked"],
+    ["Renderer", s.renderer],
+    ["Capture cadence", cadence],
     ["Offset between displays", offset +
       (s.presentationFeedback ? "" : " (no presentation feedback from the compositor)")],
     ["Straddles", flagged(s.straddles)],
@@ -1688,7 +1716,8 @@ function renderProjectionTiming() {
     ["Per frame", `waiting ${num(s.perFrameMs.waiting)} ms · ` +
       `snapshot ${num(s.perFrameMs.snapshot)} ms · ` +
       `request ${num(s.perFrameMs.requesting)} ms · ` +
-      `blend ${num(s.perFrameMs.blending)} ms`],
+      `blend ${num(s.perFrameMs.blending)} ms` +
+      (s.perFrameMs.gpu > 0 ? ` · gpu ${num(s.perFrameMs.gpu)} ms` : "")],
     ["Measured at", new Date(s.measuredAt * 1000).toLocaleTimeString()],
   ];
   $("pj-timing-rows").innerHTML = rows
@@ -1697,12 +1726,17 @@ function renderProjectionTiming() {
   // Trimmed like format_refresh on the daemon side: 3 decimals, no trailing
   // zeros, so 60 Hz reads as "60" rather than "60.000".
   const trimHz = (value) => value == null ? "—" : hz(value);
+  // Half the interval's spread, alongside the circular-mean phase itself —
+  // see OutputTiming.phaseMs/phaseSpreadMs on the daemon side.
+  const phaseCell = (o) => o.phaseMs == null ? "—" :
+    `${o.phaseMs > 0 ? "+" : ""}${num(o.phaseMs)} ms ± ${num(o.phaseSpreadMs / 2)}`;
   $("pj-timing-outputs").innerHTML = s.outputs.map((o) =>
     `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
-    `<td>${o.discarded}</td><td class="mono">${trimHz(o.refreshHz)}</td></tr>`).join("");
+    `<td>${o.discarded}</td><td class="mono">${trimHz(o.refreshHz)}</td>` +
+    `<td class="mono">${phaseCell(o)}</td></tr>`).join("");
 }
 
-for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "tp-pattern"]) {
+for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-renderer", "tp-pattern"]) {
   $(id).addEventListener("input", () => {
     // Silently, not with a toast: a restored form value is not a user asking
     // for anything, and a complaint about it would be the same noise in a
@@ -1723,9 +1757,9 @@ $("pj-save").onclick = () => run(async () => {
   // call, and the pattern is presented as a live diagnostic rather than a
   // setting — so committing here also takes it down.
   if (config.projection?.testPattern) {
-    const { blend, gamma, blackLift, freeRun } = config.projection;
-    config.projection = (!blend && gamma === 2.2 && blackLift === 0 && !freeRun)
-      ? null : { blend, gamma, blackLift, freeRun, testPattern: null };
+    const { blend, gamma, blackLift, freeRun, renderer } = config.projection;
+    config.projection = (!blend && gamma === 2.2 && blackLift === 0 && !freeRun && renderer === "auto")
+      ? null : { blend, gamma, blackLift, freeRun, renderer, testPattern: null };
   }
   clearTimeout(previewTimer);
   await saveCommitted();
