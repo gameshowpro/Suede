@@ -49,6 +49,10 @@ pub struct ApiState {
     pub wallpapers: Arc<crate::wallpapers::WallpaperStore>,
     pub capabilities: Arc<capabilities::CapabilityChecks>,
     pub capability_store: Arc<crate::capabilities::CapabilityStore>,
+    /// Runs `POST /system/power`'s permitted verb. A trait object, like
+    /// [`SwayClient`] and [`AudioMonitor`], so tests never have to shell out
+    /// to a real `systemctl`.
+    pub power: Arc<dyn observed::PowerControl>,
     pub started_at: Instant,
 }
 
@@ -128,6 +132,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/system", get(observed::get_system))
         .route("/system/checks", get(observed::list_checks))
         .route("/system/checks/{id}/fix", post(observed::fix_check))
+        .route("/system/power", post(observed::power))
         // Applications.
         .route("/apps", get(apps::list_apps))
         .route("/apps/preview", post(apps::preview_app))
@@ -312,15 +317,24 @@ pub mod test_support {
         pub router: Router,
         pub sway: Arc<MockSway>,
         pub audio: Arc<MockAudio>,
+        pub power: Arc<observed::power_mock::MockPower>,
         pub _dir: tempfile::TempDir,
     }
 
     /// A fully wired API backed by mocks, with no background tasks running.
     pub fn harness(token: Option<&str>) -> Harness {
+        harness_with_power(token, &[])
+    }
+
+    /// Like [`harness`], but with `bootstrap.power` set to `verbs` — the
+    /// `POST /system/power` tests need every permission combination from
+    /// empty (the default) to fully permitted.
+    pub fn harness_with_power(token: Option<&str>, verbs: &[crate::model::PowerVerb]) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let bootstrap = Arc::new(BootstrapConfig {
             token: token.map(str::to_string),
             state_dir: dir.path().to_path_buf(),
+            power: verbs.to_vec(),
             ..BootstrapConfig::default()
         });
         let sway = Arc::new(MockSway::with_fixtures());
@@ -339,6 +353,10 @@ pub mod test_support {
                 log_root: dir.path().join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
             },
+            // Unrestricted: API-level tests exercise the app lifecycle
+            // endpoints, not the allowlist, and launch stand-in commands a
+            // real appliance's browser-only default would refuse.
+            vec!["*".to_string()],
         ));
         let reconciler = Arc::new(Reconciler::new(ReconcilerDeps {
             sway: sway.clone(),
@@ -363,6 +381,8 @@ pub mod test_support {
             trigger.clone(),
         ));
 
+        let power = Arc::new(observed::power_mock::MockPower::default());
+
         let state = ApiState {
             bootstrap,
             store,
@@ -377,6 +397,7 @@ pub mod test_support {
             wallpapers,
             capabilities: Arc::new(capabilities::CapabilityChecks::default()),
             capability_store,
+            power: power.clone(),
             started_at: Instant::now(),
         };
 
@@ -385,6 +406,7 @@ pub mod test_support {
             state,
             sway,
             audio,
+            power,
             _dir: dir,
         }
     }

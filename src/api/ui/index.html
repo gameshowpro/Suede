@@ -595,13 +595,36 @@ window.addEventListener("error", (event) => {
 
   <!-- System -->
   <section id="tab-system" class="hidden">
-    <div class="panel"><h2>System</h2><table id="system"><tbody></tbody></table></div>
+    <div class="panel">
+      <h2>System</h2>
+      <table id="system"><tbody></tbody></table>
+      <div class="row" style="margin-top:14px">
+        <button class="action ghost" id="power-reboot">Restart this machine</button>
+        <button class="action ghost" id="power-poweroff">Shut down this machine</button>
+        <span class="hint" id="power-note"></span>
+      </div>
+    </div>
     <div class="panel">
       <h2>Health checks</h2>
       <p class="hint">Anything not passing also appears at the top of every tab,
         with its documentation and any fix Suede can apply itself.</p>
       <div id="checks"></div>
     </div>
+
+    <!-- Both power actions are destructive and one of them can need a hand on
+         the machine itself, so neither button fires on the first click: this
+         reuses the native-dialog confirm pattern from the app editor, with
+         its wording swapped in for whichever verb was clicked. -->
+    <dialog id="power-dialog" aria-labelledby="power-heading">
+      <div class="dialog-body">
+        <h2 id="power-heading">—</h2>
+        <p id="power-detail"></p>
+      </div>
+      <div class="dialog-foot">
+        <button class="action ghost" id="power-cancel" autofocus>Cancel</button>
+        <button class="action danger" id="power-go">—</button>
+      </div>
+    </dialog>
   </section>
 
   <!-- Raw config -->
@@ -639,6 +662,9 @@ const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
 let outputs = [], config = null, apps = [], sinks = [], checks = [], status = null,
     wallpapers = [], selected = null, editingApp = null, editingBackground = null,
+    // The last GET /system response, kept so the power dialog (opened well
+    // after renderSystem returns) can still read the hostname and verbs.
+    systemInfo = null,
     // The graphics card's connectors, including those with nothing attached.
     ports = [],
     // What the slicer measured over its last reporting interval; null when no
@@ -2083,6 +2109,7 @@ function renderStatus() {
 }
 
 function renderSystem(system) {
+  systemInfo = system;
   $("version").textContent = "v" + system.suedeVersion;
   const rows = [
     ["Sway", system.swayVersion ?? "not detected"],
@@ -2093,7 +2120,107 @@ function renderSystem(system) {
   ];
   document.querySelector("#system tbody").innerHTML = rows
     .map(([k, v]) => `<tr><th>${escape(k)}</th><td class="mono">${escape(v)}</td></tr>`).join("");
+  renderPower(system);
 }
+
+// --- power: restart or shut down the host machine -------------------------
+//
+// `powerVerbs` lists what this appliance is configured to allow — often
+// empty, since permitting either one is opt-in. The buttons stay visible but
+// disabled rather than hidden even then, because a control an operator never
+// sees is a control they never learn exists; the tooltip and the note beside
+// it both name the missing config key, not just "not allowed".
+const POWER_INFO = {
+  reboot: {
+    label: "Restart",
+    inFlight: "Restarting…",
+    tooltip: "Reboots this machine now. Every display goes dark until it comes back.",
+    consequence: (host) => `Every display on ${host} goes dark and the machine restarts. ` +
+      "This page will reconnect on its own once it comes back up.",
+  },
+  poweroff: {
+    label: "Shut down",
+    inFlight: "Shutting down…",
+    tooltip: "Shuts this machine down now. It will not come back without someone " +
+      "physically turning it on, unless it is configured to wake some other way.",
+    consequence: (host) => `${host} powers off completely. It will not come back on its ` +
+      "own — someone will need to physically turn it on again, unless it is configured " +
+      "to wake some other way.",
+  },
+};
+
+function renderPower(system) {
+  const verbs = system.powerVerbs ?? [];
+  const host = system.hostname ?? null;
+  for (const verb of ["reboot", "poweroff"]) {
+    const button = $("power-" + verb);
+    const permitted = verbs.includes(verb);
+    button.disabled = !host || !permitted;
+    button.title = !host
+      ? `${POWER_INFO[verb].label} is unavailable: this appliance reported no hostname to confirm with.`
+      : permitted
+      ? POWER_INFO[verb].tooltip
+      : `Not enabled on this appliance. Add "${verb}" to power in suede.toml and restart the daemon.`;
+  }
+  $("power-note").textContent = !host
+    ? "Power control is unavailable: this appliance reported no hostname, so the request cannot be confirmed."
+    : verbs.length === 0
+    ? "Power control is disabled in this appliance's configuration file."
+    : "";
+}
+
+function openPowerDialog(verb) {
+  const host = systemInfo?.hostname;
+  if (!host) return; // the button is disabled in this case; guard anyway
+  const info = POWER_INFO[verb];
+  $("power-heading").textContent = `${info.label} ${host}?`;
+  $("power-detail").textContent = info.consequence(host);
+  const go = $("power-go");
+  go.disabled = false;
+  go.textContent = `${info.label} now`;
+  go.onclick = () => confirmPower(verb, host);
+  $("power-dialog").showModal();
+}
+
+async function confirmPower(verb, host) {
+  const go = $("power-go");
+  go.disabled = true;
+  go.textContent = POWER_INFO[verb].inFlight;
+  try {
+    const result = await api("/system/power", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ verb, confirm: host }),
+    });
+    $("power-dialog").close();
+    // Success means the machine is on its way down: no toast, and nothing
+    // else on the page matters until it is back. The offline overlay reads
+    // the loss of the event stream as expected rather than as a fault.
+    if (verb === "poweroff") {
+      // It will not reconnect on its own, so the automatic backoff is turned
+      // off rather than left to relabel this message as a transient drop.
+      clearTimeout(retryTimer); clearInterval(countdownTimer);
+      if (stream) { stream.close(); stream = null; }
+      showOffline(true, result.detail || `${host} is shutting down.`,
+        "It will not come back on its own — turn it back on at the machine when it is time.");
+    } else {
+      // Letting the existing backoff keep trying is exactly right here: the
+      // stream will error out shortly and scheduleReconnect takes it from
+      // there, counting attempts until the machine answers again.
+      showOffline(false, result.detail || `${host} is restarting.`,
+        "This page will reconnect here on its own once it comes back up.");
+    }
+  } catch (error) {
+    go.disabled = false;
+    go.textContent = `${POWER_INFO[verb].label} now`;
+    toast(error.message, true);
+  }
+}
+
+$("power-reboot").onclick = () => openPowerDialog("reboot");
+$("power-poweroff").onclick = () => openPowerDialog("poweroff");
+$("power-cancel").onclick = () => $("power-dialog").close();
+// Esc closes a native dialog by itself, same as the app editor's.
 
 function renderChecks() {
   const container = $("checks");

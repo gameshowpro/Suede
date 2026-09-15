@@ -132,8 +132,7 @@
   ],
   "settings": {
     "hideCursor": true,
-    "outputPollIntervalSeconds": 5,
-    "allowRawSwayCommands": false
+    "outputPollIntervalSeconds": 5
   },
   "activeApp": "renderer-1",
   "committed": true

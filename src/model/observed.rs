@@ -301,6 +301,7 @@ impl Divergence {
         "app_crash_looping",
         "app_halted",
         "app_output_disabled",
+        "app_program_not_allowed",
         "audio_sink_not_present",
         "null_sink_unavailable",
         "wallpaper_not_found",
@@ -322,6 +323,7 @@ impl Divergence {
             | "app_output_disabled"
             | "app_crash_looping"
             | "app_halted" => "troubleshooting/#a-browser-will-not-start",
+            "app_program_not_allowed" => "troubleshooting/#program-not-allowed",
             "audio_sink_not_present" | "null_sink_unavailable" => {
                 "troubleshooting/#audio-goes-to-the-wrong-place-or-nowhere"
             }
@@ -376,6 +378,48 @@ pub struct SystemInfo {
     pub supports_tearing: bool,
     /// True when the reference web UI is being served.
     pub web_ui_enabled: bool,
+    /// Host power operations this appliance permits. Empty means none; the web
+    /// UI uses it to disable and explain its buttons rather than offering ones
+    /// that would be refused.
+    pub power_verbs: Vec<PowerVerb>,
+}
+
+/// A host power operation Suede may be permitted to perform.
+///
+/// Lives here, not in `desired`, because `GET /system` reports it (so it
+/// needs [`ToSchema`]) and it is read by [`crate::config::BootstrapConfig`],
+/// which cannot depend on desired state without an awkward cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PowerVerb {
+    Reboot,
+    Poweroff,
+}
+
+impl PowerVerb {
+    /// Every accepted verb, in the order an error message should list them.
+    pub const ALL: &'static [PowerVerb] = &[PowerVerb::Reboot, PowerVerb::Poweroff];
+
+    /// The lowercase spelling used in TOML, `SUEDE_POWER`, and as the
+    /// `systemctl` subcommand — the three places this string travels all
+    /// happen to want exactly the same word.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Reboot => "reboot",
+            Self::Poweroff => "poweroff",
+        }
+    }
+
+    /// Parse the lowercase spelling. `None` rather than an error type of its
+    /// own: every caller that cares about a bad value wants to name it and
+    /// list [`PowerVerb::ALL`] itself, which needs the original string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "reboot" => Some(Self::Reboot),
+            "poweroff" => Some(Self::Poweroff),
+            _ => None,
+        }
+    }
 }
 
 /// Result of a single environment health check.

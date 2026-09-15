@@ -26,3 +26,25 @@ bind = "0.0.0.0:9088"
 # Base URL used to build documentation links in health checks.
 # Env: SUEDE_DOCS_BASE_URL
 docs_base_url = "https://suede.gameshow.pro/"
+
+# Host power operations this appliance may perform.  Env: SUEDE_POWER
+# (comma-separated, e.g. SUEDE_POWER=reboot,poweroff)
+#
+# Empty by default: a display appliance should not be able to turn itself
+# off because somebody found the button. This is a declaration of intent,
+# not a security boundary, and it lives here rather than in desired state
+# because desired state is writable through the very API this permission
+# would otherwise be meant to constrain. See configuration.md#host-power.
+# power = ["reboot"]
+
+# Programs applications are permitted to launch.  Env: SUEDE_ALLOWED_PROGRAMS
+# (comma-separated, e.g. SUEDE_ALLOWED_PROGRAMS=chromium,firefox)
+#
+# Defaults to the browsers Suede knows how to drive, so a stock appliance
+# runs kiosk pages and nothing else. Matching is on the program's file name,
+# so a path works the same as a bare name. `["*"]` lifts the restriction
+# entirely; an empty list permits nothing, which is a legitimate way to
+# freeze a machine. Lives here rather than in desired state for the same
+# reason `power` does: desired state is writable through the very API this
+# is meant to constrain. See configuration.md#allowed-programs.
+# allowed_programs = ["chromium", "google-chrome-stable"]

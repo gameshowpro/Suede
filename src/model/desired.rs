@@ -1045,7 +1045,12 @@ pub struct Settings {
     pub hide_cursor: bool,
     /// Backstop poll interval for output changes.
     pub output_poll_interval_seconds: u64,
-    /// Enable the raw `POST /sway/command` passthrough.
+    /// Accepted and ignored since 0.2.0; the raw-command endpoint is no
+    /// longer gated. Kept as a field, never written back, so a document
+    /// saved by an older release still loads — `Settings` refuses unknown
+    /// fields and there is no migration step. Delete it once no appliance
+    /// still holds a document that predates 0.2.0.
+    #[serde(default, skip_serializing)]
     pub allow_raw_sway_commands: bool,
     /// Measure browser decode capabilities at startup when the browser,
     /// its configuration, or the GPU driver changed since last measured.

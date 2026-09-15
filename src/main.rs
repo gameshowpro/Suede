@@ -207,6 +207,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
             // Loopback: the browsers posting heartbeats run on this machine.
             api_base: format!("http://127.0.0.1:{}/api/v1", bootstrap.bind.port()),
         },
+        bootstrap.allowed_programs.clone(),
     ));
     let wallpapers = Arc::new(suede::wallpapers::WallpaperStore::new(
         bootstrap.state_dir.join("wallpapers"),
@@ -276,6 +277,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         wallpapers,
         capabilities: std::sync::Arc::new(api::capabilities::CapabilityChecks::default()),
         capability_store,
+        power: std::sync::Arc::new(api::observed::SystemPower),
         started_at: Instant::now(),
     };
 

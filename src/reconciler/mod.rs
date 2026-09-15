@@ -1011,6 +1011,10 @@ mod tests {
                 log_root: dir.path().join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
             },
+            // Unrestricted: these tests exercise reconciliation, not the
+            // allowlist, and launch stand-ins like "sleep" that a real
+            // appliance's browser-only default would refuse.
+            vec!["*".to_string()],
         ));
         let reconciler = Arc::new(Reconciler::new(ReconcilerDeps {
             sway: sway.clone(),

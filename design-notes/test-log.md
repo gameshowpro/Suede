@@ -44,7 +44,15 @@ What to keep in mind when reading the results:
   is therefore the machine most likely to *regress* and least likely to show a
   gain — which is exactly why it has to be measured.
 - **`ampere-x86` is the reference for production.** Most outputs, biggest
-  canvas, weakest of the two NVIDIA cards.
+  canvas, weakest of the two NVIDIA cards. **Its geometry is not stable
+  across a reboot**: no output in its saved configuration names a `mode`, so
+  sway takes each display's preferred one at boot. Entry 1 was measured with
+  all four at 1920x1200 @ 59.95 and a 3840x2385 canvas; after a cold boot on
+  2026-09-15 two of them came up at 3840x2160 @ 60 instead, making a
+  5750x3345 canvas — 19.2 Mpx against 9.2, which is not a comparable
+  measurement. **Check the canvas size and the four modes before trusting a
+  number from this machine against an earlier one**, and pin the modes in its
+  configuration if it is to stay a reference.
 - **`v3d-arm` runs a different driver family** (Mesa rather than NVIDIA), so it
   catches assumptions quietly baked in against NVIDIA behaviour — it has
   already caught one. Build for it with `cross build --release --target

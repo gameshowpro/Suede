@@ -114,8 +114,9 @@ Imperative escape hatches (not persisted):
 | `POST` | `/apps/{id}/restart` | Kill and relaunch a managed app. |
 | `POST` | `/apps/{id}/heartbeat` | Watchdog heartbeat from the rendered content. Accepted from loopback connections only; no other auth. See [App watchdog](#app-watchdog-heartbeats). |
 | `POST` | `/system/checks/{id}/fix` | Run the automated remediation for a failing environment check. |
+| `POST` | `/system/power` | Reboot or power off the host. Refused (`403`) unless the verb is listed in bootstrap's `power`; requires `confirm` to repeat the machine's hostname (`400` otherwise). See [Host power control](configuration.md#host-power). |
 | `POST` | `/reconcile` | Force an immediate reconciliation pass. |
-| `POST` | `/sway/command` | Raw Sway command passthrough (`{"command": "..."}` → Sway's response array). Disabled by default; enable via settings. For debugging only. |
+| `POST` | `/sway/command` | Raw Sway command passthrough (`{"command": "..."}` → Sway's response array). Always available; for debugging only. |
 
 ### Events (SSE)
 
@@ -170,8 +171,7 @@ The desired-state document:
   ],
   "settings": {
     "hideCursor": true,                             // implemented via `seat * hide_cursor 1000` + park off-screen
-    "outputPollIntervalSeconds": 5,
-    "allowRawSwayCommands": false
+    "outputPollIntervalSeconds": 5
   }
 }
 ```
@@ -263,7 +263,8 @@ Suede depends on an environment it does not own (Sway session, browsers, PipeWir
 - **Optional static bearer token** (`Authorization: Bearer …`), set via config file or environment variable, for deployments on less-trusted networks. When a token is configured: it is required on every endpoint except `/healthz` and `/apps/{id}/heartbeat`, and **the reference web UI is disabled** — serving a UI that embeds the token would defeat it. Token mode is for machine-to-machine API clients that hold the credential properly.
 - `/apps/{id}/heartbeat` is always loopback-only and never requires the token (see [App watchdog](#app-watchdog-heartbeats)).
 - No TLS: front with a reverse proxy (Caddy, nginx) where transport security is required.
-- `/sway/command` passthrough and `exec`-kind launchers both allow arbitrary process execution as the session user; they are the same trust level as the rest of the API but `allowRawSwayCommands` defaults to off to prevent casual misuse.
+- `/sway/command` passthrough and `exec`-kind launchers both allow arbitrary process execution as the session user, at the same trust level as the rest of the API. `/sway/command` is always available and is not a privilege boundary: a client that can write configuration can already define an `exec` app that runs any program, so a flag gating only the passthrough endpoint (`allowRawSwayCommands`, retired) protected against nothing a hostile caller could not already do another way.
+- `/system/power` is bootstrap-gated (`power` in `suede.toml`, or `SUEDE_POWER`) rather than API-gated, precisely because it needs to withstand a caller who can write desired state — see [Host power control](configuration.md#host-power). Like the raw-command passthrough, it is not a boundary against a network attacker; that boundary is still the bearer token.
 
 ## Reference web UI
 
