@@ -123,10 +123,10 @@ mod tests {
             ("hideCursor", "no settings tab yet"),
             ("outputPollIntervalSeconds", "no settings tab yet"),
             ("measureCapabilitiesOnStart", "no settings tab yet"),
-            (
-                "allowRawSwayCommands",
-                "no settings tab yet; a debugging escape hatch",
-            ),
+            // allowRawSwayCommands is deliberately absent from this list: it
+            // carries `#[serde(skip_serializing)]` (see
+            // `Settings::allow_raw_sway_commands`), which drops it from the
+            // OpenAPI schema entirely, so it never reaches `fields` below.
             (
                 "policy",
                 "restart policy is not exposed; the default suits an appliance",

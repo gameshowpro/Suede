@@ -152,6 +152,26 @@ curl -s http://appliance:9088/api/v1/apps | python3 -m json.tool
 | `crashed` | The restart policy declined a relaunch |
 | `starting` | Launched, but no window has appeared yet |
 
+### The status says its program is not allowed {: #program-not-allowed }
+
+```
+app `signage` asks to launch `curl`, which is not in `allowed_programs`; add
+it to suede.toml (or SUEDE_ALLOWED_PROGRAMS) and restart the daemon, or
+change the app's launcher.
+```
+
+This is a deliberate refusal, not a fault: bootstrap's `allowed_programs`
+(default: the browsers Suede knows how to drive) limits which programs any
+application may launch, and this app's launcher names one that is not on the
+list. It shows as `crashed`, and it stays that way — nothing retries it on a
+timer, because nothing short of restarting the daemon can change what
+`allowed_programs` permits, so retrying would only ever fail again the same
+way.
+
+Either add the program to `allowed_programs` (or `SUEDE_ALLOWED_PROGRAMS`)
+and restart the daemon, or change the app to launch something already
+permitted. See [Allowed programs](configuration.md#allowed-programs).
+
 ### "Failed to create a ProcessSingleton for your profile directory" {: #process-singleton }
 
 The app crash-loops, and Chromium's own log says:

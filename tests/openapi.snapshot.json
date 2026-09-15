@@ -598,7 +598,6 @@
           },
           "settings": {
             "default": {
-              "allowRawSwayCommands": false,
               "hideCursor": true,
               "measureCapabilitiesOnStart": true,
               "outputPollIntervalSeconds": 5
@@ -1231,6 +1230,48 @@
         ],
         "type": "object"
       },
+      "PowerOutcome": {
+        "description": "What `POST /api/v1/system/power` accepted.",
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "verb": {
+            "$ref": "#/components/schemas/PowerVerb"
+          }
+        },
+        "required": [
+          "verb",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "PowerRequest": {
+        "additionalProperties": false,
+        "description": "Body of `POST /api/v1/system/power`.",
+        "properties": {
+          "confirm": {
+            "description": "The machine's hostname, repeated back. Proof that the caller meant\nthis machine: a retry, a stray script or a fuzzer does not know it,\nand the cost of being wrong here is a dark video wall mid-show.",
+            "type": "string"
+          },
+          "verb": {
+            "$ref": "#/components/schemas/PowerVerb"
+          }
+        },
+        "required": [
+          "verb",
+          "confirm"
+        ],
+        "type": "object"
+      },
+      "PowerVerb": {
+        "description": "A host power operation Suede may be permitted to perform.\n\nLives here, not in `desired`, because `GET /system` reports it (so it\nneeds [`ToSchema`]) and it is read by [`crate::config::BootstrapConfig`],\nwhich cannot depend on desired state without an awkward cycle.",
+        "enum": [
+          "reboot",
+          "poweroff"
+        ],
+        "type": "string"
+      },
       "PresentationOffset": {
         "description": "Spread between the earliest and latest output to present the same frame,\nfrom `wp_presentation` feedback, in ms.",
         "properties": {
@@ -1579,10 +1620,6 @@
         "additionalProperties": false,
         "description": "Daemon-level settings that belong to desired state.",
         "properties": {
-          "allowRawSwayCommands": {
-            "description": "Enable the raw `POST /sway/command` passthrough.",
-            "type": "boolean"
-          },
           "hideCursor": {
             "description": "Hide the pointer and park it beyond the layout.",
             "type": "boolean"
@@ -1600,8 +1637,7 @@
         },
         "required": [
           "hideCursor",
-          "outputPollIntervalSeconds",
-          "allowRawSwayCommands"
+          "outputPollIntervalSeconds"
         ],
         "type": "object"
       },
@@ -1680,6 +1716,13 @@
             },
             "type": "array"
           },
+          "powerVerbs": {
+            "description": "Host power operations this appliance permits. Empty means none; the web\nUI uses it to disable and explain its buttons rather than offering ones\nthat would be refused.",
+            "items": {
+              "$ref": "#/components/schemas/PowerVerb"
+            },
+            "type": "array"
+          },
           "suedeVersion": {
             "type": "string"
           },
@@ -1710,7 +1753,8 @@
           "uptimeSeconds",
           "packages",
           "supportsTearing",
-          "webUiEnabled"
+          "webUiEnabled",
+          "powerVerbs"
         ],
         "type": "object"
       },
@@ -3236,9 +3280,6 @@
           "204": {
             "description": "Sway accepted the command"
           },
-          "403": {
-            "description": "Raw commands are disabled"
-          },
           "503": {
             "description": "Sway rejected the command"
           }
@@ -3322,6 +3363,45 @@
         },
         "tags": [
           "observed"
+        ]
+      }
+    },
+    "/api/v1/system/power": {
+      "post": {
+        "operationId": "power",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PowerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PowerOutcome"
+                }
+              }
+            },
+            "description": "The instruction was accepted. Whether it completes is no longer observable over this connection."
+          },
+          "400": {
+            "description": "confirm does not repeat this machine's hostname"
+          },
+          "403": {
+            "description": "This verb is not permitted by bootstrap.power"
+          },
+          "503": {
+            "description": "systemctl refused, or could not be run"
+          }
+        },
+        "tags": [
+          "control"
         ]
       }
     },

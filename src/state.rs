@@ -383,6 +383,43 @@ mod tests {
         assert_eq!(state.revision, 7);
     }
 
+    /// The project's alpha status means the only backwards-compatibility
+    /// promise Suede makes is that an upgrade migrates correctly, which makes
+    /// `Settings::allow_raw_sway_commands`'s `#[serde(default,
+    /// skip_serializing)]` the single load-bearing guarantee behind retiring
+    /// the raw-command gate: `Settings` refuses unknown fields and there is
+    /// no migration step, so that shim is the only thing standing between an
+    /// upgrade and a daemon that cannot read its own saved configuration.
+    ///
+    /// The document is a string literal, not built from today's `Settings`,
+    /// because a document built from the current struct could never exercise
+    /// the regression this guards against — it would never have had the
+    /// field serialized into it to begin with.
+    #[test]
+    fn a_document_from_before_the_raw_command_flag_was_retired_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            br#"{"settings": {"hideCursor": true, "outputPollIntervalSeconds": 5,
+                 "allowRawSwayCommands": false}}"#,
+        )
+        .unwrap();
+
+        let store = StateStore::load(dir.path().to_path_buf()).unwrap();
+        let state = store.get();
+        assert!(state.settings.hide_cursor);
+        assert_eq!(state.settings.output_poll_interval_seconds, 5);
+
+        // Proves it drops off disk at the next save: `persist` serializes
+        // with exactly this `Serialize` impl, so if the key survives here it
+        // would survive there too.
+        let resaved = serde_json::to_string(&state).unwrap();
+        assert!(
+            !resaved.contains("allowRawSwayCommands"),
+            "the retired field must never be written back: {resaved}"
+        );
+    }
+
     #[test]
     fn no_temp_file_is_left_behind() {
         let dir = tempfile::tempdir().unwrap();

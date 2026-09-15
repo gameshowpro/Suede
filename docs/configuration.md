@@ -19,6 +19,103 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `token` | `SUEDE_TOKEN` | unset | Bearer token; setting it disables the web UI |
 | `state_dir` | `SUEDE_STATE_DIR` | `$XDG_STATE_HOME/suede` | Where desired state is persisted |
 | `docs_base_url` | `SUEDE_DOCS_BASE_URL` | `https://suede.gameshow.pro/` | Base for health-check documentation links |
+| `power` | `SUEDE_POWER` | `[]` (none) | Host power operations this appliance may perform — see [Host power control](#host-power) |
+| `allowed_programs` | `SUEDE_ALLOWED_PROGRAMS` | the browsers Suede knows how to drive | Programs applications may launch — see [Allowed programs](#allowed-programs) |
+
+### Host power control {: #host-power }
+
+`POST /api/v1/system/power` can ask the host to `reboot` or `poweroff`, but
+only for the verbs listed in bootstrap's `power` (or `SUEDE_POWER`, a
+comma-separated override, e.g. `SUEDE_POWER=reboot,poweroff`). Empty is the
+default: a display appliance should not be able to turn itself off because
+somebody found the button.
+
+That list lives in the bootstrap file, not in desired state, and that is
+deliberate: desired state is writable through the very API the permission is
+meant to constrain, so a gate the caller can open by writing configuration is
+not a gate. `GET /api/v1/system` reports the permitted verbs (`powerVerbs`)
+so a UI can disable and explain its buttons rather than offering ones that
+would be refused.
+
+A request must also repeat the machine's hostname in `confirm`, exactly as
+`GET /system` reports it. This is not a secret — it is proof the caller meant
+*this* machine: a retry aimed at the wrong appliance, a stray script, or a
+fuzzer does not know it, and the cost of being wrong here is a dark video
+wall mid-show.
+
+```bash
+curl -X POST -H 'content-type: application/json' \
+  -d '{"verb":"reboot","confirm":"wall-3"}' \
+  http://appliance:9088/api/v1/system/power
+```
+
+The daemon runs as a user service, so the action still has to clear logind:
+Suede runs plain `systemctl reboot` / `systemctl poweroff`, not `--user`, and
+whether that succeeds is polkit's call, not Suede's. A refusal — no active
+session, no policy grant — surfaces as `503` carrying polkit's own message.
+
+!!! warning "A declaration of intent, not a security boundary"
+    `power` decides which buttons the appliance offers, nothing more. An API
+    client that can write configuration can already define an application
+    that runs any program — see [Raw Sway commands](#raw-sway-commands) —
+    so the protection against a hostile caller is the network and the bearer
+    token, not this list. Do not treat it as one.
+
+### Allowed programs {: #allowed-programs }
+
+An `exec` launcher runs any executable verbatim, and applications are
+configured through the API — so by default, any client that can write
+configuration can run any program as the session user. `allowed_programs`
+lets an appliance say "this machine only ever runs a browser":
+
+```toml
+allowed_programs = ["chromium", "google-chrome-stable"]
+```
+
+Matching is on the program's **file name**, so a path works the same as a
+bare name: `/usr/local/bin/chromium` and `chromium` are the same program as
+far as this list is concerned. The comparison is case-sensitive, as Linux
+file names are.
+
+The default is the browser binaries the launcher presets know how to find —
+`chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
+`firefox`, and `firefox-esr` — so a stock appliance runs kiosk pages and
+nothing else, without needing an explicit list. `["*"]` lifts the
+restriction entirely, and an empty list (`allowed_programs = []`) permits
+nothing, exactly as an empty allowlist means everywhere else in Suede — a
+legitimate way to freeze a machine so that no application can start at all.
+
+Like `power`, this lives in the bootstrap file rather than in desired state:
+desired state — including which program an application launches — is
+writable through the very API this key is meant to constrain, so a gate the
+caller can open by writing configuration would not be a gate.
+
+An application whose launcher names a program that is not on the list is
+never spawned. Its status shows `crashed`, and `GET /api/v1/status` carries
+an `app_program_not_allowed` divergence naming the app, the program it
+asked for, and the key that would permit it:
+
+```
+app `signage` asks to launch `curl`, which is not in `allowed_programs`; add
+it to suede.toml (or SUEDE_ALLOWED_PROGRAMS) and restart the daemon, or
+change the app's launcher.
+```
+
+Because `allowed_programs` is bootstrap configuration, nothing short of
+restarting the daemon can change what it permits — so, unlike an ordinary
+crash, this is refused once and left alone rather than retried on the
+restart timer, which could never do anything but fail again.
+
+!!! warning "A declaration of intent, not a full boundary"
+    This stops the direct route — an application configured to launch
+    something other than a browser — and makes the intent explicit, but it
+    does not contain a determined caller. Chromium itself accepts arguments
+    such as `--gpu-launcher` that make it spawn a helper program of the
+    caller's choosing, and `extraArgs` is part of desired state, which an API
+    client can already write. As with `power`, the boundary that actually
+    holds against a hostile client is the network and the bearer token — see
+    [Raw Sway commands](#raw-sway-commands). Do not treat this list as more
+    than what it is.
 
 ## Desired state
 
@@ -923,11 +1020,17 @@ build without it still accepts and stores this configuration, and reports a
 |---|---|---|
 | `hideCursor` | `true` | Hide the pointer and park it below the layout |
 | `outputPollIntervalSeconds` | `5` | Backstop poll, in case an event is missed |
-| `allowRawSwayCommands` | `false` | Enable `POST /sway/command` passthrough |
 | `measureCapabilitiesOnStart` | `true` | Measure browser decode capabilities at startup when something changed — see below |
 
-!!! danger "Raw command passthrough"
-    `allowRawSwayCommands` permits arbitrary Sway commands, including `exec`. It is off by default and intended for debugging.
+#### Raw Sway commands {: #raw-sway-commands }
+
+`POST /sway/command` sends a string straight to Sway's IPC (`{"command": "..."}`,
+for debugging). It is always available, and was never actually the privilege
+boundary it looked like: an `exec`-kind launcher already runs any program as
+the session user, and apps are configured through this same API, so a client
+that could reach the endpoint could already run anything by defining an app.
+A setting that implied a protection it did not provide (`allowRawSwayCommands`,
+retired) was worse than not having one.
 
 ## Where state is stored
 

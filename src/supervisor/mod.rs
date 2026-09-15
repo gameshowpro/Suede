@@ -48,6 +48,15 @@ struct ManagedApp {
     last_probe: Option<Instant>,
     /// When Suede first started waiting, for the give-up timer.
     waiting_since: Option<Instant>,
+    /// Set when `advance` refused to spawn this app because its resolved
+    /// program is not in `allowed_programs`, so the divergence loop in
+    /// `reconcile` can report `app_program_not_allowed` instead of the
+    /// generic `app_halted` — the operator's fix is completely different
+    /// (edit bootstrap config and restart the daemon, not touch the app).
+    /// Cleared by [`schedule_restart_or_halt`], which every other path to a
+    /// halted app goes through, so a later, unrelated failure cannot inherit
+    /// a stale reason.
+    program_not_allowed: bool,
 }
 
 impl ManagedApp {
@@ -67,6 +76,7 @@ impl ManagedApp {
             dependency_ready: false,
             last_probe: None,
             waiting_since: None,
+            program_not_allowed: false,
         }
     }
 
@@ -80,6 +90,11 @@ pub struct Supervisor {
     events: EventHub,
     context: LaunchContext,
     apps: Mutex<HashMap<String, ManagedApp>>,
+    /// Programs any app may launch, from bootstrap's `allowed_programs`. A
+    /// copy of the list rather than the whole `BootstrapConfig`: launching is
+    /// all the supervisor needs from it, and bootstrap config is otherwise
+    /// the API layer's concern.
+    allowed_programs: Vec<String>,
 }
 
 impl Supervisor {
@@ -93,12 +108,18 @@ impl Supervisor {
         &self.context
     }
 
-    pub fn new(sway: Arc<dyn SwayClient>, events: EventHub, context: LaunchContext) -> Self {
+    pub fn new(
+        sway: Arc<dyn SwayClient>,
+        events: EventHub,
+        context: LaunchContext,
+        allowed_programs: Vec<String>,
+    ) -> Self {
         Self {
             sway,
             events,
             context,
             apps: Mutex::new(HashMap::new()),
+            allowed_programs,
         }
     }
 
@@ -169,8 +190,12 @@ impl Supervisor {
                 }
                 // A new specification earns a halted app another attempt, and
                 // a changed readiness URL must be re-probed rather than
-                // inheriting the old verdict.
+                // inheriting the old verdict. `allowed_programs` itself
+                // cannot change without a daemon restart, but the app's own
+                // launcher can — switching it to a permitted program deserves
+                // the same fresh attempt as any other reconfiguration.
                 managed.halted = false;
+                managed.program_not_allowed = false;
                 managed.attempts = 0;
                 managed.restart_at = Some(Instant::now());
                 if managed.config.readiness != config.readiness {
@@ -200,6 +225,9 @@ impl Supervisor {
                 .clone()
                 .unwrap_or_else(|| "no detail".to_string());
             match managed.status.state {
+                AppState::Crashed if managed.program_not_allowed => divergences.push(
+                    Divergence::new("app_program_not_allowed", &managed.config.id, detail),
+                ),
                 AppState::Crashed => {
                     divergences.push(Divergence::new("app_halted", &managed.config.id, detail))
                 }
@@ -579,6 +607,25 @@ impl Supervisor {
 
             match self.spawn(managed).await {
                 Ok(()) => self.publish(managed),
+                // A program that is not allowed will never become allowed
+                // without a daemon restart — `allowed_programs` is bootstrap
+                // config, read once at startup — so the usual backoff timer
+                // would just spin forever between now and that restart.
+                // Refuse once per pass and halt outright, the same way a
+                // restart policy of `never` does, rather than counting this
+                // toward a crash loop it cannot recover from on its own.
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    tracing::warn!(app = %managed.config.id, %error, "program not allowed; halting");
+                    managed.halted = true;
+                    managed.program_not_allowed = true;
+                    managed.restart_at = None;
+                    set_state(
+                        &mut managed.status,
+                        AppState::Crashed,
+                        Some(error.to_string()),
+                    );
+                    self.publish(managed);
+                }
                 Err(error) => {
                     tracing::error!(app = %managed.config.id, %error, "failed to launch app");
                     let detail = error.to_string();
@@ -594,6 +641,40 @@ impl Supervisor {
         // Resolve first, then describe: the profile directory depends on
         // which program won, and only one of the two touches the disk.
         let chosen = launcher::choose_program(&managed.config);
+
+        // Enforced immediately around `choose_program`, the one place a
+        // program is resolved for every launcher kind — chromium-kiosk,
+        // firefox-kiosk, exec, and any kind added later, since
+        // `candidates_for`'s exhaustive match over `Launcher` forces a new
+        // variant through this same path or the crate fails to compile.
+        // Checking here, before anything below touches the filesystem, means
+        // a refused app leaves no profile directory or log file behind.
+        //
+        // `ErrorKind::PermissionDenied` rather than a bespoke error type:
+        // it is carried through the same `std::io::Result` the "not
+        // installed" case already uses, and `advance` below tells the two
+        // apart by kind, which is exactly the distinction the operator needs
+        // — one says "install a browser", the other says "that program is
+        // deliberately not allowed here".
+        if let Some(program) = &chosen {
+            if !crate::config::program_name_matches(&self.allowed_programs, program) {
+                let name = program
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| program.display().to_string());
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "app `{}` asks to launch `{name}`, which is not in `allowed_programs`; \
+                         add it to suede.toml (or SUEDE_ALLOWED_PROGRAMS) and restart the daemon, \
+                         or change the app's launcher.",
+                        managed.config.id
+                    ),
+                ));
+            }
+        }
+
         let spec = launcher::build(&managed.config, &self.context, chosen.as_deref());
 
         if let Some(profile) = &spec.profile_dir {
@@ -720,7 +801,14 @@ const CRASH_LOOP_ATTEMPTS: u32 = 3;
 ///
 /// Halting matters: without it, an app whose policy is `never` would be started
 /// again by the very next pass, because nothing else stops the start path.
+///
+/// Every ordinary path to a halted or backed-off app goes through here, so
+/// `program_not_allowed` is cleared unconditionally: it must not survive
+/// into a later, unrelated failure and mislabel it as a policy refusal.
+/// `advance` sets that flag itself, bypassing this function entirely, for
+/// the one case where it means something.
 fn schedule_restart_or_halt(managed: &mut ManagedApp, exit_code: Option<i32>, detail: &str) {
+    managed.program_not_allowed = false;
     if managed.config.restart.should_restart(exit_code) {
         managed.attempts += 1;
         let delay = managed.config.restart.delay_for(managed.attempts);
@@ -817,7 +905,15 @@ mod tests {
 
     fn supervisor(root: &std::path::Path) -> (Supervisor, Arc<MockSway>) {
         let sway = Arc::new(MockSway::empty());
-        let supervisor = Supervisor::new(sway.clone(), EventHub::new(), context(root));
+        // Unrestricted: these tests are about lifecycle, not the allowlist,
+        // and use stand-ins like "sleep" and "true" that a real appliance's
+        // default (browsers only) would refuse outright.
+        let supervisor = Supervisor::new(
+            sway.clone(),
+            EventHub::new(),
+            context(root),
+            vec!["*".to_string()],
+        );
         (supervisor, sway)
     }
 
@@ -1305,6 +1401,52 @@ mod tests {
                 .any(|d| d.kind == "app_halted" && d.subject == "ghost"),
             "a halted app must be reported immediately: {divergences:?}"
         );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_app_whose_program_is_not_allowed_is_never_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let sway = Arc::new(MockSway::empty());
+        // Only firefox is permitted; the app below asks for `sleep`, which is
+        // certain to exist on the test machine's PATH — the point is that
+        // being installed does not matter when policy refuses it.
+        let supervisor = Supervisor::new(
+            sway,
+            EventHub::new(),
+            context(dir.path()),
+            vec!["firefox".to_string()],
+        );
+        let apps = [sleeper("ghost")];
+        let targets = [target("ghost", None)];
+
+        let divergences = supervisor.reconcile(&apps, &targets).await;
+
+        let status = supervisor.status("ghost").await.unwrap();
+        assert!(status.pid.is_none(), "must never be spawned");
+        assert_eq!(status.state, AppState::Crashed);
+
+        let found = divergences
+            .iter()
+            .find(|d| d.kind == "app_program_not_allowed")
+            .unwrap_or_else(|| panic!("expected app_program_not_allowed, got {divergences:?}"));
+        assert_eq!(found.subject, "ghost");
+        assert!(found.detail.contains("sleep"), "{}", found.detail);
+        assert!(
+            found.detail.contains("allowed_programs"),
+            "{}",
+            found.detail
+        );
+
+        // Refused once per pass, not retried on a timer: a second pass with
+        // nothing changed must repeat the same divergence, never escalate to
+        // a crash loop that implies retrying will eventually work.
+        let second = supervisor.reconcile(&apps, &targets).await;
+        assert!(
+            !second.iter().any(|d| d.kind == "app_crash_looping"),
+            "a disallowed program must never spin into a crash loop: {second:?}"
+        );
+        assert!(second.iter().any(|d| d.kind == "app_program_not_allowed"));
         supervisor.shutdown().await;
     }
 

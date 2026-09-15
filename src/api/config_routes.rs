@@ -980,7 +980,11 @@ mod tests {
     async fn an_uncommitted_write_reaches_the_outputs_but_never_the_disk() {
         let harness = harness(None);
         let mut working = harness.state.store.get();
-        working.settings.allow_raw_sway_commands = true;
+        // Any settings bool would do here; `hideCursor` is used because,
+        // unlike `allowRawSwayCommands`, it still serialises — the retired
+        // field's `skip_serializing` would make this write silently omit it
+        // and the test would stop proving anything.
+        working.settings.hide_cursor = false;
         working.committed = false;
 
         let (status, body) = call(
@@ -993,16 +997,9 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         // Reads now serve the working copy, honestly flagged.
         assert_eq!(body["committed"], false);
-        assert!(
-            harness
-                .state
-                .store
-                .effective()
-                .settings
-                .allow_raw_sway_commands
-        );
+        assert!(!harness.state.store.effective().settings.hide_cursor);
         // Disk keeps the saved state - a restart would return to it.
-        assert!(!harness.state.store.get().settings.allow_raw_sway_commands);
+        assert!(harness.state.store.get().settings.hide_cursor);
         assert!(harness.state.store.get().committed);
 
         // Revert discards the working copy and returns the saved document.
@@ -1016,7 +1013,7 @@ mod tests {
     async fn committing_the_same_document_persists_it() {
         let harness = harness(None);
         let mut document = harness.state.store.get();
-        document.settings.allow_raw_sway_commands = true;
+        document.settings.hide_cursor = false;
         document.committed = false;
         call(
             &harness,
@@ -1036,7 +1033,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(harness.state.store.get().settings.allow_raw_sway_commands);
+        assert!(!harness.state.store.get().settings.hide_cursor);
         assert!(!harness.state.store.has_preview());
     }
 
@@ -1062,7 +1059,7 @@ mod tests {
     async fn a_committed_section_write_discards_the_working_copy() {
         let harness = harness(None);
         let mut working = harness.state.store.get();
-        working.settings.allow_raw_sway_commands = true;
+        working.settings.hide_cursor = false;
         working.committed = false;
         call(
             &harness,
