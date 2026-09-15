@@ -682,8 +682,16 @@ function toast(message, isError) {
 
 const escape = (v) => String(v ?? "").replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-const modeLabel = (m) => m ? `${m.width}×${m.height} @ ${Math.round(m.refreshHz * 100) / 100}Hz` : "—";
-const bytes = (n) => n > 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} kB`;
+// Numbers follow the browser's locale (a German browser shows 6,7 ms, not
+// 6.7 ms); the precision is fixed here so a value never gains or loses
+// digits between renders.
+const num = (value, digits = 1) => Number(value).toLocaleString(undefined,
+  { minimumFractionDigits: digits, maximumFractionDigits: digits });
+// Refresh rates: up to three decimals, trailing zeros dropped (60 Hz, 59.939 Hz).
+const hz = (value) => Number(value).toLocaleString(undefined,
+  { minimumFractionDigits: 0, maximumFractionDigits: 3 });
+const modeLabel = (m) => m ? `${m.width}×${m.height} @ ${hz(m.refreshHz)}Hz` : "—";
+const bytes = (n) => n > 1048576 ? `${num(n / 1048576)} MB` : `${num(n / 1024, 0)} kB`;
 
 // --- live preview --------------------------------------------------------
 //
@@ -1232,7 +1240,7 @@ function renderModeNote() {
   note.hidden = mismatched.length === 0;
   if (mismatched.length === 0) return;
   note.textContent = mismatched
-    .map((m) => `${m.name} runs at ${Math.round(m.rate * 100) / 100} Hz`).join(", ") +
+    .map((m) => `${m.name} runs at ${hz(m.rate)} Hz`).join(", ") +
     " — pick the same rate so the displays stay in step";
 }
 
@@ -1562,7 +1570,7 @@ $("a-capabilities").onclick = async () => {
       status.textContent = outcome.note ?? "the check did not complete";
       return;
     }
-    status.textContent = `Measured in ${(outcome.elapsedMs / 1000).toFixed(1)}s.`;
+    status.textContent = `Measured in ${num(outcome.elapsedMs / 1000)}s.`;
     paintCapabilities(outcome.report);
     results.classList.remove("hidden");
   } catch (error) {
@@ -1667,20 +1675,20 @@ function renderProjectionTiming() {
   // in a sentence — the operator scans for color, not text.
   const flagged = (n) => n > 0 ? `<span class="pill bad">${n}</span>` : String(n);
   const offset = s.offsetMs
-    ? `mean ${s.offsetMs.mean.toFixed(1)} ms, max ${s.offsetMs.max.toFixed(1)} ms`
+    ? `mean ${num(s.offsetMs.mean)} ms, max ${num(s.offsetMs.max)} ms`
     : "not measured";
   const rows = [
-    ["Canvas", `${s.canvasFps.toFixed(1)} fps captured, ${s.presentedFps.toFixed(1)} presented`],
+    ["Canvas", `${num(s.canvasFps)} fps captured, ${num(s.presentedFps)} presented`],
     ["Mode", s.freeRun ? "free-run" : "locked"],
     ["Offset between displays", offset +
       (s.presentationFeedback ? "" : " (no presentation feedback from the compositor)")],
     ["Straddles", flagged(s.straddles)],
     ["Superseded frames", flagged(s.framesSuperseded)],
     ["Stalls", flagged(s.stalls)],
-    ["Per frame", `waiting ${s.perFrameMs.waiting.toFixed(1)} ms · ` +
-      `snapshot ${s.perFrameMs.snapshot.toFixed(1)} ms · ` +
-      `request ${s.perFrameMs.requesting.toFixed(1)} ms · ` +
-      `blend ${s.perFrameMs.blending.toFixed(1)} ms`],
+    ["Per frame", `waiting ${num(s.perFrameMs.waiting)} ms · ` +
+      `snapshot ${num(s.perFrameMs.snapshot)} ms · ` +
+      `request ${num(s.perFrameMs.requesting)} ms · ` +
+      `blend ${num(s.perFrameMs.blending)} ms`],
     ["Measured at", new Date(s.measuredAt * 1000).toLocaleTimeString()],
   ];
   $("pj-timing-rows").innerHTML = rows
@@ -1688,7 +1696,7 @@ function renderProjectionTiming() {
 
   // Trimmed like format_refresh on the daemon side: 3 decimals, no trailing
   // zeros, so 60 Hz reads as "60" rather than "60.000".
-  const trimHz = (hz) => hz == null ? "—" : String(Math.round(hz * 1000) / 1000);
+  const trimHz = (value) => value == null ? "—" : hz(value);
   $("pj-timing-outputs").innerHTML = s.outputs.map((o) =>
     `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
     `<td>${o.discarded}</td><td class="mono">${trimHz(o.refreshHz)}</td></tr>`).join("");
@@ -2018,7 +2026,7 @@ function clampGain(value) {
 
 function gainLabel(db) {
   if (db === null || db === undefined) return "—";
-  return db <= GAIN_FLOOR_DB ? "silent" : `${db > 0 ? "+" : ""}${db.toFixed(1)} dB`;
+  return db <= GAIN_FLOOR_DB ? "silent" : `${db > 0 ? "+" : ""}${num(db)} dB`;
 }
 
 // A level belongs to a sink, so it only means anything once one is named.
@@ -2190,7 +2198,7 @@ function scheduleReconnect() {
   const tick = () => {
     showOffline(false,
       `The connection to the daemon was lost. Attempt ${attempt}.`,
-      left > 0 ? `Trying again in ${left}s.` : "Trying again now…");
+      left > 0 ? `Trying again in ${num(left, 0)}s.` : "Trying again now…");
     left -= 1;
   };
   tick();
