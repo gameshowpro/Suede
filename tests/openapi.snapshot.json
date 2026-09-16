@@ -1,6 +1,57 @@
 {
   "components": {
     "schemas": {
+      "AdoptedOutput": {
+        "additionalProperties": false,
+        "description": "What Suede observed and pinned because the configuration named none.\n\nKept apart from the operator's own fields, not merged into them, because\nthe two must stay distinguishable forever: an operator who asked for\n1920x1200 and cannot have it deserves a divergence that persists until a\nhuman decides, while a value that is merely what happened to be plugged in\nlast week should be replaced without ceremony when the display changes.\nMerged into one field, nothing could tell those two cases apart.\n\nDeliberately absent: **position**. In projection mode the configured\nposition is a canvas coordinate where the beams overlap, while sway is\nhanded a plain edge-to-edge tiling, so observed position is not desired\nposition by design — on the four-projector bench the configuration holds\na 2x2 grid while sway reports a single row, and adopting observed\npositions would flatten the layout and destroy the blend. Do not add it.",
+        "properties": {
+          "capturedAt": {
+            "description": "Unix seconds, so an operator can see how old a pin is.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "display": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DisplayIdentity",
+                "description": "The display these were taken from, so that swapping the screen on a\nconnector re-adopts rather than pinning the old one's values forever.\n`None` when the display reported no EDID identity at all."
+              }
+            ]
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Mode"
+              }
+            ]
+          },
+          "scale": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "transform": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Transform"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AppConfig": {
         "additionalProperties": false,
         "description": "A managed application: a launch specification, not a window.",
@@ -468,6 +519,32 @@
         ],
         "type": "string"
       },
+      "CheckSummary": {
+        "description": "How the environment health checks last came out, tallied by status.\n\nThe field names are exactly [`CheckStatus`]'s variants: no second\nvocabulary for the same three words.",
+        "properties": {
+          "fail": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pass": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "warn": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pass",
+          "warn",
+          "fail"
+        ],
+        "type": "object"
+      },
       "CodecSupport": {
         "additionalProperties": false,
         "description": "One codec at one resolution, as the media APIs answered.",
@@ -606,6 +683,31 @@
               {
                 "$ref": "#/components/schemas/Settings"
               }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DisplayIdentity": {
+        "additionalProperties": false,
+        "description": "Enough of a display's EDID to tell \"the same screen\" from \"a different\none on the same connector\".",
+        "properties": {
+          "make": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serial": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         },
@@ -1017,6 +1119,17 @@
           "adaptiveSync": {
             "type": "boolean"
           },
+          "adopted": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AdoptedOutput",
+                "description": "What Suede observed and pinned because the configuration named none.\n\nKept apart from the operator's own fields, not merged into them, because\nthe two must stay distinguishable forever: an operator who asked for\n1920x1200 and cannot have it deserves a divergence that persists until a\nhuman decides, while a value that is merely what happened to be plugged in\nlast week should be replaced without ceremony when the display changes.\nMerged into one field, nothing could tell those two cases apart."
+              }
+            ]
+          },
           "allowTearing": {
             "description": "Applied only when the detected Sway version supports it (≥ 1.10).",
             "type": "boolean"
@@ -1056,7 +1169,7 @@
               },
               {
                 "$ref": "#/components/schemas/Mode",
-                "description": "Mode to apply. When absent, Sway's preferred mode is left in place."
+                "description": "Mode to apply. When absent, Sway's preferred mode is left in place —\nand, once settled, pinned into `adopted.mode`. Reading this field\ndirectly sees only the operator's own choice; almost every reader\nwants [`OutputConfig::effective_mode`] instead."
               }
             ]
           },
@@ -1067,11 +1180,12 @@
               },
               {
                 "$ref": "#/components/schemas/Position",
-                "description": "Position in the global layout. Suede performs no layout arithmetic."
+                "description": "Position in the global layout. Suede performs no layout arithmetic.\nNever adopted — see [`AdoptedOutput`]."
               }
             ]
           },
           "scale": {
+            "description": "When absent, left as Sway's own and, once settled, pinned into\n`adopted.scale`. Prefer [`OutputConfig::effective_scale`].",
             "format": "double",
             "type": [
               "number",
@@ -1084,7 +1198,8 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/Transform"
+                "$ref": "#/components/schemas/Transform",
+                "description": "When absent, left as Sway's own and, once settled, pinned into\n`adopted.transform`. Prefer [`OutputConfig::effective_transform`]."
               }
             ]
           }
@@ -1395,8 +1510,32 @@
         },
         "type": "object"
       },
+      "ProjectionReport": {
+        "description": "What the projection pipeline is doing right now, as served by `GET\n/projection/stats` and `projection_stats_changed`.\n\nAdded 2026-09-15: a four-projector bench had a slicer that was\ndemonstrably alive (`pgrep -f \"suede slice\"` found it, and it had logged\nits startup line) but had produced no frames, because the frame loop is\ndamage-driven and the active page was a static image. The endpoint used\nto be `ProjectionStats | null`, and that `null` was reported for \"no\nslicer at all\" and \"slicer running but silent\" alike — which is exactly\nhow a running slicer got diagnosed as not running. `running` is tracked\nseparately from whatever the slicer has or has not reported, so the two\nsituations are no longer the same value.",
+        "properties": {
+          "lastInterval": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectionStats",
+                "description": "The last completed reporting interval, or `null` when none has been\nproduced yet."
+              }
+            ]
+          },
+          "running": {
+            "description": "Whether a slicer process is alive. A slicer can be running and yet\nhave reported nothing: the frame loop is damage-driven, so a static\npage produces no frames and therefore no interval. Distinguishing\nthat from \"no slicer at all\" is the point of this field — the two\nwere indistinguishable until a bench reported \"the slicer is not\nrunning\" about a slicer that was running.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "running"
+        ],
+        "type": "object"
+      },
       "ProjectionStats": {
-        "description": "What the slicer measured over its last reporting interval.\n\nReported by the slicer subprocess as a JSON line on its stdout every ten\nseconds (see `crate::projection::slicer`), read by the manager and served\nas `GET /projection/stats` / `projection_stats_changed`. `None` at both of\nthose means no slicer is currently running — there is nothing configured\nto blend, or projection is off.",
+        "description": "What the slicer measured over its last reporting interval.\n\nReported by the slicer subprocess as a JSON line on its stdout every ten\nseconds (see `crate::projection::slicer`), read by the manager and held\nas [`ProjectionReport::last_interval`]. `None` there means no interval\nhas completed yet, which is normal for a slicer that is running but has\nnothing to capture — see [`ProjectionReport::running`].",
         "properties": {
           "canvasFps": {
             "description": "Canvas frames captured per second.",
@@ -1642,8 +1781,29 @@
         "type": "object"
       },
       "Status": {
-        "description": "Reconciliation status, as served by `GET /status`.",
+        "description": "Reconciliation status, as served by `GET /status`.\n\nAnswers \"is this appliance doing what I asked, and will it still be after\na reboot\" from one call: `state` and `divergences` alone say whether\ndesired state is fulfilled *right now*, but say nothing about whether the\ndocument behind that answer survives a restart, whether the machine has\ncaught up with a write still in flight, or whether the environment it\ndepends on is otherwise healthy. See `docs/specification.md`'s `/status`\nsection for the predicate spelled out for client authors.",
         "properties": {
+          "checks": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CheckSummary",
+                "description": "How the environment health checks last came out, by status.\n\nDivergences and checks are different axes: a machine can apply its\nconfiguration perfectly while its browser is missing hardware video\ndecode. Summarised here so the common question takes one call; the\ndetail stays at `GET /system/checks`.\n\n`None` rather than an all-zero [`CheckSummary`] wherever the counts\nare not actually known. A reconciliation pass never runs the checks\nitself — they shell out to other programs, and a pass must stay\ncheap — so the `Status` it publishes over SSE cannot honestly fill\nthis in; a zeroed summary there would read as \"everything passed\",\nwhich is a claim nobody made. `GET /status` always fills it in from\nthe check runner's last results, because it has one to ask."
+              }
+            ]
+          },
+          "committed": {
+            "description": "Whether the document the last pass applied was the saved one.\n\nA working copy is applied exactly as a saved document is, so an\nappliance can be `synced` against a document that will vanish on\nrestart. A client asking \"will it still look like this tomorrow\"\nneeds this, and it is not otherwise visible without fetching the\nconfiguration too.",
+            "type": "boolean"
+          },
+          "currentRevision": {
+            "description": "The revision of the desired-state document right now.\n\n`revision` is the one the last pass *applied*; these differ while a\nwrite is still being reconciled. Equal values mean the machine has\ncaught up with the last write, which is the question a client asks\nafter a PUT.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "divergences": {
             "items": {
               "$ref": "#/components/schemas/Divergence"
@@ -1672,7 +1832,9 @@
         "required": [
           "state",
           "divergences",
-          "revision"
+          "revision",
+          "committed",
+          "currentRevision"
         ],
         "type": "object"
       },
@@ -3204,18 +3366,11 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "oneOf": [
-                    {
-                      "type": "null"
-                    },
-                    {
-                      "$ref": "#/components/schemas/ProjectionStats"
-                    }
-                  ]
+                  "$ref": "#/components/schemas/ProjectionReport"
                 }
               }
             },
-            "description": "What the slicer measured over its last interval; null when no slicer is running"
+            "description": "What the projection pipeline is doing right now: whether a slicer is alive, and what it measured over its last reporting interval, if any has completed"
           }
         },
         "tags": [

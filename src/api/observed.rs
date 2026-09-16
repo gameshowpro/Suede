@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    AudioSink, Check, Output, PowerVerb, ProjectionStats, Status, SystemInfo, Window,
+    AudioSink, Check, CheckSummary, Output, PowerVerb, ProjectionReport, Status, SystemInfo, Window,
 };
 
 #[utoipa::path(
@@ -77,20 +77,36 @@ pub async fn list_audio_outputs(State(state): State<ApiState>) -> Json<Vec<Audio
     responses((status = 200, description = "Reconciliation status", body = Status))
 )]
 pub async fn get_status(State(state): State<ApiState>) -> Json<Status> {
-    Json(state.snapshot.status())
+    let mut status = state.snapshot.status();
+    // `committed` and `currentRevision` describe the desired-state document
+    // as it stands *right now*, not as of whichever pass last published a
+    // `Status` — a working copy set, or a write saved, since that pass must
+    // be visible immediately, not only once the next reconciliation gets
+    // around to republishing. Both are cheap reads off the same `StateStore`
+    // the reconciler itself consults, so refreshing them here costs nothing.
+    status.committed = !state.store.has_preview();
+    status.current_revision = state.store.revision();
+    // The runner's last results, not a fresh run: checks shell out to other
+    // programs, so this stays a cheap read, matching whatever `main.rs`'s
+    // periodic check task (or the last on-demand `GET /system/checks`) has
+    // already published. `None` when nothing has run yet, rather than a
+    // zeroed summary that would misreport a clean bill of health.
+    status.checks = CheckSummary::tally(&state.checks.results());
+    Json(status)
 }
 
 #[utoipa::path(
     get, path = "/api/v1/projection/stats", tag = "observed",
     responses((
         status = 200,
-        description = "What the slicer measured over its last interval; \
-                       null when no slicer is running",
-        body = Option<ProjectionStats>,
+        description = "What the projection pipeline is doing right now: \
+                       whether a slicer is alive, and what it measured over \
+                       its last reporting interval, if any has completed",
+        body = ProjectionReport,
     ))
 )]
-pub async fn get_projection_stats(State(state): State<ApiState>) -> Json<Option<ProjectionStats>> {
-    Json(state.snapshot.projection_stats())
+pub async fn get_projection_stats(State(state): State<ApiState>) -> Json<ProjectionReport> {
+    Json(state.snapshot.projection_report())
 }
 
 #[utoipa::path(
@@ -358,8 +374,9 @@ pub(crate) mod power_mock {
 #[cfg(test)]
 mod tests {
     use crate::api::test_support::{harness, harness_with_power, Harness};
-    use crate::model::PowerVerb;
+    use crate::model::{CheckStatus, PowerVerb};
     use axum::body::Body;
+    use axum::extract::State;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
 
@@ -458,16 +475,122 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["state"], "synced");
         assert!(body["divergences"].is_array());
+        // Nothing has set a working copy or run a check yet.
+        assert_eq!(body["committed"], true);
+        assert_eq!(body["currentRevision"], 0);
+        assert!(body["checks"].is_null());
     }
 
     #[tokio::test]
-    async fn projection_stats_are_null_when_no_slicer_is_running() {
+    async fn committed_reflects_whether_a_working_copy_is_live() {
+        // Set and clear a preview directly through the store, the way
+        // src/api/config_routes.rs's own tests do, rather than driving a
+        // PUT through the router: what is under test is `get_status`
+        // reading the store live, not the write path that populates it.
+        let harness = harness(None);
+
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        assert!(status.committed, "no working copy yet");
+
+        harness
+            .state
+            .store
+            .set_preview(Some(harness.state.store.get()));
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        assert!(
+            !status.committed,
+            "a live working copy is not what is saved on disk"
+        );
+
+        harness.state.store.set_preview(None);
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        assert!(status.committed, "clearing the working copy restores it");
+    }
+
+    #[tokio::test]
+    async fn current_revision_outruns_the_applied_revision_until_the_next_pass() {
+        let harness = harness(None);
+        // A completed pass establishes a real (non-default) `revision` to
+        // compare against.
+        harness.state.reconciler.reconcile().await;
+
+        // The write lands immediately; nothing has re-reconciled since.
+        harness.state.store.update(|_| {}).unwrap();
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        assert_eq!(status.revision, 0, "the last completed pass applied rev 0");
+        assert_eq!(status.current_revision, 1, "the store has already moved on");
+        assert!(status.current_revision > status.revision);
+
+        harness.state.reconciler.reconcile().await;
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        assert_eq!(
+            status.revision, status.current_revision,
+            "a completed pass has caught up with the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_summary_counts_what_the_runner_last_reported() {
+        let harness = harness(None);
+
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        assert!(status.checks.is_none(), "no check has run yet");
+
+        let checks = harness.state.checks.run_all().await;
+        let (mut pass, mut warn, mut fail) = (0u32, 0u32, 0u32);
+        for check in &checks {
+            match check.status {
+                CheckStatus::Pass => pass += 1,
+                CheckStatus::Warn => warn += 1,
+                CheckStatus::Fail => fail += 1,
+            }
+        }
+
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        let summary = status.checks.expect("a run has now happened");
+        assert_eq!(summary.pass, pass);
+        assert_eq!(summary.warn, warn);
+        assert_eq!(summary.fail, fail);
+    }
+
+    #[tokio::test]
+    async fn projection_stats_report_not_running_when_no_slicer_is_running() {
         // The harness never starts a slicer, so this is the "nothing to
         // report" case a client sees whenever projection is off or the
-        // config has no seams.
+        // config has no seams. The endpoint is an object either way, never
+        // a bare null: `running: false` and no `lastInterval` at all.
         let (status, body) = get_json("/api/v1/projection/stats").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.is_null());
+        assert_eq!(body, serde_json::json!({"running": false}));
+    }
+
+    #[tokio::test]
+    async fn projection_stats_report_running_with_no_interval_yet() {
+        // A slicer that is alive but has produced no frames — a static
+        // page, or the first ten seconds after start — must not read as
+        // "not running". See ProjectionReport for the bench this is from.
+        let harness = harness(None);
+        harness.state.snapshot.set_slicer_running(true);
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projection/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"running": true}));
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 use tokio::sync::broadcast;
 
 use crate::model::{
-    AppStatus, AudioSink, Check, ConfigChange, Output, ProjectionStats, Status, WindowChange,
+    AppStatus, AudioSink, Check, ConfigChange, Output, ProjectionReport, Status, WindowChange,
 };
 
 const CAPACITY: usize = 256;
@@ -21,9 +21,12 @@ pub enum ServerEvent {
     ConfigChanged(ConfigChange),
     StatusChanged(Box<Status>),
     ChecksChanged(Vec<Check>),
-    /// Same shape as `GET /projection/stats`; `None` when the slicer stops
-    /// or none is running.
-    ProjectionStatsChanged(Option<Box<ProjectionStats>>),
+    /// Same shape as `GET /projection/stats`: whether a slicer is alive,
+    /// plus its last reported interval, if any. Published whenever either
+    /// half changes, so a client that only watches events also learns that
+    /// a running slicer has simply reported nothing yet, rather than
+    /// reading that as "not running" — see `ProjectionReport`.
+    ProjectionStatsChanged(Box<ProjectionReport>),
 }
 
 impl ServerEvent {
@@ -51,9 +54,7 @@ impl ServerEvent {
             Self::ConfigChanged(change) => serde_json::to_value(change),
             Self::StatusChanged(status) => serde_json::to_value(status),
             Self::ChecksChanged(checks) => serde_json::to_value(checks),
-            // `None` must serialise as JSON `null`, not be dropped, so a
-            // client sees the slicer stop rather than seeing nothing.
-            Self::ProjectionStatsChanged(stats) => serde_json::to_value(stats),
+            Self::ProjectionStatsChanged(report) => serde_json::to_value(report),
         }
         .unwrap_or(serde_json::Value::Null)
     }
@@ -126,11 +127,16 @@ mod tests {
     }
 
     #[test]
-    fn projection_stats_stopping_serialises_as_null() {
-        // The event a client sees when the slicer stops: not omitted, not
-        // absent, but an explicit `null` it can use to blank its display.
-        let event = ServerEvent::ProjectionStatsChanged(None);
+    fn projection_stats_stopping_reports_not_running() {
+        // The event a client sees when the slicer stops: an object saying
+        // `running: false`, not a bare `null` a client could equally read
+        // as "still running, just quiet" — the ambiguity this type exists
+        // to remove.
+        let event = ServerEvent::ProjectionStatsChanged(Box::new(crate::model::ProjectionReport {
+            running: false,
+            last_interval: None,
+        }));
         assert_eq!(event.name(), "projection_stats_changed");
-        assert_eq!(event.data(), serde_json::Value::Null);
+        assert_eq!(event.data(), serde_json::json!({"running": false}));
     }
 }

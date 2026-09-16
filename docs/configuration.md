@@ -135,7 +135,7 @@ The document carries a server-managed `revision`. Send it back as `If-Match` to 
 |---|---|---|---|
 | `match` | object | required | Which physical output this applies to |
 | `enable` | bool | `true` | `false` actively disables the output |
-| `mode` | object \| null | null | `{width, height, refreshHz}`; null leaves Sway's preferred mode |
+| `mode` | object \| null | null | `{width, height, refreshHz}`; null leaves Sway's preferred mode, which Suede then pins — see [Adopted values](#adopted-values) |
 | `position` | object \| null | null | `{x, y}` in the global layout |
 | `scale` | number \| null | null | Output scale factor |
 | `transform` | string \| null | null | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`… |
@@ -143,6 +143,7 @@ The document carries a server-managed `revision`. Send it back as `If-Match` to 
 | `allowTearing` | bool | `false` | Applied only on Sway 1.10+; reported as a divergence otherwise |
 | `maxRenderTimeMs` | number \| null | null | Frame render deadline; null means off |
 | `background` | object \| null | null | What the output shows when no window covers it |
+| `adopted` | object \| null | null | Read-only: what Suede pinned for a field left unset — see [Adopted values](#adopted-values) |
 
 `match` selects by connector name, which is the normal case:
 
@@ -215,6 +216,77 @@ therefore also be configured completely before the projectors are unpacked.
 
 !!! warning "Connected outputs with no entry are left alone"
     Suede only touches outputs you have configured. To turn one off, give it an entry with `"enable": false`.
+
+#### Adopted values {: #adopted-values }
+
+A `mode`, `scale` or `transform` left unset is not really unconfigured once
+the appliance has booted once: Sway settles on *something* — usually
+whatever the display advertises as preferred — and from then on that choice
+is real, whether or not anyone wrote it down. On 2026-09-15 a four-projector
+bench was rebooted and two displays came back at 3840x2160@60 instead of the
+1920x1200@59.95 they had been running: nothing was misconfigured, nothing
+had been configured at all, and the machine had simply been lucky until
+then. The resolution change took the projection canvas from 9.2 to
+19.2 megapixels and invalidated a set of performance measurements.
+
+So each of these three fields is in one of three states:
+
+| State | Who set it | Survives a reboot | Survives a display swap |
+|---|---|---|---|
+| **Unset** | nobody yet | no — Sway picks again, possibly differently | no |
+| **Adopted** | Suede, from what settled | yes — pinned in `adopted` | no — a different display re-adopts fresh |
+| **Set** | the operator | yes | yes — a divergence if the new display cannot deliver it |
+
+An adopted value appears read-only in `adopted`, shaped like the field it
+pins plus which display it was taken from and when:
+
+```json
+"adopted": {
+  "mode": { "width": 1920, "height": 1200, "refreshHz": 59.95 },
+  "scale": 1.0,
+  "display": { "make": "Acme Displays", "model": "AD-2400", "serial": "0x00012345" },
+  "capturedAt": 1757894400
+}
+```
+
+It is only ever written by Suede, after a value has been observed twice in a
+row (so a display still waking cannot pin a value that was never its final
+answer) and only when nothing about that output diverged that pass — a
+configuration that could not be fully applied has not settled. It is never
+written while a working copy is live, so an edit in progress is never
+rewritten underneath the operator.
+
+Adopting never *overrides* the operator: `mode`, `scale` and `transform`
+still mean exactly what they say, and setting one always wins over anything
+adopted. Writing `"mode": null` does not erase history — it returns that
+field to adoption, and the next two agreeing passes pin whatever the display
+settles on next, which may be the same value or a different one.
+
+The same display settling on a different value later is reported, not
+silently repinned: Suede keeps applying the adopted value (surfacing as
+`mode_unsupported` if the display truly no longer offers it) rather than
+treating a later disagreement as a new truth. Only when the EDID identity on
+that connector changes — a different physical display — does Suede discard
+the old pin and adopt fresh for the new one.
+
+**`position` is never adopted, and never will be.** In projection mode the
+configured position is a canvas coordinate where the beams are meant to
+overlap, while Sway is always handed a plain edge-to-edge tiling — on a
+four-projector bench the configuration holds a 2x2 grid while Sway reports a
+single row. Observed position is therefore not desired position, by design;
+adopting it would flatten the layout and destroy the blend the next time the
+outputs settled.
+
+The reference UI offers two shortcuts onto this state machine. Per output,
+**Pin current settings** promotes whatever is actually running — the
+adopted value where one exists, else the observed mode/scale/transform —
+into stated intent, exactly as if the operator had typed it in by hand: a
+later display swap then raises a divergence instead of silently changing
+the wall. **Pin all displays**, beside the layout, is the same action
+applied to every configured, attached output at once — the commissioning
+move once the wall looks right. **Clear pinned values** does the reverse,
+setting `mode`, `scale` and `transform` back to null so the daemon adopts
+afresh on its next settled pass. None of the three buttons touch `position`.
 
 ### Backgrounds and wallpapers
 

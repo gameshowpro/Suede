@@ -340,7 +340,15 @@ impl Divergence {
 }
 
 /// Reconciliation status, as served by `GET /status`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
+///
+/// Answers "is this appliance doing what I asked, and will it still be after
+/// a reboot" from one call: `state` and `divergences` alone say whether
+/// desired state is fulfilled *right now*, but say nothing about whether the
+/// document behind that answer survives a restart, whether the machine has
+/// caught up with a write still in flight, or whether the environment it
+/// depends on is otherwise healthy. See `docs/specification.md`'s `/status`
+/// section for the predicate spelled out for client authors.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
     pub state: SyncState,
@@ -349,6 +357,90 @@ pub struct Status {
     pub last_reconciled: Option<u64>,
     /// Desired-state revision the last pass applied.
     pub revision: u64,
+    /// Whether the document the last pass applied was the saved one.
+    ///
+    /// A working copy is applied exactly as a saved document is, so an
+    /// appliance can be `synced` against a document that will vanish on
+    /// restart. A client asking "will it still look like this tomorrow"
+    /// needs this, and it is not otherwise visible without fetching the
+    /// configuration too.
+    pub committed: bool,
+    /// The revision of the desired-state document right now.
+    ///
+    /// `revision` is the one the last pass *applied*; these differ while a
+    /// write is still being reconciled. Equal values mean the machine has
+    /// caught up with the last write, which is the question a client asks
+    /// after a PUT.
+    pub current_revision: u64,
+    /// How the environment health checks last came out, by status.
+    ///
+    /// Divergences and checks are different axes: a machine can apply its
+    /// configuration perfectly while its browser is missing hardware video
+    /// decode. Summarised here so the common question takes one call; the
+    /// detail stays at `GET /system/checks`.
+    ///
+    /// `None` rather than an all-zero [`CheckSummary`] wherever the counts
+    /// are not actually known. A reconciliation pass never runs the checks
+    /// itself — they shell out to other programs, and a pass must stay
+    /// cheap — so the `Status` it publishes over SSE cannot honestly fill
+    /// this in; a zeroed summary there would read as "everything passed",
+    /// which is a claim nobody made. `GET /status` always fills it in from
+    /// the check runner's last results, because it has one to ask.
+    pub checks: Option<CheckSummary>,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            state: SyncState::default(),
+            divergences: Vec::new(),
+            last_reconciled: None,
+            revision: 0,
+            // An appliance that has reconciled nothing yet has no working
+            // copy to distrust either, so the honest answer to "will this
+            // survive a reboot" is yes — there is only the (empty) saved
+            // document.
+            committed: true,
+            current_revision: 0,
+            checks: None,
+        }
+    }
+}
+
+/// How the environment health checks last came out, tallied by status.
+///
+/// The field names are exactly [`CheckStatus`]'s variants: no second
+/// vocabulary for the same three words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckSummary {
+    pub pass: u32,
+    pub warn: u32,
+    pub fail: u32,
+}
+
+impl CheckSummary {
+    /// Tally a set of check results by status.
+    ///
+    /// `None` for an empty slice rather than an all-zero summary: the two
+    /// are indistinguishable in the counts alone, but mean opposite things to
+    /// a client — "every check passed" versus "no check has ever run", which
+    /// is exactly the state at daemon startup, before the first scheduled
+    /// pass.
+    pub fn tally(checks: &[Check]) -> Option<Self> {
+        if checks.is_empty() {
+            return None;
+        }
+        let mut summary = Self::default();
+        for check in checks {
+            match check.status {
+                CheckStatus::Pass => summary.pass += 1,
+                CheckStatus::Warn => summary.warn += 1,
+                CheckStatus::Fail => summary.fail += 1,
+            }
+        }
+        Some(summary)
+    }
 }
 
 /// Version of a package relevant to Suede's operation.
@@ -518,13 +610,41 @@ pub struct ConfigChange {
     pub section: String,
 }
 
+/// What the projection pipeline is doing right now, as served by `GET
+/// /projection/stats` and `projection_stats_changed`.
+///
+/// Added 2026-09-15: a four-projector bench had a slicer that was
+/// demonstrably alive (`pgrep -f "suede slice"` found it, and it had logged
+/// its startup line) but had produced no frames, because the frame loop is
+/// damage-driven and the active page was a static image. The endpoint used
+/// to be `ProjectionStats | null`, and that `null` was reported for "no
+/// slicer at all" and "slicer running but silent" alike — which is exactly
+/// how a running slicer got diagnosed as not running. `running` is tracked
+/// separately from whatever the slicer has or has not reported, so the two
+/// situations are no longer the same value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionReport {
+    /// Whether a slicer process is alive. A slicer can be running and yet
+    /// have reported nothing: the frame loop is damage-driven, so a static
+    /// page produces no frames and therefore no interval. Distinguishing
+    /// that from "no slicer at all" is the point of this field — the two
+    /// were indistinguishable until a bench reported "the slicer is not
+    /// running" about a slicer that was running.
+    pub running: bool,
+    /// The last completed reporting interval, or `null` when none has been
+    /// produced yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_interval: Option<ProjectionStats>,
+}
+
 /// What the slicer measured over its last reporting interval.
 ///
 /// Reported by the slicer subprocess as a JSON line on its stdout every ten
-/// seconds (see `crate::projection::slicer`), read by the manager and served
-/// as `GET /projection/stats` / `projection_stats_changed`. `None` at both of
-/// those means no slicer is currently running — there is nothing configured
-/// to blend, or projection is off.
+/// seconds (see `crate::projection::slicer`), read by the manager and held
+/// as [`ProjectionReport::last_interval`]. `None` there means no interval
+/// has completed yet, which is normal for a slicer that is running but has
+/// nothing to capture — see [`ProjectionReport::running`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionStats {
@@ -842,6 +962,75 @@ mod tests {
         let max = output.maximum_mode().unwrap();
         assert_eq!((max.width, max.height), (3840, 2160));
         assert_eq!(max.refresh_hz, 60.0);
+    }
+
+    #[test]
+    fn status_serialises_the_new_fields_in_camel_case() {
+        let status = Status {
+            state: SyncState::Synced,
+            divergences: vec![],
+            last_reconciled: Some(10),
+            revision: 3,
+            committed: false,
+            current_revision: 4,
+            checks: Some(CheckSummary {
+                pass: 1,
+                warn: 2,
+                fail: 3,
+            }),
+        };
+        let value = serde_json::to_value(&status).unwrap();
+        assert_eq!(value["committed"], false);
+        assert_eq!(value["currentRevision"], 4);
+        assert_eq!(value["checks"]["pass"], 1);
+        assert_eq!(value["checks"]["warn"], 2);
+        assert_eq!(value["checks"]["fail"], 3);
+    }
+
+    #[test]
+    fn status_default_is_committed_with_no_checks_yet_reported() {
+        let status = Status::default();
+        assert!(
+            status.committed,
+            "an empty document has no working copy to distrust"
+        );
+        assert_eq!(status.current_revision, 0);
+        assert!(
+            status.checks.is_none(),
+            "nothing has run from a bare default"
+        );
+    }
+
+    #[test]
+    fn check_summary_tally_distinguishes_never_run_from_all_pass() {
+        assert!(
+            CheckSummary::tally(&[]).is_none(),
+            "no checks run is not the same claim as zero failures"
+        );
+
+        let sample = |status: CheckStatus| Check {
+            id: "x".into(),
+            title: "X".into(),
+            status,
+            detail: String::new(),
+            docs_url: None,
+            fix_available: false,
+            fix_description: None,
+        };
+        let checks = vec![
+            sample(CheckStatus::Pass),
+            sample(CheckStatus::Pass),
+            sample(CheckStatus::Warn),
+            sample(CheckStatus::Fail),
+        ];
+        assert_eq!(
+            CheckSummary::tally(&checks),
+            Some(CheckSummary {
+                pass: 2,
+                warn: 1,
+                fail: 1
+            })
+        );
     }
 
     #[test]

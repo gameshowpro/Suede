@@ -245,7 +245,11 @@ impl DesiredState {
             .iter()
             .filter(|output| output.enable)
             .filter_map(|output| {
-                let mode = output.mode?;
+                // The adopted mode counts too: once a value has been pinned,
+                // it is as settled a fact as one the operator typed in, and
+                // a layout that only validates the operator's own half would
+                // wrongly exempt an output the moment it gets adopted.
+                let mode = output.effective_mode()?;
                 let position = output.position?;
                 Some((
                     output.r#match.key(),
@@ -555,6 +559,84 @@ impl Transform {
             Self::Flipped270 => "flipped-270",
         }
     }
+
+    /// Inverse of [`Transform::as_sway`], parsing what `get_outputs` reports
+    /// back. Needed to compare a freshly observed transform against a
+    /// previous one when deciding whether a value has settled — see
+    /// [`AdoptedOutput`].
+    pub fn from_sway(value: &str) -> Option<Self> {
+        Some(match value {
+            "normal" => Self::Normal,
+            "90" => Self::Rotate90,
+            "180" => Self::Rotate180,
+            "270" => Self::Rotate270,
+            "flipped" => Self::Flipped,
+            "flipped-90" => Self::Flipped90,
+            "flipped-180" => Self::Flipped180,
+            "flipped-270" => Self::Flipped270,
+            _ => return None,
+        })
+    }
+}
+
+/// What Suede observed and pinned because the configuration named none.
+///
+/// Kept apart from the operator's own fields, not merged into them, because
+/// the two must stay distinguishable forever: an operator who asked for
+/// 1920x1200 and cannot have it deserves a divergence that persists until a
+/// human decides, while a value that is merely what happened to be plugged in
+/// last week should be replaced without ceremony when the display changes.
+/// Merged into one field, nothing could tell those two cases apart.
+///
+/// Deliberately absent: **position**. In projection mode the configured
+/// position is a canvas coordinate where the beams overlap, while sway is
+/// handed a plain edge-to-edge tiling, so observed position is not desired
+/// position by design — on the four-projector bench the configuration holds
+/// a 2x2 grid while sway reports a single row, and adopting observed
+/// positions would flatten the layout and destroy the blend. Do not add it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdoptedOutput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<Mode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<Transform>,
+    /// The display these were taken from, so that swapping the screen on a
+    /// connector re-adopts rather than pinning the old one's values forever.
+    /// `None` when the display reported no EDID identity at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayIdentity>,
+    /// Unix seconds, so an operator can see how old a pin is.
+    #[serde(default)]
+    pub captured_at: u64,
+}
+
+/// Enough of a display's EDID to tell "the same screen" from "a different
+/// one on the same connector".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DisplayIdentity {
+    pub make: Option<String>,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+}
+
+impl DisplayIdentity {
+    /// Build from what was observed. `None` when `output` carries no EDID
+    /// identity at all, so "no identity either time" never reads as a
+    /// display change.
+    pub fn of(output: &Output) -> Option<Self> {
+        if output.make.is_none() && output.model.is_none() && output.serial.is_none() {
+            return None;
+        }
+        Some(Self {
+            make: output.make.clone(),
+            model: output.model.clone(),
+            serial: output.serial.clone(),
+        })
+    }
 }
 
 /// Desired configuration for one output.
@@ -566,14 +648,22 @@ pub struct OutputConfig {
     /// Whether the output should be enabled. `false` actively disables it.
     #[serde(default = "default_true")]
     pub enable: bool,
-    /// Mode to apply. When absent, Sway's preferred mode is left in place.
+    /// Mode to apply. When absent, Sway's preferred mode is left in place —
+    /// and, once settled, pinned into `adopted.mode`. Reading this field
+    /// directly sees only the operator's own choice; almost every reader
+    /// wants [`OutputConfig::effective_mode`] instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<Mode>,
     /// Position in the global layout. Suede performs no layout arithmetic.
+    /// Never adopted — see [`AdoptedOutput`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// When absent, left as Sway's own and, once settled, pinned into
+    /// `adopted.scale`. Prefer [`OutputConfig::effective_scale`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<f64>,
+    /// When absent, left as Sway's own and, once settled, pinned into
+    /// `adopted.transform`. Prefer [`OutputConfig::effective_transform`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<Transform>,
     #[serde(default)]
@@ -588,6 +678,16 @@ pub struct OutputConfig {
     /// properties spelled out. See [`BackgroundRef`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background: Option<BackgroundRef>,
+    /// What Suede observed and pinned because the configuration named none.
+    ///
+    /// Kept apart from the operator's own fields, not merged into them, because
+    /// the two must stay distinguishable forever: an operator who asked for
+    /// 1920x1200 and cannot have it deserves a divergence that persists until a
+    /// human decides, while a value that is merely what happened to be plugged in
+    /// last week should be replaced without ceremony when the display changes.
+    /// Merged into one field, nothing could tell those two cases apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<AdoptedOutput>,
 }
 
 /// How a wallpaper is scaled onto an output, matching `sway-output(5)`.
@@ -795,7 +895,29 @@ impl OutputConfig {
             allow_tearing: false,
             max_render_time_ms: None,
             background: None,
+            adopted: None,
         }
+    }
+
+    /// The mode to apply: the operator's own if given, else whatever was
+    /// adopted because none was. This is what every reconciliation reader
+    /// wants — reading `mode` directly sees only the operator's half of the
+    /// story and will look like "the pin did nothing".
+    pub fn effective_mode(&self) -> Option<Mode> {
+        self.mode
+            .or_else(|| self.adopted.as_ref().and_then(|adopted| adopted.mode))
+    }
+
+    /// As [`OutputConfig::effective_mode`], for scale.
+    pub fn effective_scale(&self) -> Option<f64> {
+        self.scale
+            .or_else(|| self.adopted.as_ref().and_then(|adopted| adopted.scale))
+    }
+
+    /// As [`OutputConfig::effective_mode`], for transform.
+    pub fn effective_transform(&self) -> Option<Transform> {
+        self.transform
+            .or_else(|| self.adopted.as_ref().and_then(|adopted| adopted.transform))
     }
 }
 
@@ -1208,6 +1330,7 @@ mod tests {
             allow_tearing: false,
             max_render_time_ms: None,
             background: None,
+            adopted: None,
         }
     }
 
@@ -1502,5 +1625,96 @@ mod tests {
         assert!(BackgroundRef::Preset("gone".into())
             .resolve(&presets)
             .is_none());
+    }
+
+    // --- adopted output values ---------------------------------------------
+
+    #[test]
+    fn effective_fields_prefer_the_operators_own_value() {
+        let mut output = OutputConfig::new(OutputMatch::by_name("HDMI-A-1"));
+        output.mode = Some(Mode {
+            width: 1920,
+            height: 1200,
+            refresh_hz: 59.95,
+        });
+        output.adopted = Some(AdoptedOutput {
+            mode: Some(Mode {
+                width: 3840,
+                height: 2160,
+                refresh_hz: 60.0,
+            }),
+            scale: Some(2.0),
+            transform: Some(Transform::Rotate90),
+            display: None,
+            captured_at: 0,
+        });
+
+        // The operator's own mode wins even though a different one is
+        // adopted; scale and transform, which the operator never set, fall
+        // through to the adopted value.
+        assert_eq!(output.effective_mode(), output.mode);
+        assert_eq!(output.effective_scale(), Some(2.0));
+        assert_eq!(output.effective_transform(), Some(Transform::Rotate90));
+    }
+
+    #[test]
+    fn effective_fields_fall_back_to_nothing_when_neither_is_set() {
+        let output = OutputConfig::new(OutputMatch::by_name("HDMI-A-1"));
+        assert_eq!(output.effective_mode(), None);
+        assert_eq!(output.effective_scale(), None);
+        assert_eq!(output.effective_transform(), None);
+    }
+
+    #[test]
+    fn display_identity_is_none_without_any_edid_field() {
+        assert_eq!(DisplayIdentity::of(&output("HDMI-A-1", None)), None);
+        assert_eq!(
+            DisplayIdentity::of(&output("HDMI-A-1", Some("Acme"))),
+            Some(DisplayIdentity {
+                make: Some("Acme".into()),
+                model: None,
+                serial: None,
+            })
+        );
+    }
+
+    #[test]
+    fn transform_survives_the_round_trip_through_sways_own_spelling() {
+        for transform in [
+            Transform::Normal,
+            Transform::Rotate90,
+            Transform::Rotate180,
+            Transform::Rotate270,
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            assert_eq!(Transform::from_sway(transform.as_sway()), Some(transform));
+        }
+        assert_eq!(Transform::from_sway("sideways"), None);
+    }
+
+    #[test]
+    fn an_adopted_mode_counts_toward_the_contiguity_check() {
+        // Adopting fills in geometry the operator never typed, and a
+        // validator that only looked at the operator's own field would
+        // wrongly stop enforcing contiguity the moment a mode is pinned.
+        let mut second = placed("B", 1760, 0, 1920, 1080);
+        second.mode = None;
+        second.adopted = Some(AdoptedOutput {
+            mode: Some(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            }),
+            scale: None,
+            transform: None,
+            display: None,
+            captured_at: 0,
+        });
+        layout(vec![placed("A", 0, 0, 1920, 1080), second])
+            .validate()
+            .expect("the adopted mode should still chain to A");
     }
 }

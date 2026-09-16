@@ -6,7 +6,10 @@
 
 use std::collections::HashMap;
 
-use crate::model::{AppConfig, Background, Divergence, Output, OutputConfig};
+use crate::model::{
+    AdoptedOutput, AppConfig, Background, DisplayIdentity, Divergence, Output, OutputConfig,
+    Transform,
+};
 
 /// Version-gated compositor features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -127,7 +130,7 @@ where
         let unmanaged = applied.is_none();
         let force = just_enabled || unmanaged;
 
-        if let Some(mode) = config.mode {
+        if let Some(mode) = config.effective_mode() {
             // An inactive output reports no modes, so the request is passed
             // through and sway validates it once the output comes up.
             let target = if output.modes.is_empty() {
@@ -172,7 +175,7 @@ where
             }
         }
 
-        if let Some(scale) = config.scale {
+        if let Some(scale) = config.effective_scale() {
             let differs = output
                 .scale
                 .is_none_or(|current| (current - scale).abs() > 1e-6);
@@ -182,7 +185,7 @@ where
             }
         }
 
-        if let Some(transform) = config.transform {
+        if let Some(transform) = config.effective_transform() {
             let wanted = transform.as_sway();
             if force || output.transform.as_deref() != Some(wanted) {
                 plan.commands
@@ -277,6 +280,115 @@ where
     }
 
     plan
+}
+
+/// Whether `config` should adopt (or re-adopt, or leave alone) the mode,
+/// scale and transform an output settled on, given this pass's observation.
+///
+/// Pure, so every combination — first pin, an operator-owned field, a
+/// display still waking, a pass that diverged, a display swap — is
+/// table-testable without a compositor or a reconciler. The caller is
+/// responsible for the guards this function cannot see on its own: that no
+/// working copy is live (`StateStore::has_preview()`), and for feeding
+/// `previous_observation` from the *prior* pass's observation of this same
+/// live output, not this one's.
+///
+/// A field is only ever a candidate when the operator has left it unset —
+/// `mode_unsupported` exists for the case where they set one and the display
+/// cannot deliver it, and adoption must never paper over that with a silent
+/// substitution. Among the unset fields, a value is only adopted once it has
+/// been observed twice in a row: a display still negotiating its link can
+/// report something on the first pass that is not its final answer, and
+/// pinning that would be permanent. Once something is adopted, a later
+/// disagreement on the *same* display is left alone rather than overwritten
+/// — it is a transient worth reporting (the reconciler will keep trying to
+/// force the pinned value back, surfacing as `mode_unsupported` if it truly
+/// cannot), not evidence that the pin was wrong. A *different* display
+/// invalidates the old pin entirely, so every field is re-adopted fresh.
+pub fn adoption_for(
+    config: &OutputConfig,
+    observed: &Output,
+    previous_observation: Option<&Output>,
+    diverged: bool,
+) -> Option<AdoptedOutput> {
+    // An unplugged connector keeps its place in the layout by design, and a
+    // pass that could not do what it was asked has not settled — pinning
+    // either would be pinning a cable, or an interrupted attempt.
+    if diverged || !observed.active {
+        return None;
+    }
+    let previous = previous_observation?;
+
+    // Only a value seen on two consecutive passes counts as settled, and
+    // only for a field the operator has left unset — never touched here.
+    fn settle<T: Copy + PartialEq>(
+        configured: Option<T>,
+        now: Option<T>,
+        before: Option<T>,
+    ) -> Option<T> {
+        if configured.is_some() {
+            return None;
+        }
+        let now = now?;
+        (before == Some(now)).then_some(now)
+    }
+
+    let settled_mode = settle(config.mode, observed.current_mode, previous.current_mode);
+    let settled_scale = settle(config.scale, observed.scale, previous.scale);
+    let observed_transform = observed.transform.as_deref().and_then(Transform::from_sway);
+    let previous_transform = previous.transform.as_deref().and_then(Transform::from_sway);
+    let settled_transform = settle(config.transform, observed_transform, previous_transform);
+
+    let identity = DisplayIdentity::of(observed);
+    let existing = config.adopted.as_ref();
+    let display_changed = existing.is_some_and(|adopted| adopted.display != identity);
+    // A display swap invalidates whatever was pinned for the old panel; keep
+    // nothing from it, even for a field the operator still leaves unset.
+    let carry_forward = existing.filter(|_| !display_changed);
+
+    let mode = if config.mode.is_some() {
+        None
+    } else {
+        carry_forward.and_then(|a| a.mode).or(settled_mode)
+    };
+    let scale = if config.scale.is_some() {
+        None
+    } else {
+        carry_forward.and_then(|a| a.scale).or(settled_scale)
+    };
+    let transform = if config.transform.is_some() {
+        None
+    } else {
+        carry_forward
+            .and_then(|a| a.transform)
+            .or(settled_transform)
+    };
+
+    // Nothing settled, nothing carried forward: there is nothing to record.
+    if mode.is_none() && scale.is_none() && transform.is_none() {
+        return None;
+    }
+
+    // Write only when something actually differs — a pass that would write
+    // the same bytes must write nothing, or a flapping cable churns the
+    // revision and wakes every SSE client for no reason.
+    let unchanged = existing.is_some_and(|adopted| {
+        adopted.mode == mode
+            && adopted.scale == scale
+            && adopted.transform == transform
+            && adopted.display == identity
+    });
+    if unchanged {
+        return None;
+    }
+
+    Some(AdoptedOutput {
+        mode,
+        scale,
+        transform,
+        display: identity,
+        captured_at: crate::util::unix_now(),
+    })
 }
 
 /// Where a managed app should run.
@@ -1419,5 +1531,184 @@ mod tests {
         // A canvas slower than an output would starve it; the slicer's
         // gating simply drops the faster canvas's extra frames evenly.
         assert_eq!(canvas_refresh_hz(&[59.939, 60.0]), Some(60.0));
+    }
+
+    // --- adoption ----------------------------------------------------------
+
+    fn with_adopted(name: &str, adopted: AdoptedOutput) -> OutputConfig {
+        let mut cfg = config(name);
+        cfg.adopted = Some(adopted);
+        cfg
+    }
+
+    fn pinned(mode: Mode, display: Option<DisplayIdentity>) -> AdoptedOutput {
+        AdoptedOutput {
+            mode: Some(mode),
+            scale: None,
+            transform: None,
+            display,
+            captured_at: 0,
+        }
+    }
+
+    #[test]
+    fn first_adoption_of_an_unset_mode() {
+        let config = config("HDMI-A-1");
+        let now = output("HDMI-A-1", true);
+        let previous = now.clone();
+        let adopted = adoption_for(&config, &now, Some(&previous), false)
+            .expect("a mode settled on two consecutive passes must be pinned");
+        assert_eq!(adopted.mode, now.current_mode);
+        assert_eq!(adopted.display, DisplayIdentity::of(&now));
+    }
+
+    #[test]
+    fn no_adoption_when_the_operator_set_the_mode() {
+        let mut config = config("HDMI-A-1");
+        config.mode = Some(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        });
+        // Scale and transform are unset too, but this test is about mode in
+        // isolation, so give it a display that reports neither.
+        let mut now = output("HDMI-A-1", true);
+        now.scale = None;
+        now.transform = None;
+        let previous = now.clone();
+        assert_eq!(adoption_for(&config, &now, Some(&previous), false), None);
+    }
+
+    #[test]
+    fn no_adoption_on_the_first_sighting() {
+        let config = config("HDMI-A-1");
+        let now = output("HDMI-A-1", true);
+        assert_eq!(adoption_for(&config, &now, None, false), None);
+    }
+
+    #[test]
+    fn no_adoption_when_the_pass_diverged() {
+        let config = config("HDMI-A-1");
+        let now = output("HDMI-A-1", true);
+        let previous = now.clone();
+        assert_eq!(adoption_for(&config, &now, Some(&previous), true), None);
+    }
+
+    #[test]
+    fn no_adoption_when_the_output_is_inactive() {
+        // An unplugged connector keeps its place in the layout by design;
+        // adopting from it would let a pulled cable rewrite the document.
+        let config = config("HDMI-A-1");
+        let now = output("HDMI-A-1", false);
+        let previous = now.clone();
+        assert_eq!(adoption_for(&config, &now, Some(&previous), false), None);
+    }
+
+    #[test]
+    fn no_re_adopt_when_the_same_display_settles_differently() {
+        let existing = pinned(
+            Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            },
+            None,
+        );
+        let config = with_adopted("HDMI-A-1", existing);
+        let mut now = output("HDMI-A-1", true);
+        // The same (identity-less) display now settles on something else,
+        // stably, for two passes. Scale and transform are unset here too,
+        // so isolated to mode as the case describes.
+        now.current_mode = Some(Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60.0,
+        });
+        now.scale = None;
+        now.transform = None;
+        let previous = now.clone();
+        assert_eq!(
+            adoption_for(&config, &now, Some(&previous), false),
+            None,
+            "a transient disagreement on the same display must be left alone"
+        );
+    }
+
+    #[test]
+    fn re_adopt_when_the_display_identity_changes() {
+        let old_identity = DisplayIdentity {
+            make: Some("Old".into()),
+            model: None,
+            serial: None,
+        };
+        let existing = pinned(
+            Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            },
+            Some(old_identity),
+        );
+        let config = with_adopted("HDMI-A-1", existing);
+
+        let mut now = output("HDMI-A-1", true);
+        now.make = Some("New".into());
+        now.current_mode = Some(Mode {
+            width: 1280,
+            height: 720,
+            refresh_hz: 60.0,
+        });
+        let previous = now.clone();
+
+        let adopted = adoption_for(&config, &now, Some(&previous), false)
+            .expect("a different display must re-adopt");
+        assert_eq!(adopted.mode, now.current_mode);
+        assert_eq!(adopted.display, DisplayIdentity::of(&now));
+    }
+
+    #[test]
+    fn nothing_written_when_the_adopted_value_already_matches() {
+        let now = output("HDMI-A-1", true);
+        let existing = AdoptedOutput {
+            mode: now.current_mode,
+            scale: now.scale,
+            transform: now.transform.as_deref().and_then(Transform::from_sway),
+            display: DisplayIdentity::of(&now),
+            captured_at: 123,
+        };
+        let config = with_adopted("HDMI-A-1", existing);
+        let previous = now.clone();
+        assert_eq!(
+            adoption_for(&config, &now, Some(&previous), false),
+            None,
+            "an unchanged pin must not be rewritten"
+        );
+    }
+
+    #[test]
+    fn clearing_an_operators_field_returns_it_to_adoption() {
+        let now = output("HDMI-A-1", true);
+        // Mode and transform are already pinned; scale was operator-set
+        // until just now, so nothing was ever adopted for it.
+        let existing = AdoptedOutput {
+            mode: now.current_mode,
+            scale: None,
+            transform: now.transform.as_deref().and_then(Transform::from_sway),
+            display: DisplayIdentity::of(&now),
+            captured_at: 1,
+        };
+        let config = with_adopted("HDMI-A-1", existing);
+        let previous = now.clone();
+
+        let adopted = adoption_for(&config, &now, Some(&previous), false)
+            .expect("the freed field must be adopted once settled");
+        assert_eq!(
+            adopted.scale, now.scale,
+            "the newly freed field is filled in"
+        );
+        assert_eq!(
+            adopted.mode, now.current_mode,
+            "the already-pinned field is carried forward"
+        );
     }
 }

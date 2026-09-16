@@ -87,11 +87,27 @@ Status conventions: `400` malformed JSON, `404` unknown resource, `409` revision
 | `GET` | `/windows` | All windows in the tree: id, app_id, pid, title, geometry, fullscreen state, output, and — where Suede launched them — the owning app id. |
 | `GET` | `/audio/outputs` | All audio sinks reported by PipeWire: stable id (`node.name`), human-readable description, availability, and whether it is Suede's null sink. See [Audio routing](#audio-routing). |
 | `GET` | `/apps/{id}/status` | Runtime status of a managed app: `running` \| `starting` \| `stopped` \| `crashed` \| `backoff`, pid, start time, restart count, matched window ids. |
-| `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, plus a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"). |
+| `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"), whether the applied document is the saved one (`committed`), the desired-state document's revision right now (`currentRevision`, which outruns the applied `revision` while a write is still being reconciled), and a summary of the last environment health-check run (`checks`: `pass`/`warn`/`fail` counts, `null` if none has run). See [below](#is-the-appliance-doing-what-i-asked) for how to read these together. |
 | `GET` | `/projection/stats` | What the slicer measured over its last interval: canvas and presented frame rates, per-frame cost, the inter-output presentation offset (mean/max ms), straddles (frames shown on different refreshes), per-output presented/discarded counts and measured refresh. `null` when no slicer is running. |
 | `GET` | `/system` | Suede version, Sway version, relevant package versions (sway, chromium, firefox, …), hostname, uptime. |
 | `GET` | `/system/checks` | Environment health checks: id, status (`pass` \| `warn` \| `fail`), detail, and whether an automated fix is available. See [Environment preparation](#environment-preparation-and-health-checks). |
 | `GET` | `/healthz` | Liveness: 200 when the HTTP server and Sway IPC connection are up. Unversioned, unauthenticated. |
+
+#### Is the appliance doing what I asked?
+
+An outside application — a show-control system, a dashboard — usually wants the answer to exactly that question, without making four calls and inferring the rest. `GET /status` is built to answer it in one:
+
+- Desired state is fulfilled *right now* when `state` is `synced` and `divergences` is empty.
+- It will still be fulfilled *after a restart* when `committed` is also `true`. A working copy (`PUT /config` with `committed: false`) is applied to the outputs exactly as a saved document is, so an appliance can be `synced` against a document that vanishes the moment it reboots.
+- The appliance has *caught up with your last write* when `currentRevision` equals `revision`. While they differ, the write is safely persisted but not yet reconciled.
+- The *environment underneath it* is sound when `checks.fail` is zero.
+
+`degraded` and a failing check are different conditions with different remedies, and conflating them is the mistake this call exists to head off:
+
+- `degraded` means the machine **cannot currently do what was asked** — an output is unplugged, a Sway command failed. The remedy is to fix the configuration or the display it names.
+- A failing check means **something about the machine's own environment needs attention** — PipeWire isn't serving, a browser is missing — independent of whether the current configuration happens to exercise it right now. The remedy is on the machine, not in the document.
+
+A `synced` appliance can still be carrying a failing check, and a `degraded` one can have a perfectly healthy environment; neither implies the other.
 
 ### Desired state (read-write)
 
@@ -128,7 +144,7 @@ Imperative escape hatches (not persisted):
 - `app_status_changed` — payload: same shape as `GET /apps/{id}/status`.
 - `checks_changed` — payload: same shape as `GET /system/checks`.
 - `config_changed` — payload: the new desired-state document revision number and which section changed.
-- `status_changed` — payload: same shape as `GET /status`.
+- `status_changed` — payload: same shape as `GET /status`, except `checks` is always `null`: a reconciliation pass never runs the health checks itself (they shell out to other programs, and a pass must stay cheap), so it has nothing honest to report there. Poll `GET /status` for the checks summary.
 - `projection_stats_changed` — payload: same shape as `GET /projection/stats`, every 10 s while the slicer runs; `null` when it stops.
 - Heartbeat comment every 15 s to keep intermediaries from timing out the connection.
 

@@ -652,7 +652,8 @@ impl CheckRunner {
     /// See [`CheckRunner::fix_output_phase`] for the remedy this offers.
     async fn check_output_phase(&self) -> Check {
         let stats = self.snapshot.projection_stats();
-        let (status, detail) = output_phase_verdict(stats.as_ref());
+        let running = self.snapshot.slicer_running();
+        let (status, detail) = output_phase_verdict(running, stats.as_ref());
         let mut check = self.check(
             ids::OUTPUT_PHASE,
             "Displays are in phase",
@@ -1962,12 +1963,29 @@ fn refresh_rate_verdict(outputs: &[Output], configured: &[OutputConfig]) -> (Che
 /// Pure, so every combination is table-testable without a compositor or a
 /// slicer. See [`CheckRunner::check_output_phase`] for the measurement
 /// behind the 1.0 ms threshold and what a batched re-enable does about it.
-fn output_phase_verdict(stats: Option<&ProjectionStats>) -> (CheckStatus, String) {
+///
+/// `running` is `Snapshot::slicer_running`, not inferred from `stats`: a
+/// four-projector bench on 2026-09-15 had a slicer that was alive and had
+/// logged its startup line, but had produced no frames because the frame
+/// loop is damage-driven and the active page was static — `stats` was
+/// `None` exactly as it would be with no slicer at all, and this check said
+/// "not measured: the slicer is not running" about a slicer that was
+/// running. The two cases now get their own, both true, sentences.
+fn output_phase_verdict(running: bool, stats: Option<&ProjectionStats>) -> (CheckStatus, String) {
     let Some(stats) = stats else {
-        return (
-            CheckStatus::Pass,
-            "not measured: the slicer is not running".to_string(),
-        );
+        return if running {
+            (
+                CheckStatus::Pass,
+                "not measured: the slicer has reported no frames yet, which is what a \
+                 static page looks like — the frame loop only runs when the content draws"
+                    .to_string(),
+            )
+        } else {
+            (
+                CheckStatus::Pass,
+                "not measured: no slicer is running".to_string(),
+            )
+        };
     };
     if !stats.presentation_feedback {
         return (
@@ -2976,15 +2994,29 @@ mod tests {
 
     #[test]
     fn no_slicer_running_is_a_pass() {
-        let (status, detail) = output_phase_verdict(None);
+        let (status, detail) = output_phase_verdict(false, None);
         assert_eq!(status, CheckStatus::Pass);
-        assert_eq!(detail, "not measured: the slicer is not running");
+        assert_eq!(detail, "not measured: no slicer is running");
+    }
+
+    #[test]
+    fn a_running_but_silent_slicer_is_a_pass() {
+        // The 2026-09-15 bench, verbatim: alive and logged, but the active
+        // page was static so the damage-driven frame loop had nothing to
+        // capture. Must read as normal, not as the slicer being down.
+        let (status, detail) = output_phase_verdict(true, None);
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(
+            detail,
+            "not measured: the slicer has reported no frames yet, which is what a \
+             static page looks like — the frame loop only runs when the content draws"
+        );
     }
 
     #[test]
     fn no_presentation_feedback_is_a_pass() {
         let stats = stats_with(false, vec![timing("DP-5", None), timing("DP-6", None)]);
-        let (status, detail) = output_phase_verdict(Some(&stats));
+        let (status, detail) = output_phase_verdict(true, Some(&stats));
         assert_eq!(status, CheckStatus::Pass);
         assert_eq!(
             detail,
@@ -2995,7 +3027,7 @@ mod tests {
     #[test]
     fn fewer_than_two_measured_outputs_is_a_pass() {
         let stats = stats_with(true, vec![timing("DP-5", Some(0.0))]);
-        let (status, _detail) = output_phase_verdict(Some(&stats));
+        let (status, _detail) = output_phase_verdict(true, Some(&stats));
         assert_eq!(status, CheckStatus::Pass);
     }
 
@@ -3011,7 +3043,7 @@ mod tests {
                 timing("DP-8", Some(0.01)),
             ],
         );
-        let (status, detail) = output_phase_verdict(Some(&stats));
+        let (status, detail) = output_phase_verdict(true, Some(&stats));
         assert_eq!(status, CheckStatus::Pass);
         assert_eq!(detail, "DP-5, DP-6, DP-7, DP-8 within 0.03 ms");
     }
@@ -3030,7 +3062,7 @@ mod tests {
                 timing("DP-8", Some(7.1)),
             ],
         );
-        let (status, detail) = output_phase_verdict(Some(&stats));
+        let (status, detail) = output_phase_verdict(true, Some(&stats));
         assert_eq!(status, CheckStatus::Warn);
         assert_eq!(
             detail,
@@ -3052,7 +3084,7 @@ mod tests {
                 timing("DP-7", Some(-3.4)),
             ],
         );
-        let (status, detail) = output_phase_verdict(Some(&stats));
+        let (status, detail) = output_phase_verdict(true, Some(&stats));
         assert_eq!(status, CheckStatus::Warn);
         assert!(
             detail.starts_with("out of phase with DP-5: DP-7 -3.4 ms"),

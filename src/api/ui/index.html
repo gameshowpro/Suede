@@ -248,6 +248,14 @@ window.addEventListener("error", (event) => {
       <!-- The diagram alone left the editor undiscoverable, so every display
            in the layout also gets a plain button that opens it. -->
       <div class="row" id="display-buttons" style="margin-top:10px"></div>
+      <!-- The commissioning action: freeze every attached display's settled
+           mode/scale/transform into stated intent in one preview, so the
+           wall stops drifting the moment it looks right. -->
+      <div class="row" style="margin-top:10px">
+        <button class="action ghost" id="pin-all">Pin all displays</button>
+        <span class="hint">Pins what every attached display is currently
+          showing.</span>
+      </div>
       <!-- Everything the hardware has that is not in the layout yet. Names
            are never typed: the operator picks from what actually exists. -->
       <div id="unused-outputs" class="hidden" style="margin-top:14px">
@@ -287,14 +295,18 @@ window.addEventListener("error", (event) => {
         <div><label for="o-enable">Enabled</label>
           <input type="checkbox" role="switch" class="switch" id="o-enable"></div>
         <div><label for="o-mode">Mode</label><select id="o-mode"></select>
-          <span class="hint" id="o-mode-note" hidden></span></div>
+          <span class="hint" id="o-mode-note" hidden></span>
+          <span class="hint" id="o-mode-hint"></span></div>
         <div><label for="o-x">Position X</label><input id="o-x" type="number" step="1"></div>
         <div><label for="o-y">Position Y</label><input id="o-y" type="number" step="1"></div>
-        <div><label for="o-scale">Scale</label><input id="o-scale" type="number" step="0.25" min="0.25"></div>
+        <div><label for="o-scale">Scale</label><input id="o-scale" type="number" step="0.25" min="0.25">
+          <span class="hint" id="o-scale-hint"></span></div>
         <div><label for="o-transform">Transform</label><select id="o-transform">
+          <option value="">Leave to sway</option>
           <option>normal</option><option>90</option><option>180</option><option>270</option>
           <option>flipped</option><option>flipped-90</option><option>flipped-180</option><option>flipped-270</option>
-        </select></div>
+        </select>
+          <span class="hint" id="o-transform-hint"></span></div>
         <div><label for="o-adaptive">Adaptive sync</label>
           <input type="checkbox" role="switch" class="switch" id="o-adaptive"></div>
         <div><label for="o-tearing">Allow tearing</label>
@@ -320,6 +332,8 @@ window.addEventListener("error", (event) => {
 
       <div class="row" style="margin-top:14px">
         <button class="action" id="o-save">Save</button>
+        <button class="action ghost" id="o-pin">Pin current settings</button>
+        <button class="action ghost" id="o-pin-clear">Clear pinned values</button>
         <button class="action ghost" id="o-remove">Remove from config</button>
         <button class="action ghost" id="o-cancel">Cancel</button>
         <span class="hint" id="o-note"></span>
@@ -377,15 +391,18 @@ window.addEventListener("error", (event) => {
       </div>
       <div id="pj-timing" hidden style="margin-top:14px">
         <h3 style="margin:0 0 8px">Frame timing</h3>
-        <table><tbody id="pj-timing-rows"></tbody></table>
-        <table style="margin-top:8px"><thead><tr>
+        <p class="hint" id="pj-timing-silent" hidden>The slicer is running.
+          No frames have been reported yet — the loop only runs while the
+          content is drawing.</p>
+        <table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table>
+        <table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
           <th>Output</th><th>Presented</th><th>Discarded</th><th>Refresh</th><th>Phase</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
-        <p class="hint">Measured by the slicer over each 10 s interval from
-          the compositor's presentation timestamps. Offset is how far apart
-          the displays showed the same frame; a straddle is a frame they
-          showed on different refreshes. Healthy: a steady offset of a few
-          milliseconds and no straddles.</p>
+        <p class="hint" id="pj-timing-hint">Measured by the slicer over each
+          10 s interval from the compositor's presentation timestamps.
+          Offset is how far apart the displays showed the same frame; a
+          straddle is a frame they showed on different refreshes. Healthy: a
+          steady offset of a few milliseconds and no straddles.</p>
       </div>
     </div>
   </section>
@@ -667,8 +684,11 @@ let outputs = [], config = null, apps = [], sinks = [], checks = [], status = nu
     systemInfo = null,
     // The graphics card's connectors, including those with nothing attached.
     ports = [],
-    // What the slicer measured over its last reporting interval; null when no
-    // slicer is running (no projection configured, or nothing overlaps).
+    // { running, lastInterval } — whether a slicer is alive right now, and
+    // what it last measured, if any interval has completed. `lastInterval`
+    // is absent both when nothing is running and when one is running but
+    // has reported no frames yet (a static page never damages, so the
+    // frame loop never runs); `running` is what tells those two apart.
     projectionStats = null;
 
 // Every screen's background comes from here, so the lookup is shared.
@@ -1057,6 +1077,34 @@ function removeFromLayout(name) {
   pushPreview();
 }
 
+// The commissioning action: the wall is right, freeze every configured,
+// attached display's settled mode/scale/transform into stated intent, all
+// in one preview. Skips anything not yet in the layout (nothing to promote)
+// and anything Pin would not change, exactly as "Pin current settings" does
+// per output — this is that button, applied to the whole layout at once.
+// Position is never touched.
+function pinAllDisplays() {
+  if (!loaded()) return;
+  let pinned = 0;
+  for (const known of knownOutputs()) {
+    if (!known.output) continue;
+    const existing = configEntry(known.name);
+    if (!existing || !pinWouldChange(known, existing)) continue;
+    const fields = pinnableFields(known, existing);
+    const index = config.outputs.findIndex((o) => o.match?.name === known.name);
+    config.outputs[index] = { ...existing, mode: fields.mode, scale: fields.scale, transform: fields.transform };
+    pinned++;
+  }
+  renderLayout();
+  renderBackgrounds();
+  if (selected) refreshFieldHints(selected);
+  pushPreview();
+  toast(pinned
+    ? `pinned ${pinned} display${pinned === 1 ? "" : "s"} — Save to keep, Cancel to undo`
+    : "nothing to pin");
+}
+$("pin-all").onclick = pinAllDisplays;
+
 const OFFLINE_TOOLTIP =
   "Configured here, but no display is attached to this connector right now. " +
   "Its place in the canvas is kept, so the other displays carry on showing " +
@@ -1167,6 +1215,11 @@ function renderLayout() {
     ? "These are the machine's own connectors. Adding one places it to the " +
       "right of the layout; move it from there."
     : "";
+
+  // Recomputed here rather than only when an output is open, so the button
+  // is right the moment the Displays tab is drawn — before anything is
+  // selected — and after every load, edit, and revert.
+  $("pin-all").disabled = !pinAllWouldChangeSomething();
 }
 
 // The canvas the active app renders into: the bounding box of the configured
@@ -1232,18 +1285,28 @@ function selectOutput(name) {
       Math.round(m.refreshHz) === Math.round(existing.mode.refreshHz))) {
     offered.unshift(existing.mode);
   }
+  // "Leave to sway" is always offered, whether or not a display is attached
+  // right now: a value can be pinned for a socket that is currently empty
+  // (aimed at whatever arrives) and Clear must be able to put it back.
   $("o-mode").innerHTML =
-    (output ? `<option value="">Leave to sway</option>` : "") +
+    `<option value="">Leave to sway</option>` +
     offered.map((m) =>
       `<option value="${m.width}x${m.height}x${m.refreshHz}">${escape(modeLabel(m))}</option>`).join("");
-  const wanted = existing?.mode ?? output?.currentMode;
+  // Select only the operator's own choice. Falling back to the observed
+  // mode here is exactly the bug this fixes: a connector with nothing
+  // configured must show "Leave to sway", not whatever sway happened to
+  // pick, or opening the editor and pressing Save would silently pin it.
+  const wanted = existing?.mode ?? null;
   if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
   renderModeNote();
 
   $("o-x").value = existing?.position?.x ?? output?.rect.x ?? 0;
   $("o-y").value = existing?.position?.y ?? output?.rect.y ?? 0;
-  $("o-scale").value = existing?.scale ?? output?.scale ?? 1;
-  $("o-transform").value = existing?.transform ?? output?.transform ?? "normal";
+  // Scale must be able to show "unset": a blank input with a placeholder
+  // naming the value actually in effect, rather than a coerced 1.
+  $("o-scale").value = existing?.scale ?? "";
+  $("o-scale").placeholder = num(existing?.adopted?.scale ?? output?.scale ?? 1, 2);
+  $("o-transform").value = existing?.transform ?? "";
   $("o-adaptive").checked = existing?.adaptiveSync ?? false;
   $("o-tearing").checked = existing?.allowTearing ?? false;
   $("o-mrt").value = existing?.maxRenderTimeMs ?? "";
@@ -1254,7 +1317,101 @@ function selectOutput(name) {
   $("o-note").textContent = !existing ? "not yet in the layout"
     : known.connected ? ""
     : "nothing is plugged into this connector — its place in the canvas is kept";
+
+  refreshFieldHints(name);
   renderLayout();
+}
+
+// What "Pin current settings" and "Pin all displays" write: whatever is
+// actually in effect for this output, preferring Suede's own adopted pin
+// (it already carries provenance and survives more reboots) and falling
+// back to what the display is observed running right now.
+function pinnableFields(known, existing) {
+  const output = known?.output ?? null;
+  return {
+    mode: existing?.adopted?.mode ?? output?.currentMode ?? null,
+    scale: existing?.adopted?.scale ?? output?.scale ?? null,
+    transform: existing?.adopted?.transform ?? output?.transform ?? null,
+  };
+}
+
+// Same tolerance as the mismatched-refresh-rate note below: floating point
+// Hz values are never going to compare exactly, and a difference this small
+// is not a different mode. Null on either side counts as a difference —
+// including null against null — so a field with nothing to pin never masks
+// a real one that does.
+function modeMatches(a, b) {
+  if (a == null || b == null) return false;
+  return a.width === b.width && a.height === b.height &&
+    Math.abs(a.refreshHz - b.refreshHz) <= 0.01;
+}
+function valueMatches(a, b) {
+  if (a == null || b == null) return false;
+  return a === b;
+}
+
+// Whether pinning this output would actually write anything different from
+// what its operator fields already say — the button is for promoting a
+// running value into stated intent, not for re-stating one already there.
+// Deliberately not "all three fields are set": a field can be set and wrong
+// (a mode_unsupported divergence) and that is exactly when Pin is useful,
+// overwriting it with what the display can actually do.
+function pinWouldChange(known, existing) {
+  if (!known?.output) return false;
+  const fields = pinnableFields(known, existing);
+  return !modeMatches(existing?.mode ?? null, fields.mode) ||
+    !valueMatches(existing?.scale ?? null, fields.scale) ||
+    !valueMatches(existing?.transform ?? null, fields.transform);
+}
+
+// For "Pin all displays": whether any configured, attached output has
+// anything left for Pin to do, so the button reflects the whole layout.
+function pinAllWouldChangeSomething() {
+  for (const known of knownOutputs()) {
+    if (!known.output) continue;
+    const existing = configEntry(known.name);
+    if (existing && pinWouldChange(known, existing)) return true;
+  }
+  return false;
+}
+
+// One hint per pinnable field: what is actually in effect, and where it
+// came from. `adopted` is the whole AdoptedOutput object (for its display
+// provenance), `key` picks the field within it.
+function renderFieldProvenance(hintId, operatorValue, observedValue, adopted, key, format) {
+  const hint = $(hintId);
+  const adoptedValue = adopted?.[key] ?? null;
+  if (operatorValue != null) {
+    hint.textContent = observedValue != null
+      ? `Running ${format(observedValue)}`
+      : `Set to ${format(operatorValue)}`;
+  } else if (adoptedValue != null) {
+    const display = adopted?.display;
+    const from = display && (display.make || display.model)
+      ? ` — pinned from ${[display.make, display.model].filter(Boolean).join(" ")}`
+      : "";
+    hint.textContent = `Running ${format(adoptedValue)}${from}`;
+  } else {
+    hint.textContent = "Not set; sway will choose";
+  }
+}
+
+// Refreshes the three provenance hints and the Pin/Clear buttons' disabled
+// state for whichever output is open. Kept separate from selectOutput so an
+// ordinary field edit (which must not stomp on whatever the operator is
+// mid-typing into the controls) can still keep the hints honest.
+function refreshFieldHints(name) {
+  const known = knownOutputs().find((k) => k.name === name);
+  const output = known?.output ?? null;
+  const existing = configEntry(name);
+
+  renderFieldProvenance("o-mode-hint", existing?.mode, output?.currentMode, existing?.adopted, "mode", modeLabel);
+  renderFieldProvenance("o-scale-hint", existing?.scale, output?.scale, existing?.adopted, "scale", (v) => `${num(v, 2)}×`);
+  renderFieldProvenance("o-transform-hint", existing?.transform, output?.transform, existing?.adopted, "transform", (v) => v);
+
+  $("o-pin").disabled = !pinWouldChange(known, existing);
+  $("o-pin-clear").disabled =
+    !(existing?.mode != null || existing?.scale != null || existing?.transform != null);
 }
 
 // Two outputs at different refresh rates drift a frame apart every so
@@ -1287,13 +1444,17 @@ function outputEntryFromForm() {
   // A preset is sent as its bare name; the API accepts that or a full object.
   const background = $("o-bg").value || null;
   const mrt = $("o-mrt").value.trim();
+  // Both must be able to say "unset", not just "leave to sway"/blank: a
+  // coerced 1 or "normal" here silently turns every defaulted value into a
+  // specified one the moment the operator opens the editor and hits Save.
+  const scale = $("o-scale").value.trim();
   return {
     match: { name },
     enable: $("o-enable").checked,
     mode: width ? { width, height, refreshHz } : null,
     position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
-    scale: Number($("o-scale").value) || 1,
-    transform: $("o-transform").value,
+    scale: scale === "" ? null : Number(scale),
+    transform: $("o-transform").value || null,
     adaptiveSync: $("o-adaptive").checked,
     allowTearing: $("o-tearing").checked,
     maxRenderTimeMs: mrt ? Number(mrt) : null,
@@ -1313,6 +1474,9 @@ function outputEdited() {
   // Which displays use which background is derived from this edit, so the
   // Backgrounds table's "Used by" column goes stale unless it is redrawn.
   renderBackgrounds();
+  // The provenance hints and the Pin/Clear buttons describe `existing`,
+  // which this edit just changed.
+  refreshFieldHints(selected);
   pushPreview();
 }
 for (const id of ["o-enable", "o-mode", "o-x", "o-y", "o-scale", "o-transform",
@@ -1327,6 +1491,40 @@ $("o-save").onclick = () => run(async () => {
   clearTimeout(previewTimer);
   await saveCommitted();
 }, "saved display configuration");
+
+// Fills the controls from whatever is actually running — the adopted pin if
+// there is one, else the observed mode/scale/transform — then goes through
+// the same edit path as typing into the controls by hand: an ordinary
+// preview the operator can inspect and Cancel, not a new endpoint, and not
+// a confirmation dialog, because nothing changes on the display until Save.
+// It overwrites all three, including a field the operator already set: that
+// is what makes it useful on a `mode_unsupported` divergence, where "pin
+// current settings" means "stop asking for what this display cannot do,
+// and state what it is actually showing instead."
+$("o-pin").onclick = () => {
+  if (!selected) return;
+  const known = knownOutputs().find((k) => k.name === selected);
+  const existing = configEntry(selected);
+  const fields = pinnableFields(known, existing);
+  $("o-mode").value = fields.mode
+    ? `${fields.mode.width}x${fields.mode.height}x${fields.mode.refreshHz}` : "";
+  $("o-scale").value = fields.scale ?? "";
+  $("o-transform").value = fields.transform ?? "";
+  outputEdited();
+  toast("pinned — Save to keep, Cancel to undo");
+};
+
+// The opposite direction: back to "nothing settled yet", so the daemon
+// re-adopts on its next settled pass. Position is never touched by either
+// button — it is never adopted in the first place.
+$("o-pin-clear").onclick = () => {
+  if (!selected) return;
+  $("o-mode").value = "";
+  $("o-scale").value = "";
+  $("o-transform").value = "";
+  outputEdited();
+  toast("cleared — Save to keep, Cancel to undo");
+};
 
 $("o-remove").onclick = () => {
   // A layout edit like any other: it goes to the outputs immediately, Save
@@ -1707,10 +1905,24 @@ function projectionFromForm() {
 //
 // What the slicer measured, not what was asked for: shown alongside the
 // controls above so a drifting wall is visible without leaving the panel.
+//
+// Three states, not two: hidden with no slicer running; a single
+// explanatory line when one is running but has reported nothing (a static
+// page never damages, so the damage-driven frame loop never runs); the
+// tables below once an interval has actually completed. Collapsing the
+// last two into "no stats, so hide the block" is exactly what made a live
+// slicer on a static page read as not running.
 function renderProjectionTiming() {
-  $("pj-timing").hidden = !projectionStats;
-  if (!projectionStats) return;
-  const s = projectionStats;
+  const running = !!projectionStats?.running;
+  $("pj-timing").hidden = !running;
+  if (!running) return;
+
+  const s = projectionStats.lastInterval;
+  $("pj-timing-silent").hidden = !!s;
+  $("pj-timing-table").hidden = !s;
+  $("pj-timing-outputs-table").hidden = !s;
+  $("pj-timing-hint").hidden = !s;
+  if (!s) return;
   // A value worth a second look is styled like a failing check, not buried
   // in a sentence — the operator scans for color, not text.
   const flagged = (n) => n > 0 ? `<span class="pill bad">${n}</span>` : String(n);
@@ -2280,8 +2492,10 @@ async function loadAll() {
   sinks = await api("/audio/outputs");
   apps = await api("/apps");
   wallpapers = await api("/wallpapers");
-  // Advisory, like ports: an older daemon lacks the route, and no slicer
-  // running is a normal null rather than a failure.
+  // Advisory, like ports: an older daemon lacks the route. The endpoint
+  // itself always answers with an object now — {running, lastInterval} —
+  // never a bare null, so a fetch failure here means the route is missing,
+  // not that nothing is running.
   projectionStats = await api("/projection/stats").catch(() => null);
   await loadConfig();
   renderSinks(); renderOutputChoices();

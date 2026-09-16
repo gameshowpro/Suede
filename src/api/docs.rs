@@ -135,6 +135,8 @@ impl Modify for SecurityAddon {
         crate::model::SyncState,
         crate::model::Divergence,
         crate::model::Status,
+        crate::model::CheckSummary,
+        crate::model::ProjectionReport,
         crate::model::ProjectionStats,
         crate::model::FrameCost,
         crate::model::CaptureIntervals,

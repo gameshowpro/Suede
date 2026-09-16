@@ -139,6 +139,35 @@ When a display stays dark on a mode it claims to support:
    fractional refresh selects a single advertised mode instead of letting
    the compositor pick between identically-numbered ones.
 
+### The displays are black but the slicer reports frames {: #slicer-presenting-to-nothing }
+
+Only relevant to an overlapping (edge-blended) layout, where Suede's own
+slicer process — not Sway — presents each projector's slice.
+
+```bash
+curl -s http://appliance:9088/api/v1/projection/stats | python3 -m json.tool
+```
+
+The signature is `canvasFps`/`presentedFps` staying healthy while every
+output's `discarded` count climbs and `presented` stays at zero. That means
+the slicer is still capturing the canvas and committing frames, but every
+commit is landing on outputs the compositor has already destroyed — the
+layer surfaces the slicer built at startup no longer belong to anything on
+screen. It happens whenever an output is disabled and re-enabled, or
+unplugged and replugged, since either one destroys and recreates the
+output in the compositor; a running slicer built against the old one has no
+way to notice on its own unless told to.
+
+Suede detects and corrects this itself now, three ways: the slicer notices
+its own outputs disappearing from the Wayland registry and exits so the
+daemon respawns it; failing that, the slicer notices two consecutive
+ten-second intervals of presentation feedback answering "discarded" for
+everything and exits anyway; and the reconciler forces a slicer restart on
+any pass that actually changed which outputs are enabled, whether or not the
+compositor removes the global. A `systemctl --user restart suede` remains a
+manual fix for the same condition, and a fast way to confirm the diagnosis,
+but should no longer be necessary.
+
 ## A browser will not start
 
 ```bash

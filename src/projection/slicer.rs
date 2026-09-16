@@ -101,7 +101,7 @@ use wayland_client::protocol::{
     wl_compositor::WlCompositor,
     wl_output::{self, WlOutput},
     wl_region::WlRegion,
-    wl_registry::WlRegistry,
+    wl_registry::{self, WlRegistry},
     wl_shm::{self, WlShm},
     wl_shm_pool::WlShmPool,
     wl_surface::WlSurface,
@@ -154,6 +154,20 @@ const MAX_FAILURES: u32 = 3;
 /// DPMS-off or otherwise unrendering output does not freeze the rest of the
 /// wall for more than a third of a second.
 const STALL_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Feedback answers required in one interval before "none of them were
+/// `Presented`" is trusted as a signal rather than noise. On a four-projector
+/// bench on 2026-09-15 a dead interval carried 605 answers per output — this
+/// is set far below that, just high enough that a couple of stray answers
+/// right at startup or during a resize cannot look like the wall going dark.
+const MIN_FEEDBACK_ANSWERS_FOR_SELF_HEAL: u32 = 30;
+
+/// Consecutive dead intervals (see [`DeadIntervalTracker`]) required before
+/// the slicer gives up on itself and exits. Two, not one, so a single odd
+/// interval — a resize settling, a momentary compositor hiccup — cannot
+/// trigger a respawn on its own; the condition has to still be true ten
+/// seconds later.
+const CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL: u32 = 2;
 
 /// How to read one pixel of the captured canvas: bytes per pixel and where
 /// red, green, and blue live within them.
@@ -778,14 +792,87 @@ impl Timing {
     }
 }
 
+/// Whether one report interval, taken alone, is the "every frame is going
+/// nowhere" condition: presentation feedback was available, a meaningful
+/// number of answers came back, and not one of them was `Presented`.
+///
+/// Without feedback (`presentation_feedback` false) this never fires — a
+/// compositor that offers no `wp_presentation` gives no grounds to conclude
+/// anything about where frames landed, so silence is not evidence. Zero
+/// answers must not count as "none presented" either: that is the ordinary
+/// case before the compositor has answered anything at all, not the failure
+/// this exists to catch, which is why `answers` is checked against
+/// [`MIN_FEEDBACK_ANSWERS_FOR_SELF_HEAL`] rather than merely `> 0`. See
+/// [`DeadIntervalTracker`] for why one dead interval is not enough on its own
+/// to act on.
+fn interval_is_dead(presentation_feedback: bool, answers: u32, presented: u32) -> bool {
+    presentation_feedback && answers >= MIN_FEEDBACK_ANSWERS_FOR_SELF_HEAL && presented == 0
+}
+
+/// Counts consecutive dead intervals (see [`interval_is_dead`]) and says when
+/// enough of them in a row have been seen to act on.
+///
+/// Exists because of a four-projector bench on 2026-09-15: the
+/// `output-phase` check's fix disables and re-enables every output together,
+/// which destroys and recreates them in the compositor, and the
+/// already-running slicer kept presenting to the layer surfaces it had built
+/// against the old ones. `GET /api/v1/projection/stats` read `presented 0
+/// discarded 605` on all four outputs for a full ten-second interval while
+/// the same report claimed `presentedFps 60.4` throughout — the wall was
+/// black and the daemon insisted it was fine. A `systemctl --user restart
+/// suede` fixed it instantly. This is not specific to that one fix: any event
+/// that destroys and recreates an output does the same thing, including a
+/// projector simply being unplugged and replugged, so this reasons from the
+/// symptom rather than any one cause.
+///
+/// A single dead interval is deliberately not enough — a resize settling or a
+/// momentary compositor hiccup could plausibly produce one — so this waits
+/// for a second consecutive interval before reporting the condition as real.
+/// Any interval with at least one `Presented` answer resets the count to
+/// zero, because that proves frames are still reaching somewhere.
+#[derive(Default)]
+struct DeadIntervalTracker {
+    consecutive: u32,
+}
+
+impl DeadIntervalTracker {
+    /// Record one interval's outcome. Returns true once
+    /// [`CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL`] consecutive dead
+    /// intervals have been seen (and keeps returning true for as long as
+    /// that stays true, though the caller only needs to act on it once).
+    fn record(&mut self, presentation_feedback: bool, answers: u32, presented: u32) -> bool {
+        if interval_is_dead(presentation_feedback, answers, presented) {
+            self.consecutive += 1;
+        } else {
+            self.consecutive = 0;
+        }
+        self.consecutive >= CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL
+    }
+}
+
 struct State {
     /// Third element: this output's current-mode refresh in mHz, from
     /// `wl_output`'s `Mode` event — used only to size the canvas period for
-    /// the capture-interval histogram (see `report_stats_if_due`).
-    outputs: Vec<(WlOutput, Option<String>, Option<i32>)>,
+    /// the capture-interval histogram (see `report_stats_if_due`). Fourth:
+    /// the registry `name` this output's `wl_output` global was bound under —
+    /// not to be confused with the output's own advertised name string in
+    /// the second element — kept so a later `wl_registry::GlobalRemove` can
+    /// be matched back to it. See `used_outputs` and the
+    /// `Dispatch<WlRegistry, GlobalListContents>` impl.
+    outputs: Vec<(WlOutput, Option<String>, Option<i32>, u32)>,
+    /// Registry names (the same numbering as `outputs`' fourth element, and
+    /// what `wl_registry::Event::GlobalRemove` names) of the outputs this
+    /// slicer actually captures from or presents to — a subset of `outputs`,
+    /// which also holds every other `wl_output` global the compositor
+    /// advertises. Populated once in `run`, after `source` and every
+    /// presenter's target are resolved.
+    used_outputs: Vec<u32>,
     presenters: Vec<Presenter>,
     capture: Capture,
     closed: bool,
+    /// Counts consecutive intervals where feedback came back for nobody; see
+    /// `DeadIntervalTracker`.
+    dead_intervals: DeadIntervalTracker,
     /// From `SlicerSpec.free_run`; see the type it lives on for the tradeoff.
     free_run: bool,
     /// From `SlicerSpec.renderer`; see `decide_backend` for how this turns
@@ -922,6 +1009,29 @@ impl State {
             )
             .collect();
 
+        // The self-heal check (see `DeadIntervalTracker`): reuses this
+        // interval's per-output tallies rather than accumulating a separate
+        // pair, since the pass/fail signal is already sitting right here in
+        // `outputs`.
+        let interval_presented: u32 = outputs.iter().map(|o| o.presented).sum();
+        let interval_answers: u32 = outputs.iter().map(|o| o.presented + o.discarded).sum();
+        if self
+            .dead_intervals
+            .record(presentation_feedback, interval_answers, interval_presented)
+        {
+            eprintln!(
+                "slicer: two consecutive {:.0}s intervals answered {interval_answers} \
+                 presentation-feedback requests and none were `Presented` — every frame is \
+                 going nowhere, most likely because the outputs this slicer was built against \
+                 were destroyed and recreated by the compositor (measured on a four-projector \
+                 bench on 2026-09-15: `presented 0 discarded 605` on every output while this \
+                 process kept reporting 60.4 fps). Exiting so the daemon's sync_slicer respawns \
+                 it against whatever exists now.",
+                elapsed.as_secs_f64(),
+            );
+            self.closed = true;
+        }
+
         // Per-output vblank phase, name and value only — see the `phase_ms`
         // doc on `OutputTiming` for what stable versus wandering looks like
         // here. The half-spread is folded in only when it is non-zero, which
@@ -1032,9 +1142,11 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
 
     let mut state = State {
         outputs: Vec::new(),
+        used_outputs: Vec::new(),
         presenters: Vec::new(),
         capture: Capture::default(),
         closed: false,
+        dead_intervals: DeadIntervalTracker::default(),
         free_run: spec.free_run,
         renderer: spec.renderer,
         presentation,
@@ -1051,7 +1163,13 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
             let output: WlOutput = globals.registry().bind(global.name, 4, &handle, ());
-            state.outputs.push((output, None, None));
+            // The registry `name` is discarded nowhere near here any more:
+            // kept alongside the proxy so a later `GlobalRemove` — the event
+            // this same registry sends when the compositor destroys this
+            // output, as it does on every enable/disable-together commit and
+            // on every unplug — can be matched back to it. See `used_outputs`
+            // and the `Dispatch<WlRegistry, GlobalListContents>` impl.
+            state.outputs.push((output, None, None, global.name));
         }
     }
     queue.roundtrip(&mut state)?;
@@ -1060,11 +1178,19 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         state
             .outputs
             .iter()
-            .find(|(_, n, _)| n.as_deref() == Some(name))
+            .find(|(_, n, ..)| n.as_deref() == Some(name))
             .map(|(o, ..)| o.clone())
     };
     let source = find(&state, &spec.source)
         .ok_or_else(|| anyhow::anyhow!("no output named {} to capture", spec.source))?;
+    if let Some(name) = state
+        .outputs
+        .iter()
+        .find(|(o, ..)| *o == source)
+        .map(|(.., name)| *name)
+    {
+        state.used_outputs.push(name);
+    }
 
     // The canvas's own refresh, for the capture-interval histogram's bucket
     // width (see `FrameStats.capture_intervals`); an assumed 60 Hz stands in
@@ -1074,7 +1200,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         .outputs
         .iter()
         .find(|(o, ..)| *o == source)
-        .and_then(|(_, _, refresh)| *refresh);
+        .and_then(|(_, _, refresh, _)| *refresh);
     state.canvas_period_ms = canvas_refresh_mhz
         .filter(|&mhz| mhz > 0)
         .map(|mhz| 1_000_000.0 / f64::from(mhz))
@@ -1103,6 +1229,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     for (index, slice) in spec.slices.iter().enumerate() {
         let target = find(&state, &slice.output)
             .ok_or_else(|| anyhow::anyhow!("no output named {}", slice.output))?;
+        if let Some(name) = state
+            .outputs
+            .iter()
+            .find(|(o, ..)| *o == target)
+            .map(|(.., name)| *name)
+        {
+            state.used_outputs.push(name);
+        }
         let surface = compositor.create_surface(&handle, ());
         let region: WlRegion = compositor.create_region(&handle, ());
         surface.set_input_region(Some(&region));
@@ -1359,6 +1493,17 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         }
 
         state.report_stats_if_due();
+        // A dead-interval trip (see `DeadIntervalTracker`) sets `closed`
+        // from inside that call, same as a `GlobalRemove` or the layer
+        // surface's own `Closed` — checked here so the process actually
+        // exits on the interval it was decided, rather than drifting on for
+        // another cycle or more before the next `blocking_dispatch` above
+        // happens to re-check it.
+        if state.closed {
+            current.destroy();
+            next.destroy();
+            return Ok(());
+        }
     }
 }
 
@@ -2364,15 +2509,62 @@ fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::
     }
 }
 
+impl State {
+    /// A `wl_registry` global named `removed` just went away. If it is one
+    /// of the outputs this slicer captures from or presents to, this is the
+    /// slicer's own outputs being torn down under it — end the process the
+    /// same way the layer surface's own `Closed` event already does, and say
+    /// so. Returns whether it was.
+    ///
+    /// Split out from the `Dispatch<WlRegistry, GlobalListContents>` impl
+    /// below (its only real caller) so the decision is testable on its own,
+    /// without the live Wayland connection that trait's other parameters
+    /// require.
+    ///
+    /// A compositor that destroys and recreates an output removes its
+    /// `wl_output` global and later advertises a new one — under a new
+    /// registry name, even when the output keeps the same name string. That
+    /// is exactly what happens on every enable/disable-together commit (see
+    /// the `output-phase` fix's note in `reconciler::mod`) and exactly what
+    /// unplugging and replugging a projector does. Measured on a
+    /// four-projector bench on 2026-09-15: without this, the already-running
+    /// slicer kept presenting to the layer surfaces it had built against the
+    /// old outputs, and `GET /api/v1/projection/stats` read `presented 0
+    /// discarded 605` on all four for a full ten-second interval while the
+    /// process itself kept reporting 60.4 fps — the wall was black and
+    /// nothing said so. Closing here lets the daemon's `sync_slicer` reap
+    /// this exit and respawn against whatever exists now.
+    fn handle_output_removed(&mut self, removed: u32) -> bool {
+        if !self.used_outputs.contains(&removed) {
+            return false;
+        }
+        let label = self
+            .outputs
+            .iter()
+            .find(|(.., global_name)| *global_name == removed)
+            .and_then(|(_, output_name, ..)| output_name.clone())
+            .unwrap_or_else(|| format!("registry name {removed}"));
+        eprintln!(
+            "slicer: output {label} was removed by the compositor; exiting so the daemon's \
+             sync_slicer respawns against whatever replaces it"
+        );
+        self.closed = true;
+        true
+    }
+}
+
 impl Dispatch<WlRegistry, GlobalListContents> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &WlRegistry,
-        _: <WlRegistry as Proxy>::Event,
+        event: <WlRegistry as Proxy>::Event,
         _: &GlobalListContents,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_registry::Event::GlobalRemove { name } = event {
+            state.handle_output_removed(name);
+        }
     }
 }
 
@@ -2387,7 +2579,7 @@ impl Dispatch<WlOutput, ()> for State {
     ) {
         match event {
             wl_output::Event::Name { name } => {
-                for (candidate, stored, _) in &mut state.outputs {
+                for (candidate, stored, ..) in &mut state.outputs {
                     if candidate == output {
                         *stored = Some(name);
                         break;
@@ -2402,7 +2594,7 @@ impl Dispatch<WlOutput, ()> for State {
                     .map(|f| f.contains(wl_output::Mode::Current))
                     .unwrap_or(false);
                 if current {
-                    for (candidate, _, stored_refresh) in &mut state.outputs {
+                    for (candidate, _, stored_refresh, _) in &mut state.outputs {
                         if candidate == output {
                             *stored_refresh = Some(refresh);
                             break;
@@ -2871,5 +3063,108 @@ mod tests {
         // Only presenter 1 presented; there is nothing to measure it against.
         let settled = settle(&[Slot::Discarded, presented(1003, 60.0)]);
         assert!(settled.phase_samples.is_empty());
+    }
+
+    // --- self-heal: the dead-interval predicate -------------------------
+
+    #[test]
+    fn two_consecutive_dead_intervals_trip_the_tracker() {
+        let mut tracker = DeadIntervalTracker::default();
+        assert!(!tracker.record(true, 40, 0), "one bad interval is not enough");
+        assert!(
+            tracker.record(true, 40, 0),
+            "a second consecutive bad interval must trip it"
+        );
+    }
+
+    #[test]
+    fn a_single_dead_interval_does_not_trip_it() {
+        let mut tracker = DeadIntervalTracker::default();
+        assert!(!tracker.record(true, 40, 0));
+        // A good interval in between resets the count, so a run of isolated
+        // bad ones — a resize here, a hiccup there — never accumulates.
+        assert!(!tracker.record(true, 40, 5));
+        assert!(!tracker.record(true, 40, 0));
+    }
+
+    #[test]
+    fn zero_answers_never_trips_it() {
+        // The ordinary case for an idle canvas or a compositor that has not
+        // answered anything yet: no evidence either way, not "none presented".
+        let mut tracker = DeadIntervalTracker::default();
+        for _ in 0..5 {
+            assert!(!tracker.record(true, 0, 0));
+        }
+    }
+
+    #[test]
+    fn any_presented_frame_resets_the_count() {
+        let mut tracker = DeadIntervalTracker::default();
+        assert!(!tracker.record(true, 40, 0));
+        assert!(!tracker.record(true, 40, 1), "a presented frame is not itself dead");
+        // Back to square one: this alone must not trip it.
+        assert!(!tracker.record(true, 40, 0));
+    }
+
+    #[test]
+    fn without_feedback_the_predicate_never_fires() {
+        // `presentation_feedback` false means no `wp_presentation` at all —
+        // there is nothing to conclude from, so this must never act blind.
+        let mut tracker = DeadIntervalTracker::default();
+        assert!(!tracker.record(false, 1000, 0));
+        assert!(!tracker.record(false, 1000, 0));
+    }
+
+    #[test]
+    fn fewer_than_the_threshold_of_answers_does_not_count_as_dead() {
+        assert!(!interval_is_dead(true, 29, 0));
+        assert!(interval_is_dead(true, 30, 0));
+    }
+
+    // --- self-heal: noticing an output's global disappear ----------------
+
+    /// A `State` with no real Wayland objects at all — every field that
+    /// would otherwise need a live connection is empty or `None`.
+    /// `handle_output_removed` never dereferences a `WlOutput` proxy, so an
+    /// empty `outputs` costs it nothing but the human-readable label (it
+    /// falls back to printing the registry name instead).
+    fn bare_state(used_outputs: Vec<u32>) -> State {
+        State {
+            outputs: Vec::new(),
+            used_outputs,
+            presenters: Vec::new(),
+            capture: Capture::default(),
+            closed: false,
+            dead_intervals: DeadIntervalTracker::default(),
+            free_run: false,
+            renderer: Renderer::Cpu,
+            presentation: None,
+            timing: Timing::new(0),
+            stats: FrameStats::new(),
+            gpu: None,
+            gpu_formats: HashMap::new(),
+            gpu_error: None,
+            present_format: None,
+            dmabuf_feedback: None,
+            canvas_period_ms: 1000.0 / 60.0,
+            last_capture_at: None,
+        }
+    }
+
+    #[test]
+    fn a_global_remove_naming_a_used_output_closes_the_slicer() {
+        let mut state = bare_state(vec![42]);
+        assert!(state.handle_output_removed(42));
+        assert!(state.closed, "the output this slicer presents to went away");
+    }
+
+    #[test]
+    fn a_global_remove_naming_an_unrelated_global_is_ignored() {
+        let mut state = bare_state(vec![42]);
+        assert!(!state.handle_output_removed(7));
+        assert!(
+            !state.closed,
+            "a global the slicer neither captures from nor presents to must not stop it"
+        );
     }
 }
