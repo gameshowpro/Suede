@@ -65,7 +65,7 @@ pub async fn put_config(
     }
     // Not committed: everything except persistence. The document reaches the
     // outputs immediately; disk keeps the last saved state.
-    body.validate()
+    body.validate(state.bootstrap.allow_overlaps)
         .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
     state.store.set_preview(Some(body));
     state.trigger.request("working copy");

@@ -6,10 +6,16 @@
 # auto-login, starting sway at boot, getting competing desktop environments
 # out of the way, and opening the API port in the host firewall. It is
 # idempotent — safe to re-run after an upgrade — and it never touches Suede's
-# own configuration, which lives in the API and survives package operations.
+# desired state, which lives in the API and survives package operations.
 #
 #   sudo /usr/share/suede/provision.sh [--user NAME] [--no-reboot]
 #                                      [--port N] [--no-firewall]
+#                                      [--allow-overlaps]
+#
+# --allow-overlaps provisions the other display path: outputs may overlap in
+# canvas space, every multi-output layout goes through the slicer, and each
+# display scans out its own buffer — so sway is started *with* direct scanout
+# and `allow_overlaps = true` is written into the user's suede.toml.
 
 set -euo pipefail
 
@@ -18,6 +24,7 @@ ASK_REBOOT=1
 # Must match DEFAULT_BIND in src/config.rs.
 SUEDE_PORT=9088
 OPEN_FIREWALL=1
+ALLOW_OVERLAPS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -25,7 +32,8 @@ while [[ $# -gt 0 ]]; do
     --no-reboot) ASK_REBOOT=0; shift ;;
     --port) SUEDE_PORT="$2"; shift 2 ;;
     --no-firewall) OPEN_FIREWALL=0; shift ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --allow-overlaps) ALLOW_OVERLAPS=1; shift ;;
+    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
@@ -147,6 +155,21 @@ if [[ -d /sys/module/nvidia_drm ]]; then
     echo "           nvidia_drm.modeset=1 to the kernel command line and reboot."
   fi
 fi
+# One spanning window across every output, or one private buffer per output:
+# the two display paths want opposite things from direct scanout, and this is
+# where that choice is made for the compositor. It has to agree with
+# `allow_overlaps` in suede.toml, which is why one flag writes both.
+if [[ "$ALLOW_OVERLAPS" -eq 1 ]]; then
+  SCANOUT_BLOCK="  # Direct scanout left enabled: no client spans the physical outputs here.
+  # The app renders into the headless canvas and the slicer hands each display
+  # one output-sized buffer, which the display controller can flip directly."
+else
+  SCANOUT_BLOCK="  # Without this, a window spanning several outputs is handed straight to each
+  # display controller, so every screen shows the same part of it instead of
+  # its own. Verified on the Nvidia proprietary driver.
+  export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1"
+fi
+
 BEGIN="# BEGIN SUEDE_PROVISION"
 END="# END SUEDE_PROVISION"
 PROFILE="$USER_HOME/.bash_profile"
@@ -163,10 +186,7 @@ if [ "\$(tty)" = "/dev/tty1" ] && [ -z "\${WAYLAND_DISPLAY:-}" ]; then
   export XDG_SESSION_TYPE=wayland
   export XDG_CURRENT_DESKTOP=sway
   export XDG_SESSION_DESKTOP=sway
-  # Without this, a window spanning several outputs is handed straight to each
-  # display controller, so every screen shows the same part of it instead of
-  # its own. Verified on the Nvidia proprietary driver.
-  export WLR_SCENE_DISABLE_DIRECT_SCANOUT=1
+$SCANOUT_BLOCK
   # The headless backend provides the projection canvas: an off-screen
   # output the app renders into, which the slicer cuts up per projector.
   export WLR_BACKENDS=drm,libinput,headless
@@ -246,6 +266,45 @@ default_floating_border none
 $SWAY_END
 EOF
   chown "$APPLIANCE_USER:$APPLIANCE_USER" "$SWAY_CONFIG"
+fi
+
+# --- 4b. Bootstrap configuration ----------------------------------------
+#
+# Only written when the display path was chosen explicitly: the default needs
+# no file at all, and a provisioning run must not quietly rewrite settings an
+# operator put here by hand.
+if [[ "$ALLOW_OVERLAPS" -eq 1 ]]; then
+  step "Recording allow_overlaps in suede.toml"
+  SUEDE_DIR="$USER_HOME/.config/suede"
+  install -d -o "$APPLIANCE_USER" -g "$APPLIANCE_USER" "$SUEDE_DIR"
+  SUEDE_TOML="$SUEDE_DIR/suede.toml"
+  touch "$SUEDE_TOML"
+  if grep -qE '^[[:space:]]*#?[[:space:]]*allow_overlaps[[:space:]]*=' "$SUEDE_TOML"; then
+    # Rewrite the existing key, commented or not, rather than appending a
+    # second one: TOML takes the first, so an appended line would be read as
+    # a no-op and the machine would boot into the wrong path.
+    sed -i -E 's|^[[:space:]]*#?[[:space:]]*allow_overlaps[[:space:]]*=.*|allow_overlaps = true|' \
+      "$SUEDE_TOML"
+  else
+    cat >> "$SUEDE_TOML" <<'EOF'
+
+# Outputs may overlap in canvas space, so every multi-output layout goes
+# through the slicer and each display scans out its own buffer. Sway is
+# started without WLR_SCENE_DISABLE_DIRECT_SCANOUT to match.
+allow_overlaps = true
+EOF
+  fi
+  chown "$APPLIANCE_USER:$APPLIANCE_USER" "$SUEDE_TOML"
+  echo "  $SUEDE_TOML: allow_overlaps = true"
+  # The drop-in is the health check's business, not this script's: it lives in
+  # the user's systemd directory and a running compositor has to be restarted
+  # for either of them to matter.
+  LEFTOVER="$(ls "$USER_HOME"/.config/systemd/user/*.service.d/10-suede-scanout.conf 2>/dev/null || true)"
+  if [[ -n "$LEFTOVER" ]]; then
+    echo "  NOTE: a Suede scanout drop-in is still present and would undo this:"
+    echo "$LEFTOVER" | sed 's/^/          /'
+    echo "        Apply the direct-scanout check's fix, then restart sway."
+  fi
 fi
 
 # --- 5. sway-session.target ---------------------------------------------

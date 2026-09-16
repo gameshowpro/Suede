@@ -23,5 +23,7 @@ pub mod pattern;
 #[cfg(unix)]
 pub mod slicer;
 
-pub use blend::{canvas_plan, overlay_specs, CanvasPlan, OverlaySpec, Participant, SlicerSpec};
+pub use blend::{
+    canvas_plan, overlay_specs, CanvasPlan, OverlaySpec, Participant, SlicerSpec, Slicing,
+};
 pub use manager::BlendManager;

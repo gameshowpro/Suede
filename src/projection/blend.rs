@@ -133,6 +133,23 @@ pub struct CanvasPlan {
     pub slices: Vec<SliceSpec>,
 }
 
+/// Which layouts the slicer is asked to handle — the `allow_overlaps`
+/// bootstrap flag, as [`canvas_plan`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Slicing {
+    /// Only when the layout overlaps. Sway tiles everything else natively and
+    /// the direct path costs nothing per frame, so there is no reason to
+    /// interpose a capture and a blend.
+    WhenOverlapping,
+    /// Every layout of two or more outputs, overlapping or not.
+    ///
+    /// A tiled layout then yields slices with no seams and so no ramps. What
+    /// it buys is that each display scans out one private, output-sized
+    /// buffer instead of sharing one window across the lot — the case direct
+    /// scanout was built for, and the case a driver cannot mirror by mistake.
+    Always,
+}
+
 /// Derive the canvas from the configured layout.
 ///
 /// **The layout is the projection configuration.** Each participant's
@@ -150,22 +167,26 @@ pub struct CanvasPlan {
 /// unlit. Deriving any of the geometry from what happens to be plugged in
 /// would make one loose connector reflow the whole installation.
 ///
-/// Returns `None` when nothing overlaps: sway can tile non-overlapping
-/// layouts natively, and the direct path costs nothing per frame.
+/// A single output is never sliced, whichever mode the appliance runs in:
+/// there is nothing to cut up, and a canvas the size of one display bought
+/// with a capture and a blend pass is pure loss.
 pub fn canvas_plan(
     participants: &[Participant],
     config: Option<&ProjectionConfig>,
+    slicing: Slicing,
 ) -> Option<CanvasPlan> {
     if participants.len() < 2 {
         return None;
     }
-    let any_overlap = participants.iter().enumerate().any(|(i, a)| {
-        participants[i + 1..]
-            .iter()
-            .any(|b| intersect(&a.rect, &b.rect).is_some())
-    });
-    if !any_overlap {
-        return None;
+    if slicing == Slicing::WhenOverlapping {
+        let any_overlap = participants.iter().enumerate().any(|(i, a)| {
+            participants[i + 1..]
+                .iter()
+                .any(|b| intersect(&a.rect, &b.rect).is_some())
+        });
+        if !any_overlap {
+            return None;
+        }
     }
 
     // Normalise so the canvas starts at 0,0 wherever the user drew it.
@@ -583,6 +604,7 @@ mod tests {
                 participant("DP-1", 1760, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .expect("overlap must produce a plan");
 
@@ -632,11 +654,13 @@ mod tests {
             participant("DP-1", 1760, 0, 1920, 1080),
             participant("DP-2", 3520, 0, 1920, 1080),
         ];
-        let whole = canvas_plan(&configured, Some(&blending())).expect("plan");
+        let whole =
+            canvas_plan(&configured, Some(&blending()), Slicing::WhenOverlapping).expect("plan");
 
         let mut degraded = configured;
         degraded[1].connected = false;
-        let degraded = canvas_plan(&degraded, Some(&blending())).expect("plan");
+        let degraded =
+            canvas_plan(&degraded, Some(&blending()), Slicing::WhenOverlapping).expect("plan");
 
         // The canvas is unchanged, so the app renders exactly as before and
         // is never reloaded at a different size.
@@ -672,6 +696,7 @@ mod tests {
                 absent("DP-1", 1760, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .expect("a configured overlap is a plan even with nothing attached");
 
@@ -711,6 +736,7 @@ mod tests {
                 participant("C", 3580, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
 
@@ -734,6 +760,7 @@ mod tests {
                 participant("D", 1760, 990, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
 
@@ -767,9 +794,66 @@ mod tests {
                 participant("DP-1", 1920, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .is_none());
-        assert!(canvas_plan(&[participant("DP-1", 0, 0, 1920, 1080)], None).is_none());
+        assert!(canvas_plan(
+            &[participant("DP-1", 0, 0, 1920, 1080)],
+            None,
+            Slicing::WhenOverlapping,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_tiled_layout_is_sliced_anyway_when_the_appliance_asks_for_it() {
+        // `allow_overlaps = true`: the point is not the seams (there are
+        // none) but that each display scans out its own buffer.
+        let plan = canvas_plan(
+            &[
+                participant("DP-3", 0, 0, 1920, 1080),
+                participant("DP-1", 1920, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+            Slicing::Always,
+        )
+        .expect("a forced plan covers a tiled layout too");
+
+        assert_eq!((plan.canvas_width, plan.canvas_height), (3840, 1080));
+        assert_eq!(plan.slices.len(), 2);
+        // Nothing intersects, so nothing fades: blending is still on, it
+        // simply has no seam to shape.
+        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
+        assert_eq!(
+            plan.slices[0].source,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }
+        );
+        assert_eq!(
+            plan.slices[1].source,
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }
+        );
+    }
+
+    #[test]
+    fn one_output_is_never_sliced_however_the_appliance_is_configured() {
+        // Even forced: there is nothing to cut up, and the capture and blend
+        // pass would be pure loss.
+        assert!(canvas_plan(
+            &[participant("DP-1", 0, 0, 1920, 1080)],
+            Some(&blending()),
+            Slicing::Always,
+        )
+        .is_none());
     }
 
     #[test]
@@ -782,6 +866,7 @@ mod tests {
                 participant("R", 2260, 300, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
@@ -799,6 +884,7 @@ mod tests {
                 participant("STACKED", 0, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
@@ -817,6 +903,7 @@ mod tests {
                 blend: false,
                 ..Default::default()
             }),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
@@ -828,6 +915,7 @@ mod tests {
                 participant("R", 1760, 0, 1920, 1080),
             ],
             None,
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
@@ -843,6 +931,7 @@ mod tests {
                 participant("R", 1760, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         let gamma = 2.2;
@@ -886,6 +975,7 @@ mod tests {
                 participant("R", 1760, 0, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         let left = &plan.slices[0];
@@ -914,6 +1004,7 @@ mod tests {
                 participant("BR", 1760, 920, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
@@ -950,6 +1041,7 @@ mod tests {
                 participant("BR", 1760, 920, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
@@ -982,6 +1074,7 @@ mod tests {
                 participant("D", 1760, 990, 1920, 1080),
             ],
             Some(&blending()),
+            Slicing::WhenOverlapping,
         )
         .unwrap();
         // Slice A, mid-corner: both ramps at half strength -> product 0.25

@@ -7,7 +7,7 @@ There are two kinds of configuration, and the split is a hard rule:
 
 ## Bootstrap configuration
 
-Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value can be overridden by an environment variable, which wins. A missing file means all defaults.
+Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps` can be overridden by an environment variable, which wins. A missing file means all defaults.
 
 ```toml
 --8<-- "examples/suede.toml"
@@ -21,6 +21,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `docs_base_url` | `SUEDE_DOCS_BASE_URL` | `https://suede.gameshow.pro/` | Base for health-check documentation links |
 | `power` | `SUEDE_POWER` | `[]` (none) | Host power operations this appliance may perform — see [Host power control](#host-power) |
 | `allowed_programs` | `SUEDE_ALLOWED_PROGRAMS` | the browsers Suede knows how to drive | Programs applications may launch — see [Allowed programs](#allowed-programs) |
+| `allow_overlaps` | — | `false` | Whether outputs may overlap in canvas space, and so which display path this machine runs — see [Overlapping layouts and direct scanout](#direct-scanout) |
 
 ### Host power control {: #host-power }
 
@@ -116,6 +117,58 @@ restart timer, which could never do anything but fail again.
     holds against a hostile client is the network and the bearer token — see
     [Raw Sway commands](#raw-sway-commands). Do not treat this list as more
     than what it is.
+
+### Overlapping layouts and direct scanout {: #direct-scanout }
+
+An appliance runs one of two display paths, and this key is where it says
+which. It is a fact about how the machine's compositor was started, which is
+why it lives in the bootstrap file and has no environment override: a client
+writing it through the API would only be claiming an environment that is
+already fixed.
+
+=== "`allow_overlaps = false` (default)"
+
+    Sway tiles the layout itself. One application covers every display as a
+    single window (`fullscreen enable global`), and a write whose output
+    rectangles intersect is **rejected** — sway's single global coordinate
+    space gives every output the same pixels in a shared region, so an
+    overlap here is not a projector overlap, it is a layout that cannot be
+    rendered as drawn. The error names both outputs and the overlap:
+
+    ```
+    outputs HDMI-A-1 and HDMI-A-2 overlap by 160x1080 pixels, and this
+    appliance tiles: set allow_overlaps = true in suede.toml to project
+    overlapping layouts through the slicer, or move them apart
+    ```
+
+    The compositor must run with `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`, or
+    that one spanning window is handed straight to each display controller
+    and every screen shows the same part of it. `provision.sh` exports it,
+    and the `direct-scanout` health check warns when it is missing.
+
+=== "`allow_overlaps = true`"
+
+    Every layout of two or more outputs goes through the slicer, overlapping
+    or not. The application renders into the headless canvas and each display
+    is handed one private, output-sized buffer — see
+    [Projection and edge blending](#projection-edge-blending). A tiled layout
+    is sliced with no seams, so it costs a capture and a blend pass and buys
+    a display path a driver cannot mirror by mistake; `projection.blend`
+    still governs the ramps wherever the layout does overlap.
+
+    Here the compositor must run **without**
+    `WLR_SCENE_DISABLE_DIRECT_SCANOUT`: no client ever spans the physical
+    outputs, so the mirroring bug cannot happen, and the variable costs a
+    full-screen compositor pass per output per frame for nothing. The
+    `direct-scanout` check inverts to match — it warns while the variable is
+    set, and its fix removes the drop-in that sets it. Neither fix ever
+    restarts sway: that would tear down every window on every display.
+
+A single-output layout is never sliced in either mode.
+
+`provision.sh --allow-overlaps` provisions the second path whole: it starts
+sway without the variable and writes `allow_overlaps = true` into the user's
+`suede.toml`. The two halves must agree, which is why one flag writes both.
 
 ## Desired state
 
@@ -456,14 +509,19 @@ The page then sees one 7680x1080 viewport. Position the outputs to form the
 canvas you want; Suede performs no layout arithmetic, so the geometry is
 entirely yours.
 
-!!! warning "Start sway with direct scanout disabled"
-    Spanning a non-overlapping layout needs
-    `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` on the compositor.
-    Without it, some drivers show the same part of the window on every display
-    instead of spanning — see
+!!! warning "Direct scanout has to match the display path"
+    On a tiling appliance (`allow_overlaps = false`, the default) one window
+    spans every output, and that needs `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`
+    on the compositor. Without it, some drivers show the same part of the
+    window on every display instead of spanning — see
     [troubleshooting](troubleshooting.md#a-spanned-window-mirrors-instead-of-spanning).
-    `provision.sh` sets it, and the `direct-scanout` health check warns if it is
-    missing.
+    `provision.sh` sets it, and the `direct-scanout` health check warns if it
+    is missing.
+
+    With `allow_overlaps = true` the rule is exactly inverted: no client spans
+    the physical outputs, each display scans out its own slice, and the
+    variable must *not* be set. See
+    [Overlapping layouts and direct scanout](#direct-scanout).
 
 !!! tip "Give the outputs matching heights"
     A spanned window covers the *bounding box* of every output. Where an output
@@ -812,6 +870,11 @@ however much the rigging actually overlaps, each seam its own amount, rows
 and grids included. The canvas is the layout's bounding box, and the Displays
 tab reports it live.
 
+An overlapping layout is only accepted on an appliance provisioned for one:
+set [`allow_overlaps = true`](#direct-scanout) in `suede.toml`, or
+`provision.sh --allow-overlaps`. On the default tiling appliance an overlap
+is rejected as a layout sway cannot render, naming both outputs.
+
 The layout must be **contiguous**: every enabled output must chain back to
 the first through overlaps or shared edges (any number of intermediates; a
 corner-to-corner touch does not count). A gap would leave part of the canvas
@@ -834,8 +897,15 @@ measured on hardware). Instead:
    own output. The loop is damage-driven; a static page costs nothing.
 
 Superimposed on the surface, the two copies of every seam sum to constant
-luminance (measured: worst deviation 0.008 across a 160 px seam). A layout
-with no overlaps skips all of this: sway tiles it directly, at zero cost.
+luminance (measured: worst deviation 0.008 across a 160 px seam).
+
+What happens to a layout with **no** overlaps depends on
+[`allow_overlaps`](#direct-scanout). On a tiling appliance it skips all of
+this: sway tiles it directly, at zero cost. On an overlapping one there is
+no second path, so every layout of two or more outputs is sliced — the
+same capture, the same presenters, simply with no intersections, so no
+ramps. That is not free, and it is not meant to be: it buys each display a
+private, output-sized buffer the display controller can flip on its own.
 
 ```json
 "projection": { "blend": true, "gamma": 2.2, "blackLift": 0.04 }
@@ -851,8 +921,10 @@ with no overlaps skips all of this: sway tiles it directly, at zero cost.
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](#renderer) |
 
 Slicing engages whenever the configured layout overlaps, with or without
-this section; the section adds the blending. A full overlap (a stacked
-projector, a mirror) is duplicated at full strength and never ramped.
+this section — and on an `allow_overlaps` appliance whenever two or more
+outputs take part at all; the section adds the blending. A single-output
+layout is never sliced either way. A full overlap (a stacked projector, a
+mirror) is duplicated at full strength and never ramped.
 
 !!! info "`testPattern` needs no overlaps"
     It is the one field here that is not about blending. Patterns are drawn
@@ -927,9 +999,12 @@ Measuring it: `GET /projection/stats` (and the `projection_stats_changed`
 event) report the inter-output presentation offset (mean/max milliseconds,
 read from `wp_presentation`), straddles (frames the outputs showed on
 different refreshes), superseded frames, stalls, and per-output
-presented/discarded counts and measured refresh, alongside the canvas and
-presented frame rates and the per-frame cost breakdown. The web UI shows all
-of this in the Projection panel. A steady offset of a few milliseconds with
+presented/discarded counts, zero-copy presented count, and measured refresh,
+alongside the canvas and presented frame rates and the per-frame cost
+breakdown. The web UI shows all of this in the Projection panel. A non-zero
+`zeroCopyPresented` proves the compositor scanned that output's buffer
+straight out to the display controller for at least one frame this interval,
+with no compositing pass in between. A steady offset of a few milliseconds with
 zero straddles is what a healthy wall looks like; straddles that rise over
 time mean commits are landing between two outputs' renders. Each output's
 `phaseMs` is its vblank phase relative to the first output, circular-mean'd

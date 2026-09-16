@@ -285,8 +285,10 @@ WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 sway
 ```
 
 `provision.sh` sets this for you. The `direct-scanout` health check warns
-whenever an application is spanning a non-overlapping layout while the running
-compositor was started without it:
+whenever an application is spanning a tiled layout while the running
+compositor was started without it, and its fix writes a systemd drop-in on
+the compositor's unit — you restart the compositor yourself, since that tears
+down every window:
 
 ```bash
 curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="direct-scanout"])'
@@ -294,6 +296,20 @@ curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,js
 
 Observed with the Nvidia proprietary driver. Per-output kiosks are unaffected —
 each window covers one display, so the buffer and the output match.
+
+!!! info "On an `allow_overlaps` appliance, this is the wrong fix"
+    Everything above applies to the default tiling path, where one window
+    genuinely spans every output. With
+    [`allow_overlaps = true`](configuration.md#direct-scanout) no client ever
+    spans the physical outputs: the app renders into the headless canvas and
+    the slicer hands each display its own output-sized buffer, which is the
+    case direct scanout was built for and cannot be mirrored by mistake.
+    There the variable only costs a full-screen compositor pass per output
+    per frame, so the same check inverts — it warns while
+    `WLR_SCENE_DISABLE_DIRECT_SCANOUT` is set, and its fix *removes* the
+    drop-in. A machine showing this symptom while `allow_overlaps` is true is
+    telling you something else is wrong: check that the slicer is running at
+    all (`GET /api/v1/projection/stats`).
 
 ## A page freezes but the browser keeps running
 

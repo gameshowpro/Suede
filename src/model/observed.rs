@@ -790,6 +790,11 @@ pub struct OutputTiming {
     pub name: String,
     pub presented: u32,
     pub discarded: u32,
+    /// How many of `presented` carried the presentation feedback's
+    /// `zero_copy` flag: the compositor scanned this output's buffer out
+    /// directly to the display controller, with no compositing pass, rather
+    /// than blitting it into its own framebuffer first.
+    pub zero_copy_presented: u32,
     /// From wp_presentation's refresh field: the output's actual refresh interval, as Hz.
     pub refresh_hz: Option<f64>,
     /// This output's vblank phase relative to the first output, in ms, within

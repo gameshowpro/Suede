@@ -4,7 +4,10 @@
 //! as a `wl_buffer`. The protocol negotiation (binding the global, sending
 //! `get_default_feedback`, deciding whether to use what it reports) stays in
 //! `slicer.rs`, next to the `State` it decides for; this module only holds
-//! the parsing that does not need `State` at all.
+//! the parsing that does not need `State` at all. Since the tranche's
+//! `tranche_flags` event, a main-device tranche flagged `scanout` is kept
+//! separately too, so a caller wanting a modifier the display controller
+//! can flip directly does not have to guess from `formats` alone.
 
 use std::collections::HashMap;
 use std::os::fd::AsFd;
@@ -54,23 +57,38 @@ fn decode_dev_t(bytes: &[u8]) -> Option<u64> {
         .map(u64::from_ne_bytes)
 }
 
+/// Bit 0 of `tranche_flags`: a hint that the compositor may scan this
+/// tranche's formats out to the display controller directly, given a buffer
+/// allocated accordingly. See the protocol's `tranche_flags` enum.
+const TRANCHE_FLAG_SCANOUT: u32 = 1;
+
 /// Accumulates one `zwp_linux_dmabuf_feedback_v1` exchange: the format
 /// table (mmap'd once `format_table` arrives), the main device, and — for
-/// whichever tranche targets that same device — the fourcc -> modifier map
-/// the caller ultimately wants. Every other tranche (typically a scan-out
-/// device that is not what we want to render with) is walked and discarded,
-/// per the protocol's "grouped by tranches of preference" ordering. Binding
-/// version 4 (this module never asks for more) guarantees `main_device`
-/// arrives before any tranche, so `current_tranche_device` is always known
-/// by the time a `tranche_formats` event needs to test against it.
+/// whichever tranche targets that same device — the fourcc -> modifier maps
+/// the caller ultimately wants: `formats` from every main-device tranche,
+/// and `scanout_formats` from the subset of those tranches whose
+/// `tranche_flags` carries the `scanout` bit, kept rather than discarded so
+/// a caller can prefer a modifier the display controller can flip directly.
+/// Every other tranche (a device other than the one we render with) is
+/// walked and discarded regardless of its flags, per the protocol's
+/// "grouped by tranches of preference" ordering. Binding version 4 (this
+/// module never asks for more) guarantees `main_device` arrives before any
+/// tranche, so `current_tranche_device` is always known by the time a
+/// `tranche_formats` event needs to test against it.
 #[derive(Default)]
 pub struct FeedbackCollector {
     table: Vec<FormatEntry>,
     pub main_device: Option<u64>,
     current_tranche_device: Option<u64>,
+    /// Raw `tranche_flags` bits for the tranche currently being walked,
+    /// reset in `tranche_done`.
+    current_tranche_flags: u32,
     /// fourcc -> modifiers, in advertised order, `DRM_FORMAT_MOD_INVALID`
     /// dropped, main-device tranche(s) only.
     pub formats: HashMap<u32, Vec<u64>>,
+    /// Same shape as `formats`, but only the entries from main-device
+    /// tranches whose `tranche_flags` carried the `scanout` bit.
+    pub scanout_formats: HashMap<u32, Vec<u64>>,
     pub done: bool,
 }
 
@@ -97,6 +115,12 @@ impl FeedbackCollector {
         self.current_tranche_device = decode_dev_t(device);
     }
 
+    /// `tranche_flags`: sent before `tranche_formats` for the tranche it
+    /// applies to. Stored raw and consulted once `tranche_formats` arrives.
+    pub fn tranche_flags(&mut self, flags: u32) {
+        self.current_tranche_flags = flags;
+    }
+
     /// `tranche_formats`: `indices` is an array of u16 (native endianness)
     /// indices into the format table, only meaningful for the main-device
     /// tranche this collector cares about.
@@ -105,6 +129,7 @@ impl FeedbackCollector {
         {
             return;
         }
+        let scanout = self.current_tranche_flags & TRANCHE_FLAG_SCANOUT != 0;
         for chunk in indices.chunks_exact(2) {
             let Ok(raw) = chunk.try_into() else { continue };
             let index = u16::from_ne_bytes(raw) as usize;
@@ -118,11 +143,18 @@ impl FeedbackCollector {
             if !list.contains(&entry.modifier) {
                 list.push(entry.modifier);
             }
+            if scanout {
+                let list = self.scanout_formats.entry(entry.fourcc).or_default();
+                if !list.contains(&entry.modifier) {
+                    list.push(entry.modifier);
+                }
+            }
         }
     }
 
     pub fn tranche_done(&mut self) {
         self.current_tranche_device = None;
+        self.current_tranche_flags = 0;
     }
 
     pub fn done(&mut self) {
@@ -239,6 +271,97 @@ mod tests {
         collector.tranche_formats(&indices_bytes(&[0, 1]));
         collector.tranche_done();
         assert_eq!(collector.formats.get(&0x3432_5258), Some(&vec![7]));
+    }
+
+    #[test]
+    fn a_flagged_main_device_tranche_lands_in_both_maps() {
+        let mut collector = FeedbackCollector {
+            table: vec![FormatEntry {
+                fourcc: 0x3432_5258,
+                modifier: 7,
+            }],
+            ..Default::default()
+        };
+        collector.main_device(&42u64.to_ne_bytes());
+
+        collector.tranche_target_device(&42u64.to_ne_bytes());
+        collector.tranche_flags(TRANCHE_FLAG_SCANOUT);
+        collector.tranche_formats(&indices_bytes(&[0]));
+        collector.tranche_done();
+
+        assert_eq!(collector.formats.get(&0x3432_5258), Some(&vec![7]));
+        assert_eq!(collector.scanout_formats.get(&0x3432_5258), Some(&vec![7]));
+    }
+
+    #[test]
+    fn an_unflagged_main_device_tranche_lands_only_in_formats() {
+        let mut collector = FeedbackCollector {
+            table: vec![FormatEntry {
+                fourcc: 0x3432_5258,
+                modifier: 7,
+            }],
+            ..Default::default()
+        };
+        collector.main_device(&42u64.to_ne_bytes());
+
+        collector.tranche_target_device(&42u64.to_ne_bytes());
+        collector.tranche_formats(&indices_bytes(&[0]));
+        collector.tranche_done();
+
+        assert_eq!(collector.formats.get(&0x3432_5258), Some(&vec![7]));
+        assert!(collector.scanout_formats.is_empty());
+    }
+
+    #[test]
+    fn a_flagged_tranche_for_another_device_lands_in_neither_map() {
+        let mut collector = FeedbackCollector {
+            table: vec![FormatEntry {
+                fourcc: 0x3432_5258,
+                modifier: 7,
+            }],
+            ..Default::default()
+        };
+        collector.main_device(&42u64.to_ne_bytes());
+
+        collector.tranche_target_device(&99u64.to_ne_bytes());
+        collector.tranche_flags(TRANCHE_FLAG_SCANOUT);
+        collector.tranche_formats(&indices_bytes(&[0]));
+        collector.tranche_done();
+
+        assert!(collector.formats.is_empty());
+        assert!(collector.scanout_formats.is_empty());
+    }
+
+    #[test]
+    fn tranche_flags_reset_between_tranches() {
+        let mut collector = FeedbackCollector {
+            table: vec![FormatEntry {
+                fourcc: 0x3432_5258,
+                modifier: 7,
+            }],
+            ..Default::default()
+        };
+        collector.main_device(&42u64.to_ne_bytes());
+
+        // First tranche is flagged scanout.
+        collector.tranche_target_device(&42u64.to_ne_bytes());
+        collector.tranche_flags(TRANCHE_FLAG_SCANOUT);
+        collector.tranche_formats(&indices_bytes(&[0]));
+        collector.tranche_done();
+        assert_eq!(collector.scanout_formats.get(&0x3432_5258), Some(&vec![7]));
+
+        // A second, differently-fourcc'd tranche with no flags must not
+        // inherit the previous tranche's scanout flag.
+        collector.table.push(FormatEntry {
+            fourcc: 0x5847_4258,
+            modifier: 3,
+        });
+        collector.tranche_target_device(&42u64.to_ne_bytes());
+        collector.tranche_formats(&indices_bytes(&[1]));
+        collector.tranche_done();
+
+        assert_eq!(collector.formats.get(&0x5847_4258), Some(&vec![3]));
+        assert!(!collector.scanout_formats.contains_key(&0x5847_4258));
     }
 
     #[test]
