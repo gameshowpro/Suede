@@ -1575,7 +1575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn topology_change_restarts_the_slicer_even_with_an_unchanged_spec() {
+    async fn topology_change_reaches_the_slicer_as_a_forced_restart() {
         // Mirrors the 2026-09-15 bench measurement: the `output-phase`
         // check's fix disables and re-enables every output together, which
         // destroys and recreates them in the compositor, but an output that
@@ -1584,6 +1584,19 @@ mod tests {
         // Without `OutputPlan::topology_changed` forcing a restart, the
         // already-running slicer would be left alone, still bound to layer
         // surfaces built against outputs that no longer exist.
+        //
+        // This exercises only that the wiring reaches `BlendManager`: a
+        // topology-changing pass still issues its enable command and the
+        // slicer is still running afterwards. `BlendManager::restart_slicer`
+        // itself — that it forces a respawn on an unchanged spec, and that
+        // an ordinary call does not — is proven precisely in
+        // `projection::manager::tests`, deliberately with no `.await` or
+        // sleep between calls: the real slicer here is this very test
+        // binary re-exec'd, which does not understand the `slice`
+        // subcommand and exits almost immediately, so comparing process
+        // identity across a real time gap (a second whole reconciliation
+        // pass, or the `SETTLE` sleep below) cannot tell "forced restart"
+        // apart from "the fake process had, by then, simply crashed".
         let harness = harness();
         let mut outputs = harness.sway.get_outputs().await.unwrap();
         outputs.push(Output {
@@ -1614,18 +1627,9 @@ mod tests {
             .unwrap();
 
         harness.reconciler.reconcile().await;
-        let pid_after_first_pass = harness
-            .reconciler
-            .slicer_pid()
-            .await
-            .expect("the overlap must have started a slicer");
-
-        // An ordinary pass, nothing changed: left alone.
-        harness.reconciler.reconcile().await;
-        assert_eq!(
-            harness.reconciler.slicer_pid().await,
-            Some(pid_after_first_pass),
-            "an unchanged pass must not restart the slicer"
+        assert!(
+            harness.reconciler.slicer_pid().await.is_some(),
+            "the overlap must have started a slicer"
         );
 
         // Simulate the output going away and coming back under the same
@@ -1649,15 +1653,9 @@ mod tests {
             "the simulated teardown must have been re-enabled: {:?}",
             harness.sway.commands()
         );
-        let pid_after_topology_change = harness
-            .reconciler
-            .slicer_pid()
-            .await
-            .expect("the slicer must still be running after the output came back");
-        assert_ne!(
-            pid_after_topology_change, pid_after_first_pass,
-            "a pass that changed output topology must restart the slicer even \
-             though its spec is unchanged"
+        assert!(
+            harness.reconciler.slicer_pid().await.is_some(),
+            "the slicer must still be running after the topology-changing pass"
         );
         harness.supervisor.shutdown().await;
     }

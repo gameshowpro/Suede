@@ -3070,7 +3070,10 @@ mod tests {
     #[test]
     fn two_consecutive_dead_intervals_trip_the_tracker() {
         let mut tracker = DeadIntervalTracker::default();
-        assert!(!tracker.record(true, 40, 0), "one bad interval is not enough");
+        assert!(
+            !tracker.record(true, 40, 0),
+            "one bad interval is not enough"
+        );
         assert!(
             tracker.record(true, 40, 0),
             "a second consecutive bad interval must trip it"
@@ -3101,7 +3104,10 @@ mod tests {
     fn any_presented_frame_resets_the_count() {
         let mut tracker = DeadIntervalTracker::default();
         assert!(!tracker.record(true, 40, 0));
-        assert!(!tracker.record(true, 40, 1), "a presented frame is not itself dead");
+        assert!(
+            !tracker.record(true, 40, 1),
+            "a presented frame is not itself dead"
+        );
         // Back to square one: this alone must not trip it.
         assert!(!tracker.record(true, 40, 0));
     }
