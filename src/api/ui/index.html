@@ -2570,11 +2570,15 @@ function scheduleReconnect() {
   const delay = RECONNECT_DELAYS[Math.min(attempt, RECONNECT_DELAYS.length - 1)];
   attempt += 1;
   let left = Math.round(delay / 1000);
+  // The countdown only counts. Saying "now" is left to `connect`, because
+  // this interval drifts and reliably loses the race to the retry timer
+  // below, which would clear it before the last tick could be shown.
   const tick = () => {
     showOffline(false,
       `The connection to the daemon was lost. Attempt ${attempt}.`,
-      left > 0 ? `Trying again in ${num(left, 0)}s.` : "Trying again now…");
+      `Trying again in ${num(left, 0)}s.`);
     left -= 1;
+    if (left <= 0) clearInterval(countdownTimer);
   };
   tick();
   countdownTimer = setInterval(tick, 1000);
@@ -2587,6 +2591,13 @@ $("offline-reload").onclick = () => location.reload();
 function connect() {
   clearTimeout(retryTimer);
   clearInterval(countdownTimer);
+  // Opening the stream is not instant: a host that is unreachable rather
+  // than refusing takes the browser's connect timeout to fail, which can be
+  // long enough for a frozen "in 1s" to look like a hung page. So the
+  // overlay says what is actually happening for as long as it takes.
+  if ($("offline").classList.contains("show")) {
+    $("offline-next").textContent = "Trying again now…";
+  }
   // Only one stream at a time: a manual retry during a scheduled one would
   // otherwise leave the old stream delivering events behind the new.
   if (stream) { stream.close(); stream = null; }
