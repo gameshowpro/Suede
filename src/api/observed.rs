@@ -92,6 +92,12 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<Status> {
     // already published. `None` when nothing has run yet, rather than a
     // zeroed summary that would misreport a clean bill of health.
     status.checks = CheckSummary::tally(&state.checks.results());
+    // Same reasoning as `committed`: the last published `Status` can be
+    // stale between passes, and "is my app on the screens" is exactly the
+    // question a between-pass reader is asking.
+    let active_app_id = state.store.effective().active_app.clone();
+    status.active_app =
+        crate::reconciler::active_app_status(&state.supervisor, active_app_id.as_deref()).await;
     Json(status)
 }
 
@@ -479,6 +485,50 @@ mod tests {
         assert_eq!(body["committed"], true);
         assert_eq!(body["currentRevision"], 0);
         assert!(body["checks"].is_null());
+    }
+
+    #[tokio::test]
+    async fn status_includes_the_active_app() {
+        let harness = harness(None);
+        assert!(
+            super::get_status(State(harness.state.clone()))
+                .await
+                .0
+                .active_app
+                .is_none(),
+            "nothing is active yet"
+        );
+
+        harness
+            .state
+            .store
+            .update(|state| {
+                state.apps.push(crate::model::AppConfig {
+                    id: "renderer".into(),
+                    enabled: true,
+                    launcher: crate::model::Launcher::Exec {
+                        command: "sleep".into(),
+                        args: vec!["30".into()],
+                    },
+                    output: None,
+                    fullscreen: true,
+                    span_outputs: false,
+                    env: Default::default(),
+                    readiness: None,
+                    audio: None,
+                    heartbeat: None,
+                    restart: crate::model::RestartPolicy::default(),
+                    persist_profile: false,
+                });
+                state.active_app = Some("renderer".into());
+            })
+            .unwrap();
+
+        harness.state.reconciler.reconcile().await;
+        let status = super::get_status(State(harness.state.clone())).await.0;
+        let active_app = status.active_app.expect("the app is active");
+        assert_eq!(active_app.id, "renderer");
+        harness.state.supervisor.shutdown().await;
     }
 
     #[tokio::test]

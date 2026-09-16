@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::audio::AudioMonitor;
 use crate::events::{EventHub, ServerEvent};
-use crate::model::{Divergence, Status, SyncState, Window};
+use crate::model::{ActiveApp, AppState, Divergence, Status, SyncState, Window};
 use crate::snapshot::Snapshot;
 use crate::state::StateStore;
 use crate::supervisor::Supervisor;
@@ -47,6 +47,34 @@ impl ReconcileTrigger {
             tracing::trace!(reason, "reconciliation already pending");
         }
     }
+}
+
+/// What `Status.active_app` should say for `active_app_id` right now.
+///
+/// `None` when nothing is active. Otherwise the supervisor's live status for
+/// it, or a synthesized `stopped` for an id that has never been launched —
+/// there is no supervisor entry yet to ask, and "stopped" is the truthful
+/// read for an app that is not running. Free rather than a method on
+/// `Reconciler` so `GET /status` can call it too, for the same live read
+/// `committed` already gets there instead of whatever a background pass last
+/// published.
+pub(crate) async fn active_app_status(
+    supervisor: &Supervisor,
+    active_app_id: Option<&str>,
+) -> Option<ActiveApp> {
+    let id = active_app_id?;
+    Some(match supervisor.status(id).await {
+        Some(status) => ActiveApp {
+            id: id.to_string(),
+            state: status.state,
+            detail: status.detail,
+        },
+        None => ActiveApp {
+            id: id.to_string(),
+            state: AppState::Stopped,
+            detail: None,
+        },
+    })
 }
 
 pub struct Reconciler {
@@ -235,6 +263,10 @@ impl Reconciler {
             // last results on top of whatever this publishes; SSE
             // subscribers only ever see `None` from this path.
             checks: None,
+            // Carried over rather than recomputed: this pass has not yet
+            // touched the supervisor, so the last pass's answer is still the
+            // best one available while `state` reads `reconciling`.
+            active_app: previous.active_app,
         });
 
         self.refresh_outputs().await;
@@ -424,6 +456,7 @@ impl Reconciler {
             committed: !self.store.has_preview(),
             current_revision: self.store.revision(),
             checks: None,
+            active_app: active_app_status(&self.supervisor, desired.active_app.as_deref()).await,
         };
         self.publish_status(status.clone());
         status
@@ -1103,6 +1136,23 @@ impl Reconciler {
                     if current != faults {
                         faults = current;
                         self.reconcile().await;
+                    } else {
+                        // A full reconcile only runs when the fault
+                        // signature moves; a heartbeat timeout clearing, a
+                        // window appearing, or a backoff step can change the
+                        // active app's state without moving it, and a
+                        // between-pass reader deserves to see that promptly
+                        // rather than wait for the next unrelated pass. Do
+                        // not run a full reconcile just for this — read what
+                        // is already known and republish if it moved.
+                        let active_app_id = self.store.effective().active_app.clone();
+                        let active_app =
+                            active_app_status(&self.supervisor, active_app_id.as_deref()).await;
+                        let mut status = self.snapshot.status();
+                        if status.active_app != active_app {
+                            status.active_app = active_app;
+                            self.publish_status(status);
+                        }
                     }
                 }
                 _ = poll.tick() => {
@@ -1498,6 +1548,44 @@ mod tests {
         harness.store.set_preview(None);
         let status = harness.reconciler.reconcile().await;
         assert!(status.committed);
+    }
+
+    #[tokio::test]
+    async fn status_carries_the_active_app_and_its_state() {
+        let harness = harness();
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app("renderer", None, None));
+                state.active_app = Some("renderer".into());
+            })
+            .unwrap();
+
+        let status = harness.reconciler.reconcile().await;
+        let active_app = status.active_app.expect("an app is active");
+        assert_eq!(active_app.id, "renderer");
+        assert_ne!(
+            active_app.state,
+            AppState::Stopped,
+            "the pass just launched it"
+        );
+        harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn status_active_app_is_none_when_nothing_is_active() {
+        let harness = harness();
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app("renderer", None, None));
+                // active_app left unset.
+            })
+            .unwrap();
+
+        let status = harness.reconciler.reconcile().await;
+        assert!(status.active_app.is_none());
+        harness.supervisor.shutdown().await;
     }
 
     #[tokio::test]

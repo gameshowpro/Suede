@@ -87,7 +87,7 @@ Status conventions: `400` malformed JSON, `404` unknown resource, `409` revision
 | `GET` | `/windows` | All windows in the tree: id, app_id, pid, title, geometry, fullscreen state, output, and — where Suede launched them — the owning app id. |
 | `GET` | `/audio/outputs` | All audio sinks reported by PipeWire: stable id (`node.name`), human-readable description, availability, and whether it is Suede's null sink. See [Audio routing](#audio-routing). |
 | `GET` | `/apps/{id}/status` | Runtime status of a managed app: `running` \| `starting` \| `stopped` \| `crashed` \| `backoff`, pid, start time, restart count, matched window ids. |
-| `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"), whether the applied document is the saved one (`committed`), the desired-state document's revision right now (`currentRevision`, which outruns the applied `revision` while a write is still being reconciled), and a summary of the last environment health-check run (`checks`: `pass`/`warn`/`fail` counts, `null` if none has run). See [below](#is-the-appliance-doing-what-i-asked) for how to read these together. |
+| `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"), whether the applied document is the saved one (`committed`), the desired-state document's revision right now (`currentRevision`, which outruns the applied `revision` while a write is still being reconciled), a summary of the last environment health-check run (`checks`: `pass`/`warn`/`fail` counts, `null` if none has run), and the app `activeApp` names alongside its runtime state (`activeApp`: `id`, `state`, `detail`; `null` when no app is active). See [below](#is-the-appliance-doing-what-i-asked) for how to read these together. |
 | `GET` | `/projection/stats` | What the slicer measured over its last interval: canvas and presented frame rates, per-frame cost, the inter-output presentation offset (mean/max ms), straddles (frames shown on different refreshes), per-output presented/discarded counts and measured refresh. `null` when no slicer is running. |
 | `GET` | `/system` | Suede version, Sway version, relevant package versions (sway, chromium, firefox, …), hostname, uptime. |
 | `GET` | `/system/checks` | Environment health checks: id, status (`pass` \| `warn` \| `fail`), detail, and whether an automated fix is available. See [Environment preparation](#environment-preparation-and-health-checks). |
@@ -101,6 +101,7 @@ An outside application — a show-control system, a dashboard — usually wants 
 - It will still be fulfilled *after a restart* when `committed` is also `true`. A working copy (`PUT /config` with `committed: false`) is applied to the outputs exactly as a saved document is, so an appliance can be `synced` against a document that vanishes the moment it reboots.
 - The appliance has *caught up with your last write* when `currentRevision` equals `revision`. While they differ, the write is safely persisted but not yet reconciled.
 - The *environment underneath it* is sound when `checks.fail` is zero.
+- Your app is *actually on the screens* when `activeApp.state` is `running`. `null` means nothing is active; any other state (`starting`, `waitingForDependency`, `backoff`, `crashed`) means it is not up yet, and `activeApp.detail` says why. This is the one call the other three fields above cannot answer: an appliance can be `synced` with a `null` `activeApp` (nothing configured to run) or `degraded` for a reason unrelated to the app at all.
 
 `degraded` and a failing check are different conditions with different remedies, and conflating them is the mistake this call exists to head off:
 
@@ -120,8 +121,10 @@ A `synced` appliance can still be carrying a failing check, and a `degraded` one
 | `GET/PUT` | `/config/apps` | The apps section. |
 | `GET/PUT/DELETE` | `/config/apps/{id}` | A single app config. |
 | `GET/PUT` | `/config/settings` | Daemon-level settings (cursor hiding, poll interval, …). |
+| `POST` | `/apps/{id}/activate` | Persist `activeApp` as this id, replacing whichever app was active. Accepts `?wait=` like other writes. |
+| `POST` | `/apps/{id}/deactivate` | Persist `activeApp` as `null`, if this id is the one currently active (`409` otherwise). Accepts `?wait=` like other writes. |
 
-Writes are validated synchronously (schema, mode plausibility, unique app ids) and return `200` with the persisted document once *saved* — not once applied. Application is asynchronous and observable via `/status` and SSE, because reconciliation may take seconds (mode sets) or be currently impossible (output unplugged). An optional `?wait=<seconds>` query parameter blocks the response until reconciliation settles or the timeout elapses, returning the resulting `/status` payload.
+Writes are validated synchronously (schema, mode plausibility, unique app ids) and return `200` with the persisted document once *saved* — not once applied. Application is asynchronous and observable via `/status` and SSE, because reconciliation may take seconds (mode sets) or be currently impossible (output unplugged). An optional `?wait=<seconds>` query parameter blocks the response until the pass that applies the write has run, or the timeout elapses; the body is still the persisted document, and `/status` then reflects that pass. This matters most for `activate`: without it, `GET /apps/{id}/status` called right after reports this app's state from before the switch, or `404` for an app added moments ago and not yet reconciled; with `?wait=`, the response comes back only after the pass that launched the app, so the read that follows is not a race.
 
 Imperative escape hatches (not persisted):
 
@@ -144,7 +147,7 @@ Imperative escape hatches (not persisted):
 - `app_status_changed` — payload: same shape as `GET /apps/{id}/status`.
 - `checks_changed` — payload: same shape as `GET /system/checks`.
 - `config_changed` — payload: the new desired-state document revision number and which section changed.
-- `status_changed` — payload: same shape as `GET /status`, except `checks` is always `null`: a reconciliation pass never runs the health checks itself (they shell out to other programs, and a pass must stay cheap), so it has nothing honest to report there. Poll `GET /status` for the checks summary.
+- `status_changed` — payload: same shape as `GET /status`, except `checks` is always `null`: a reconciliation pass never runs the health checks itself (they shell out to other programs, and a pass must stay cheap), so it has nothing honest to report there. Poll `GET /status` for the checks summary. Published after every reconciliation pass, and also between passes whenever `activeApp`'s state changes on its own — a heartbeat timeout, a window appearing, a backoff step — so a client watching for `activeApp.state == running` does not have to poll.
 - `projection_stats_changed` — payload: same shape as `GET /projection/stats`, every 10 s while the slicer runs; `null` when it stops.
 - Heartbeat comment every 15 s to keep intermediaries from timing out the connection.
 
@@ -253,6 +256,7 @@ Process liveness alone cannot detect a hung page (Chromium happily keeps running
 - The app config carries `heartbeat: { enabled, timeoutSeconds, startupGraceSeconds }` (defaults: 25 s timeout, 60 s startup grace).
 - The rendered content is expected to `POST /api/v1/apps/{id}/heartbeat` (empty body) every ~10 seconds, using the `{heartbeatUrl}` URI placeholder to learn the address. The endpoint is deliberately unauthenticated but accepted **only from loopback connections** — the kiosk browsers posting heartbeats always run on the same machine as Suede, and the endpoint is low-risk (worst case, a local process delays a watchdog restart).
 - Arming: the watchdog arms on the *first* heartbeat received after launch. Until then only the startup grace period applies (covering page load); if no heartbeat arrives within `startupGraceSeconds`, or an armed app goes silent for `timeoutSeconds`, the process is killed and relaunched with its stored parameters, subject to the app's restart backoff policy.
+- Heartbeats and `state` are independent: `lastHeartbeat` can be set while the app still reports `starting` (it becomes `running` once its window is placed), and the reverse is possible too. "Launched and alive" is `state == running` **and** `lastHeartbeat != null`.
 - Watchdog trips are surfaced as `app_status_changed` events (status `crashed`, reason `heartbeatTimeout`) and counted in `/apps/{id}/status`.
 
 ## Environment preparation and health checks
