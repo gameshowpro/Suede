@@ -36,7 +36,10 @@ cleanup() {
 trap cleanup EXIT
 
 start_daemon() {
-  "$BIN" run --mock --bind "127.0.0.1:${PORT}" >>"$LOG" 2>&1 &
+  # The stand-in app is `sleep`, which no browser allowlist admits; name it
+  # explicitly rather than widening the default the daemon ships with.
+  SUEDE_ALLOWED_PROGRAMS=sleep \
+    "$BIN" run --mock --bind "127.0.0.1:${PORT}" >>"$LOG" 2>&1 &
   DAEMON_PID=$!
   for _ in $(seq 1 50); do
     if curl -sf "${BASE}/healthz" >/dev/null 2>&1; then return 0; fi
@@ -78,7 +81,8 @@ echo "Desired state"
 CONFIG='{
   "outputs": [
     {"match":{"name":"HDMI-A-3"},"enable":true,
-     "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":3840,"y":0}}
+     "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":3840,"y":0},
+     "scale":1.0,"transform":"normal"}
   ],
   "apps": [
     {"id":"renderer-1",
@@ -180,6 +184,8 @@ start_daemon || exit 1
 # delay) and launch apps.
 sleep 6
 # Revision 3: the initial write plus the two accepted projection writes above.
+# The output is configured in full (mode, scale, transform) so adoption has
+# nothing to pin; a pin is a write of Suede's own and would move this number.
 check "configuration survived the restart" "3" \
   "$(json_of "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
 check "app was relaunched after restart" "1" \
