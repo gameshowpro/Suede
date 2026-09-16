@@ -62,8 +62,12 @@ check "output detail is served" "HDMI-A-1" \
 check "unknown output is 404" "404" "$(status_of "${BASE}/api/v1/outputs/HDMI-A-99")"
 check "windows are visible" "2" \
   "$(json_of "${BASE}/api/v1/windows" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
-check "audio sinks are visible" "2" \
-  "$(json_of "${BASE}/api/v1/audio/outputs" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
+check "audio outputs are visible" "2" \
+  "$(json_of "${BASE}/api/v1/av" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["audioOutputs"]))')"
+check "audio inputs are visible" "1" \
+  "$(json_of "${BASE}/api/v1/av" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["audioInputs"]))')"
+check "video inputs are visible" "1" \
+  "$(json_of "${BASE}/api/v1/av" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["videoInputs"]))')"
 check "health checks run" "17" \
   "$(json_of "${BASE}/api/v1/system/checks" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
 check "system reports its version" "true" \

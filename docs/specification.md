@@ -85,7 +85,7 @@ Status conventions: `400` malformed JSON, `404` unknown resource, `409` revision
 | `GET` | `/outputs` | All outputs as reported by Sway: name, active, make/model/serial, current mode, full mode list (deduplicated), position, scale, transform. |
 | `GET` | `/outputs/{name}` | A single output. |
 | `GET` | `/windows` | All windows in the tree: id, app_id, pid, title, geometry, fullscreen state, output, and — where Suede launched them — the owning app id. |
-| `GET` | `/audio/outputs` | All audio sinks reported by PipeWire: stable id (`node.name`), human-readable description, availability, and whether it is Suede's null sink. See [Audio routing](#audio-routing). |
+| `GET` | `/av` | Every AV device PipeWire reports, in three lists: `audioOutputs` (sinks: stable id from `node.name`, description, whether it is Suede's null sink, and `isDefault`), `audioInputs` (sources: id, description, `card`), and `videoInputs` (sources: id, description, `path` such as `/dev/video0`, and `card`). Only audio outputs have a default. Exposed so an app in the kiosk browser, which may not enumerate devices itself, can ask for the right one: a browser labels an audio device by its `description` and a video device by its `card`. See [Audio routing](#audio-routing). |
 | `GET` | `/apps/{id}/status` | Runtime status of a managed app: `running` \| `starting` \| `stopped` \| `crashed` \| `backoff`, pid, start time, restart count, matched window ids. |
 | `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"), whether the applied document is the saved one (`committed`), the desired-state document's revision right now (`currentRevision`, which outruns the applied `revision` while a write is still being reconciled), a summary of the last environment health-check run (`checks`: `pass`/`warn`/`fail` counts, `null` if none has run), and the app `activeApp` names alongside its runtime state (`activeApp`: `id`, `state`, `detail`; `null` when no app is active). See [below](#is-the-appliance-doing-what-i-asked) for how to read these together. |
 | `GET` | `/projection/stats` | What the slicer measured over its last interval: canvas and presented frame rates, per-frame cost, the inter-output presentation offset (mean/max ms), straddles (frames shown on different refreshes), per-output presented/discarded counts and measured refresh. `null` when no slicer is running. |
@@ -143,7 +143,7 @@ Imperative escape hatches (not persisted):
 
 - `outputs_changed` — payload: full current outputs array (same shape as `GET /outputs`).
 - `windows_changed` — payload: the changed window and change type (`new`, `close`, `title`, `move`, `fullscreen_mode`, `floating`).
-- `audio_outputs_changed` — payload: full current sink list (same shape as `GET /audio/outputs`).
+- `av_changed` — payload: full current audio outputs, inputs, and video inputs (same shape as `GET /av`).
 - `app_status_changed` — payload: same shape as `GET /apps/{id}/status`.
 - `checks_changed` — payload: same shape as `GET /system/checks`.
 - `config_changed` — payload: the new desired-state document revision number and which section changed.
@@ -243,7 +243,7 @@ Failures of individual Sway commands are logged, reflected in `/status`, and ret
 
 Audio is out of Sway's scope, so Suede talks to **PipeWire** directly (the `pipewire` crate), mirroring the output-like feature set the display side has:
 
-- **Enumeration.** Suede monitors the PipeWire registry for nodes with `media.class == "Audio/Sink"` and exposes them at `GET /audio/outputs`. Registry add/remove events drive the `audio_outputs_changed` SSE event — no polling.
+- **Enumeration.** Suede monitors the PipeWire registry for nodes with `media.class` of `Audio/Sink`, `Audio/Source`, and `Video/Source`, exposing all three at `GET /av`. Registry add/remove events drive the `av_changed` SSE event — no polling. Video sources appear only when WirePlumber's v4l2 monitor is enabled (the default), which is the same condition under which PipeWire itself knows about the device.
 - **Stable identification.** Sinks are identified by PipeWire `node.name` (e.g. `alsa_output.pci-0000_01_00.1.hdmi-stereo-extra1`), which is derived from the hardware path and profile and is stable across reboots and replugging for fixed hardware. (PipeWire's numeric ids and `object.serial` are *not* stable and are never used in the API.) Each sink also carries its human-readable `node.description` and, where derivable from the ALSA device hierarchy, a hint associating an HDMI sink with its video connector.
 - **Per-app routing.** Chromium and Firefox are PulseAudio clients (via `pipewire-pulse`), so routing is done at spawn time: Suede sets `PULSE_SINK=<node.name>` in the app's environment — a direct benefit of spawning apps as child processes rather than via Sway `exec`. Changing an app's `audio.output` in the desired state relaunches the app on the next reconcile pass (consistent with the declarative model); live migration of already-playing streams is deferred to v2.
 - **Null routing.** At startup Suede ensures a virtual null sink named `suede-null` exists. Apps configured with `"audio": { "output": null }` are launched with `PULSE_SINK=suede-null`: the browser sees a fully functional audio device, but nothing is audible.

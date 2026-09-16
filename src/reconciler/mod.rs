@@ -1214,8 +1214,8 @@ impl Reconciler {
             tokio::select! {
                 _ = shutdown.changed() => return,
                 received = receiver.recv() => match received {
-                    Ok(sinks) => {
-                        events.publish(ServerEvent::AudioOutputsChanged(sinks));
+                    Ok(devices) => {
+                        events.publish(ServerEvent::AvChanged(devices));
                         trigger.request("audio change");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -1251,7 +1251,7 @@ mod tests {
     fn harness() -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let sway = Arc::new(MockSway::with_fixtures());
-        let audio = Arc::new(MockAudio::with_sinks());
+        let audio = Arc::new(MockAudio::with_devices());
         let store = Arc::new(StateStore::ephemeral(dir.path().to_path_buf()));
         let snapshot = Arc::new(Snapshot::new());
         let events = EventHub::new();

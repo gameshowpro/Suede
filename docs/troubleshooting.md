@@ -369,11 +369,11 @@ service should come back on its own within about a minute.
 ## Audio goes to the wrong place, or nowhere
 
 ```bash
-curl -s http://appliance:9088/api/v1/audio/outputs | python3 -m json.tool
+curl -s http://appliance:9088/api/v1/av | python3 -m json.tool
 wpctl status    # what PipeWire itself thinks
 ```
 
-Use the `id` field (PipeWire's `node.name`) in the app's `audio.output`; it is stable across reboots. A configured sink that is absent is reported as an `audio_sink_not_present` divergence, and the app still launches on the default sink.
+Use the `id` field (PipeWire's `node.name`) from `.audioOutputs` in the app's `audio.output`; it is stable across reboots. A configured sink that is absent is reported as an `audio_sink_not_present` divergence, and the app still launches on the default sink.
 
 If no sinks appear at all, `pw-dump` is failing — check that PipeWire is running. If sinks appear but browsers have no audio device, `pipewire-pulse` is missing; browsers reach PipeWire through its PulseAudio compatibility layer, which is what `PULSE_SINK` routing depends on.
 

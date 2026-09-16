@@ -247,6 +247,49 @@ pub struct AudioSink {
     pub gain_db: Option<f64>,
 }
 
+/// An audio input (capture) device reported by PipeWire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioSource {
+    /// PipeWire `node.name` — stable across reboots and replugging.
+    pub id: String,
+    /// Human-readable `node.description`. This is what a Chromium kiosk's
+    /// `enumerateDevices` labels the device as, since audio devices are
+    /// opened through pipewire-pulse.
+    pub description: Option<String>,
+    /// ALSA card name (`api.alsa.card.name`), where PipeWire reports one.
+    pub card: Option<String>,
+}
+
+/// A video input (capture) device, surfaced via WirePlumber's v4l2 monitor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoSource {
+    /// PipeWire `node.name` — stable across reboots and replugging.
+    pub id: String,
+    /// Human-readable `node.description`.
+    pub description: Option<String>,
+    /// V4L2 device path (`api.v4l2.path`), e.g. `/dev/video0`.
+    pub path: Option<String>,
+    /// V4L2 card string (`api.v4l2.cap.card`). This, not `description`, is
+    /// what a Chromium kiosk's `enumerateDevices` labels the device as,
+    /// since video devices are opened straight through V4L2.
+    pub card: Option<String>,
+}
+
+/// Every audio and video device PipeWire currently reports: outputs Suede
+/// can route to, and inputs an app might ask to be given.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AvDevices {
+    /// Audio sinks. The only list with a notion of default.
+    pub audio_outputs: Vec<AudioSink>,
+    /// Audio sources (`Audio/Source` nodes).
+    pub audio_inputs: Vec<AudioSource>,
+    /// Video sources (`Video/Source` nodes), from WirePlumber's v4l2 monitor.
+    pub video_inputs: Vec<VideoSource>,
+}
+
 /// Overall reconciliation state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "lowercase")]

@@ -127,7 +127,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/outputs/{name}", get(observed::get_output))
         .route("/ports", get(observed::list_ports))
         .route("/windows", get(observed::list_windows))
-        .route("/audio/outputs", get(observed::list_audio_outputs))
+        .route("/av", get(observed::list_av_devices))
         .route("/status", get(observed::get_status))
         .route("/projection/stats", get(observed::get_projection_stats))
         .route("/system", get(observed::get_system))
@@ -353,7 +353,7 @@ pub mod test_support {
             ..BootstrapConfig::default()
         });
         let sway = Arc::new(MockSway::with_fixtures());
-        let audio = Arc::new(MockAudio::with_sinks());
+        let audio = Arc::new(MockAudio::with_devices());
         let store = Arc::new(StateStore::ephemeral(dir.path().to_path_buf()));
         let snapshot = Arc::new(Snapshot::new());
         let hub = EventHub::new();

@@ -2375,7 +2375,7 @@ mod tests {
         CheckRunner::new(
             bootstrap,
             Arc::new(MockSway::with_fixtures()),
-            Arc::new(MockAudio::with_sinks()),
+            Arc::new(MockAudio::with_devices()),
             store,
             EventHub::new(),
             capabilities,

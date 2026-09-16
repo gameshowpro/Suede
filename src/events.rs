@@ -6,7 +6,7 @@
 use tokio::sync::broadcast;
 
 use crate::model::{
-    AppStatus, AudioSink, Check, ConfigChange, Output, ProjectionReport, Status, WindowChange,
+    AppStatus, AvDevices, Check, ConfigChange, Output, ProjectionReport, Status, WindowChange,
 };
 
 const CAPACITY: usize = 256;
@@ -16,7 +16,7 @@ const CAPACITY: usize = 256;
 pub enum ServerEvent {
     OutputsChanged(Vec<Output>),
     WindowsChanged(Box<WindowChange>),
-    AudioOutputsChanged(Vec<AudioSink>),
+    AvChanged(AvDevices),
     AppStatusChanged(Box<AppStatus>),
     ConfigChanged(ConfigChange),
     StatusChanged(Box<Status>),
@@ -35,7 +35,7 @@ impl ServerEvent {
         match self {
             Self::OutputsChanged(_) => "outputs_changed",
             Self::WindowsChanged(_) => "windows_changed",
-            Self::AudioOutputsChanged(_) => "audio_outputs_changed",
+            Self::AvChanged(_) => "av_changed",
             Self::AppStatusChanged(_) => "app_status_changed",
             Self::ConfigChanged(_) => "config_changed",
             Self::StatusChanged(_) => "status_changed",
@@ -49,7 +49,7 @@ impl ServerEvent {
         match self {
             Self::OutputsChanged(outputs) => serde_json::to_value(outputs),
             Self::WindowsChanged(change) => serde_json::to_value(change),
-            Self::AudioOutputsChanged(sinks) => serde_json::to_value(sinks),
+            Self::AvChanged(devices) => serde_json::to_value(devices),
             Self::AppStatusChanged(status) => serde_json::to_value(status),
             Self::ConfigChanged(change) => serde_json::to_value(change),
             Self::StatusChanged(status) => serde_json::to_value(status),
@@ -124,6 +124,31 @@ mod tests {
         }));
         assert_eq!(event.name(), "status_changed");
         assert_eq!(event.data()["state"], "degraded");
+    }
+
+    #[test]
+    fn av_changed_event_serializes_the_whole_device_set() {
+        let event = ServerEvent::AvChanged(crate::model::AvDevices {
+            audio_outputs: vec![crate::model::AudioSink {
+                id: "alsa_output.hdmi-stereo".into(),
+                description: Some("HDMI".into()),
+                is_null_sink: false,
+                is_default: true,
+                output_hint: None,
+                gain_db: Some(0.0),
+            }],
+            audio_inputs: vec![crate::model::AudioSource {
+                id: "alsa_input.usb".into(),
+                description: Some("USB Capture HDMI Analog Stereo".into()),
+                card: Some("USB Capture HDMI".into()),
+            }],
+            video_inputs: vec![],
+        });
+        assert_eq!(event.name(), "av_changed");
+        let data = event.data();
+        assert_eq!(data["audioOutputs"][0]["id"], "alsa_output.hdmi-stereo");
+        assert_eq!(data["audioInputs"][0]["card"], "USB Capture HDMI");
+        assert_eq!(data["videoInputs"], serde_json::json!([]));
     }
 
     #[test]

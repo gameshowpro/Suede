@@ -742,7 +742,7 @@ The first is a decision deferred, not a decision recorded. An app with no
 default can move on its own — plugging in a USB headset is enough for
 WirePlumber to promote it. Naming a sink pins the app to it regardless.
 
-Get the available identifiers from `GET /api/v1/audio/outputs`. Changing an app's sink relaunches it, because routing is applied at launch through `PULSE_SINK`.
+Get the available identifiers from `GET /api/v1/av` and use an id from `.audioOutputs`. Changing an app's sink relaunches it, because routing is applied at launch through `PULSE_SINK`.
 
 ##### Level
 
