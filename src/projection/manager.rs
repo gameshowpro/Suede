@@ -442,4 +442,81 @@ mod tests {
         spec.gamma = 2.4;
         assert_ne!(original, fingerprint(&spec), "gamma changes must repaint");
     }
+
+    // --- restart_slicer: forcing a respawn the fingerprint cannot see ----
+    //
+    // `sync_slicer` re-execs this very test binary as `suede slice`, which
+    // does not understand that subcommand and exits (with an error)
+    // virtually as soon as it starts — real enough to exercise process
+    // bookkeeping, but too short-lived to stand in for a genuinely running
+    // slicer across any real time gap. Every test below therefore makes its
+    // two `sync_slicer`/`restart_slicer` calls back-to-back with no `.await`
+    // or sleep in between, so they run in the same thread well inside the
+    // minimum time a freshly exec'd process needs to even start, let alone
+    // exit — unlike a reconciler-level test spanning a whole extra pass (or
+    // the 3-second output-settle sleep), which cannot tell a forced restart
+    // apart from the fake process simply having crashed on its own by then.
+
+    fn minimal_slicer_spec() -> SlicerSpec {
+        SlicerSpec {
+            source: "HEADLESS-1".to_string(),
+            canvas_width: 100,
+            canvas_height: 100,
+            gamma: 2.2,
+            black_lift: 0.0,
+            pattern: None,
+            free_run: false,
+            renderer: crate::model::Renderer::Cpu,
+            slices: Vec::new(),
+        }
+    }
+
+    fn manager_for_test() -> BlendManager {
+        BlendManager::new(Arc::new(Snapshot::new()), EventHub::new())
+    }
+
+    #[test]
+    fn an_unforced_call_with_an_unchanged_spec_leaves_the_slicer_alone() {
+        let mut manager = manager_for_test();
+        let spec = minimal_slicer_spec();
+
+        manager.sync_slicer(Some(&spec));
+        let pid = manager.slicer_pid().expect("must have spawned a slicer");
+
+        manager.sync_slicer(Some(&spec));
+        assert_eq!(
+            manager.slicer_pid(),
+            Some(pid),
+            "an unchanged spec must not be restarted"
+        );
+    }
+
+    #[test]
+    fn restart_slicer_forces_a_respawn_even_with_an_unchanged_spec() {
+        // This is exactly what the reconciler calls before `sync_slicer` on
+        // any pass whose `OutputPlan::topology_changed` is true — see
+        // `restart_slicer`'s own doc for why the spec alone cannot be
+        // trusted to notice an output that disappeared and came back under
+        // the same name.
+        let mut manager = manager_for_test();
+        let spec = minimal_slicer_spec();
+
+        manager.sync_slicer(Some(&spec));
+        let pid = manager.slicer_pid().expect("must have spawned a slicer");
+
+        manager.restart_slicer();
+        manager.sync_slicer(Some(&spec));
+        assert_ne!(
+            manager.slicer_pid(),
+            Some(pid),
+            "a forced restart must respawn even an unchanged spec"
+        );
+    }
+
+    #[test]
+    fn restart_slicer_is_a_no_op_when_nothing_is_running() {
+        let mut manager = manager_for_test();
+        manager.restart_slicer();
+        assert!(!manager.slicer_running());
+    }
 }
