@@ -1,6 +1,29 @@
 {
   "components": {
     "schemas": {
+      "ActiveApp": {
+        "description": "What `Status.activeApp` says about the one app the appliance is showing.",
+        "properties": {
+          "detail": {
+            "description": "Human-readable detail for the current state, mirroring\n[`AppStatus::detail`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/AppState"
+          }
+        },
+        "required": [
+          "id",
+          "state"
+        ],
+        "type": "object"
+      },
       "AdoptedOutput": {
         "additionalProperties": false,
         "description": "What Suede observed and pinned because the configuration named none.\n\nKept apart from the operator's own fields, not merged into them, because\nthe two must stay distinguishable forever: an operator who asked for\n1920x1200 and cannot have it deserves a divergence that persists until a\nhuman decides, while a value that is merely what happened to be plugged in\nlast week should be replaced without ceremony when the display changes.\nMerged into one field, nothing could tell those two cases apart.\n\nDeliberately absent: **position**. In projection mode the configured\nposition is a canvas coordinate where the beams overlap, while sway is\nhanded a plain edge-to-edge tiling, so observed position is not desired\nposition by design — on the four-projector bench the configuration holds\na 2x2 grid while sway reports a single row, and adopting observed\npositions would flatten the layout and destroy the blend. Do not add it.",
@@ -1783,6 +1806,17 @@
       "Status": {
         "description": "Reconciliation status, as served by `GET /status`.\n\nAnswers \"is this appliance doing what I asked, and will it still be after\na reboot\" from one call: `state` and `divergences` alone say whether\ndesired state is fulfilled *right now*, but say nothing about whether the\ndocument behind that answer survives a restart, whether the machine has\ncaught up with a write still in flight, or whether the environment it\ndepends on is otherwise healthy. See `docs/specification.md`'s `/status`\nsection for the predicate spelled out for client authors.",
         "properties": {
+          "activeApp": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ActiveApp",
+                "description": "The app `activeApp` names, and how it is doing, so \"is my app on the\nscreens\" is one call: `state == running` here beside `synced` above.\n`None` when no app is active. Full detail (pid, restarts, window ids)\nstays on `GET /apps/{id}/status`."
+              }
+            ]
+          },
           "checks": {
             "oneOf": [
               {
@@ -2261,6 +2295,17 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "in": "query",
+            "name": "wait",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -2294,6 +2339,17 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "in": "query",
+            "name": "wait",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
             }
           }
         ],

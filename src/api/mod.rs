@@ -15,11 +15,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::extract::{Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::Router;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::audio::AudioMonitor;
 use crate::checks::CheckRunner;
@@ -153,7 +154,21 @@ pub fn router(state: ApiState) -> Router {
         .route("/apps/{id}/restart", post(apps::restart_app))
         .route("/apps/{id}/activate", post(apps::activate_app))
         .route("/apps/{id}/deactivate", post(apps::deactivate_app))
-        .route("/apps/{id}/heartbeat", post(apps::heartbeat))
+        .route(
+            "/apps/{id}/heartbeat",
+            // Heartbeats come from page content, which may be served from a
+            // different origin or port than the appliance's own API (or
+            // loaded over `file://`), so this one route answers preflight
+            // and carries `Access-Control-Allow-*`. The rest of the API
+            // stays same-origin only; scoping the layer to this route
+            // (rather than the whole router) keeps it that way.
+            post(apps::heartbeat).layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods([Method::POST])
+                    .allow_private_network(true),
+            ),
+        )
         // Desired state.
         .route(
             "/config",

@@ -39,10 +39,18 @@ struct ManagedApp {
     /// Set when the restart policy declined to relaunch, so nothing may
     /// auto-start this app until the configuration changes or the API asks.
     halted: bool,
-    /// Whether the app's readiness URL has answered acceptably.
+    /// Whether the app's readiness URL has answered acceptably for the
+    /// launch currently in flight.
     ///
-    /// Latched: once a dependency has been seen up, a later blip must not stop
-    /// a crashed app from being relaunched.
+    /// Not latched across relaunches: [`unlatch_readiness`] clears it
+    /// whenever an app is stopped and about to launch again — a crash, a
+    /// heartbeat timeout, a window that never appeared, a manual restart, or
+    /// a config change — so a dependency that died in the meantime holds the
+    /// app back instead of sending it into a browser error page. The
+    /// original worry, that a blip would stall a crash relaunch, is bounded:
+    /// `tick()` probes every second, so a healthy dependency only delays a
+    /// relaunch by about one tick, while an unhealthy one is exactly what
+    /// should hold the launch.
     dependency_ready: bool,
     /// When the last readiness probe ran, to honour the configured interval.
     last_probe: Option<Instant>,
@@ -186,23 +194,28 @@ impl Supervisor {
                 if managed.is_running() {
                     tracing::info!(app = %config.id, "configuration changed; restarting");
                     stop(managed).await;
-                    managed.status.last_restart_reason = Some(RestartReason::ConfigChanged);
+                    // A pure deactivation (the synthesized `enabled` flag
+                    // going false because `activeApp` moved on) is not a
+                    // restart of this app's own config, so it must not
+                    // overwrite whatever reason is already on the books.
+                    if config.enabled {
+                        managed.status.last_restart_reason = Some(RestartReason::ConfigChanged);
+                    }
                 }
-                // A new specification earns a halted app another attempt, and
-                // a changed readiness URL must be re-probed rather than
-                // inheriting the old verdict. `allowed_programs` itself
-                // cannot change without a daemon restart, but the app's own
-                // launcher can — switching it to a permitted program deserves
-                // the same fresh attempt as any other reconfiguration.
+                // A new specification earns a halted app another attempt.
+                // `allowed_programs` itself cannot change without a daemon
+                // restart, but the app's own launcher can — switching it to
+                // a permitted program deserves the same fresh attempt as any
+                // other reconfiguration.
                 managed.halted = false;
                 managed.program_not_allowed = false;
                 managed.attempts = 0;
                 managed.restart_at = Some(Instant::now());
-                if managed.config.readiness != config.readiness {
-                    managed.dependency_ready = false;
-                    managed.last_probe = None;
-                    managed.waiting_since = None;
-                }
+                // Every relaunch re-probes readiness now, so a config change
+                // (deactivation included, so a later reactivation probes
+                // afresh) needs the same reset the readiness URL changing
+                // used to trigger on its own.
+                unlatch_readiness(managed);
             }
             managed.config = config.clone();
             managed.target = target;
@@ -367,6 +380,7 @@ impl Supervisor {
         managed.halted = false;
         managed.attempts = 0;
         managed.restart_at = Some(Instant::now());
+        unlatch_readiness(managed);
         self.publish(managed);
         self.advance(&mut apps).await;
         true
@@ -766,6 +780,17 @@ fn set_state(status: &mut AppStatus, state: AppState, detail: Option<String>) {
     status.detail = detail;
 }
 
+/// Clear the readiness latch so the next launch probes fresh.
+///
+/// Called wherever an app is stopped and about to launch again — see the
+/// call sites — so the dependency check gates every launch, not just the
+/// first one.
+fn unlatch_readiness(managed: &mut ManagedApp) {
+    managed.dependency_ready = false;
+    managed.last_probe = None;
+    managed.waiting_since = None;
+}
+
 fn describe(code: Option<i32>) -> String {
     match code {
         Some(0) => "cleanly".to_string(),
@@ -809,6 +834,11 @@ const CRASH_LOOP_ATTEMPTS: u32 = 3;
 /// the one case where it means something.
 fn schedule_restart_or_halt(managed: &mut ManagedApp, exit_code: Option<i32>, detail: &str) {
     managed.program_not_allowed = false;
+    // Whether this launch is retried or the app is halted, the verdict on
+    // the dependency is about to be stale either way — a retry must re-probe
+    // before it launches, and a halted app should not resume on a stopped
+    // clock the next time something restarts it.
+    unlatch_readiness(managed);
     if managed.config.restart.should_restart(exit_code) {
         managed.attempts += 1;
         let delay = managed.config.restart.delay_for(managed.attempts);
@@ -1307,6 +1337,147 @@ mod tests {
         let status = supervisor.status("a").await.unwrap();
         assert_eq!(status.state, AppState::WaitingForDependency);
         assert!(status.pid.is_none());
+    }
+
+    /// Like [`serve`], but the answer can be flipped off after the fact, to
+    /// prove a dependency that dies between launches is caught on the very
+    /// next probe rather than trusting an old verdict.
+    async fn serve_toggle() -> (String, Arc<std::sync::atomic::AtomicBool>) {
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let flag = up.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                use tokio::io::AsyncWriteExt;
+                let status = if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    "200 OK"
+                } else {
+                    "503 Service Unavailable"
+                };
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                    .await;
+            }
+        });
+        (format!("http://{address}/ready"), up)
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_re_probes_readiness_and_waits_if_the_dependency_died() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let (url, up) = serve_toggle().await;
+        let mut config = sleeper("a");
+        config.readiness = Some(waiting_on(&url));
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+        supervisor.tick(&[]).await;
+        assert!(
+            supervisor.status("a").await.unwrap().pid.is_some(),
+            "should have launched once the dependency answered"
+        );
+
+        // The dependency dies before the app is relaunched.
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        supervisor.restart("a").await;
+        // `restart()` itself must not relaunch on the old, latched verdict.
+        assert!(
+            supervisor.status("a").await.unwrap().pid.is_none(),
+            "a relaunch must not skip the readiness check"
+        );
+
+        // The next tick probes, finds the dependency down, and holds the launch.
+        supervisor.tick(&[]).await;
+        let status = supervisor.status("a").await.unwrap();
+        assert_eq!(status.state, AppState::WaitingForDependency);
+        assert!(status.pid.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_relaunch_does_not_wait_when_the_dependency_is_still_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let url = serve("200 OK").await;
+        let mut config = sleeper("a");
+        config.readiness = Some(waiting_on(&url));
+        supervisor.reconcile(&[config], &[target("a", None)]).await;
+        supervisor.tick(&[]).await;
+        assert!(supervisor.status("a").await.unwrap().pid.is_some());
+
+        supervisor.restart("a").await;
+        // The probe itself only runs in `tick()`; give it one.
+        supervisor.tick(&[]).await;
+        let status = supervisor.status("a").await.unwrap();
+        assert!(
+            status.pid.is_some(),
+            "a healthy dependency must not block a relaunch: {:?}",
+            status.detail
+        );
+        assert!(
+            matches!(status.state, AppState::Starting | AppState::Running),
+            "unexpected state: {:?}",
+            status.state
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_leaves_last_restart_reason_alone_but_a_real_change_stamps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+
+        // Get a known restart reason on the books first.
+        let mut config = sleeper("a");
+        config.launcher = Launcher::Exec {
+            command: "true".into(),
+            args: vec![],
+        };
+        config.restart.delay_ms = 10_000;
+        supervisor
+            .reconcile(&[config.clone()], &[target("a", None)])
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        supervisor.tick(&[]).await;
+        assert_eq!(
+            supervisor.status("a").await.unwrap().last_restart_reason,
+            Some(RestartReason::ProcessExited)
+        );
+
+        // Deactivating is a config change (the synthesized `enabled` flag
+        // flips), but not one about the app's own config, so it must not
+        // relabel the reason already recorded.
+        let mut disabled = config.clone();
+        disabled.enabled = false;
+        supervisor.reconcile(&[disabled.clone()], &[]).await;
+        assert_eq!(
+            supervisor.status("a").await.unwrap().last_restart_reason,
+            Some(RestartReason::ProcessExited),
+            "a pure deactivation must not stamp ConfigChanged"
+        );
+
+        // A genuine config change on an enabled, running app still records it.
+        let mut reactivated = disabled;
+        reactivated.enabled = true;
+        reactivated.launcher = Launcher::Exec {
+            command: "sleep".into(),
+            args: vec!["30".into()],
+        };
+        supervisor
+            .reconcile(&[reactivated.clone()], &[target("a", None)])
+            .await;
+        assert!(supervisor.status("a").await.unwrap().pid.is_some());
+
+        let mut changed = reactivated.clone();
+        changed.env.insert("X".into(), "1".into());
+        supervisor.reconcile(&[changed], &[target("a", None)]).await;
+        assert_eq!(
+            supervisor.status("a").await.unwrap().last_restart_reason,
+            Some(RestartReason::ConfigChanged)
+        );
+        supervisor.shutdown().await;
     }
 
     #[tokio::test]

@@ -2,8 +2,9 @@
 
 use std::net::SocketAddr;
 
+use crate::api::config_routes::WaitQuery;
 use crate::api::json::Json;
-use axum::extract::{ConnectInfo, Path, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::StatusCode;
 
 use super::ApiState;
@@ -176,7 +177,7 @@ pub async fn restart_app(
 
 #[utoipa::path(
     post, path = "/api/v1/apps/{id}/activate", tag = "apps",
-    params(("id" = String, Path, description = "App identifier")),
+    params(("id" = String, Path, description = "App identifier"), WaitQuery),
     responses(
         (status = 200, description = "The persisted document", body = crate::model::DesiredState),
         (status = 404, description = "No such app"),
@@ -185,6 +186,7 @@ pub async fn restart_app(
 pub async fn activate_app(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Query(query): Query<WaitQuery>,
 ) -> ApiResult<Json<crate::model::DesiredState>> {
     let mut next = state.store.get();
     if !next.apps.iter().any(|app| app.id == id) {
@@ -193,12 +195,12 @@ pub async fn activate_app(
     // One pointer, one active app: activating B deactivates A atomically.
     next.active_app = Some(id.clone());
     tracing::info!(app = %id, "activated");
-    state.commit(next, "apps", None).await.map(Json)
+    state.commit(next, "apps", query.wait).await.map(Json)
 }
 
 #[utoipa::path(
     post, path = "/api/v1/apps/{id}/deactivate", tag = "apps",
-    params(("id" = String, Path, description = "App identifier")),
+    params(("id" = String, Path, description = "App identifier"), WaitQuery),
     responses(
         (status = 200, description = "The persisted document", body = crate::model::DesiredState),
         (status = 404, description = "No such app"),
@@ -208,6 +210,7 @@ pub async fn activate_app(
 pub async fn deactivate_app(
     State(state): State<ApiState>,
     Path(id): Path<String>,
+    Query(query): Query<WaitQuery>,
 ) -> ApiResult<Json<crate::model::DesiredState>> {
     let mut next = state.store.get();
     if !next.apps.iter().any(|app| app.id == id) {
@@ -225,7 +228,7 @@ pub async fn deactivate_app(
         None => {}
     }
     tracing::info!(app = %id, "deactivated");
-    state.commit(next, "apps", None).await.map(Json)
+    state.commit(next, "apps", query.wait).await.map(Json)
 }
 
 #[utoipa::path(
@@ -323,6 +326,25 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .unwrap()
+    }
+
+    /// Like [`send`], but keeps the response headers — the CORS tests need
+    /// to see `access-control-allow-*`, which `send` discards.
+    async fn send_with_headers(
+        harness: &Harness,
+        request: Request<Body>,
+        peer: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = request;
+        let address: SocketAddr = peer.parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(address));
+        let response = harness.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
     }
 
     #[tokio::test]
@@ -494,6 +516,139 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
+        harness.state.supervisor.shutdown().await;
+    }
+
+    /// Page content posting a heartbeat is cross-origin (another host or
+    /// port than the API, sometimes `file://`), so Chromium sends a
+    /// preflight, including its private-network variant when the page
+    /// itself is treated as a public address. The route must answer it
+    /// directly rather than falling through to a plain 405.
+    #[tokio::test]
+    async fn heartbeat_preflight_gets_cors_headers() {
+        let harness = with_app("renderer").await;
+        let request = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/v1/apps/renderer/heartbeat")
+            .header("Origin", "http://example.test")
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Private-Network", "true")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_with_headers(&harness, request, "127.0.0.1:1").await;
+        assert!(status.is_success());
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert!(headers
+            .get("access-control-allow-methods")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("POST"));
+        assert_eq!(
+            headers.get("access-control-allow-private-network").unwrap(),
+            "true"
+        );
+        harness.state.supervisor.shutdown().await;
+    }
+
+    /// The real POST, not just the preflight, needs the header: it is what
+    /// the page's `fetch` promise actually checks.
+    #[tokio::test]
+    async fn heartbeat_post_carries_cors_header_on_success_and_404() {
+        let harness = with_app("renderer").await;
+
+        let ok = Request::builder()
+            .method("POST")
+            .uri("/api/v1/apps/renderer/heartbeat")
+            .header("Origin", "http://example.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_with_headers(&harness, ok, "127.0.0.1:1").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+
+        let unknown = Request::builder()
+            .method("POST")
+            .uri("/api/v1/apps/nope/heartbeat")
+            .header("Origin", "http://example.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_with_headers(&harness, unknown, "127.0.0.1:1").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+
+        harness.state.supervisor.shutdown().await;
+    }
+
+    /// The CORS layer is scoped to the heartbeat route only; every other
+    /// endpoint must stay same-origin.
+    #[tokio::test]
+    async fn other_routes_carry_no_cors_headers() {
+        let harness = harness(None);
+        let request = Request::builder()
+            .uri("/api/v1/status")
+            .header("Origin", "http://example.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_with_headers(&harness, request, "127.0.0.1:1").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(headers.get("access-control-allow-origin").is_none());
+    }
+
+    /// Without `?wait=`, a status read right after activation can land
+    /// before the pass that launches the app; with it, the response only
+    /// comes back once that pass has run, so the read that follows is not a
+    /// race.
+    #[tokio::test]
+    async fn activating_with_wait_blocks_until_the_app_is_launched() {
+        let harness = harness(None);
+        harness
+            .state
+            .store
+            .update(|state| state.apps.push(sleeper("renderer")))
+            .unwrap();
+
+        let (status, _) = send(
+            &harness,
+            post("/api/v1/apps/renderer/activate?wait=5"),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send(
+            &harness,
+            Request::builder()
+                .uri("/api/v1/apps/renderer/status")
+                .body(Body::empty())
+                .unwrap(),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let app: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // A headless exec app owns no window, so it is running immediately
+        // once the pass that `wait` blocked for has completed.
+        assert_eq!(app["state"], "running");
+        harness.state.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn activating_without_wait_still_succeeds() {
+        let harness = harness(None);
+        harness
+            .state
+            .store
+            .update(|state| state.apps.push(sleeper("renderer")))
+            .unwrap();
+
+        let (status, _) = send(
+            &harness,
+            post("/api/v1/apps/renderer/activate"),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
         harness.state.supervisor.shutdown().await;
     }
 }

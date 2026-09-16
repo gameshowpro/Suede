@@ -135,7 +135,7 @@ The document carries a server-managed `revision`. Send it back as `If-Match` to 
 |---|---|---|---|
 | `match` | object | required | Which physical output this applies to |
 | `enable` | bool | `true` | `false` actively disables the output |
-| `mode` | object \| null | null | `{width, height, refreshHz}`; null leaves Sway's preferred mode, which Suede then pins — see [Adopted values](#adopted-values) |
+| `mode` | object \| null | null | `{width, height, refreshHz}`; null leaves Sway's preferred mode, which Suede then pins — see [Adopted values](#adopted-values). A requested `refreshHz` is resolved to the nearest advertised rate within 1 Hz — see [Refresh rates](#refresh-rates) |
 | `position` | object \| null | null | `{x, y}` in the global layout |
 | `scale` | number \| null | null | Output scale factor |
 | `transform` | string \| null | null | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`… |
@@ -158,6 +158,10 @@ or by EDID, for installations where connector enumeration is unstable:
 ```
 
 Every field you specify must match. A configured output that is not currently connected is a reported divergence, not an error — Suede keeps the configuration and applies it when the display appears.
+
+#### Refresh rates {: #refresh-rates }
+
+A requested `refreshHz` is resolved against the modes the display advertises. An exact match within 0.01 Hz wins. Otherwise the nearest advertised rate within 1 Hz is selected and applied as the display advertises it: asking for 60 Hz on a display offering 59.951 Hz selects 59.951 and reports no divergence. Only a resolution the display does not offer, or a refresh rate more than 1 Hz from any advertised rate, raises `mode_unsupported`.
 
 #### Connectors, not displays {: #connectors-not-displays }
 
@@ -248,6 +252,8 @@ pins plus which display it was taken from and when:
   "capturedAt": 1757894400
 }
 ```
+
+The `refreshHz: 59.95` in the mode is what Suede observed the display settle on and pinned; it is not a value the operator supplied or needs to know.
 
 It is only ever written by Suede, after a value has been observed twice in a
 row (so a display still waking cannot pin a value that was never its final
@@ -388,9 +394,16 @@ An application is a *launch specification*, not a window. That is what makes it 
 **One application is active at a time — `activeApp` — and it always covers
 the whole canvas.** The rest of the list is a library to switch between:
 `POST /api/v1/apps/{id}/activate` swaps every display to another app atomically,
-killing the previous one and launching the new. There is no per-app output
+killing the previous one and launching the new; `POST /api/v1/apps/{id}/deactivate`
+clears `activeApp` if this id is the one active. There is no per-app output
 targeting and no per-app enable flag; the appliance is a single canvas, not a
 window manager.
+
+Both accept `?wait=<seconds>` like any other write. Without it, a
+`GET /apps/{id}/status` called right after `activate` still reports the app's
+state from before the switch, or `404` for an app just added and not yet
+reconciled; with `?wait=`, the response only returns once the pass that
+launched the app has run.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
@@ -682,6 +695,13 @@ background until the service appears is better than showing an error page that
 nobody will reload. Set `giveUpAfterSeconds` if you would rather see whatever
 the browser makes of it.
 
+The probe gates every launch, not just the first. A relaunch after a crash, a
+heartbeat timeout, a manual restart, or activation all wait on it again, so a
+dependency that dies while its app is running is caught the moment that app is
+next launched, and the app goes back to `waitingForDependency` rather than
+into a browser error page. `giveUpAfterSeconds` counts from the start of each
+wait, so it restarts with every relaunch rather than accumulating across them.
+
 !!! note "Only http://"
     The probe reads the status line and nothing more, so it deliberately has no
     TLS stack — that keeps Suede a single binary with no native dependencies.
@@ -777,7 +797,11 @@ setInterval(() => fetch(heartbeat, { method: "POST" }), 10_000);
 
 The watchdog **arms on the first heartbeat**. Before that, only `startupGraceSeconds` applies, which covers page load. Once armed, `timeoutSeconds` of silence kills and relaunches the app.
 
+Heartbeats and the app's `state` are independent. A page can post its first heartbeat while the app still reports `starting`, because `running` waits for the window to be placed, and a placed window can equally precede the first heartbeat. A client that wants "launched and its content is alive" should wait for both: `state` is `running` and `lastHeartbeat` is set.
+
 The endpoint is unauthenticated but accepted only from loopback, so the key-free design cannot be abused from the network.
+
+It also answers cross-origin requests from any origin, including Chromium's private-network preflight, so page content served from another host or port (or opened as a local file) can post with a plain `fetch` and read the response: 404 means the app id in the URL is wrong, 403 means the request did not arrive from loopback. Log a non-2xx response so a misconfiguration is visible in the page console. Do not set `mode: "no-cors"`: it discards the response, and the response is the only way the page can notice either failure.
 
 ### Projection and edge blending {: #projection-edge-blending }
 

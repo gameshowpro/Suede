@@ -387,6 +387,22 @@ pub struct Status {
     /// which is a claim nobody made. `GET /status` always fills it in from
     /// the check runner's last results, because it has one to ask.
     pub checks: Option<CheckSummary>,
+    /// The app `activeApp` names, and how it is doing, so "is my app on the
+    /// screens" is one call: `state == running` here beside `synced` above.
+    /// `None` when no app is active. Full detail (pid, restarts, window ids)
+    /// stays on `GET /apps/{id}/status`.
+    pub active_app: Option<ActiveApp>,
+}
+
+/// What `Status.activeApp` says about the one app the appliance is showing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveApp {
+    pub id: String,
+    pub state: AppState,
+    /// Human-readable detail for the current state, mirroring
+    /// [`AppStatus::detail`].
+    pub detail: Option<String>,
 }
 
 impl Default for Status {
@@ -403,6 +419,7 @@ impl Default for Status {
             committed: true,
             current_revision: 0,
             checks: None,
+            active_app: None,
         }
     }
 }
@@ -978,6 +995,11 @@ mod tests {
                 warn: 2,
                 fail: 3,
             }),
+            active_app: Some(ActiveApp {
+                id: "renderer".into(),
+                state: AppState::Running,
+                detail: None,
+            }),
         };
         let value = serde_json::to_value(&status).unwrap();
         assert_eq!(value["committed"], false);
@@ -985,6 +1007,19 @@ mod tests {
         assert_eq!(value["checks"]["pass"], 1);
         assert_eq!(value["checks"]["warn"], 2);
         assert_eq!(value["checks"]["fail"], 3);
+        assert_eq!(value["activeApp"]["id"], "renderer");
+        assert_eq!(value["activeApp"]["state"], "running");
+    }
+
+    #[test]
+    fn status_serialises_active_app_as_null_when_absent() {
+        let status = Status::default();
+        let value = serde_json::to_value(&status).unwrap();
+        assert!(
+            value.get("activeApp").is_some(),
+            "must be present, not skipped"
+        );
+        assert!(value["activeApp"].is_null());
     }
 
     #[test]
