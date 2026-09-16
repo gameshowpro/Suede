@@ -171,6 +171,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         version = suede::VERSION_STRING,
         bind = %bootstrap.bind,
         state_dir = %bootstrap.state_dir.display(),
+        allow_overlaps = bootstrap.allow_overlaps,
         mock = args.mock,
         "starting suede"
     );
@@ -221,6 +222,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         events: events.clone(),
         wallpapers: wallpapers.clone(),
         docs_base_url: bootstrap.docs_base_url.clone(),
+        allow_overlaps: bootstrap.allow_overlaps,
     }));
     let capability_store = Arc::new(suede::capabilities::CapabilityStore::new(
         &bootstrap.state_dir,

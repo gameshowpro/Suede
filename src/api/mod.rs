@@ -69,7 +69,7 @@ impl ApiState {
         section: &str,
         wait: Option<u64>,
     ) -> ApiResult<DesiredState> {
-        next.validate()
+        next.validate(self.bootstrap.allow_overlaps)
             .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
 
         let saved = self
@@ -382,6 +382,7 @@ pub mod test_support {
             events: hub.clone(),
             wallpapers: wallpapers.clone(),
             docs_base_url: bootstrap.docs_base_url.clone(),
+            allow_overlaps: bootstrap.allow_overlaps,
         }));
         let capability_store = Arc::new(crate::capabilities::CapabilityStore::new(dir.path()));
         let (trigger, _receiver) = Reconciler::channel();

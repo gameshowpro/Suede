@@ -1365,12 +1365,19 @@
               "number",
               "null"
             ]
+          },
+          "zeroCopyPresented": {
+            "description": "How many of `presented` carried the presentation feedback's\n`zero_copy` flag: the compositor scanned this output's buffer out\ndirectly to the display controller, with no compositing pass, rather\nthan blitting it into its own framebuffer first.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
           "name",
           "presented",
-          "discarded"
+          "discarded",
+          "zeroCopyPresented"
         ],
         "type": "object"
       },

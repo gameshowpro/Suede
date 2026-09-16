@@ -99,6 +99,10 @@ pub struct Reconciler {
     wallpapers: Arc<WallpaperStore>,
     /// Base for the documentation links attached to divergences.
     docs_base_url: String,
+    /// The `allow_overlaps` bootstrap flag. Copied rather than held as a whole
+    /// `BootstrapConfig`, like `docs_base_url` beside it: it is the only other
+    /// bootstrap value a pass needs.
+    allow_overlaps: bool,
     /// Blend-overlay processes, one per projector output with seams.
     #[cfg(feature = "projection")]
     blend: Mutex<crate::projection::BlendManager>,
@@ -118,6 +122,10 @@ pub struct ReconcilerDeps {
     pub wallpapers: Arc<WallpaperStore>,
     /// Base for the documentation links attached to divergences.
     pub docs_base_url: String,
+    /// Whether this appliance slices every multi-output layout (`true`) or
+    /// lets sway tile it (`false`); see
+    /// [`crate::config::BootstrapConfig::allow_overlaps`].
+    pub allow_overlaps: bool,
 }
 
 impl Reconciler {
@@ -131,6 +139,7 @@ impl Reconciler {
             events,
             wallpapers,
             docs_base_url,
+            allow_overlaps,
         } = deps;
         // Built before the struct literal below moves `snapshot` and
         // `events` into their own fields.
@@ -148,6 +157,7 @@ impl Reconciler {
             events,
             wallpapers,
             docs_base_url,
+            allow_overlaps,
             pass: Mutex::new(()),
             applied: Mutex::new(HashMap::new()),
             previous_observations: Mutex::new(HashMap::new()),
@@ -780,7 +790,15 @@ impl Reconciler {
                 connected: matched.is_some(),
             });
         }
-        crate::projection::canvas_plan(&participants, desired.projection.as_ref())
+        crate::projection::canvas_plan(
+            &participants,
+            desired.projection.as_ref(),
+            if self.allow_overlaps {
+                crate::projection::Slicing::Always
+            } else {
+                crate::projection::Slicing::WhenOverlapping
+            },
+        )
     }
 
     #[cfg(not(feature = "projection"))]
@@ -1277,6 +1295,7 @@ mod tests {
             events: events.clone(),
             wallpapers: Arc::new(WallpaperStore::new(dir.path().join("wallpapers"))),
             docs_base_url: "https://suede.gameshow.pro/".to_string(),
+            allow_overlaps: false,
         }));
         Harness {
             reconciler,

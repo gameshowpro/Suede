@@ -1,8 +1,9 @@
 //! Bootstrap configuration: everything that must be known before the API can serve.
 //!
-//! Read once at startup from `$XDG_CONFIG_HOME/suede/suede.toml`; every value is
-//! overridable by a `SUEDE_*` environment variable, which wins. Everything else
-//! is desired state, owned by the API (see [`crate::state`]).
+//! Read once at startup from `$XDG_CONFIG_HOME/suede/suede.toml`; every value
+//! but [`BootstrapConfig::allow_overlaps`] is overridable by a `SUEDE_*`
+//! environment variable, which wins. Everything else is desired state, owned
+//! by the API (see [`crate::state`]).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -32,6 +33,7 @@ struct FileConfig {
     /// default) — `serde`'s usual "missing means empty" would conflate the
     /// two, and they mean opposite things.
     allowed_programs: Option<Vec<String>>,
+    allow_overlaps: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -69,6 +71,25 @@ pub struct BootstrapConfig {
     /// In the file rather than in desired state, because desired state is
     /// written through the API this is meant to constrain.
     pub allowed_programs: Vec<String>,
+    /// Whether outputs may overlap in canvas space — the one setting that
+    /// decides which of the two display paths this machine runs.
+    ///
+    /// `false` (the default, and what `provision.sh` provisions): sway tiles
+    /// the layout itself and a spanning application is one window across all
+    /// of it, so a write whose output rectangles intersect is rejected rather
+    /// than quietly producing a layout sway cannot render distinctly. The
+    /// compositor must then run with `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`,
+    /// or spanning mirrors on some drivers.
+    ///
+    /// `true`: every layout of two or more outputs goes through the slicer,
+    /// overlapping or not — each display shows one private, output-sized
+    /// buffer, which is the case direct scanout was built for, so the
+    /// compositor should run *without* that variable.
+    ///
+    /// Bootstrap rather than desired state because it is a fact about how the
+    /// machine's compositor was started, which the API cannot change: a client
+    /// writing it would only claim an environment that is already fixed.
+    pub allow_overlaps: bool,
 }
 
 impl Default for BootstrapConfig {
@@ -82,6 +103,7 @@ impl Default for BootstrapConfig {
             systemd_user_dir: default_systemd_user_dir(),
             power: Vec::new(),
             allowed_programs: default_allowed_programs(),
+            allow_overlaps: false,
         }
     }
 }
@@ -190,6 +212,7 @@ impl BootstrapConfig {
         config.power = parse_power(power_source(file.power))?;
         config.allowed_programs =
             allowed_programs_source(file.allowed_programs).unwrap_or_else(default_allowed_programs);
+        config.allow_overlaps = file.allow_overlaps.unwrap_or(false);
 
         Ok(config)
     }
@@ -415,6 +438,30 @@ mod tests {
         assert!(error.contains("poweroff"), "{error}");
 
         unsafe { std::env::remove_var("SUEDE_POWER") };
+    }
+
+    #[test]
+    fn allow_overlaps_defaults_to_off_and_is_read_from_the_file() {
+        let _guard = env_lock();
+        // Absent means tiling: the path every existing appliance already
+        // runs, so an upgrade cannot change what a machine does at its next
+        // boot.
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(!config.allow_overlaps);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+
+        std::fs::write(&path, "allow_overlaps = true\n").unwrap();
+        assert!(BootstrapConfig::load(Some(&path)).unwrap().allow_overlaps);
+
+        std::fs::write(&path, "allow_overlaps = false\n").unwrap();
+        assert!(!BootstrapConfig::load(Some(&path)).unwrap().allow_overlaps);
+
+        // A misspelling is refused outright rather than silently leaving the
+        // machine on the other display path.
+        std::fs::write(&path, "allow_overlap = true\n").unwrap();
+        assert!(BootstrapConfig::load(Some(&path)).is_err());
     }
 
     #[test]

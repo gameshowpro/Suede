@@ -396,7 +396,7 @@ window.addEventListener("error", (event) => {
           content is drawing.</p>
         <table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table>
         <table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
-          <th>Output</th><th>Presented</th><th>Discarded</th><th>Refresh</th><th>Phase</th>
+          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
         <p class="hint" id="pj-timing-hint">Measured by the slicer over each
           10 s interval from the compositor's presentation timestamps.
@@ -1986,7 +1986,8 @@ function renderProjectionTiming() {
     `${o.phaseMs > 0 ? "+" : ""}${num(o.phaseMs)} ms ± ${num(o.phaseSpreadMs / 2)}`;
   $("pj-timing-outputs").innerHTML = s.outputs.map((o) =>
     `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
-    `<td>${o.discarded}</td><td class="mono">${trimHz(o.refreshHz)}</td>` +
+    `<td>${o.discarded}</td><td class="mono">${o.zeroCopyPresented}/${o.presented}</td>` +
+    `<td class="mono">${trimHz(o.refreshHz)}</td>` +
     `<td class="mono">${phaseCell(o)}</td></tr>`).join("");
 }
 

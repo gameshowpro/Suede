@@ -179,7 +179,14 @@ impl DesiredState {
     }
 
     /// Semantic validation beyond what serde enforces. Returns all problems found.
-    pub fn validate(&self) -> Result<(), Vec<String>> {
+    ///
+    /// `allow_overlaps` is the bootstrap flag of the same name: it says which
+    /// of the two display paths this machine runs, and so whether a layout
+    /// whose rectangles intersect is a legitimate projector overlap or a
+    /// mistake. It is not part of the document, because it is a fact about
+    /// how the compositor was started rather than something a client may
+    /// choose — see [`crate::config::BootstrapConfig::allow_overlaps`].
+    pub fn validate(&self, allow_overlaps: bool) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
 
         let mut seen_outputs = std::collections::HashSet::new();
@@ -260,6 +267,31 @@ impl DesiredState {
                 ))
             })
             .collect();
+        if rects.len() > 1 && !allow_overlaps {
+            // Sway is handed this layout verbatim on a tiling appliance, and
+            // its single global coordinate space gives every output the same
+            // pixels in a shared region — so an overlap is not a projector
+            // overlap here, it is a layout that cannot be rendered as drawn.
+            // Rejected rather than clamped, for the same reason a gap is: the
+            // API never alters a document it was given, it says what is wrong
+            // with it and leaves the fix to whoever wrote it.
+            for i in 0..rects.len() {
+                for j in (i + 1)..rects.len() {
+                    let (a, b) = (&rects[i], &rects[j]);
+                    let ox = (a.1 + a.3).min(b.1 + b.3) - a.1.max(b.1);
+                    let oy = (a.2 + a.4).min(b.2 + b.4) - a.2.max(b.2);
+                    if ox > 0 && oy > 0 {
+                        errors.push(format!(
+                            "outputs {} and {} overlap by {ox}x{oy} pixels, and this \
+                             appliance tiles: set allow_overlaps = true in suede.toml \
+                             to project overlapping layouts through the slicer, or \
+                             move them apart",
+                            a.0, b.0
+                        ));
+                    }
+                }
+            }
+        }
         if rects.len() > 1 {
             // Chained = closed rectangles meeting in more than a single
             // point: overlap, or a shared edge segment. A corner-to-corner
@@ -1310,7 +1342,7 @@ mod tests {
             apps: vec![app.clone(), app],
             ..DesiredState::new()
         };
-        let errors = state.validate().unwrap_err();
+        let errors = state.validate(false).unwrap_err();
         assert!(errors.iter().any(|e| e.contains("is not unique")));
     }
 
@@ -1351,7 +1383,10 @@ mod tests {
             placed("C", 3680, 0, 1920, 1080),
             placed("D", 3680, 1080, 1920, 1080),
         ])
-        .validate()
+        // `true`: overlapping rectangles are only legitimate on an
+        // appliance configured for them, and this is the chaining rule they
+        // exercise.
+        .validate(true)
         .expect("chained layout must validate");
     }
 
@@ -1361,7 +1396,7 @@ mod tests {
             placed("A", 0, 0, 1920, 1080),
             placed("B", 2000, 0, 1920, 1080),
         ])
-        .validate()
+        .validate(false)
         .unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("not contiguous")),
@@ -1377,7 +1412,7 @@ mod tests {
             placed("A", 0, 0, 1920, 1080),
             placed("B", 1920, 1080, 1920, 1080),
         ])
-        .validate()
+        .validate(false)
         .unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("not contiguous")),
@@ -1393,7 +1428,7 @@ mod tests {
             placed("B", 1760, 0, 1920, 1080),
             placed("C", 10_000, 0, 1920, 1080),
         ])
-        .validate()
+        .validate(true)
         .unwrap_err();
         let message = errors
             .iter()
@@ -1407,13 +1442,68 @@ mod tests {
     }
 
     #[test]
+    fn an_overlapping_pair_is_rejected_on_a_tiling_appliance() {
+        let errors = layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 1760, 0, 1920, 1080),
+        ])
+        .validate(false)
+        .unwrap_err();
+        let message = errors
+            .iter()
+            .find(|e| e.contains("overlap"))
+            .expect("overlap error");
+        // Both names, because either one of them could be the one in the
+        // wrong place and the writer is the only one who knows which.
+        assert!(message.contains('A') && message.contains('B'), "{message}");
+        assert!(message.contains("160x1080"), "{message}");
+    }
+
+    #[test]
+    fn an_overlapping_pair_is_accepted_when_overlaps_are_allowed() {
+        layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 1760, 0, 1920, 1080),
+        ])
+        .validate(true)
+        .expect("an overlap is the projection configuration on such a machine");
+    }
+
+    #[test]
+    fn a_shared_edge_is_not_an_overlap() {
+        // Edge to edge is exactly what a tiling appliance wants: the
+        // rectangles touch along a line and share no pixel.
+        layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 1920, 0, 1920, 1080),
+        ])
+        .validate(false)
+        .expect("a tiled layout must validate");
+    }
+
+    #[test]
+    fn every_overlapping_pair_is_named_not_just_the_first() {
+        // Three stacked outputs overlap pairwise in three different ways, and
+        // a writer fixing one of them should not have to submit again to
+        // discover the next.
+        let errors = layout(vec![
+            placed("A", 0, 0, 1920, 1080),
+            placed("B", 100, 0, 1920, 1080),
+            placed("C", 200, 0, 1920, 1080),
+        ])
+        .validate(false)
+        .unwrap_err();
+        assert_eq!(errors.iter().filter(|e| e.contains("overlap")).count(), 3);
+    }
+
+    #[test]
     fn outputs_without_a_pinned_rectangle_are_not_checked() {
         // No configured mode or position: geometry comes from observation at
         // reconcile time, so the document alone cannot condemn it.
         let mut floating = placed("B", 9_999, 0, 1920, 1080);
         floating.position = None;
         layout(vec![placed("A", 0, 0, 1920, 1080), floating])
-            .validate()
+            .validate(false)
             .expect("unpinned outputs are exempt");
     }
 
@@ -1428,7 +1518,7 @@ mod tests {
             bridge,
             placed("C", 3600, 0, 1920, 1080),
         ])
-        .validate()
+        .validate(false)
         .unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("not contiguous")),
@@ -1460,7 +1550,7 @@ mod tests {
             apps: vec![app],
             ..DesiredState::new()
         };
-        let errors = state.validate().unwrap_err();
+        let errors = state.validate(false).unwrap_err();
         assert!(errors.iter().any(|e| e.contains("invalid variable name")));
     }
 
@@ -1486,7 +1576,7 @@ mod tests {
             }],
             ..DesiredState::new()
         };
-        assert!(state.validate().is_err());
+        assert!(state.validate(false).is_err());
     }
 
     #[test]
@@ -1563,7 +1653,7 @@ mod tests {
         output.background = Some(BackgroundRef::Preset("nope".into()));
         state.outputs.push(output);
 
-        let errors = state.validate().unwrap_err();
+        let errors = state.validate(false).unwrap_err();
         assert!(
             errors
                 .iter()
@@ -1587,7 +1677,7 @@ mod tests {
             ..Default::default()
         });
 
-        let errors = state.validate().unwrap_err();
+        let errors = state.validate(false).unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("is not unique")),
             "{errors:?}"
@@ -1714,7 +1804,7 @@ mod tests {
             captured_at: 0,
         });
         layout(vec![placed("A", 0, 0, 1920, 1080), second])
-            .validate()
+            .validate(true)
             .expect("the adopted mode should still chain to A");
     }
 }

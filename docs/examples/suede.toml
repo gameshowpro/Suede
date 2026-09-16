@@ -48,3 +48,14 @@ docs_base_url = "https://suede.gameshow.pro/"
 # reason `power` does: desired state is writable through the very API this
 # is meant to constrain. See configuration.md#allowed-programs.
 # allowed_programs = ["chromium", "google-chrome-stable"]
+
+# Whether outputs may overlap in canvas space.
+#
+# Left false, sway tiles the layout itself and a write whose output rectangles
+# intersect is rejected; the compositor must run with
+# WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 or a spanned window mirrors on some
+# drivers. Set true, every layout of two or more outputs goes through the
+# slicer instead — each display scans out its own buffer, so that variable
+# must *not* be set. `provision.sh --allow-overlaps` configures both halves.
+# See configuration.md#direct-scanout.
+# allow_overlaps = false

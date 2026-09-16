@@ -79,6 +79,15 @@ It is idempotent, so re-running it after an upgrade is safe. It will:
 7. Disable and mask competing display managers and compositors.
 8. Open port 9088 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
 
+Sway is started with direct scanout disabled, because on the default display
+path one application window spans every display and some drivers otherwise
+show the same part of it on each. For an edge-blended installation, where the
+projectors' beams overlap and Suede slices a canvas into them instead, pass
+`--allow-overlaps`: sway is then started *with* direct scanout and
+`allow_overlaps = true` is written into `~/.config/suede/suede.toml`. The two
+halves must agree, which is why one flag writes both — see [Overlapping
+layouts and direct scanout](configuration.md#direct-scanout).
+
 It warns rather than proceeds silently in two cases worth knowing about: if
 something else on the machine already starts Sway — two compositors cannot
 share a graphics card, and whichever publishes `SWAYSOCK` last is the one

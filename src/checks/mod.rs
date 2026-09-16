@@ -491,15 +491,23 @@ impl CheckRunner {
         )
     }
 
-    /// Spanning a window across outputs can silently mirror instead.
+    /// Whether the compositor's direct scanout setting matches the display
+    /// path this appliance runs — and the two cases are opposites.
     ///
-    /// When wlroots hands a fullscreen client buffer straight to the display
-    /// controller, each output scans that buffer out from its own origin — so
-    /// a window that genuinely covers the whole layout shows the *same*
-    /// left-hand region on every display. Sway reports everything as correct,
-    /// which makes this near-impossible to diagnose from the API alone.
-    /// Observed with the Nvidia proprietary driver; the compositor-side
-    /// workaround is `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`.
+    /// Tiling (`allow_overlaps = false`): sway hands one spanning window to
+    /// every output. When wlroots can pass that fullscreen client buffer
+    /// straight to the display controller, each output scans it out from its
+    /// *own* origin, so a window covering the whole layout shows the same
+    /// left-hand region everywhere. Sway reports it all as correct, which
+    /// makes it near-impossible to diagnose from the API alone. Observed with
+    /// the Nvidia proprietary driver; the workaround is
+    /// `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`.
+    ///
+    /// Slicing (`allow_overlaps = true`): no client ever spans the physical
+    /// outputs. The app renders into the headless canvas and each display is
+    /// handed one private, output-sized slicer buffer — the textbook scanout
+    /// case, and immune to that mirroring bug. The variable then costs a
+    /// full-screen compositor pass per output per frame and buys nothing.
     fn check_direct_scanout(&self) -> Check {
         let spanning: Vec<String> = self
             .store
@@ -513,43 +521,37 @@ impl CheckRunner {
         let disabled = compositor_env("WLR_SCENE_DISABLE_DIRECT_SCANOUT")
             .is_some_and(|value| value != "0" && !value.is_empty());
 
-        let (status, detail) = match (spanning.is_empty(), disabled) {
-            (_, true) => (
-                CheckStatus::Pass,
-                "direct scanout is disabled, so a spanned window covers every output".to_string(),
-            ),
-            (true, false) => (
-                CheckStatus::Pass,
-                "no app spans outputs, so direct scanout is harmless".to_string(),
-            ),
-            (false, false) => (
-                CheckStatus::Warn,
-                format!(
-                    "{} spans every output, but the compositor was started with direct \
-                     scanout enabled. On some drivers (notably Nvidia's) this makes each \
-                     display show the same part of the window instead of its own — the \
-                     window is the right size, it simply renders wrong. Start sway with \
-                     WLR_SCENE_DISABLE_DIRECT_SCANOUT=1.",
-                    spanning.join(", ")
-                ),
-            ),
-        };
+        let allow_overlaps = self.bootstrap.allow_overlaps;
+        let (status, detail) = judge_direct_scanout(allow_overlaps, &spanning, disabled);
 
         let mut check = self.check(
             ids::DIRECT_SCANOUT,
-            "Spanning renders across outputs",
+            if allow_overlaps {
+                "Projectors scan out directly"
+            } else {
+                "Spanning renders across outputs"
+            },
             status,
             detail,
-            Some("troubleshooting/#a-spanned-window-mirrors-instead-of-spanning"),
+            Some(if allow_overlaps {
+                "configuration/#direct-scanout"
+            } else {
+                "troubleshooting/#a-spanned-window-mirrors-instead-of-spanning"
+            }),
         );
         if check.status != CheckStatus::Pass {
             check.fix_available = true;
-            check.fix_description = Some(
+            check.fix_description = Some(if allow_overlaps {
+                "Remove the systemd drop-in that sets \
+                 WLR_SCENE_DISABLE_DIRECT_SCANOUT on the compositor's unit. You then \
+                 restart the compositor yourself, since that tears down every window."
+                    .to_string()
+            } else {
                 "Write a systemd drop-in setting WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 \
                  on the compositor's unit. You then restart the compositor \
                  yourself, since that tears down every window."
-                    .to_string(),
-            );
+                    .to_string()
+            });
         }
         check
     }
@@ -1465,27 +1467,69 @@ impl CheckRunner {
         Ok(format!("started {}", started.join(", ")))
     }
 
-    /// Set `WLR_SCENE_DISABLE_DIRECT_SCANOUT` on the compositor's own unit.
+    /// Make the compositor's `WLR_SCENE_DISABLE_DIRECT_SCANOUT` match the
+    /// display path this appliance runs: set it where sway tiles the layout
+    /// itself, remove it where the slicer gives each display its own buffer.
     ///
     /// The variable has to be in the *compositor's* environment, not Suede's,
-    /// so the only thing Suede can do without privileges is write a systemd
-    /// drop-in and ask for a restart.
+    /// so the only thing Suede can do without privileges is write (or delete)
+    /// a systemd drop-in and ask for a restart. It never restarts sway
+    /// itself: that would tear down every window on every display.
     async fn fix_direct_scanout(&self) -> ApiResult<String> {
         let Some(unit) = compositor_unit() else {
-            return Err(ApiError::Validation(
+            return Err(ApiError::Validation(if self.bootstrap.allow_overlaps {
+                "the compositor is not running as a systemd user unit, so Suede cannot \
+                 change its environment. Remove WLR_SCENE_DISABLE_DIRECT_SCANOUT wherever \
+                 sway is started (provision.sh omits it when given --allow-overlaps)."
+                    .to_string()
+            } else {
                 "the compositor is not running as a systemd user unit, so Suede cannot \
                  set its environment. Add WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 wherever \
                  sway is started (provision.sh does this for a standard install)."
-                    .into(),
-            ));
+                    .to_string()
+            }));
         };
 
         let dir = self.bootstrap.systemd_user_dir.join(format!("{unit}.d"));
+        let path = dir.join("10-suede-scanout.conf");
+
+        if self.bootstrap.allow_overlaps {
+            // Only the drop-in Suede itself writes is removed. An operator who
+            // set the variable somewhere else — the unit, the profile — is
+            // told where to look rather than having their file deleted.
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ApiError::Validation(format!(
+                        "{} does not exist, so the variable is being set somewhere else \
+                         — check {unit} itself and the shell profile that starts sway.",
+                        path.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(ApiError::Internal(format!(
+                        "cannot remove {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+
+            run("systemctl", &["--user", "daemon-reload"])
+                .await
+                .map_err(|error| ApiError::Internal(format!("daemon-reload failed: {error}")))?;
+
+            return Ok(format!(
+                "removed {} for {unit}. Restart the compositor to apply it \
+                 (`systemctl --user restart {unit}`) — Suede will not do that itself, \
+                 because it would tear down every window on every display.",
+                path.display()
+            ));
+        }
+
         std::fs::create_dir_all(&dir).map_err(|error| {
             ApiError::Internal(format!("cannot create {}: {error}", dir.display()))
         })?;
 
-        let path = dir.join("10-suede-scanout.conf");
         std::fs::write(
             &path,
             "# Written by Suede.\n\
@@ -1707,6 +1751,66 @@ async fn run(program: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
 
 fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
+}
+
+/// What the `direct-scanout` check should be saying, given the display path
+/// this appliance runs, which apps span, and whether the compositor was
+/// started with `WLR_SCENE_DISABLE_DIRECT_SCANOUT`. Pure, so the whole
+/// matrix is table-testable.
+///
+/// The two modes want opposite things from the same variable — see
+/// [`CheckRunner::check_direct_scanout`] for why.
+fn judge_direct_scanout(
+    allow_overlaps: bool,
+    spanning: &[String],
+    disabled: bool,
+) -> (CheckStatus, String) {
+    if allow_overlaps {
+        // Nothing spans the physical outputs here, so which apps are enabled
+        // does not enter into it: the slicer gives every display its own
+        // buffer either way, and the only question is whether the compositor
+        // is allowed to flip it.
+        return if disabled {
+            (
+                CheckStatus::Warn,
+                "the compositor was started with WLR_SCENE_DISABLE_DIRECT_SCANOUT set, \
+                 but this appliance slices every layout, so no window ever spans two \
+                 displays and the mirroring bug that variable works around cannot \
+                 happen. Every projector pays a compositor pass for nothing; remove \
+                 the drop-in and restart the compositor."
+                    .to_string(),
+            )
+        } else {
+            (
+                CheckStatus::Pass,
+                "direct scanout is enabled, so each projector's slice can be flipped \
+                 straight to the display"
+                    .to_string(),
+            )
+        };
+    }
+
+    match (spanning.is_empty(), disabled) {
+        (_, true) => (
+            CheckStatus::Pass,
+            "direct scanout is disabled, so a spanned window covers every output".to_string(),
+        ),
+        (true, false) => (
+            CheckStatus::Pass,
+            "no app spans outputs, so direct scanout is harmless".to_string(),
+        ),
+        (false, false) => (
+            CheckStatus::Warn,
+            format!(
+                "{} spans every output, but the compositor was started with direct \
+                 scanout enabled. On some drivers (notably Nvidia's) this makes each \
+                 display show the same part of the window instead of its own — the \
+                 window is the right size, it simply renders wrong. Start sway with \
+                 WLR_SCENE_DISABLE_DIRECT_SCANOUT=1.",
+                spanning.join(", ")
+            ),
+        ),
+    }
 }
 
 /// Judge a browser's own capability report against what this hardware
@@ -2384,6 +2488,89 @@ mod tests {
         )
     }
 
+    /// The same runner, on an appliance whose layouts may overlap — the one
+    /// bootstrap flag that inverts the `direct-scanout` check.
+    fn runner_allowing_overlaps(state_dir: std::path::PathBuf) -> CheckRunner {
+        let runner = runner(state_dir);
+        let bootstrap = Arc::new(BootstrapConfig {
+            allow_overlaps: true,
+            ..(*runner.bootstrap).clone()
+        });
+        CheckRunner {
+            bootstrap,
+            ..runner
+        }
+    }
+
+    #[test]
+    fn a_tiling_appliance_wants_direct_scanout_disabled() {
+        let spanning = vec!["wall".to_string()];
+
+        // The variable set is the whole point of a tiling appliance, whether
+        // or not anything currently spans.
+        let (status, detail) = judge_direct_scanout(false, &spanning, true);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("disabled"), "{detail}");
+        assert_eq!(judge_direct_scanout(false, &[], true).0, CheckStatus::Pass);
+
+        // Unset with nothing spanning is harmless: no client covers two
+        // displays, so there is nothing to mirror.
+        let (status, detail) = judge_direct_scanout(false, &[], false);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("no app spans"), "{detail}");
+
+        // Unset with a spanning app is the bug this check was written for,
+        // and it names the app.
+        let (status, detail) = judge_direct_scanout(false, &spanning, false);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("wall"), "{detail}");
+        assert!(
+            detail.contains("WLR_SCENE_DISABLE_DIRECT_SCANOUT=1"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn a_slicing_appliance_wants_direct_scanout_left_alone() {
+        // Exactly inverted, and spanning apps do not enter into it: the app
+        // spans the headless canvas, never the physical outputs.
+        for spanning in [vec![], vec!["wall".to_string()]] {
+            let (status, detail) = judge_direct_scanout(true, &spanning, true);
+            assert_eq!(status, CheckStatus::Warn, "{detail}");
+            assert!(detail.contains("compositor pass"), "{detail}");
+            assert!(!detail.contains("wall"), "{detail}");
+
+            let (status, detail) = judge_direct_scanout(true, &spanning, false);
+            assert_eq!(status, CheckStatus::Pass, "{detail}");
+        }
+    }
+
+    #[test]
+    fn the_scanout_check_points_each_mode_at_its_own_remedy() {
+        let dir = tempfile::tempdir().unwrap();
+        let tiling = runner(dir.path().to_path_buf()).check_direct_scanout();
+        assert_eq!(tiling.title, "Spanning renders across outputs");
+        assert!(
+            tiling
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("#a-spanned-window-mirrors-instead-of-spanning")),
+            "{:?}",
+            tiling.docs_url
+        );
+
+        let slicing = runner_allowing_overlaps(dir.path().to_path_buf()).check_direct_scanout();
+        assert_eq!(slicing.title, "Projectors scan out directly");
+        assert!(
+            slicing
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("#direct-scanout")),
+            "{:?}",
+            slicing.docs_url
+        );
+    }
+
     fn codec(family: &str, supported: bool, hardware: Option<bool>) -> crate::model::CodecSupport {
         crate::model::CodecSupport {
             label: format!("{family} High 1080p60"),
@@ -2961,6 +3148,7 @@ mod tests {
             name: name.to_string(),
             presented: 330,
             discarded: 0,
+            zero_copy_presented: 0,
             refresh_hz: Some(60.0),
             phase_ms,
             phase_spread_ms: Some(0.1),

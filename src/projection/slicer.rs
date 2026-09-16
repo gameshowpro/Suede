@@ -87,6 +87,60 @@
 //! its own timer regardless; the slicer presents whatever the newest
 //! completed capture is, dropping or repeating frames symmetrically across
 //! every output when the clocks beat against each other.
+//!
+//! ## Direct scanout
+//!
+//! Each presenter's buffer already *is* a fullscreen, opaque, output-sized
+//! image of exactly what that projector should show, so the compositor's
+//! own render pass over it is pure cost: wlroots can instead flip the
+//! slicer's dmabuf straight to the KMS plane and skip compositing that
+//! output entirely. Doing so needs four things of the client, and the GPU
+//! path arranges all four: a fullscreen layer surface (the anchors and
+//! `set_exclusive_zone(-1)` at presenter creation), an opaque region
+//! covering the whole surface (set from the layer surface's `Configure`,
+//! since that is where the size comes from), a buffer that is exactly the
+//! output's pixel grid, and a dmabuf whose DRM modifier the display
+//! controller accepts — the compositor names those in the `scanout`-flagged
+//! tranches of its dmabuf feedback (see [`dmabuf::FeedbackCollector`]), and
+//! [`create_present_buffers`] allocates from the intersection of that set
+//! with what this device can render to, falling back to the wider set when
+//! they share nothing. Nothing here is load-bearing: a buffer that cannot be
+//! scanned out is composited exactly as before, and the shm path (whose
+//! buffers can never be scanned out) is untouched.
+//!
+//! Scanning out changes how long the compositor keeps a buffer, and that is
+//! a correctness matter, not a tuning one. Compositing releases a buffer as
+//! soon as sway has rendered from it; a flipped buffer is being read by the
+//! display controller for as long as it is on screen, so it comes back only
+//! after the *following* flip has completed. A scanning-out sway therefore
+//! holds two of an output's buffers at once — on screen, and queued — and
+//! the two-slot rotation this path started with then had nothing free at
+//! the next commit and overwrote a buffer still on the display. Hence
+//! [`GPU_PRESENT_SLOTS`] = 3 (on screen, queued, being drawn into) against
+//! the shm path's [`CPU_PRESENT_SLOTS`] = 2; `buffer reuse` in the periodic
+//! report line is the counter that catches getting this wrong.
+//!
+//! Two things report on scanout, and only one of them is proof. The startup
+//! line (`scanout candidate: ...`, one per output) is a *diagnostic*: it
+//! says which precondition a wall is failing, and it is trusted only for
+//! the conditions this process can check for itself — the buffer's size
+//! against the output's mode, and the modifier the driver actually chose.
+//! It cannot say "no" from the dmabuf feedback alone. On `brain` (test-log
+//! Entry 2) the default feedback named no scanout tranche at all and every
+//! presented frame was nonetheless zero-copy, so an absent tranche is
+//! reported as `unconfirmed`. The proof is `zeroCopyPresented` in
+//! `GET /projection/stats`, counted from the compositor's own
+//! `wp_presentation_feedback` flags: that is what the compositor did, not
+//! what it advertised.
+//!
+//! The buffer-size condition is the one this process does not paper over.
+//! The slicer never calls `wl_surface.set_buffer_scale`, so its buffers are
+//! the surface-local size the compositor configured — which equals the
+//! output's pixel size only at scale 1. A scaled output therefore cannot be
+//! scanned out, and the startup line says so rather than the slicer
+//! silently rescaling: a projector wall is a pixel-exact mapping, and a
+//! scaled output would already be wrong for reasons that have nothing to do
+//! with scanout.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -143,6 +197,49 @@ const FOURCC_XB24: u32 = 0x3432_4258; // XBGR8888
 /// `Capture.gpu_slot` — see the module doc's paragraph on why two, not the
 /// single image this started as.
 const GPU_CAPTURE_SLOTS: usize = 2;
+
+/// Present buffers each GPU-path presenter owns, rotated by `Presenter`'s
+/// `busy`/`next_buffer`.
+///
+/// Three, because direct scanout changes how long the compositor keeps one.
+/// A *compositing* sway releases a buffer as soon as it has rendered from
+/// it, so two slots alternate cleanly: one being drawn into, one being read.
+/// A sway that flips the buffer straight to the KMS plane cannot let go that
+/// early — the display controller reads the on-screen buffer continuously,
+/// so that buffer is only released once the *next* flip has completed.
+/// Scanning out therefore holds two buffers per output at once (on screen,
+/// and queued for the next vblank), leaving the slicer's next commit with no
+/// free slot: it reused a busy one and overwrote a buffer still being
+/// scanned out. Measured on `brain` (test-log Entry 2): `buffer reuse` went
+/// from 0 in 43 consecutive sampled intervals to 609–1781 per 10 s the
+/// moment scanout was enabled, with the GPU fence wait doubled and the
+/// compositor's CPU up an order of magnitude. Three slots restore the
+/// invariant the two-slot pool had under compositing — one free to draw
+/// into while the compositor holds the others — at the cost of one more
+/// output-sized image per projector.
+const GPU_PRESENT_SLOTS: usize = 3;
+
+/// Present buffers each CPU/shm-path presenter owns.
+///
+/// Two, and deliberately not [`GPU_PRESENT_SLOTS`]: an shm buffer is never
+/// scanned out. The compositor has to read it into a buffer of its own and
+/// releases it as soon as it has, exactly the compositing lifetime two slots
+/// were always enough for, so there is no third holder to cover. Named
+/// beside its GPU counterpart so the asymmetry between the paths reads as a
+/// decision rather than an oversight.
+const CPU_PRESENT_SLOTS: usize = 2;
+
+/// How many Present buffers a presenter gets, given the backend the capture
+/// side settled on. The GPU path's dmabufs can be flipped to a plane and so
+/// need the extra slot ([`GPU_PRESENT_SLOTS`]); everything else presents
+/// through shm and keeps [`CPU_PRESENT_SLOTS`]. `None` — no backend decided
+/// yet — reads as the shm path, which is what the callers do with it.
+fn present_slots(backend: Option<Backend>) -> usize {
+    match backend {
+        Some(Backend::Gpu) => GPU_PRESENT_SLOTS,
+        _ => CPU_PRESENT_SLOTS,
+    }
+}
 
 /// Consecutive capture failures tolerated before giving up. The daemon
 /// respawns the slicer on its next pass, which is the retry policy.
@@ -211,16 +308,31 @@ struct Presenter {
     #[allow(dead_code)]
     layer_surface: ZwlrLayerSurfaceV1,
     configured: Option<(u32, u32)>,
+    /// The size the surface's opaque region was last set for, so a
+    /// `Configure` that repeats a size it already answered does not build
+    /// and destroy a `wl_region` for nothing. See the `Configure` handler.
+    opaque_for: Option<(u32, u32)>,
+    /// This output's current mode in pixels, as `wl_output` reported it
+    /// before the presenters were created. `configured` is surface-local
+    /// (logical), so the two differ exactly when the output is scaled — and
+    /// a buffer that is not the output's pixel grid can never be scanned
+    /// out. Diagnostic only: it decides nothing but the wording of the
+    /// startup `scanout candidate:` line. `None` if the compositor never
+    /// sent a current mode for it.
+    output_mode: Option<(i32, i32)>,
     /// Output name, carried on the presenter so stats and stall messages can
     /// name it without threading the spec through every call.
     name: String,
-    /// Two buffers, alternated so we never write one the compositor reads.
-    /// CPU path only — empty on the GPU path, which uses `gpu_buffers`
-    /// instead; the two are never both populated for one presenter.
+    /// [`CPU_PRESENT_SLOTS`] buffers, rotated so we never write one the
+    /// compositor reads. CPU path only — empty on the GPU path, which uses
+    /// `gpu_buffers` instead; the two are never both populated for one
+    /// presenter.
     buffers: Vec<(WlBuffer, memmap2::MmapMut)>,
     /// The GPU path's equivalent of `buffers`: the shader renders into
     /// `DmabufImage`, the compositor scans out or samples the `WlBuffer`
-    /// wrapping it. Same rotation semantics, same `busy`/`next_buffer`.
+    /// wrapping it. Same rotation semantics, same `busy`/`next_buffer`, but
+    /// [`GPU_PRESENT_SLOTS`] of them — a scanned-out buffer is held across
+    /// the following flip, so the compositor can hold two at once.
     gpu_buffers: Vec<(WlBuffer, gpu::DmabufImage)>,
     /// Parallel to whichever of `buffers`/`gpu_buffers` is in use: true
     /// while the compositor holds that buffer, from attach+commit until its
@@ -258,8 +370,8 @@ enum Backend {
     Gpu,
 }
 
-/// One presenter due to take a frame this cycle, and which of its two
-/// buffer slots it will use — gathered by the GPU path's blend phase and
+/// One presenter due to take a frame this cycle, and which of its buffer
+/// slots it will use — gathered by the GPU path's blend phase and
 /// consumed by its present phase; see `gpu_blend_due`/`gpu_present_due`.
 struct Due {
     index: usize,
@@ -364,7 +476,11 @@ struct FrameStats {
     stalls: u32,
     /// Every buffer in a presenter's rotation was still busy at commit time,
     /// forcing a reuse. Should stay zero outside a stall — see the
-    /// buffer-selection comment in `present_frame`.
+    /// buffer-selection comment in `present_frame`. It is also the counter
+    /// that catches a pool sized for the wrong buffer lifetime: direct
+    /// scanout holds one more buffer per output than compositing does, and
+    /// this went from 0 to hundreds per interval on `brain` until the GPU
+    /// path grew a third slot ([`GPU_PRESENT_SLOTS`]).
     buffer_reuse: u32,
     /// GPU path only: `gpu.blend()`'s fence-wait, summed across every call
     /// this interval. Zero on the CPU path, which never waits on a fence.
@@ -439,7 +555,14 @@ enum Slot {
     /// Feedback requested; the compositor has not answered yet.
     Waiting,
     /// The compositor showed this update to the user.
-    Presented { at_ns: u64, refresh_ns: u32 },
+    Presented {
+        at_ns: u64,
+        refresh_ns: u32,
+        /// The `zero_copy` bit of the feedback's `flags` — the compositor
+        /// scanned this output's buffer out directly, with no compositing
+        /// pass, rather than blitting it into its own framebuffer.
+        zero_copy: bool,
+    },
     /// The compositor never showed this update (superseded, surface
     /// destroyed, ...). The feedback protocol destroys the object either
     /// way, so there is nothing further to clean up here.
@@ -450,6 +573,10 @@ enum Slot {
 struct OutputAccum {
     presented: u32,
     discarded: u32,
+    /// How many of `presented` carried the `zero_copy` feedback flag — the
+    /// compositor scanned the slicer's buffer straight to the display
+    /// controller with no compositing pass.
+    zero_copy_presented: u32,
     /// `None` until a `Presented` event carries a non-zero refresh.
     refresh_ns: Option<u32>,
 }
@@ -479,7 +606,10 @@ struct Settled {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum SettledOutcome {
-    Presented { refresh_ns: Option<u32> },
+    Presented {
+        refresh_ns: Option<u32>,
+        zero_copy: bool,
+    },
     Discarded,
 }
 
@@ -573,9 +703,19 @@ fn settle(slots: &[Slot]) -> Settled {
 
     for (index, slot) in slots.iter().enumerate() {
         match *slot {
-            Slot::Presented { at_ns, refresh_ns } => {
+            Slot::Presented {
+                at_ns,
+                refresh_ns,
+                zero_copy,
+            } => {
                 let refresh_ns = (refresh_ns != 0).then_some(refresh_ns);
-                outcomes.push((index, SettledOutcome::Presented { refresh_ns }));
+                outcomes.push((
+                    index,
+                    SettledOutcome::Presented {
+                        refresh_ns,
+                        zero_copy,
+                    },
+                ));
                 presented_at.push(at_ns);
                 if let Some(refresh_ns) = refresh_ns {
                     known_refreshes.push(refresh_ns);
@@ -681,9 +821,13 @@ impl Timing {
         }
     }
 
-    fn presented(&mut self, id: u64, index: usize, at_ns: u64, refresh_ns: u32) {
+    fn presented(&mut self, id: u64, index: usize, at_ns: u64, refresh_ns: u32, zero_copy: bool) {
         if let Some(slot) = self.pending.get_mut(&id).and_then(|s| s.get_mut(index)) {
-            *slot = Slot::Presented { at_ns, refresh_ns };
+            *slot = Slot::Presented {
+                at_ns,
+                refresh_ns,
+                zero_copy,
+            };
         }
         self.finalize_if_settled(id);
     }
@@ -717,8 +861,14 @@ impl Timing {
                 continue;
             };
             match outcome {
-                SettledOutcome::Presented { refresh_ns } => {
+                SettledOutcome::Presented {
+                    refresh_ns,
+                    zero_copy,
+                } => {
                     accum.presented += 1;
+                    if zero_copy {
+                        accum.zero_copy_presented += 1;
+                    }
                     if refresh_ns.is_some() {
                         accum.refresh_ns = refresh_ns;
                     }
@@ -774,6 +924,7 @@ impl Timing {
         for accum in &mut self.per_output {
             accum.presented = 0;
             accum.discarded = 0;
+            accum.zero_copy_presented = 0;
         }
         self.offset_sum_ms = 0.0;
         self.offset_max_ms = 0.0;
@@ -867,6 +1018,17 @@ struct State {
     /// advertises. Populated once in `run`, after `source` and every
     /// presenter's target are resolved.
     used_outputs: Vec<u32>,
+    /// Registry name -> the current mode's size in *pixels*, from the same
+    /// `wl_output::Mode` event the refresh comes from. Compared against a
+    /// presenter's configured (surface-local) size to tell whether the
+    /// buffer it commits is exactly the output's pixel grid — the
+    /// precondition for direct scanout that nothing else here checks. See
+    /// `Presenter.output_mode`.
+    output_modes: HashMap<u32, (i32, i32)>,
+    /// Kept so the layer-surface `Configure` handler can build a new opaque
+    /// region at the size it was just given. `None` only in unit tests,
+    /// which construct a `State` with no live Wayland objects at all.
+    compositor: Option<WlCompositor>,
     presenters: Vec<Presenter>,
     capture: Capture,
     closed: bool,
@@ -890,16 +1052,17 @@ struct State {
     /// that chain failed — `gpu_error` says what, for `decide_backend`'s
     /// fallback message.
     gpu: Option<gpu::Gpu>,
-    /// fourcc -> modifiers advertised by the compositor's main-device
-    /// tranche; empty until `negotiate_gpu` runs (or if it never does).
-    gpu_formats: HashMap<u32, Vec<u64>>,
+    /// What the compositor's main device advertises, and the subset of it
+    /// flagged for direct scanout; both empty until `negotiate_gpu` runs
+    /// (or if it never does).
+    gpu_formats: DmabufFormats,
     /// Why `gpu` is `None`, when it is — the step `negotiate_gpu` gave up at.
     gpu_error: Option<String>,
     /// Fourcc and modifiers `create_present_buffers` settled on for every
     /// output's Present images (every output shares one format — see
     /// `gpu.rs`'s note on `ensure_pipeline`), reused if a presenter's
     /// surface is reconfigured to a new size mid-run.
-    present_format: Option<(u32, Vec<u64>)>,
+    present_format: Option<(u32, PresentModifiers)>,
     /// Staging area for one `zwp_linux_dmabuf_feedback_v1` exchange; see
     /// `negotiate_gpu` and the `Dispatch` impl below.
     dmabuf_feedback: Option<dmabuf::FeedbackCollector>,
@@ -1002,6 +1165,7 @@ impl State {
                     name: presenter.name.clone(),
                     presented: accum.presented,
                     discarded: accum.discarded,
+                    zero_copy_presented: accum.zero_copy_presented,
                     refresh_hz: accum.refresh_ns.map(|ns| 1_000_000_000.0 / f64::from(ns)),
                     phase_ms,
                     phase_spread_ms,
@@ -1143,6 +1307,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     let mut state = State {
         outputs: Vec::new(),
         used_outputs: Vec::new(),
+        output_modes: HashMap::new(),
+        compositor: Some(compositor.clone()),
         presenters: Vec::new(),
         capture: Capture::default(),
         closed: false,
@@ -1153,7 +1319,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         timing: Timing::new(spec.slices.len()),
         stats: FrameStats::new(),
         gpu: None,
-        gpu_formats: HashMap::new(),
+        gpu_formats: DmabufFormats::default(),
         gpu_error: None,
         present_format: None,
         dmabuf_feedback: None,
@@ -1229,6 +1395,11 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     for (index, slice) in spec.slices.iter().enumerate() {
         let target = find(&state, &slice.output)
             .ok_or_else(|| anyhow::anyhow!("no output named {}", slice.output))?;
+        // The mode is recorded on the presenter as it stood after the
+        // roundtrip above, so the `scanout candidate:` line can say whether
+        // the buffer will be the output's own pixel grid. See
+        // `Presenter.output_mode`.
+        let mut output_mode = None;
         if let Some(name) = state
             .outputs
             .iter()
@@ -1236,11 +1407,15 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             .map(|(.., name)| *name)
         {
             state.used_outputs.push(name);
+            output_mode = state.output_modes.get(&name).copied();
         }
         let surface = compositor.create_surface(&handle, ());
         let region: WlRegion = compositor.create_region(&handle, ());
         surface.set_input_region(Some(&region));
         region.destroy();
+        // The opaque region itself cannot be set yet — it wants the size the
+        // compositor has not configured us with — so the layer-surface
+        // `Configure` handler sets it, and resets it on any later resize.
         let layer_surface = layer_shell.get_layer_surface(
             &surface,
             Some(&target),
@@ -1258,6 +1433,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             surface,
             layer_surface,
             configured: None,
+            opaque_for: None,
+            output_mode,
             name: slice.output.clone(),
             buffers: Vec::new(),
             gpu_buffers: Vec::new(),
@@ -1310,7 +1487,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         // `negotiate_gpu` was skipped above for exactly this reason).
         for (index, presenter) in state.presenters.iter_mut().enumerate() {
             let (width, height) = presenter.configured.unwrap();
-            for slot in 0..2 {
+            // Always the shm count, whatever `renderer` says: a pattern is
+            // poked pixel by pixel into a mapped buffer, so this is the CPU
+            // path even when the GPU one was available.
+            for slot in 0..CPU_PRESENT_SLOTS {
                 presenter
                     .buffers
                     .push(shm_buffer(&shm, &handle, width, height, (index, slot))?);
@@ -1685,7 +1865,12 @@ fn gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Result<
             .clone()
             .unwrap_or_else(|| "no Vulkan device available".to_string()));
     };
-    let capture_modifiers = state.gpu_formats.get(&format).cloned().unwrap_or_default();
+    let capture_modifiers = state
+        .gpu_formats
+        .all
+        .get(&format)
+        .cloned()
+        .unwrap_or_default();
     if gpu
         .supported_modifiers(format, &capture_modifiers, gpu::Usage::Capture)
         .is_empty()
@@ -1695,7 +1880,12 @@ fn gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Result<
         ));
     }
     let present_ok = [FOURCC_XR24, FOURCC_XB24].into_iter().any(|fourcc| {
-        let modifiers = state.gpu_formats.get(&fourcc).cloned().unwrap_or_default();
+        let modifiers = state
+            .gpu_formats
+            .all
+            .get(&fourcc)
+            .cloned()
+            .unwrap_or_default();
         !gpu.supported_modifiers(fourcc, &modifiers, gpu::Usage::Present)
             .is_empty()
     });
@@ -1803,7 +1993,7 @@ fn ensure_gpu_capture_buffer(
         None => true,
     };
     if stale {
-        let modifiers = gpu_formats.get(&format).cloned().unwrap_or_default();
+        let modifiers = gpu_formats.all.get(&format).cloned().unwrap_or_default();
         let supported = gpu.supported_modifiers(format, &modifiers, gpu::Usage::Capture);
         if supported.is_empty() {
             anyhow::bail!(
@@ -1833,12 +2023,218 @@ fn ensure_gpu_capture_buffer(
     Ok(())
 }
 
+/// What one `zwp_linux_dmabuf_feedback_v1` exchange told us, beside which
+/// device to render on: every fourcc -> modifier pair the compositor's main
+/// device advertises, and the subset it flagged as scan-out capable. Both
+/// are wanted when a Present image is allocated — the scanout subset to
+/// allocate from so wlroots can flip the buffer straight to the KMS plane,
+/// the full list to fall back to when the two share nothing.
+#[derive(Default)]
+struct DmabufFormats {
+    /// fourcc -> modifiers, in the compositor's advertised order.
+    all: HashMap<u32, Vec<u64>>,
+    /// The subset of `all` that came from tranches carrying the protocol's
+    /// `scanout` tranche flag. Empty on a compositor that flags none.
+    scanout: HashMap<u32, Vec<u64>>,
+}
+
+/// The two modifier lists `create_present_buffers` settled on for the fourcc
+/// it chose, kept on `State.present_format` so a mid-run resize reallocates
+/// from exactly the same choice.
+#[derive(Clone)]
+struct PresentModifiers {
+    /// Every modifier this device can render a Present image with that the
+    /// compositor also advertises. Always non-empty (a `Backend::Gpu` run
+    /// got here only because `gpu_availability` found one).
+    all: Vec<u64>,
+    /// The subset of `all` the compositor flagged for scanout, in the same
+    /// order. Empty when there is no such subset, and then `all` is simply
+    /// what gets allocated.
+    scanout: Vec<u64>,
+}
+
+/// The modifiers to allocate an output's Present image from if the buffer is
+/// to be eligible for direct scanout: those the device supports *and* the
+/// compositor listed in a scanout tranche, in `supported`'s order — which is
+/// the compositor's advertised order, since `Gpu::supported_modifiers` keeps
+/// its caller's. Empty when the two share nothing (or the compositor flagged
+/// no scanout tranche for this fourcc at all), and the caller then allocates
+/// from `supported` whole: a buffer that cannot be scanned out still
+/// composites correctly, which is exactly today's behaviour.
+fn scanout_modifiers(supported: &[u64], scanout: &[u64]) -> Vec<u64> {
+    supported
+        .iter()
+        .copied()
+        .filter(|modifier| scanout.contains(modifier))
+        .collect()
+}
+
+/// Allocate one Present image, preferring the narrowed scanout modifier
+/// list. Narrowing it is the whole point — `VkImageDrmFormatModifierList`
+/// lets the *driver* pick any entry, so offering the non-scanout ones
+/// alongside would simply let it choose one — but a failure with the narrow
+/// list must not end the run: the wider list is tried before giving up,
+/// because a picture that costs a compositing pass beats no picture.
+fn create_present_image(
+    gpu: &gpu::Gpu,
+    width: u32,
+    height: u32,
+    fourcc: u32,
+    modifiers: &PresentModifiers,
+) -> anyhow::Result<gpu::DmabufImage> {
+    if !modifiers.scanout.is_empty() {
+        match gpu.create_image(
+            width,
+            height,
+            fourcc,
+            &modifiers.scanout,
+            gpu::Usage::Present,
+        ) {
+            Ok(image) => return Ok(image),
+            Err(error) => eprintln!(
+                "slicer: allocating a {width}x{height} present image from the compositor's \
+                 scanout modifiers failed ({error:#}); falling back to every importable \
+                 modifier, which costs a compositing pass per frame"
+            ),
+        }
+    }
+    gpu.create_image(width, height, fourcc, &modifiers.all, gpu::Usage::Present)
+}
+
+/// A DRM fourcc as the four characters it spells ("XR24"), for log lines.
+/// Anything unprintable becomes `?` — this is never parsed back.
+fn fourcc_name(fourcc: u32) -> String {
+    fourcc
+        .to_le_bytes()
+        .iter()
+        .map(|&byte| {
+            let c = char::from(byte);
+            if c.is_ascii_graphic() {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect()
+}
+
+/// What the startup line can honestly say about one output's Present buffer.
+///
+/// Three answers, not two, because the default dmabuf feedback is not
+/// evidence of a negative: on `brain` (test-log Entry 2) wlroots' default
+/// feedback carried no scanout-flagged tranche for the chosen fourcc, this
+/// function said "no", and every single presented frame came back
+/// zero-copy anyway. The tranche flag is a hint about what the compositor
+/// *prefers*; the real gate is the buffer's format, modifier and size
+/// against the KMS plane at commit time, which only the compositor can
+/// evaluate. So an absent tranche is [`ScanoutVerdict::Unconfirmed`] — this
+/// line cannot tell — while the conditions that are checkable from here
+/// stay definite.
+#[derive(Debug, PartialEq, Eq)]
+enum ScanoutVerdict {
+    /// Every precondition this process can check is met: the buffer is the
+    /// output's pixel grid and carries a modifier the compositor flagged for
+    /// scanout.
+    Yes { fourcc: u32, modifier: u64 },
+    /// A precondition that is decidable from here fails, so no flip is
+    /// possible however the compositor feels about it.
+    No(String),
+    /// Nothing disqualifies this buffer, but the compositor's default
+    /// feedback did not say it prefers the modifier for scanout either.
+    /// `zeroCopyPresented` is the only authority.
+    Unconfirmed(String),
+}
+
+/// Whether the buffer an output is about to commit is something wlroots can
+/// flip straight to the plane, the first reason it definitely is not, or
+/// that this process cannot tell. Ordered so the most fundamental obstacle
+/// wins: a buffer that is not the output's pixel grid is disqualified
+/// whatever modifier it carries. Nothing here changes what is allocated —
+/// the allocation already happened, and `chosen_modifier` is what the driver
+/// picked for it; this only words the log line.
+fn scanout_verdict(
+    configured: (u32, u32),
+    output_mode: Option<(i32, i32)>,
+    fourcc: u32,
+    modifiers: &PresentModifiers,
+    compositor_flagged_scanout: bool,
+    chosen_modifier: u64,
+) -> ScanoutVerdict {
+    let (width, height) = configured;
+    if let Some((mode_width, mode_height)) = output_mode {
+        // The slicer never calls `set_buffer_scale`, so the buffer is the
+        // surface-local (logical) size; on a scaled output that is smaller
+        // than the mode and the compositor must scale it, which no plane
+        // here is asked to do. A rotated output reads as a mismatch too —
+        // a false negative in this line only, since the mode is reported
+        // before transform.
+        let matches = (i64::from(width), i64::from(height))
+            == (i64::from(mode_width), i64::from(mode_height));
+        if !matches {
+            return ScanoutVerdict::No(format!(
+                "buffer is {width}x{height} but the output's mode is \
+                 {mode_width}x{mode_height} pixels; direct scanout needs scale 1"
+            ));
+        }
+    }
+    if !compositor_flagged_scanout {
+        // Deliberately not a "no": see [`ScanoutVerdict`]. The compositor
+        // never named a scanout tranche for this fourcc, which says nothing
+        // about whether it will flip the buffer.
+        return ScanoutVerdict::Unconfirmed(
+            "default feedback carries no scanout tranche; zeroCopyPresented in \
+             GET /projection/stats is authoritative"
+                .to_string(),
+        );
+    }
+    // From here the compositor *did* name a tranche, so what it did or did
+    // not name is real evidence about this buffer.
+    if modifiers.scanout.is_empty() {
+        return ScanoutVerdict::No("no common modifier".to_string());
+    }
+    if !modifiers.scanout.contains(&chosen_modifier) {
+        return ScanoutVerdict::No(format!(
+            "allocated with modifier {chosen_modifier:#x}, which the compositor did not flag \
+             for scanout"
+        ));
+    }
+    ScanoutVerdict::Yes {
+        fourcc,
+        modifier: chosen_modifier,
+    }
+}
+
+/// The startup line, one per output, saying whether the buffer this
+/// presenter will commit can be flipped straight to the display controller,
+/// definitely cannot, or cannot be judged from here. Purely informational —
+/// everything it reports was already decided — but it is the only way to
+/// tell, without a compositor debug build, *which* of the several
+/// preconditions a wall is failing. It is a diagnostic and never a proof
+/// that scanout happened: `zeroCopyPresented` in `GET /projection/stats`,
+/// read from the compositor's own presentation feedback, is that.
+fn log_scanout_candidate(name: &str, verdict: ScanoutVerdict) {
+    match verdict {
+        ScanoutVerdict::Yes { fourcc, modifier } => eprintln!(
+            "slicer: output {name}: scanout candidate: yes (fourcc {}, modifier {modifier:#x})",
+            fourcc_name(fourcc)
+        ),
+        ScanoutVerdict::No(reason) => {
+            eprintln!("slicer: output {name}: scanout candidate: no ({reason})")
+        }
+        ScanoutVerdict::Unconfirmed(reason) => {
+            eprintln!("slicer: output {name}: scanout candidate: unconfirmed ({reason})")
+        }
+    }
+}
+
 /// Once the backend is decided (right after the first `arm_copy`), create
-/// each presenter's pair of Present buffers — shm as always, or a Vulkan
+/// each presenter's rotation of Present buffers — shm as always, or a Vulkan
 /// image exported as a dmabuf and wrapped as a wl_buffer on the GPU path,
 /// picking XR24 and falling back to XB24 (see the module doc's "Present
 /// buffers" section) — and, on the GPU path, upload every output's transfer
-/// table.
+/// table. How many per presenter is [`present_slots`]: the GPU path needs
+/// one more than the shm path because a scanned-out buffer is held across
+/// the following flip.
 fn create_present_buffers(
     state: &mut State,
     shm: &WlShm,
@@ -1856,19 +2252,41 @@ fn create_present_buffers(
                 let gpu = gpu
                     .as_ref()
                     .expect("Backend::Gpu implies state.gpu is Some");
-                [FOURCC_XR24, FOURCC_XB24]
+                // Both candidate fourccs worked out in full, rather than
+                // stopping at the first importable one, so a format the
+                // compositor can scan out can be preferred over one it can
+                // only composite. XR24 still leads when neither (or both)
+                // can be — see the module doc's "Present buffers".
+                let candidates: Vec<(u32, PresentModifiers)> = [FOURCC_XR24, FOURCC_XB24]
                     .into_iter()
-                    .find_map(|fourcc| {
-                        let candidates = gpu_formats.get(&fourcc)?;
-                        let supported =
-                            gpu.supported_modifiers(fourcc, candidates, gpu::Usage::Present);
-                        (!supported.is_empty()).then_some((fourcc, supported))
+                    .filter_map(|fourcc| {
+                        let advertised = gpu_formats.all.get(&fourcc)?;
+                        let all = gpu.supported_modifiers(fourcc, advertised, gpu::Usage::Present);
+                        if all.is_empty() {
+                            return None;
+                        }
+                        let scanout = scanout_modifiers(
+                            &all,
+                            gpu_formats
+                                .scanout
+                                .get(&fourcc)
+                                .map(Vec::as_slice)
+                                .unwrap_or_default(),
+                        );
+                        Some((fourcc, PresentModifiers { all, scanout }))
                     })
+                    .collect();
+                candidates
+                    .iter()
+                    .find(|(_, modifiers)| !modifiers.scanout.is_empty())
+                    .or_else(|| candidates.first())
+                    .map(|(fourcc, modifiers)| (*fourcc, modifiers.clone()))
                     // `decide_backend`/`gpu_availability` already confirmed
                     // one of these works before committing to Backend::Gpu.
                     .expect("gpu_availability already confirmed a Present format is importable")
             };
             state.present_format = Some((fourcc, modifiers.clone()));
+            let flagged = state.gpu_formats.scanout.contains_key(&fourcc);
 
             let State {
                 presenters, gpu, ..
@@ -1878,36 +2296,61 @@ fn create_present_buffers(
                 .expect("Backend::Gpu implies state.gpu is Some");
             for (index, presenter) in presenters.iter_mut().enumerate() {
                 let (width, height) = presenter.configured.unwrap();
-                for slot in 0..2 {
-                    let image = gpu
-                        .create_image(width, height, fourcc, &modifiers, gpu::Usage::Present)
+                for slot in 0..present_slots(Some(Backend::Gpu)) {
+                    let image = create_present_image(gpu, width, height, fourcc, &modifiers)
                         .with_context(|| format!("gpu.create_image (present, output {index})"))?;
                     let buffer =
                         dmabuf::dmabuf_wl_buffer(dmabuf_proxy, &image, handle, (index, slot));
                     presenter.gpu_buffers.push((buffer, image));
                 }
                 presenter.busy = vec![false; presenter.gpu_buffers.len()];
+                // The modifier the driver settled on for the images just
+                // allocated — `last`, not `[0]`, so this reports what this
+                // call produced whatever else the presenter is holding.
+                let chosen = presenter
+                    .gpu_buffers
+                    .last()
+                    .map(|(_, image)| image.modifier)
+                    .expect("the loop above pushed GPU_PRESENT_SLOTS buffers");
+                log_scanout_candidate(
+                    &presenter.name,
+                    scanout_verdict(
+                        (width, height),
+                        presenter.output_mode,
+                        fourcc,
+                        &modifiers,
+                        flagged,
+                        chosen,
+                    ),
+                );
                 gpu.set_transfer(index, width, height, &presenter.transfer)
                     .with_context(|| format!("gpu.set_transfer (output {index})"))?;
             }
             Ok(())
         }
         _ => {
+            let slots = present_slots(state.capture.backend);
             for (index, presenter) in state.presenters.iter_mut().enumerate() {
                 let (width, height) = presenter.configured.unwrap();
-                for slot in 0..2 {
+                for slot in 0..slots {
                     presenter
                         .buffers
                         .push(shm_buffer(shm, handle, width, height, (index, slot))?);
                 }
                 presenter.busy = vec![false; presenter.buffers.len()];
+                // Shared memory is never scanned out: the compositor has to
+                // read it into a buffer of its own. Said once per output so
+                // the line is present on both paths and the answer is never
+                // ambiguous silence.
+                log_scanout_candidate(&presenter.name, ScanoutVerdict::No("cpu path".to_string()));
             }
             Ok(())
         }
     }
 }
 
-/// GPU path only: recreate presenter `index`'s pair of Present images if its
+/// GPU path only: recreate presenter `index`'s [`GPU_PRESENT_SLOTS`] Present
+/// images if its
 /// surface's configured size no longer matches them — a mid-run resize (a
 /// changed output mode) rather than the initial configure `create_present_buffers`
 /// already handled. Best-effort: any failure is logged (naming the output
@@ -1922,6 +2365,7 @@ fn ensure_gpu_present_buffers(
     let Some((fourcc, modifiers)) = state.present_format.clone() else {
         return;
     };
+    let flagged = state.gpu_formats.scanout.contains_key(&fourcc);
     let Some(presenter) = state.presenters.get(index) else {
         return;
     };
@@ -1943,10 +2387,13 @@ fn ensure_gpu_present_buffers(
     } = state;
     let Some(gpu) = gpu.as_mut() else { return };
     let presenter = &mut presenters[index];
-    let mut rebuilt = Vec::with_capacity(2);
+    // The whole rotation is rebuilt, so the new size lands on every slot and
+    // a resize can never leave a presenter with a mix of sizes.
+    let slots = present_slots(Some(Backend::Gpu));
+    let mut rebuilt = Vec::with_capacity(slots);
     let mut failed = false;
-    for _ in 0..2 {
-        match gpu.create_image(width, height, fourcc, &modifiers, gpu::Usage::Present) {
+    for _ in 0..slots {
+        match create_present_image(gpu, width, height, fourcc, &modifiers) {
             Ok(image) => {
                 let buffer =
                     dmabuf::dmabuf_wl_buffer(dmabuf_proxy, &image, handle, (index, rebuilt.len()));
@@ -1974,6 +2421,26 @@ fn ensure_gpu_present_buffers(
     presenter.gpu_buffers = rebuilt;
     presenter.busy = vec![false; presenter.gpu_buffers.len()];
     presenter.next_buffer = 0;
+    // Said again here, and only here, because a resize is the one thing
+    // that can change the answer after startup: a new size against the same
+    // output mode is exactly the "buffer is not the output's pixel grid"
+    // case. Rare enough (a mode change) not to be noise.
+    let chosen = presenter
+        .gpu_buffers
+        .last()
+        .map(|(_, image)| image.modifier)
+        .expect("`rebuilt`, just moved in, holds GPU_PRESENT_SLOTS buffers");
+    log_scanout_candidate(
+        &name,
+        scanout_verdict(
+            (width, height),
+            presenter.output_mode,
+            fourcc,
+            &modifiers,
+            flagged,
+            chosen,
+        ),
+    );
     if old_transfer_matches {
         if let Err(error) = gpu.set_transfer(index, width, height, &presenter.transfer) {
             eprintln!("slicer: output {name}: set_transfer after resize failed: {error:#}");
@@ -1989,14 +2456,16 @@ fn ensure_gpu_present_buffers(
 
 /// Negotiate the GPU path once at startup: bind dmabuf feedback, wait for it
 /// to complete, and open a Vulkan device on the compositor's preferred
-/// device. `Err` names the step that failed, for `Auto`'s log line and
-/// `Gpu`'s fatal error alike — see `run`'s call site.
+/// device. `Ok` carries both halves of what that feedback said — every
+/// format the main device advertises, and the subset flagged for scanout
+/// (see [`DmabufFormats`]). `Err` names the step that failed, for `Auto`'s
+/// log line and `Gpu`'s fatal error alike — see `run`'s call site.
 fn negotiate_gpu(
     dmabuf: Option<&ZwpLinuxDmabufV1>,
     state: &mut State,
     queue: &mut wayland_client::EventQueue<State>,
     handle: &QueueHandle<State>,
-) -> Result<(gpu::Gpu, HashMap<u32, Vec<u64>>), String> {
+) -> Result<(gpu::Gpu, DmabufFormats), String> {
     let Some(dmabuf) = dmabuf else {
         return Err("compositor does not offer zwp_linux_dmabuf_v1 version 4".to_string());
     };
@@ -2017,7 +2486,15 @@ fn negotiate_gpu(
         return Err("compositor never sent zwp_linux_dmabuf_feedback_v1.done".to_string());
     }
     gpu::Gpu::new(collected.main_device)
-        .map(|gpu| (gpu, collected.formats))
+        .map(|gpu| {
+            (
+                gpu,
+                DmabufFormats {
+                    all: collected.formats,
+                    scanout: collected.scanout_formats,
+                },
+            )
+        })
         .map_err(|error| format!("Gpu::new: {error:#}"))
 }
 
@@ -2314,11 +2791,13 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         }
 
         // Choose a buffer the compositor is not currently holding, starting
-        // the search at `next_buffer` so the two slots keep alternating in
-        // the common case. Falling back to reusing a busy one only happens
-        // when an output has fallen behind on releases — a stall, in
-        // practice — and is counted so it shows up as non-zero if it ever
-        // happens without one.
+        // the search at `next_buffer` so the slots keep rotating in the
+        // common case. Falling back to reusing a busy one only happens when
+        // an output has fallen behind on releases — a stall, in practice —
+        // and is counted so it shows up as non-zero if it ever happens
+        // without one. The loop is written for any pool length; the two
+        // paths size their pools differently (see [`CPU_PRESENT_SLOTS`] and
+        // [`GPU_PRESENT_SLOTS`]).
         let len = presenter.buffers.len();
         let slot = (0..len)
             .map(|step| (presenter.next_buffer + step) % len)
@@ -2586,7 +3065,12 @@ impl Dispatch<WlOutput, ()> for State {
                     }
                 }
             }
-            wl_output::Event::Mode { flags, refresh, .. } => {
+            wl_output::Event::Mode {
+                flags,
+                refresh,
+                width,
+                height,
+            } => {
                 // Only the current mode — a compositor may still advertise
                 // deprecated non-current ones (see wl_output's own doc).
                 let current = flags
@@ -2594,11 +3078,19 @@ impl Dispatch<WlOutput, ()> for State {
                     .map(|f| f.contains(wl_output::Mode::Current))
                     .unwrap_or(false);
                 if current {
-                    for (candidate, _, stored_refresh, _) in &mut state.outputs {
+                    // The registry name, so the mode can be filed in
+                    // `output_modes` once this loop's borrow of `outputs`
+                    // has ended.
+                    let mut global = None;
+                    for (candidate, _, stored_refresh, global_name) in &mut state.outputs {
                         if candidate == output {
                             *stored_refresh = Some(refresh);
+                            global = Some(*global_name);
                             break;
                         }
+                    }
+                    if let Some(global) = global {
+                        state.output_modes.insert(global, (width, height));
                     }
                 }
             }
@@ -2614,7 +3106,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, usize> for State {
         event: zwlr_layer_surface_v1::Event,
         index: &usize,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        handle: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_layer_surface_v1::Event::Configure {
@@ -2623,8 +3115,29 @@ impl Dispatch<ZwlrLayerSurfaceV1, usize> for State {
                 height,
             } => {
                 layer_surface.ack_configure(serial);
+                let compositor = state.compositor.clone();
                 if let Some(presenter) = state.presenters.get_mut(*index) {
                     presenter.configured = Some((width, height));
+                    // A surface wlroots knows is fully opaque is one it may
+                    // flip straight to the plane instead of compositing:
+                    // nothing can show through, so nothing needs blending.
+                    // The slicer's slices are opaque by construction (an
+                    // alpha-less XR24/XB24 buffer covering the whole
+                    // output), but the compositor has no way to know that
+                    // until it is told. Set here rather than at creation
+                    // because it needs the size the configure just brought,
+                    // and reset on any later resize; it is pending state,
+                    // applied by the next commit, which is the one that
+                    // will attach a buffer of this size anyway.
+                    if presenter.opaque_for != Some((width, height)) {
+                        if let Some(compositor) = compositor {
+                            let region: WlRegion = compositor.create_region(handle, ());
+                            region.add(0, 0, width as i32, height as i32);
+                            presenter.surface.set_opaque_region(Some(&region));
+                            region.destroy();
+                            presenter.opaque_for = Some((width, height));
+                        }
+                    }
                 }
             }
             zwlr_layer_surface_v1::Event::Closed => state.closed = true,
@@ -2760,11 +3273,22 @@ impl Dispatch<WpPresentationFeedback, (usize, u64)> for State {
                 tv_sec_lo,
                 tv_nsec,
                 refresh,
+                flags,
                 ..
             } => {
                 let at_ns = ((u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo)) * 1_000_000_000
                     + u64::from(tv_nsec);
-                state.timing.presented(snapshot_id, index, at_ns, refresh);
+                // Only the `zero_copy` bit (3) is counted today. `flags` is
+                // decoded as the full `Kind` bitfield rather than masked by
+                // hand, so `vsync` (bit 0) and `hw_completion` (bit 2) stay
+                // one `.contains(...)` away without revisiting this decode.
+                let zero_copy = flags
+                    .into_result()
+                    .map(|f| f.contains(wp_presentation_feedback::Kind::ZeroCopy))
+                    .unwrap_or(false);
+                state
+                    .timing
+                    .presented(snapshot_id, index, at_ns, refresh, zero_copy);
             }
             wp_presentation_feedback::Event::Discarded => {
                 state.timing.discarded(snapshot_id, index);
@@ -2802,6 +3326,9 @@ impl Dispatch<ZwpLinuxDmabufFeedbackV1, ()> for State {
             }
             zwp_linux_dmabuf_feedback_v1::Event::TrancheTargetDevice { device } => {
                 feedback.tranche_target_device(&device);
+            }
+            zwp_linux_dmabuf_feedback_v1::Event::TrancheFlags { flags } => {
+                feedback.tranche_flags(flags.into())
             }
             zwp_linux_dmabuf_feedback_v1::Event::TrancheFormats { indices } => {
                 feedback.tranche_formats(&indices);
@@ -2923,7 +3450,18 @@ mod tests {
 
     // --- presentation-feedback settling --------------------------------
 
+    /// Defaults `zero_copy` to `false` — every existing test here is about
+    /// offset/straddle/phase arithmetic, which does not care about it. Tests
+    /// that do care use [`presented_zero_copy`] instead.
     fn presented(at_ms: u64, refresh_hz: f64) -> Slot {
+        presented_with(at_ms, refresh_hz, false)
+    }
+
+    fn presented_zero_copy(at_ms: u64, refresh_hz: f64) -> Slot {
+        presented_with(at_ms, refresh_hz, true)
+    }
+
+    fn presented_with(at_ms: u64, refresh_hz: f64, zero_copy: bool) -> Slot {
         let refresh_ns = if refresh_hz == 0.0 {
             0
         } else {
@@ -2932,6 +3470,7 @@ mod tests {
         Slot::Presented {
             at_ns: at_ms * 1_000_000,
             refresh_ns,
+            zero_copy,
         }
     }
 
@@ -2963,7 +3502,8 @@ mod tests {
                 (
                     0,
                     SettledOutcome::Presented {
-                        refresh_ns: Some(16_666_667)
+                        refresh_ns: Some(16_666_667),
+                        zero_copy: false,
                     }
                 ),
                 (1, SettledOutcome::Discarded),
@@ -2991,6 +3531,50 @@ mod tests {
         let settled = settle(&[presented(1000, 60.0)]);
         assert_eq!(settled.offset_ns, None);
         assert!(!settled.straddle);
+    }
+
+    // --- zero-copy tally --------------------------------------------------
+
+    #[test]
+    fn a_zero_copy_presentation_increments_the_output_s_counter() {
+        let mut timing = Timing::new(1);
+        timing.request(1, 0);
+        timing.presented(1, 0, 1_000_000, 16_666_667, true);
+        assert_eq!(timing.per_output[0].presented, 1);
+        assert_eq!(timing.per_output[0].zero_copy_presented, 1);
+    }
+
+    #[test]
+    fn a_non_zero_copy_presentation_leaves_the_counter_at_zero() {
+        let mut timing = Timing::new(1);
+        timing.request(1, 0);
+        timing.presented(1, 0, 1_000_000, 16_666_667, false);
+        assert_eq!(timing.per_output[0].presented, 1);
+        assert_eq!(timing.per_output[0].zero_copy_presented, 0);
+    }
+
+    #[test]
+    fn settle_carries_the_zero_copy_flag_into_the_outcome() {
+        let settled = settle(&[presented_zero_copy(1000, 60.0), presented(1003, 60.0)]);
+        assert_eq!(
+            settled.outcomes,
+            vec![
+                (
+                    0,
+                    SettledOutcome::Presented {
+                        refresh_ns: Some(16_666_667),
+                        zero_copy: true,
+                    }
+                ),
+                (
+                    1,
+                    SettledOutcome::Presented {
+                        refresh_ns: Some(16_666_667),
+                        zero_copy: false,
+                    }
+                ),
+            ]
+        );
     }
 
     // --- per-output vblank phase ----------------------------------------
@@ -3138,6 +3722,8 @@ mod tests {
         State {
             outputs: Vec::new(),
             used_outputs,
+            output_modes: HashMap::new(),
+            compositor: None,
             presenters: Vec::new(),
             capture: Capture::default(),
             closed: false,
@@ -3148,7 +3734,7 @@ mod tests {
             timing: Timing::new(0),
             stats: FrameStats::new(),
             gpu: None,
-            gpu_formats: HashMap::new(),
+            gpu_formats: DmabufFormats::default(),
             gpu_error: None,
             present_format: None,
             dmabuf_feedback: None,
@@ -3172,5 +3758,232 @@ mod tests {
             !state.closed,
             "a global the slicer neither captures from nor presents to must not stop it"
         );
+    }
+
+    // --- direct scanout: which modifiers a Present image is allocated from ---
+
+    #[test]
+    fn the_scanout_subset_is_what_the_device_and_the_scanout_tranche_share() {
+        assert_eq!(scanout_modifiers(&[1, 2, 3], &[3, 1]), vec![1, 3]);
+    }
+
+    #[test]
+    fn the_scanout_subset_keeps_the_advertised_order_not_the_tranche_s() {
+        // `supported` is the compositor's advertised order (filtered by the
+        // device); the tranche listing them the other way round must not
+        // reorder what gets offered to `vkCreateImage`.
+        assert_eq!(
+            scanout_modifiers(
+                &[0x0100_0000_0000_0001, 0, 7],
+                &[7, 0, 0x0100_0000_0000_0001]
+            ),
+            vec![0x0100_0000_0000_0001, 0, 7]
+        );
+    }
+
+    #[test]
+    fn nothing_in_common_means_an_empty_subset_and_the_caller_falls_back() {
+        assert!(scanout_modifiers(&[1, 2], &[3, 4]).is_empty());
+        // The degenerate case: a compositor that flagged no scanout tranche
+        // at all for this fourcc.
+        assert!(scanout_modifiers(&[1, 2], &[]).is_empty());
+    }
+
+    // --- direct scanout: the per-output verdict the log line reports ------
+
+    fn modifiers(all: &[u64], scanout: &[u64]) -> PresentModifiers {
+        PresentModifiers {
+            all: all.to_vec(),
+            scanout: scanout.to_vec(),
+        }
+    }
+
+    /// The reason text out of a verdict that carries one, so a test can
+    /// assert on the wording without unwrapping a specific variant.
+    fn verdict_reason(verdict: &ScanoutVerdict) -> String {
+        match verdict {
+            ScanoutVerdict::Yes { .. } => panic!("expected a reason, got a yes"),
+            ScanoutVerdict::No(reason) | ScanoutVerdict::Unconfirmed(reason) => reason.clone(),
+        }
+    }
+
+    #[test]
+    fn a_pixel_exact_buffer_on_a_flagged_modifier_is_a_candidate() {
+        assert_eq!(
+            scanout_verdict(
+                (1920, 1080),
+                Some((1920, 1080)),
+                FOURCC_XR24,
+                &modifiers(&[0, 7], &[7]),
+                true,
+                7,
+            ),
+            ScanoutVerdict::Yes {
+                fourcc: FOURCC_XR24,
+                modifier: 7
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_output_mode_does_not_disqualify_a_buffer() {
+        // A compositor that never sent a current mode (a headless output,
+        // say) leaves nothing to compare against; the modifier still decides.
+        assert_eq!(
+            scanout_verdict(
+                (1920, 1080),
+                None,
+                FOURCC_XR24,
+                &modifiers(&[7], &[7]),
+                true,
+                7,
+            ),
+            ScanoutVerdict::Yes {
+                fourcc: FOURCC_XR24,
+                modifier: 7
+            }
+        );
+    }
+
+    #[test]
+    fn a_scaled_output_is_disqualified_whatever_modifier_it_got() {
+        let verdict = scanout_verdict(
+            (1920, 1080),
+            Some((3840, 2160)),
+            FOURCC_XR24,
+            &modifiers(&[7], &[7]),
+            true,
+            7,
+        );
+        assert!(
+            matches!(verdict, ScanoutVerdict::No(_)),
+            "a buffer that is not the output's pixel grid is a definite no, got {verdict:?}"
+        );
+        let reason = verdict_reason(&verdict);
+        assert!(
+            reason.contains("1920x1080") && reason.contains("3840x2160"),
+            "the reason must name both sizes, got {reason:?}"
+        );
+        assert!(reason.contains("scale 1"), "got {reason:?}");
+    }
+
+    #[test]
+    fn a_compositor_that_flagged_no_scanout_tranche_is_unconfirmed_not_a_no() {
+        // Regression guard for test-log Entry 2: on `brain` the default
+        // feedback named no scanout tranche and 100 % of presented frames
+        // were zero-copy regardless, so this branch must not claim a
+        // negative it cannot know.
+        let verdict = scanout_verdict(
+            (1920, 1080),
+            Some((1920, 1080)),
+            FOURCC_XR24,
+            &modifiers(&[0, 7], &[]),
+            false,
+            7,
+        );
+        assert!(
+            matches!(verdict, ScanoutVerdict::Unconfirmed(_)),
+            "an absent tranche is not evidence of a negative, got {verdict:?}"
+        );
+        let reason = verdict_reason(&verdict);
+        assert!(
+            reason.contains("no scanout tranche"),
+            "the reason must still name what was missing, got {reason:?}"
+        );
+        assert!(
+            reason.contains("zeroCopyPresented"),
+            "the reason must point at the authoritative stat, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn a_flagged_tranche_the_device_cannot_use_says_no_common_modifier() {
+        assert_eq!(
+            scanout_verdict(
+                (1920, 1080),
+                Some((1920, 1080)),
+                FOURCC_XR24,
+                &modifiers(&[0], &[]),
+                true,
+                0,
+            ),
+            ScanoutVerdict::No("no common modifier".to_string())
+        );
+    }
+
+    #[test]
+    fn a_driver_that_picked_outside_the_scanout_subset_is_not_a_candidate() {
+        // Only reachable through `create_present_image`'s fallback, but that
+        // fallback is exactly when the honest answer is "no".
+        let verdict = scanout_verdict(
+            (1920, 1080),
+            Some((1920, 1080)),
+            FOURCC_XR24,
+            &modifiers(&[0, 7], &[7]),
+            true,
+            0,
+        );
+        assert!(
+            matches!(verdict, ScanoutVerdict::No(_)),
+            "the compositor named a tranche and this modifier is not in it, got {verdict:?}"
+        );
+        assert!(verdict_reason(&verdict).contains("0x0"), "got {verdict:?}");
+    }
+
+    // --- direct scanout: how many Present buffers each path keeps ---------
+
+    #[test]
+    fn the_gpu_path_keeps_one_more_present_buffer_than_the_shm_path() {
+        // A scanning-out compositor holds an output's on-screen buffer until
+        // the next flip completes, so it can hold two at once; the pool needs
+        // a third for the frame loop to draw into. shm is never scanned out
+        // and keeps the compositing-lifetime pair.
+        assert_eq!(present_slots(Some(Backend::Gpu)), 3);
+        assert_eq!(present_slots(Some(Backend::Cpu)), 2);
+        assert_eq!(
+            present_slots(Some(Backend::Gpu)),
+            present_slots(Some(Backend::Cpu)) + 1
+        );
+    }
+
+    #[test]
+    fn an_undecided_backend_sizes_the_pool_as_the_shm_path() {
+        // `create_present_buffers` reaches its shm branch for `None` as well
+        // as for `Backend::Cpu`, and a test pattern is poked into a mapped
+        // buffer whatever the backend — both are the two-slot lifetime.
+        assert_eq!(present_slots(None), CPU_PRESENT_SLOTS);
+    }
+
+    #[test]
+    fn a_pool_rotates_through_every_slot_before_reusing_one() {
+        // The slot search in `present_frame`/`gpu_blend_due` in miniature:
+        // start at `next_buffer`, take the first free slot, advance. With
+        // three slots and a compositor holding two, one is always free.
+        let len = GPU_PRESENT_SLOTS;
+        let mut busy = vec![false; len];
+        let mut next_buffer = 0;
+        let mut taken = Vec::new();
+        for frame in 0..6 {
+            let slot = (0..len)
+                .map(|step| (next_buffer + step) % len)
+                .find(|&candidate| !busy[candidate])
+                .expect("three slots against two held by the compositor always leave one free");
+            next_buffer = (slot + 1) % len;
+            busy[slot] = true;
+            taken.push(slot);
+            // The compositor releases the buffer from two flips ago, which
+            // is the lifetime direct scanout imposes.
+            if frame >= 2 {
+                busy[taken[frame - 2]] = false;
+            }
+        }
+        assert_eq!(taken, vec![0, 1, 2, 0, 1, 2]);
+    }
+
+    #[test]
+    fn a_fourcc_prints_as_the_four_characters_it_spells() {
+        assert_eq!(fourcc_name(FOURCC_XR24), "XR24");
+        assert_eq!(fourcc_name(FOURCC_XB24), "XB24");
+        assert_eq!(fourcc_name(0), "????");
     }
 }
