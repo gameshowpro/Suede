@@ -23,8 +23,8 @@ use crate::sway::{SwayClient, SwayEvent};
 use crate::wallpapers::WallpaperStore;
 
 pub use plan::{
-    cursor_commands, placement_commands, plan_outputs, resolve_app_targets, AppTarget,
-    AppliedOutput, Capabilities, OutputPlan,
+    adoption_for, cursor_commands, placement_commands, plan_outputs, resolve_app_targets,
+    AppTarget, AppliedOutput, Capabilities, OutputPlan,
 };
 
 /// Coalescing window for reconciliation triggers.
@@ -60,6 +60,12 @@ pub struct Reconciler {
     pass: Mutex<()>,
     /// What the last pass applied, for settings Sway does not report back.
     applied: Mutex<HashMap<String, AppliedOutput>>,
+    /// What the last pass observed on each live output, keyed the same way as
+    /// `applied`. Adoption only pins a value once it has been observed twice
+    /// in a row — a display still negotiating its link can report something
+    /// on the first pass that is not its final answer — and this is that
+    /// memory. See [`plan::adoption_for`].
+    previous_observations: Mutex<HashMap<String, crate::model::Output>>,
     capabilities: Mutex<Capabilities>,
     cursor_parked_at: Mutex<Option<i32>>,
     wallpapers: Arc<WallpaperStore>,
@@ -116,6 +122,7 @@ impl Reconciler {
             docs_base_url,
             pass: Mutex::new(()),
             applied: Mutex::new(HashMap::new()),
+            previous_observations: Mutex::new(HashMap::new()),
             capabilities: Mutex::new(Capabilities::default()),
             cursor_parked_at: Mutex::new(None),
             #[cfg(feature = "projection")]
@@ -128,6 +135,13 @@ impl Reconciler {
     pub async fn shutdown(&self) {
         #[cfg(feature = "projection")]
         self.blend.lock().await.shutdown();
+    }
+
+    /// The running slicer's process id, for tests that need to tell whether
+    /// a pass restarted it — see `BlendManager::slicer_pid`.
+    #[cfg(all(test, feature = "projection"))]
+    async fn slicer_pid(&self) -> Option<u32> {
+        self.blend.lock().await.slicer_pid()
     }
 
     /// Detect version-gated compositor features. Safe to call repeatedly.
@@ -213,6 +227,14 @@ impl Reconciler {
             divergences: previous.divergences,
             last_reconciled: previous.last_reconciled,
             revision: desired.revision,
+            committed: !self.store.has_preview(),
+            current_revision: self.store.revision(),
+            // The reconciler holds no `CheckRunner` — checks shell out to
+            // other programs, and a pass must stay cheap — so it cannot
+            // honestly fill this in. `GET /status` folds in the runner's
+            // last results on top of whatever this publishes; SSE
+            // subscribers only ever see `None` from this path.
+            checks: None,
         });
 
         self.refresh_outputs().await;
@@ -292,8 +314,16 @@ impl Reconciler {
         // rectangles. In canvas mode this creates and sizes the headless
         // canvas and runs the slicer; it returns which output the active app
         // must render into.
-        let (canvas_output, projection_divergences) =
-            self.sync_projection(&desired, canvas_plan).await;
+        //
+        // `output_plan.topology_changed` is passed through so the slicer can
+        // be forced to restart even when its spec turns out unchanged — see
+        // `sync_projection` and `BlendManager::restart_slicer`. It is true
+        // only for the pass that actually issued the enable/disable commands
+        // (freshly computed per call in `plan_outputs_with`, never carried
+        // over), so this cannot restart the slicer on every ordinary pass.
+        let (canvas_output, projection_divergences) = self
+            .sync_projection(&desired, canvas_plan, output_plan.topology_changed)
+            .await;
         divergences.extend(projection_divergences);
 
         // --- apps ---
@@ -333,6 +363,21 @@ impl Reconciler {
         let windows = self.refresh_windows().await;
         self.supervisor.tick(&windows).await;
 
+        // --- adoption ---
+        // Pin whatever each output settled on for a mode, scale or transform
+        // the configuration left unset, so a reboot keeps today's picture
+        // rather than trusting Sway's own default pick again. On 2026-09-15
+        // a four-projector bench came back at 3840x2160@60 instead of the
+        // 1920x1200@59.95 it had been running — nothing was misconfigured,
+        // nothing had been configured at all, and the machine had simply
+        // been lucky until then, which changed the projection canvas from
+        // 9.2 to 19.2 megapixels and invalidated a set of performance
+        // measurements. A pass that cannot reach sway has verified nothing,
+        // so it adopts nothing either — the outputs below are stale.
+        if self.sway.is_connected() {
+            self.adopt_settled_outputs(&desired, &divergences).await;
+        }
+
         // A pass that could not reach sway has not verified anything: the
         // outputs it reports are whatever was last seen, the commands it
         // planned went nowhere, and finding no divergences means only that
@@ -370,6 +415,15 @@ impl Reconciler {
             divergences,
             last_reconciled: Some(crate::util::unix_now()),
             revision: desired.revision,
+            // Read fresh, not carried over from `desired` above: a write
+            // that lands mid-pass (the store is shared with every API
+            // handler) must show up as `currentRevision` outrunning the
+            // `revision` this pass actually applied, which is exactly the
+            // "have you caught up with my last write" signal the field
+            // exists for.
+            committed: !self.store.has_preview(),
+            current_revision: self.store.revision(),
+            checks: None,
         };
         self.publish_status(status.clone());
         status
@@ -382,11 +436,20 @@ impl Reconciler {
     /// plan's slices, and report which output the active app must render
     /// into. Without one: retire any lingering canvas and show test patterns
     /// per output if asked.
+    ///
+    /// `restart_slicer` is this pass's `OutputPlan::topology_changed`: true
+    /// when the compositor was just told to enable or disable an output,
+    /// which destroys and recreates it. A running slicer's spec fingerprint
+    /// does not change when an output disappears and comes back under the
+    /// same name, so without this it would be left alone, still bound to the
+    /// layer surfaces it built against the output that no longer exists —
+    /// see `BlendManager::restart_slicer`.
     #[cfg(feature = "projection")]
     async fn sync_projection(
         &self,
         desired: &crate::model::DesiredState,
         plan: Option<crate::projection::CanvasPlan>,
+        restart_slicer: bool,
     ) -> (Option<String>, Vec<Divergence>) {
         use crate::checks::is_synthetic_output;
         use crate::projection::{overlay_specs, Participant, SlicerSpec};
@@ -574,7 +637,17 @@ impl Reconciler {
 
         let mut manager = self.blend.lock().await;
         divergences.extend(manager.sync(&overlay));
+        if restart_slicer {
+            manager.restart_slicer();
+        }
         divergences.extend(manager.sync_slicer(slicer.as_ref()));
+        // `sync_slicer` above already reaped a dead child before deciding
+        // whether to respawn, so the manager knows definitively whether one
+        // is alive now — publish that rather than leaving the API and the
+        // `output-phase` check to infer it from whether stats have arrived,
+        // which stays "no" for as long as a static page produces no frames
+        // to report (see `ProjectionReport`).
+        self.publish_slicer_running(manager.slicer_running());
         (canvas, divergences)
     }
 
@@ -585,7 +658,11 @@ impl Reconciler {
         &self,
         desired: &crate::model::DesiredState,
         _plan: Option<()>,
+        _restart_slicer: bool,
     ) -> (Option<String>, Vec<Divergence>) {
+        // No slicer ever runs in this build, so there is exactly one
+        // liveness fact to publish, once.
+        self.publish_slicer_running(false);
         if desired.projection.is_some() {
             (
                 None,
@@ -598,6 +675,20 @@ impl Reconciler {
             )
         } else {
             (None, Vec::new())
+        }
+    }
+
+    /// Publish the slicer's liveness, telling any SSE listener when it
+    /// actually changed — mirrors `publish_status`, and exists so both
+    /// `sync_projection` variants above share one place that decides
+    /// whether to say something rather than each reimplementing the
+    /// change check.
+    fn publish_slicer_running(&self, running: bool) {
+        if self.snapshot.set_slicer_running(running) {
+            self.events
+                .publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                    self.snapshot.projection_report(),
+                )));
         }
     }
 
@@ -621,11 +712,13 @@ impl Reconciler {
             let matched = observed
                 .iter()
                 .find(|output| config.r#match.matches(output));
-            // Geometry comes from the configuration first. Only an output
-            // that is both connected *and* unpinned falls back to what it
-            // currently runs — a disconnected output has no "currently".
+            // Geometry comes from the configuration first — the operator's
+            // own choice, or one already pinned because none was given.
+            // Only an output that is both connected *and* still unpinned
+            // falls back to what it currently runs — a disconnected output
+            // has no "currently".
             let size = config
-                .mode
+                .effective_mode()
                 .map(|mode| (mode.width, mode.height))
                 .or_else(|| matched?.current_mode.map(|mode| (mode.width, mode.height)));
             let position = config.position.or_else(|| {
@@ -824,6 +917,115 @@ impl Reconciler {
                 ))
             })
             .collect()
+    }
+
+    /// Pin, in the persisted document, whatever each configured output
+    /// settled on for a mode/scale/transform the operator left unset. See
+    /// [`plan::adoption_for`] for the decision and why each guard exists;
+    /// this only orchestrates it — matching each config entry to its live
+    /// output, keeping the pass-to-pass observation memory, and writing the
+    /// result through [`StateStore::update`] so it lands as a normal
+    /// committed change (a new revision, an SSE event) like any other.
+    ///
+    /// Skipped entirely while a working copy is live: an operator mid-edit
+    /// must not have the document rewritten underneath them. The
+    /// observation memory is still refreshed even then, so adoption is not
+    /// left thinking a display just changed the instant the preview clears.
+    async fn adopt_settled_outputs(
+        &self,
+        desired: &crate::model::DesiredState,
+        divergences: &[Divergence],
+    ) {
+        let observed = self.snapshot.outputs();
+        let mut history = self.previous_observations.lock().await;
+
+        let mut pins: Vec<(crate::model::OutputMatch, crate::model::AdoptedOutput)> = Vec::new();
+        if !self.store.has_preview() {
+            for config in &desired.outputs {
+                let Some(output) = observed
+                    .iter()
+                    .find(|candidate| config.r#match.matches(candidate))
+                else {
+                    continue;
+                };
+                // Divergence subjects name either the output itself
+                // (`mode_unsupported`, `output_not_connected`, …) or, for
+                // `command_failed`, the sway command that failed — which
+                // always names its output — so a substring match catches
+                // both without the caller needing to know which shape it is.
+                let this_output_diverged = divergences
+                    .iter()
+                    .any(|d| d.subject.contains(output.name.as_str()));
+                let previous = history.get(&output.name);
+                if let Some(adopted) =
+                    plan::adoption_for(config, output, previous, this_output_diverged)
+                {
+                    pins.push((config.r#match.clone(), adopted));
+                }
+            }
+        }
+
+        // Recorded for every observed output, not only ones with a config
+        // entry today, so one added later already has a pass of history to
+        // compare against.
+        for output in &observed {
+            history.insert(output.name.clone(), output.clone());
+        }
+        drop(history);
+
+        if pins.is_empty() {
+            return;
+        }
+
+        // What each pin is replacing, captured before the write, so the log
+        // can say whether this was a first pin or a re-adopt after the
+        // display on that connector changed.
+        let previous_adopted: HashMap<String, Option<crate::model::AdoptedOutput>> = pins
+            .iter()
+            .map(|(rule, _)| {
+                let previous = desired
+                    .outputs
+                    .iter()
+                    .find(|output| output.r#match.key() == rule.key())
+                    .and_then(|output| output.adopted.clone());
+                (rule.key(), previous)
+            })
+            .collect();
+
+        match self.store.update(|state| {
+            for output in &mut state.outputs {
+                if let Some((_, adopted)) = pins
+                    .iter()
+                    .find(|(rule, _)| rule.key() == output.r#match.key())
+                {
+                    output.adopted = Some(adopted.clone());
+                }
+            }
+        }) {
+            Ok(_) => {
+                for (rule, adopted) in &pins {
+                    let previous = previous_adopted.get(&rule.key()).cloned().flatten();
+                    let event = match &previous {
+                        None => "first pin",
+                        Some(previous) if previous.display != adopted.display => {
+                            "re-adopt: display changed"
+                        }
+                        Some(_) => "adopted a field the operator freed",
+                    };
+                    tracing::info!(
+                        output = %rule.key(),
+                        mode = ?adopted.mode.map(|m| m.to_sway()),
+                        scale = adopted.scale,
+                        transform = ?adopted.transform.map(|t| t.as_sway()),
+                        event,
+                        "adopted the output value the configuration left unset"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to persist adopted output values");
+            }
+        }
     }
 
     async fn park_cursor(&self) {
@@ -1278,6 +1480,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_reports_committed_and_current_revision_from_the_store() {
+        let harness = harness();
+        let status = harness.reconciler.reconcile().await;
+        assert!(status.committed, "no working copy is live");
+        assert_eq!(status.current_revision, 0);
+        // The reconciler holds no check runner, so it never claims to know.
+        assert!(status.checks.is_none());
+
+        harness.store.set_preview(Some(harness.store.get()));
+        let status = harness.reconciler.reconcile().await;
+        assert!(
+            !status.committed,
+            "a live working copy is not what is saved on disk"
+        );
+
+        harness.store.set_preview(None);
+        let status = harness.reconciler.reconcile().await;
+        assert!(status.committed);
+    }
+
+    #[tokio::test]
     async fn a_missing_canvas_is_a_divergence() {
         let harness = harness();
         harness
@@ -1347,6 +1570,94 @@ mod tests {
                 .ran_command_containing("mode --custom 3680x1080@60Hz"),
             "canvas mode command did not carry the shared rate: {:?}",
             harness.sway.commands()
+        );
+        harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn topology_change_restarts_the_slicer_even_with_an_unchanged_spec() {
+        // Mirrors the 2026-09-15 bench measurement: the `output-phase`
+        // check's fix disables and re-enables every output together, which
+        // destroys and recreates them in the compositor, but an output that
+        // disappears and comes back under the same name and geometry leaves
+        // the `SlicerSpec` — and so its fingerprint — completely unchanged.
+        // Without `OutputPlan::topology_changed` forcing a restart, the
+        // already-running slicer would be left alone, still bound to layer
+        // surfaces built against outputs that no longer exist.
+        let harness = harness();
+        let mut outputs = harness.sway.get_outputs().await.unwrap();
+        outputs.push(Output {
+            name: "HEADLESS-1".into(),
+            active: false,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: None,
+            modes: vec![],
+            rect: Default::default(),
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        });
+        harness.sway.set_outputs(outputs);
+
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app("renderer", None, None));
+                state.active_app = Some("renderer".into());
+                // Overlapping x-positions, so the canvas plan needs a
+                // headless output and the slicer actually runs.
+                state.outputs.push(configured_output("HDMI-A-1", 0));
+                state.outputs.push(configured_output("HDMI-A-2", 1760));
+            })
+            .unwrap();
+
+        harness.reconciler.reconcile().await;
+        let pid_after_first_pass = harness
+            .reconciler
+            .slicer_pid()
+            .await
+            .expect("the overlap must have started a slicer");
+
+        // An ordinary pass, nothing changed: left alone.
+        harness.reconciler.reconcile().await;
+        assert_eq!(
+            harness.reconciler.slicer_pid().await,
+            Some(pid_after_first_pass),
+            "an unchanged pass must not restart the slicer"
+        );
+
+        // Simulate the output going away and coming back under the same
+        // name and geometry: the mock reports it inactive without touching
+        // its mode or rect, so the next pass issues an `enable` command
+        // (topology_changed) even though the geometry the slicer's spec is
+        // built from — and so the spec's fingerprint — ends up identical.
+        let mut outputs = harness.sway.get_outputs().await.unwrap();
+        for output in outputs.iter_mut() {
+            if output.name == "HDMI-A-1" {
+                output.active = false;
+            }
+        }
+        harness.sway.set_outputs(outputs);
+
+        harness.reconciler.reconcile().await;
+        assert!(
+            harness
+                .sway
+                .ran_command_containing("output HDMI-A-1 enable"),
+            "the simulated teardown must have been re-enabled: {:?}",
+            harness.sway.commands()
+        );
+        let pid_after_topology_change = harness
+            .reconciler
+            .slicer_pid()
+            .await
+            .expect("the slicer must still be running after the output came back");
+        assert_ne!(
+            pid_after_topology_change, pid_after_first_pass,
+            "a pass that changed output topology must restart the slicer even \
+             though its spec is unchanged"
         );
         harness.supervisor.shutdown().await;
     }
@@ -1427,6 +1738,55 @@ mod tests {
         assert_eq!(windows.len(), 2);
         // No apps are managed, so no window is claimed.
         assert!(windows.iter().all(|window| window.app.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_settled_mode_is_adopted_after_two_passes_then_left_alone() {
+        // Mirrors the 2026-09-15 incident: mode left unset, sway settles on
+        // whatever the display already reports, and after two agreeing
+        // passes that value must be pinned so it survives a reboot.
+        let harness = harness();
+        harness.reconciler.detect_capabilities().await;
+        harness
+            .store
+            .update(|state| {
+                // No mode: left to sway's own preferred pick, exactly the
+                // case adoption exists for.
+                state
+                    .outputs
+                    .push(OutputConfig::new(OutputMatch::by_name("HDMI-A-1")));
+            })
+            .unwrap();
+
+        // First pass: nothing to compare against yet, so nothing is pinned.
+        harness.reconciler.reconcile().await;
+        assert!(
+            harness.store.get().outputs[0].adopted.is_none(),
+            "must not adopt from a single sighting"
+        );
+
+        // Second pass: the same mode was observed twice in a row.
+        let revision_after_first = harness.store.get().revision;
+        harness.reconciler.reconcile().await;
+        let after_second = harness.store.get();
+        let adopted = after_second.outputs[0]
+            .adopted
+            .clone()
+            .expect("a value settled on two consecutive passes must be pinned");
+        assert_eq!(adopted.mode.unwrap().width, 1920);
+        assert_eq!(adopted.mode.unwrap().height, 1080);
+        assert!(after_second.revision > revision_after_first);
+
+        // Third pass: already pinned and nothing changed, so nothing is
+        // written — a flapping cable must not churn the revision.
+        harness.reconciler.reconcile().await;
+        let after_third = harness.store.get();
+        assert_eq!(
+            after_third.revision, after_second.revision,
+            "an unchanged adoption must not write again"
+        );
+        assert_eq!(after_third.outputs[0].adopted, Some(adopted));
+        harness.supervisor.shutdown().await;
     }
 
     #[tokio::test]

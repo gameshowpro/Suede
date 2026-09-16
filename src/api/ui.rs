@@ -139,6 +139,10 @@ mod tests {
             ),
             ("showFpsCounter", "a diagnostic, not a configuration choice"),
             ("persistProfile", "kiosk sessions are stateless by design"),
+            (
+                "adopted",
+                "read-only: Suede's own pin of what settled, shown beside each field rather than edited",
+            ),
         ];
 
         let document: serde_json::Value =

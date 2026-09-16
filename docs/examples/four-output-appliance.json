@@ -15,7 +15,17 @@
         "y": 0
       },
       "adaptiveSync": false,
-      "maxRenderTimeMs": null
+      "maxRenderTimeMs": null,
+      "adopted": {
+        "scale": 1.0,
+        "transform": "normal",
+        "display": {
+          "make": "Acme Displays",
+          "model": "AD-2400",
+          "serial": "0x00012345"
+        },
+        "capturedAt": 1757894400
+      }
     },
     {
       "match": {

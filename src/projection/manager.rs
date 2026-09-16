@@ -14,7 +14,7 @@ use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 use crate::events::{EventHub, ServerEvent};
-use crate::model::Divergence;
+use crate::model::{Divergence, ProjectionReport};
 use crate::snapshot::Snapshot;
 
 use super::blend::{OverlaySpec, SlicerSpec};
@@ -76,13 +76,48 @@ impl BlendManager {
         }
     }
 
-    /// Clear the last-reported projection stats and tell any SSE listener,
-    /// but only if there was something to clear — a manager that never ran a
-    /// slicer must not spam a `null` on every reconciliation pass.
+    /// Whether the slicer child is alive right now.
+    ///
+    /// `sync_slicer` already reaps it with `try_wait` before touching
+    /// anything else, so this is never a guess — which is the whole point:
+    /// a bench on 2026-09-15 had `GET /projection/stats` and the
+    /// `output-phase` check both call a running slicer "not running"
+    /// because neither had anything better than "have stats arrived" to go
+    /// on, and a damage-driven frame loop reports nothing for a static
+    /// page. See `ProjectionReport`.
+    pub fn slicer_running(&self) -> bool {
+        self.slicer.is_some()
+    }
+
+    /// The running slicer's process id, if any — only ever needed to tell
+    /// "the same process" from "a fresh one" in a test, since no production
+    /// caller has a use for the number itself.
+    #[cfg(test)]
+    pub(crate) fn slicer_pid(&self) -> Option<u32> {
+        self.slicer.as_ref().map(|running| running.child.id())
+    }
+
+    /// Clear the last-reported projection stats and liveness together, and
+    /// tell any SSE listener, but only if something actually changed — a
+    /// manager that never ran a slicer must not spam a `false`/`null` on
+    /// every reconciliation pass.
+    ///
+    /// The two are cleared from this one place rather than separately,
+    /// because a stopped slicer's last interval is stale the instant it
+    /// stops: a reader that saw `running: true` with an interval left over
+    /// from ten seconds ago, while the process was already dead, would be
+    /// exactly the ambiguity this file exists to remove.
     fn clear_projection_stats(&self) {
-        if self.snapshot.set_projection_stats(None) {
+        let stats_changed = self.snapshot.set_projection_stats(None);
+        let running_changed = self.snapshot.set_slicer_running(false);
+        if stats_changed || running_changed {
             self.events
-                .publish(ServerEvent::ProjectionStatsChanged(None));
+                .publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                    ProjectionReport {
+                        running: false,
+                        last_interval: None,
+                    },
+                )));
         }
     }
 
@@ -156,6 +191,30 @@ impl BlendManager {
         }
 
         divergences
+    }
+
+    /// Force the next `sync_slicer` call to respawn the slicer even if its
+    /// spec is unchanged. A no-op when none is running.
+    ///
+    /// Cheap insurance for a teardown `sync_slicer`'s own fingerprint diff
+    /// cannot see: when an output disappears and comes back under the same
+    /// name, the geometry `SlicerSpec` is built from ends up identical to
+    /// before, so its fingerprint does not change and an unmodified
+    /// `sync_slicer` would leave the existing (dead) slicer running —
+    /// exactly the four-projector-bench defect this exists to close. The
+    /// reconciler calls this before `sync_slicer` on any pass whose
+    /// `OutputPlan::topology_changed` is true, i.e. one that actually issued
+    /// enable/disable commands, so a compositor that does not remove the
+    /// `wl_output` global on its own (this one's own self-heal in
+    /// `projection::slicer` is the other route, for one that does) still
+    /// gets a fresh slicer bound against the outputs that exist now.
+    pub fn restart_slicer(&mut self) {
+        if let Some(mut old) = self.slicer.take() {
+            tracing::info!("restarting the slicer: output topology changed");
+            let _ = old.child.kill();
+            let _ = old.child.wait();
+            self.clear_projection_stats();
+        }
     }
 
     /// Make the running slicer match `spec`. `None` tears it down.
@@ -300,8 +359,20 @@ fn spawn_stats_reader(stdout: ChildStdout, snapshot: Arc<Snapshot>, events: Even
                 };
                 match serde_json::from_str::<crate::model::ProjectionStats>(&line) {
                     Ok(stats) => {
+                        // A stats line only ever arrives from a live
+                        // process, so this is as good a place as any to
+                        // affirm liveness too — the reconciler sets it after
+                        // every `sync_slicer` call, but a client that only
+                        // watches events should not have to wait for the
+                        // next reconciliation pass to hear it.
                         snapshot.set_projection_stats(Some(stats.clone()));
-                        events.publish(ServerEvent::ProjectionStatsChanged(Some(Box::new(stats))));
+                        snapshot.set_slicer_running(true);
+                        events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                            ProjectionReport {
+                                running: true,
+                                last_interval: Some(stats),
+                            },
+                        )));
                     }
                     Err(error) => {
                         tracing::debug!(%error, line, "could not parse a slicer stats line");
