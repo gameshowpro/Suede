@@ -53,7 +53,28 @@
         "node.name": "alsa_input.pci-0000_00_1f.3.analog-stereo",
         "node.description": "Built-in Audio Analog Stereo",
         "media.class": "Audio/Source",
+        "api.alsa.card.name": "Built-in Audio",
         "device.id": 45
+      }
+    }
+  },
+  {
+    "id": 74,
+    "type": "PipeWire:Interface:Node",
+    "info": {
+      "props": {
+        "node.name": "v4l2_input.pci-0000_00_14.0-usb-0_6_1.0",
+        "node.description": "USB Capture HDMI (V4L2)",
+        "node.nick": "USB Capture HDMI",
+        "media.class": "Video/Source",
+        "media.role": "Camera",
+        "api.v4l2.path": "/dev/video0",
+        "api.v4l2.cap.card": "USB Capture HDMI: USB Capture H",
+        "api.v4l2.cap.driver": "uvcvideo",
+        "api.v4l2.cap.bus_info": "usb-0000:00:14.0-6",
+        "device.api": "v4l2",
+        "factory.name": "api.v4l2.source",
+        "object.serial": 74
       }
     }
   },

@@ -82,7 +82,7 @@ mod tests {
     fn the_page_exercises_every_endpoint_family() {
         for path in [
             "/outputs",
-            "/audio/outputs",
+            "/av",
             "/apps",
             "/apps/capabilities",
             "/apps/capabilities/measure",
@@ -246,7 +246,7 @@ mod tests {
     fn the_page_subscribes_to_every_event() {
         for event in [
             "outputs_changed",
-            "audio_outputs_changed",
+            "av_changed",
             "app_status_changed",
             "status_changed",
             "config_changed",

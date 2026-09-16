@@ -12,7 +12,7 @@ pub mod pw;
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
-use crate::model::AudioSink;
+use crate::model::{AudioSink, AvDevices};
 
 /// Name of the null sink Suede manages for silent routing.
 pub const NULL_SINK_NAME: &str = "suede-null";
@@ -121,14 +121,25 @@ mod gain_tests {
 
 pub type AudioResult<T> = Result<T, AudioError>;
 
-/// Sink enumeration and change notification.
+/// Audio and video device enumeration and change notification.
+///
+/// PipeWire is the audio server, so it stays the name of the trait; the
+/// video list is a courtesy of PipeWire's v4l2 monitor (WirePlumber),
+/// carried alongside the audio devices because it comes from the same
+/// `pw-dump` walk.
 #[async_trait]
 pub trait AudioMonitor: Send + Sync + 'static {
-    /// Most recently observed sinks.
-    fn sinks(&self) -> Vec<AudioSink>;
+    /// Most recently observed audio and video devices.
+    fn devices(&self) -> AvDevices;
+
+    /// Most recently observed sinks. A convenience over [`Self::devices`]
+    /// for the reconciler and checks, which only ever care about outputs.
+    fn sinks(&self) -> Vec<AudioSink> {
+        self.devices().audio_outputs
+    }
 
     /// Re-query PipeWire and update the cache.
-    async fn refresh(&self) -> AudioResult<Vec<AudioSink>>;
+    async fn refresh(&self) -> AudioResult<AvDevices>;
 
     /// Create the null sink if it does not already exist.
     async fn ensure_null_sink(&self) -> AudioResult<()>;
@@ -136,8 +147,8 @@ pub trait AudioMonitor: Send + Sync + 'static {
     /// Set a sink's playback gain, in dB, `0.0` being unity.
     async fn set_sink_gain(&self, sink: &str, gain_db: f64) -> AudioResult<()>;
 
-    /// Receiver notified whenever the sink list actually changes.
-    fn subscribe(&self) -> broadcast::Receiver<Vec<AudioSink>>;
+    /// Receiver notified whenever the device lists actually change.
+    fn subscribe(&self) -> broadcast::Receiver<AvDevices>;
 
     /// Whether PipeWire has answered at least once.
     fn is_available(&self) -> bool;

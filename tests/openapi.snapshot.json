@@ -300,6 +300,65 @@
         ],
         "type": "object"
       },
+      "AudioSource": {
+        "description": "An audio input (capture) device reported by PipeWire.",
+        "properties": {
+          "card": {
+            "description": "ALSA card name (`api.alsa.card.name`), where PipeWire reports one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Human-readable `node.description`. This is what a Chromium kiosk's\n`enumerateDevices` labels the device as, since audio devices are\nopened through pipewire-pulse.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "PipeWire `node.name` — stable across reboots and replugging.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "AvDevices": {
+        "description": "Every audio and video device PipeWire currently reports: outputs Suede\ncan route to, and inputs an app might ask to be given.",
+        "properties": {
+          "audioInputs": {
+            "description": "Audio sources (`Audio/Source` nodes).",
+            "items": {
+              "$ref": "#/components/schemas/AudioSource"
+            },
+            "type": "array"
+          },
+          "audioOutputs": {
+            "description": "Audio sinks. The only list with a notion of default.",
+            "items": {
+              "$ref": "#/components/schemas/AudioSink"
+            },
+            "type": "array"
+          },
+          "videoInputs": {
+            "description": "Video sources (`Video/Source` nodes), from WirePlumber's v4l2 monitor.",
+            "items": {
+              "$ref": "#/components/schemas/VideoSource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "audioOutputs",
+          "audioInputs",
+          "videoInputs"
+        ],
+        "type": "object"
+      },
       "Background": {
         "description": "What an output shows behind, or instead of, any window.\n\nAn appliance with a blank screen looks broken even when it is merely\nbetween launches, so a background gives it something deliberate to show\nwhile a browser restarts or before the first app starts.",
         "properties": {
@@ -1979,6 +2038,40 @@
         ],
         "type": "string"
       },
+      "VideoSource": {
+        "description": "A video input (capture) device, surfaced via WirePlumber's v4l2 monitor.",
+        "properties": {
+          "card": {
+            "description": "V4L2 card string (`api.v4l2.cap.card`). This, not `description`, is\nwhat a Chromium kiosk's `enumerateDevices` labels the device as,\nsince video devices are opened straight through V4L2.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "description": "Human-readable `node.description`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "PipeWire `node.name` — stable across reboots and replugging.",
+            "type": "string"
+          },
+          "path": {
+            "description": "V4L2 device path (`api.v4l2.path`), e.g. `/dev/video0`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
       "Wallpaper": {
         "description": "Metadata for a stored wallpaper, as served by the API.",
         "properties": {
@@ -2474,22 +2567,19 @@
         ]
       }
     },
-    "/api/v1/audio/outputs": {
+    "/api/v1/av": {
       "get": {
-        "operationId": "list_audio_outputs",
+        "operationId": "list_av_devices",
         "responses": {
           "200": {
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/AudioSink"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/AvDevices"
                 }
               }
             },
-            "description": "Audio sinks reported by PipeWire"
+            "description": "Every AV device PipeWire reports, in three lists: audio outputs (sinks Suede can route to), audio inputs, and video inputs. Only audio outputs have a default. Exposed so an app in the kiosk browser, which cannot enumerate devices itself, can ask for the right one: a browser labels an audio device by its `description` and a video device by its `card`."
           }
         },
         "tags": [

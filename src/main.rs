@@ -190,7 +190,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     };
 
     let audio: Arc<dyn AudioMonitor> = if args.mock {
-        Arc::new(MockAudio::with_sinks())
+        Arc::new(MockAudio::with_devices())
     } else {
         let monitor = Arc::new(PipeWireMonitor::new());
         tokio::spawn(monitor.clone().run(shutdown_rx.clone()));

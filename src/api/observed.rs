@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    AudioSink, Check, CheckSummary, Output, PowerVerb, ProjectionReport, Status, SystemInfo, Window,
+    AvDevices, Check, CheckSummary, Output, PowerVerb, ProjectionReport, Status, SystemInfo, Window,
 };
 
 #[utoipa::path(
@@ -65,11 +65,21 @@ pub async fn list_windows(State(state): State<ApiState>) -> Json<Vec<Window>> {
 }
 
 #[utoipa::path(
-    get, path = "/api/v1/audio/outputs", tag = "observed",
-    responses((status = 200, description = "Audio sinks reported by PipeWire", body = Vec<AudioSink>))
+    get, path = "/api/v1/av", tag = "observed",
+    responses((
+        status = 200,
+        description = "Every AV device PipeWire reports, in three lists: audio \
+                       outputs (sinks Suede can route to), audio inputs, and \
+                       video inputs. Only audio outputs have a default. \
+                       Exposed so an app in the kiosk browser, which cannot \
+                       enumerate devices itself, can ask for the right one: a \
+                       browser labels an audio device by its `description` and \
+                       a video device by its `card`.",
+        body = AvDevices,
+    ))
 )]
-pub async fn list_audio_outputs(State(state): State<ApiState>) -> Json<Vec<AudioSink>> {
-    Json(state.audio.sinks())
+pub async fn list_av_devices(State(state): State<ApiState>) -> Json<AvDevices> {
+    Json(state.audio.devices())
 }
 
 #[utoipa::path(
@@ -469,10 +479,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_audio_outputs() {
-        let (status, body) = get_json("/api/v1/audio/outputs").await;
+    async fn lists_av_devices() {
+        let (status, body) = get_json("/api/v1/av").await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body.as_array().unwrap().len(), 2);
+        assert_eq!(body["audioOutputs"].as_array().unwrap().len(), 2);
+        assert_eq!(body["audioInputs"].as_array().unwrap().len(), 1);
+        assert_eq!(body["videoInputs"].as_array().unwrap().len(), 1);
     }
 
     #[tokio::test]

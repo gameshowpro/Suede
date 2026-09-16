@@ -233,7 +233,7 @@ window.addEventListener("error", (event) => {
     <button role="tab" aria-selected="true" data-tab="displays">Displays</button>
     <button role="tab" aria-selected="false" data-tab="apps">Apps</button>
     <button role="tab" aria-selected="false" data-tab="wallpapers">Backgrounds</button>
-    <button role="tab" aria-selected="false" data-tab="audio">Audio</button>
+    <button role="tab" aria-selected="false" data-tab="audio">AV I/O</button>
     <button role="tab" aria-selected="false" data-tab="system">System<span id="check-badge"></span></button>
     <button role="tab" aria-selected="false" data-tab="config">Raw config</button>
   </nav>
@@ -588,10 +588,10 @@ window.addEventListener("error", (event) => {
     </div>
   </section>
 
-  <!-- Audio -->
+  <!-- Audio and video I/O -->
   <section id="tab-audio" class="hidden">
     <div class="panel">
-      <h2>Audio sinks</h2>
+      <h2>Audio outputs</h2>
       <p class="hint">The outputs PipeWire can play to. Each application picks
         one on the <a href="#" id="sinks-apps-link">Apps</a> tab; this list is what
         it picks from.</p>
@@ -607,6 +607,20 @@ window.addEventListener("error", (event) => {
         reboots. Set it from the machine with
         <span class="mono">wpctl set-default &lt;id&gt;</span>.
         <b>silent</b> marks a sink that discards whatever reaches it.</p>
+    </div>
+    <div class="panel">
+      <h2>Audio inputs</h2>
+      <p class="hint">These are listed so an app can ask for the right device
+        without being allowed to enumerate them itself: a kiosk browser
+        labels an audio device by its Description, and a video device below
+        by its Card.</p>
+      <table id="audio-inputs"><thead><tr><th>Identifier</th><th>Description</th><th>Card</th></tr></thead><tbody></tbody></table>
+      <p class="hint" id="audio-inputs-empty">No audio inputs reported. Is PipeWire running?</p>
+    </div>
+    <div class="panel">
+      <h2>Video inputs</h2>
+      <table id="video-inputs"><thead><tr><th>Identifier</th><th>Description</th><th>Device</th><th>Card</th></tr></thead><tbody></tbody></table>
+      <p class="hint" id="video-inputs-empty">No video inputs reported. Is WirePlumber's v4l2 monitor enabled?</p>
     </div>
   </section>
 
@@ -679,6 +693,8 @@ const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
 let outputs = [], config = null, apps = [], sinks = [], checks = [], status = null,
     wallpapers = [], selected = null, editingApp = null, editingBackground = null,
+    // The other two lists GET /av returns alongside the sinks above.
+    audioInputs = [], videoInputs = [],
     // The last GET /system response, kept so the power dialog (opened well
     // after renderSystem returns) can still read the hostname and verbs.
     systemInfo = null,
@@ -2285,6 +2301,34 @@ function renderSinks() {
       .map((s) => `<option value="${escape(s.id)}">Lock to ${escape(s.description ?? s.id)}</option>`).join("");
 }
 
+// Outputs, inputs and video inputs all come from one GET /av, so one
+// function renders the whole tab; it defers the outputs table to
+// renderSinks(), which the apps tab's audio picker also depends on.
+function renderAv() {
+  renderSinks();
+  const audioBody = document.querySelector("#audio-inputs tbody");
+  audioBody.innerHTML = "";
+  $("audio-inputs-empty").classList.toggle("hidden", audioInputs.length > 0);
+  for (const input of audioInputs) {
+    const row = document.createElement("tr");
+    row.innerHTML = `<td class="mono">${escape(input.id)}</td>` +
+      `<td>${escape(input.description ?? "")}</td>` +
+      `<td>${escape(input.card ?? "")}</td>`;
+    audioBody.appendChild(row);
+  }
+  const videoBody = document.querySelector("#video-inputs tbody");
+  videoBody.innerHTML = "";
+  $("video-inputs-empty").classList.toggle("hidden", videoInputs.length > 0);
+  for (const input of videoInputs) {
+    const row = document.createElement("tr");
+    row.innerHTML = `<td class="mono">${escape(input.id)}</td>` +
+      `<td>${escape(input.description ?? "")}</td>` +
+      `<td class="mono">${escape(input.path ?? "")}</td>` +
+      `<td>${escape(input.card ?? "")}</td>`;
+    videoBody.appendChild(row);
+  }
+}
+
 // Levels are stated in dB throughout, so the scale needs a bottom: the true
 // zero of an amplitude is minus infinity, which is not a number anyone can
 // type. -100 dB stands in for it, and the daemon applies it as exact silence.
@@ -2489,7 +2533,8 @@ async function loadAll() {
   // Advisory: an older daemon, or a host without /sys, simply offers fewer
   // choices — never a reason to fail the page.
   ports = await api("/ports").catch(() => []);
-  sinks = await api("/audio/outputs");
+  const av = await api("/av");
+  sinks = av.audioOutputs; audioInputs = av.audioInputs; videoInputs = av.videoInputs;
   apps = await api("/apps");
   wallpapers = await api("/wallpapers");
   // Advisory, like ports: an older daemon lacks the route. The endpoint
@@ -2498,7 +2543,7 @@ async function loadAll() {
   // not that nothing is running.
   projectionStats = await api("/projection/stats").catch(() => null);
   await loadConfig();
-  renderSinks(); renderOutputChoices();
+  renderAv(); renderOutputChoices();
   renderSystem(await api("/system"));
   await loadChecks();
 }
@@ -2629,7 +2674,11 @@ function connect() {
     renderLayout(); renderOutputChoices();
     if (selected) selectOutput(selected);
   });
-  source.addEventListener("audio_outputs_changed", (e) => { sinks = JSON.parse(e.data); renderSinks(); });
+  source.addEventListener("av_changed", (e) => {
+    const av = JSON.parse(e.data);
+    sinks = av.audioOutputs; audioInputs = av.audioInputs; videoInputs = av.videoInputs;
+    renderAv();
+  });
   source.addEventListener("app_status_changed", (e) => {
     const updated = JSON.parse(e.data);
     apps = apps.filter((a) => a.id !== updated.id).concat(updated);

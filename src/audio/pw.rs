@@ -16,7 +16,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{broadcast, watch};
 
 use super::{AudioError, AudioMonitor, AudioResult, NULL_SINK_NAME};
-use crate::model::AudioSink;
+use crate::model::{AudioSink, AudioSource, AvDevices, VideoSource};
 
 const DUMP: &str = "pw-dump";
 const CLI: &str = "pw-cli";
@@ -29,12 +29,12 @@ const WPCTL: &str = "wpctl";
 const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(750);
 
 pub struct PipeWireMonitor {
-    sinks: RwLock<Vec<AudioSink>>,
+    devices: RwLock<AvDevices>,
     /// Object id and channel count per sink, which setting a level needs and
     /// the public sink list has no business carrying.
     nodes: RwLock<HashMap<String, NodeFacts>>,
     available: AtomicBool,
-    changes: broadcast::Sender<Vec<AudioSink>>,
+    changes: broadcast::Sender<AvDevices>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,7 +53,7 @@ impl PipeWireMonitor {
     pub fn new() -> Self {
         let (changes, _) = broadcast::channel(16);
         Self {
-            sinks: RwLock::new(Vec::new()),
+            devices: RwLock::new(AvDevices::default()),
             nodes: RwLock::new(HashMap::new()),
             available: AtomicBool::new(false),
             changes,
@@ -155,11 +155,11 @@ impl PipeWireMonitor {
 
 #[async_trait]
 impl AudioMonitor for PipeWireMonitor {
-    fn sinks(&self) -> Vec<AudioSink> {
-        self.sinks.read().unwrap().clone()
+    fn devices(&self) -> AvDevices {
+        self.devices.read().unwrap().clone()
     }
 
-    async fn refresh(&self) -> AudioResult<Vec<AudioSink>> {
+    async fn refresh(&self) -> AudioResult<AvDevices> {
         let output =
             tokio::process::Command::new(DUMP)
                 .output()
@@ -179,24 +179,29 @@ impl AudioMonitor for PipeWireMonitor {
             });
         }
 
-        let (sinks, nodes) = parse_dump(&output.stdout)?;
+        let (devices, nodes) = parse_dump(&output.stdout)?;
         *self.nodes.write().unwrap() = nodes;
         self.available.store(true, Ordering::Relaxed);
 
         let changed = {
-            let mut guard = self.sinks.write().unwrap();
-            let changed = *guard != sinks;
+            let mut guard = self.devices.write().unwrap();
+            let changed = *guard != devices;
             if changed {
-                *guard = sinks.clone();
+                *guard = devices.clone();
             }
             changed
         };
 
         if changed {
-            tracing::info!(count = sinks.len(), "audio sinks changed");
-            let _ = self.changes.send(sinks.clone());
+            tracing::info!(
+                audio_outputs = devices.audio_outputs.len(),
+                audio_inputs = devices.audio_inputs.len(),
+                video_inputs = devices.video_inputs.len(),
+                "av devices changed"
+            );
+            let _ = self.changes.send(devices.clone());
         }
-        Ok(sinks)
+        Ok(devices)
     }
 
     async fn ensure_null_sink(&self) -> AudioResult<()> {
@@ -281,7 +286,7 @@ impl AudioMonitor for PipeWireMonitor {
         Ok(())
     }
 
-    fn subscribe(&self) -> broadcast::Receiver<Vec<AudioSink>> {
+    fn subscribe(&self) -> broadcast::Receiver<AvDevices> {
         self.changes.subscribe()
     }
 
@@ -362,14 +367,15 @@ fn property<'a>(props: &'a HashMap<String, serde_json::Value>, key: &str) -> Opt
     props.get(key).and_then(serde_json::Value::as_str)
 }
 
-/// Extract audio sinks, and which one PipeWire currently treats as default.
-pub fn parse_sinks(dump: &[u8]) -> AudioResult<Vec<AudioSink>> {
-    parse_dump(dump).map(|(sinks, _)| sinks)
+/// Extract every audio and video device, and which sink PipeWire currently
+/// treats as default.
+pub fn parse_devices(dump: &[u8]) -> AudioResult<AvDevices> {
+    parse_dump(dump).map(|(devices, _)| devices)
 }
 
 /// The same walk, also returning what setting a level needs: each sink's
 /// object id and how many channels it carries.
-fn parse_dump(dump: &[u8]) -> AudioResult<(Vec<AudioSink>, HashMap<String, NodeFacts>)> {
+fn parse_dump(dump: &[u8]) -> AudioResult<(AvDevices, HashMap<String, NodeFacts>)> {
     let objects: Vec<PwObject> =
         serde_json::from_slice(dump).map_err(|source| AudioError::Parse { tool: DUMP, source })?;
 
@@ -391,7 +397,7 @@ fn parse_dump(dump: &[u8]) -> AudioResult<(Vec<AudioSink>, HashMap<String, NodeF
         }
     }
 
-    let mut sinks = Vec::new();
+    let mut devices = AvDevices::default();
     let mut nodes: HashMap<String, NodeFacts> = HashMap::new();
     for object in &objects {
         if object.object_type.as_deref() != Some("PipeWire:Interface:Node") {
@@ -400,51 +406,71 @@ fn parse_dump(dump: &[u8]) -> AudioResult<(Vec<AudioSink>, HashMap<String, NodeF
         let Some(props) = object.info.as_ref().and_then(|info| info.props.as_ref()) else {
             continue;
         };
-        if property(props, "media.class") != Some("Audio/Sink") {
-            continue;
-        }
         let Some(name) = property(props, "node.name") else {
             continue;
         };
 
-        let info = object.info.as_ref().expect("props came from info");
-        let volumes = channel_volumes(info);
-        if let Some(id) = object.id {
-            nodes.insert(
-                name.to_string(),
-                NodeFacts {
-                    id,
-                    channels: volumes.as_ref().map_or(2, Vec::len),
-                },
-            );
-        }
+        match property(props, "media.class") {
+            Some("Audio/Sink") => {
+                let info = object.info.as_ref().expect("props came from info");
+                let volumes = channel_volumes(info);
+                if let Some(id) = object.id {
+                    nodes.insert(
+                        name.to_string(),
+                        NodeFacts {
+                            id,
+                            channels: volumes.as_ref().map_or(2, Vec::len),
+                        },
+                    );
+                }
 
-        sinks.push(AudioSink {
-            id: name.to_string(),
-            description: property(props, "node.description").map(str::to_string),
-            // Any sink built on the null factory discards what it is
-            // given: the one Suede manages for silent routing, and the
-            // `auto_null` dummy PipeWire falls back to when it can see no
-            // audio devices at all.
-            is_null_sink: name == NULL_SINK_NAME
-                || property(props, "factory.name") == Some("support.null-audio-sink"),
-            is_default: default_sink.as_deref() == Some(name),
-            output_hint: property(props, "api.alsa.path")
-                .or_else(|| property(props, "api.alsa.pcm.name"))
-                .map(str::to_string),
-            // One figure for a sink whose channels could in principle differ:
-            // the loudest, because that is the one that will clip.
-            gain_db: volumes.as_ref().map(|v| {
-                super::round_db(super::db_from_linear(
-                    v.iter().copied().fold(0.0_f64, f64::max),
-                ))
-            }),
-        });
+                devices.audio_outputs.push(AudioSink {
+                    id: name.to_string(),
+                    description: property(props, "node.description").map(str::to_string),
+                    // Any sink built on the null factory discards what it is
+                    // given: the one Suede manages for silent routing, and the
+                    // `auto_null` dummy PipeWire falls back to when it can see
+                    // no audio devices at all.
+                    is_null_sink: name == NULL_SINK_NAME
+                        || property(props, "factory.name") == Some("support.null-audio-sink"),
+                    is_default: default_sink.as_deref() == Some(name),
+                    output_hint: property(props, "api.alsa.path")
+                        .or_else(|| property(props, "api.alsa.pcm.name"))
+                        .map(str::to_string),
+                    // One figure for a sink whose channels could in principle
+                    // differ: the loudest, because that is the one that will
+                    // clip.
+                    gain_db: volumes.as_ref().map(|v| {
+                        super::round_db(super::db_from_linear(
+                            v.iter().copied().fold(0.0_f64, f64::max),
+                        ))
+                    }),
+                });
+            }
+            Some("Audio/Source") => {
+                devices.audio_inputs.push(AudioSource {
+                    id: name.to_string(),
+                    description: property(props, "node.description").map(str::to_string),
+                    card: property(props, "api.alsa.card.name").map(str::to_string),
+                });
+            }
+            Some("Video/Source") => {
+                devices.video_inputs.push(VideoSource {
+                    id: name.to_string(),
+                    description: property(props, "node.description").map(str::to_string),
+                    path: property(props, "api.v4l2.path").map(str::to_string),
+                    card: property(props, "api.v4l2.cap.card").map(str::to_string),
+                });
+            }
+            _ => {}
+        }
     }
 
     // Stable ordering keeps change detection meaningful and the API predictable.
-    sinks.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok((sinks, nodes))
+    devices.audio_outputs.sort_by(|a, b| a.id.cmp(&b.id));
+    devices.audio_inputs.sort_by(|a, b| a.id.cmp(&b.id));
+    devices.video_inputs.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok((devices, nodes))
 }
 
 #[cfg(test)]
@@ -455,7 +481,7 @@ mod tests {
 
     #[test]
     fn parses_sinks_from_a_real_dump() {
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let sinks = parse_devices(DUMP_FIXTURE).unwrap().audio_outputs;
         assert_eq!(sinks.len(), 4);
         let ids: Vec<&str> = sinks.iter().map(|s| s.id.as_str()).collect();
         assert!(ids.contains(&"alsa_output.pci-0000_01_00.1.hdmi-stereo"));
@@ -464,13 +490,13 @@ mod tests {
 
     #[test]
     fn ignores_sources_and_non_node_objects() {
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let sinks = parse_devices(DUMP_FIXTURE).unwrap().audio_outputs;
         assert!(sinks.iter().all(|sink| !sink.id.contains("input")));
     }
 
     #[test]
     fn identifies_the_default_sink() {
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let sinks = parse_devices(DUMP_FIXTURE).unwrap().audio_outputs;
         let default: Vec<&AudioSink> = sinks.iter().filter(|s| s.is_default).collect();
         assert_eq!(default.len(), 1);
         assert_eq!(default[0].id, "alsa_output.pci-0000_01_00.1.hdmi-stereo");
@@ -478,7 +504,7 @@ mod tests {
 
     #[test]
     fn flags_the_suede_null_sink() {
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let sinks = parse_devices(DUMP_FIXTURE).unwrap().audio_outputs;
         let null = sinks.iter().find(|s| s.id == NULL_SINK_NAME).unwrap();
         assert!(null.is_null_sink);
         assert!(!null.is_default);
@@ -489,7 +515,7 @@ mod tests {
         // When PipeWire can open no devices it invents `auto_null`. Reading
         // that as a working output is how a machine with no audio at all
         // reports itself healthy.
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let sinks = parse_devices(DUMP_FIXTURE).unwrap().audio_outputs;
         let dummy = sinks.iter().find(|s| s.id == "auto_null").unwrap();
         assert!(dummy.is_null_sink);
         // Real devices are still told apart from both dummies.
@@ -498,7 +524,7 @@ mod tests {
 
     #[test]
     fn carries_descriptions_and_hints() {
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
+        let sinks = parse_devices(DUMP_FIXTURE).unwrap().audio_outputs;
         let hdmi = sinks
             .iter()
             .find(|s| s.id == "alsa_output.pci-0000_01_00.1.hdmi-stereo")
@@ -508,20 +534,73 @@ mod tests {
     }
 
     #[test]
-    fn sinks_are_sorted_for_stable_change_detection() {
-        let sinks = parse_sinks(DUMP_FIXTURE).unwrap();
-        let mut sorted = sinks.clone();
-        sorted.sort_by(|a, b| a.id.cmp(&b.id));
-        assert_eq!(sinks, sorted);
+    fn parses_audio_inputs() {
+        let inputs = parse_devices(DUMP_FIXTURE).unwrap().audio_inputs;
+        assert_eq!(inputs.len(), 1);
+        let built_in = &inputs[0];
+        assert_eq!(built_in.id, "alsa_input.pci-0000_00_1f.3.analog-stereo");
+        assert_eq!(
+            built_in.description.as_deref(),
+            Some("Built-in Audio Analog Stereo")
+        );
+        assert_eq!(built_in.card.as_deref(), Some("Built-in Audio"));
     }
 
     #[test]
-    fn empty_dump_yields_no_sinks() {
-        assert!(parse_sinks(b"[]").unwrap().is_empty());
+    fn parses_video_inputs() {
+        let inputs = parse_devices(DUMP_FIXTURE).unwrap().video_inputs;
+        assert_eq!(inputs.len(), 1);
+        let capture = &inputs[0];
+        assert_eq!(capture.id, "v4l2_input.pci-0000_00_14.0-usb-0_6_1.0");
+        assert_eq!(
+            capture.description.as_deref(),
+            Some("USB Capture HDMI (V4L2)")
+        );
+        assert_eq!(capture.path.as_deref(), Some("/dev/video0"));
+        assert_eq!(
+            capture.card.as_deref(),
+            Some("USB Capture HDMI: USB Capture H")
+        );
+    }
+
+    #[test]
+    fn only_outputs_carry_a_default() {
+        // AudioSource and VideoSource have no `is_default` field at all;
+        // assert that by serialising and checking the key is absent, rather
+        // than by a field access that the compiler would just refuse.
+        let devices = parse_devices(DUMP_FIXTURE).unwrap();
+        let json = serde_json::to_value(&devices).unwrap();
+        let input = &json["audioInputs"][0];
+        assert!(input.get("isDefault").is_none());
+    }
+
+    #[test]
+    fn all_device_lists_are_sorted_for_stable_change_detection() {
+        let devices = parse_devices(DUMP_FIXTURE).unwrap();
+
+        let mut sorted_outputs = devices.audio_outputs.clone();
+        sorted_outputs.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(devices.audio_outputs, sorted_outputs);
+
+        let mut sorted_inputs = devices.audio_inputs.clone();
+        sorted_inputs.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(devices.audio_inputs, sorted_inputs);
+
+        let mut sorted_video = devices.video_inputs.clone();
+        sorted_video.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(devices.video_inputs, sorted_video);
+    }
+
+    #[test]
+    fn empty_dump_yields_no_devices() {
+        let devices = parse_devices(b"[]").unwrap();
+        assert!(devices.audio_outputs.is_empty());
+        assert!(devices.audio_inputs.is_empty());
+        assert!(devices.video_inputs.is_empty());
     }
 
     #[test]
     fn malformed_dump_is_an_error_not_a_panic() {
-        assert!(parse_sinks(b"not json").is_err());
+        assert!(parse_devices(b"not json").is_err());
     }
 }
