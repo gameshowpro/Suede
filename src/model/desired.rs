@@ -168,6 +168,16 @@ pub enum TestPattern {
     /// off the wall is the whole job here, so everything else gets out of
     /// the way.
     Identify,
+    /// An animated frame counter for measuring output-to-output presentation
+    /// sync with a high-speed camera.
+    ///
+    /// Unlike every other pattern here, this one is drawn *per frame* by the
+    /// slicer, through the same present path content uses — so a fast-shutter
+    /// photograph of two projectors showing different numbers is a direct
+    /// measurement of Suede's own presentation path, with no browser in it.
+    /// Needs `allowOverlaps = true` (the slicer): the tiled path's static
+    /// overlays cannot animate and show a placeholder instead.
+    Sync,
 }
 
 impl DesiredState {

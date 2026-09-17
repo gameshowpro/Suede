@@ -28,6 +28,11 @@ pub fn render(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
         Some(TestPattern::Black) => {}
         Some(TestPattern::Gamma) => gamma_chart(&mut rgb, width, height, spec.gamma),
         Some(TestPattern::Identify) => identify(&mut rgb, width, height, &spec.rect, &spec.output),
+        // The animated counter belongs to the slicer, which draws it per
+        // frame from `sync_rects` rather than through this function at all.
+        // Reaching here means the tiled path asked for it — see
+        // `sync_unavailable`.
+        Some(TestPattern::Sync) => sync_unavailable(&mut rgb, width, height),
         None => {}
     }
     rgb
@@ -466,6 +471,391 @@ fn glyph(c: char) -> [&'static str; 7] {
     }
 }
 
+// --- sync counter ---------------------------------------------------------
+
+/// Bit per segment of a seven-segment digit, `A` (the top bar) in bit 0
+/// through `G` (the middle bar) in bit 6 — the ordering `segment_rect`
+/// below and [`DIGIT_SEGMENTS`] both use.
+///
+/// ```text
+///   AAA      bit 0  A  top
+///  F   B     bit 1  B  top right
+///  F   B     bit 2  C  bottom right
+///   GGG      bit 3  D  bottom
+///  E   C     bit 4  E  bottom left
+///  E   C     bit 5  F  top left
+///   DDD      bit 6  G  middle
+/// ```
+const DIGIT_SEGMENTS: [u8; 10] = [
+    0b0111111, // 0: A B C D E F
+    0b0000110, // 1: B C
+    0b1011011, // 2: A B D E G
+    0b1001111, // 3: A B C D G
+    0b1100110, // 4: B C F G
+    0b1101101, // 5: A C D F G
+    0b1111101, // 6: A C D E F G
+    0b0000111, // 7: A B C
+    0b1111111, // 8: all
+    0b1101111, // 9: A B C D F G
+];
+
+/// The most glyphs [`sync_rects`] will draw for a name or an id, so the rect
+/// count has a ceiling the GPU path's fixed-size buffer can be sized against
+/// — see [`MAX_SYNC_RECTS`]. A connector name is never this long; a snapshot
+/// id would need a century of frames to be.
+const SYNC_TEXT_LIMIT: usize = 12;
+
+/// The ceiling [`sync_rects`] guarantees it stays under, whatever the size,
+/// the counter value, the output name or the snapshot id: 14 digit segments,
+/// 16 strip cells of at most four rects each, and two runs of
+/// [`SYNC_TEXT_LIMIT`] glyphs whose 5x7 cells merge into at most three
+/// horizontal runs per row. Rounded up, and asserted by
+/// `sync_rects_stay_under_the_advertised_ceiling`, so `gpu.rs` can allocate
+/// one fixed buffer per output and never grow it.
+pub const MAX_SYNC_RECTS: usize = 14 + 16 * 4 + 2 * SYNC_TEXT_LIMIT * 7 * 3;
+
+/// One filled white rectangle of the sync pattern, in output-local pixels
+/// and half-open: a pixel is lit when `x0 <= x < x1 && y0 <= y < y1`.
+///
+/// `u32` and half-open specifically because this is what the fragment shader
+/// receives verbatim, four `uint`s per rect (see `gpu.rs`'s
+/// `set_sync_shapes`), and because every rect has already been clipped to
+/// the output — a negative coordinate could not survive that, and pretending
+/// one might would only invite an `as` cast at the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncRect {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
+impl SyncRect {
+    /// Whether `(x, y)` is inside — the CPU path's half of what the shader's
+    /// four comparisons do.
+    pub fn contains(&self, x: u32, y: u32) -> bool {
+        x >= self.x0 && x < self.x1 && y >= self.y0 && y < self.y1
+    }
+}
+
+/// Rectangles that belong to one feature of the pattern, with the box that
+/// encloses them.
+///
+/// The grouping exists for the GPU path: a fragment shader that tested every
+/// rect against every pixel would do several hundred comparisons for a
+/// picture that is almost entirely black. Testing the four features'
+/// bounding boxes first means a pixel outside all of them costs four tests,
+/// and a pixel inside one only pays for that feature's own rects. The CPU
+/// path ignores the grouping and walks the rects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncGroup {
+    pub bounds: SyncRect,
+    pub rects: Vec<SyncRect>,
+}
+
+/// The sync pattern's geometry for one output and one frame: everything the
+/// renderers need, as white rectangles on black, and nothing about how they
+/// are drawn.
+///
+/// Pure, and the single source of both renderers' pixels — the CPU path
+/// rasterises this list into an shm buffer and the GPU path uploads it to a
+/// fragment shader — because the measurement this pattern exists for is only
+/// meaningful if switching renderers cannot change what the camera sees.
+///
+/// What is drawn, and why each part is there:
+///
+/// - **Two seven-segment digits of `frame % 100`**, 90 % of the output's
+///   height and centred. Big because the camera is looking at a projected
+///   image from across a room, and seven-segment because segments are
+///   rectangles: the same shapes the shader already tests, with no font
+///   rasterisation on either path to disagree about.
+/// - **A sixteen-bit binary strip of `frame & 0xffff`**, most significant
+///   bit at the top, filled for one and hollow for zero. Two consecutive
+///   frames differ in the low bits whatever the digits are doing, so the
+///   strip still reads when a projector's colour wheel has smeared the
+///   digits across the exposure — and it disambiguates the wrap from 99 to
+///   00.
+/// - **The output's name**, top left, so a photograph of two projectors
+///   needs no notes about which is which.
+/// - **The snapshot id**, bottom left and small, so a frame in a photograph
+///   can be matched to the ten-second `GET /projection/stats` interval that
+///   reported its straddles.
+///
+/// `frame` is the slicer's present-cycle counter; every output in one cycle
+/// is drawn with the same value, so any difference a camera sees is the
+/// presentation path's, not the pattern's.
+pub fn sync_rects(
+    width: u32,
+    height: u32,
+    frame: u32,
+    output: &str,
+    snapshot: u64,
+) -> Vec<SyncGroup> {
+    let (w, h) = (i64::from(width), i64::from(height));
+    if w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+    let inset = (w / 100).max(2);
+
+    // The digits, as large as 90 % of the height allows, narrowed if the
+    // output is too thin to carry that (`11/10` is the block's width as a
+    // multiple of one digit's height: two half-height-wide digits plus a
+    // tenth-height gap).
+    let digit_h = ((h * 9) / 10).min((w * 9 / 10) * 10 / 11).max(1);
+    let digit_w = (digit_h / 2).max(1);
+    let gap = (digit_h / 10).max(1);
+    let block_w = 2 * digit_w + gap;
+    let block_x = (w - block_w) / 2;
+    let block_y = (h - digit_h) / 2;
+    let thickness = (digit_h / 8).max(1);
+
+    let mut groups = Vec::new();
+
+    let value = frame % 100;
+    let mut digits = Vec::new();
+    for (index, digit) in [(value / 10) as usize, (value % 10) as usize]
+        .into_iter()
+        .enumerate()
+    {
+        let x = block_x + index as i64 * (digit_w + gap);
+        let lit = DIGIT_SEGMENTS[digit];
+        for segment in 0..7 {
+            if lit & (1 << segment) == 0 {
+                continue;
+            }
+            let (x0, y0, x1, y1) = segment_rect(segment, x, block_y, digit_w, digit_h, thickness);
+            push_rect(&mut digits, x0, y0, x1, y1, width, height);
+        }
+    }
+    push_group(&mut groups, digits);
+
+    // The binary strip, down the margin to the right of the digits. Squeezed
+    // rather than moved when that margin is narrow: a square output still
+    // gets a readable-from-nearby strip, and clipping keeps it on screen
+    // whatever happens.
+    let pitch = (digit_h / 16).max(2);
+    let margin = (w - (block_x + block_w) - 2 * inset).max(2);
+    let cell = pitch.min(margin).max(1);
+    let strip_x = w - inset - cell;
+    let strip_y = block_y + (digit_h - pitch * 16) / 2;
+    let border = (cell / 5).max(1);
+    let mut strip = Vec::new();
+    for bit in 0..16i64 {
+        // Most significant bit at the top, so the strip reads the way the
+        // number is written.
+        let set = (frame >> (15 - bit as u32)) & 1 == 1;
+        let (x0, y0) = (strip_x, strip_y + bit * pitch);
+        let (x1, y1) = (x0 + cell, y0 + cell);
+        if set {
+            push_rect(&mut strip, x0, y0, x1, y1, width, height);
+        } else {
+            // Hollow, as four thin bars: a shader that only knows how to
+            // test filled rectangles can still draw an outline.
+            push_rect(&mut strip, x0, y0, x1, y0 + border, width, height);
+            push_rect(&mut strip, x0, y1 - border, x1, y1, width, height);
+            push_rect(
+                &mut strip,
+                x0,
+                y0 + border,
+                x0 + border,
+                y1 - border,
+                width,
+                height,
+            );
+            push_rect(
+                &mut strip,
+                x1 - border,
+                y0 + border,
+                x1,
+                y1 - border,
+                width,
+                height,
+            );
+        }
+    }
+    push_group(&mut groups, strip);
+
+    // The output name, top left, as large as the margin beside the digits
+    // will carry — so it never runs into the counter it labels.
+    let name: String = output
+        .to_ascii_uppercase()
+        .chars()
+        .take(SYNC_TEXT_LIMIT)
+        .collect();
+    if !name.is_empty() {
+        // Two places it could go, and the bigger wins: beside the digits in
+        // the left margin (which is where the room is on a wide output), or
+        // above them in the top margin (which is where it is on a tall one).
+        // Both start at the same corner, so this is a choice of constraint
+        // rather than of position.
+        let cell = 6 * name.len() as i64;
+        let beside = ((h / 16) / 7).min(((block_x - 2 * inset).max(1)) / cell);
+        let above =
+            ((h / 16).min((block_y - 2 * inset).max(1)) / 7).min((w - 2 * inset).max(1) / cell);
+        let scale = beside.max(above).max(1);
+        let mut rects = Vec::new();
+        text_rects(&name, inset, inset, scale, width, height, &mut rects);
+        push_group(&mut groups, rects);
+    }
+
+    // The snapshot id, bottom left and deliberately small: it is read off a
+    // photograph afterwards, never from the room.
+    let label: String = format!("S{snapshot}")
+        .chars()
+        .take(SYNC_TEXT_LIMIT)
+        .collect();
+    let small = (h / 200).max(1);
+    let mut id = Vec::new();
+    text_rects(
+        &label,
+        inset,
+        h - inset - 7 * small,
+        small,
+        width,
+        height,
+        &mut id,
+    );
+    push_group(&mut groups, id);
+
+    groups
+}
+
+/// One seven-segment bar as a rectangle, `segment` indexed as
+/// [`DIGIT_SEGMENTS`] documents.
+fn segment_rect(segment: u32, x: i64, y: i64, w: i64, h: i64, t: i64) -> (i64, i64, i64, i64) {
+    // The middle bar straddles the digit's centre line, which is what makes
+    // the two halves the same height.
+    let mid0 = y + h / 2 - t / 2;
+    let mid1 = mid0 + t;
+    match segment {
+        0 => (x + t, y, x + w - t, y + t),         // A, top
+        1 => (x + w - t, y + t, x + w, mid0),      // B, top right
+        2 => (x + w - t, mid1, x + w, y + h - t),  // C, bottom right
+        3 => (x + t, y + h - t, x + w - t, y + h), // D, bottom
+        4 => (x, mid1, x + t, y + h - t),          // E, bottom left
+        5 => (x, y + t, x + t, mid0),              // F, top left
+        _ => (x + t, mid0, x + w - t, mid1),       // G, middle
+    }
+}
+
+/// Clip a rectangle to the output and keep it if anything is left. Every
+/// rect [`sync_rects`] returns goes through here, which is what lets
+/// [`SyncRect`] be unsigned and lets both renderers index without bounds
+/// checks of their own.
+fn push_rect(out: &mut Vec<SyncRect>, x0: i64, y0: i64, x1: i64, y1: i64, width: u32, height: u32) {
+    let x0 = x0.clamp(0, i64::from(width));
+    let y0 = y0.clamp(0, i64::from(height));
+    let x1 = x1.clamp(0, i64::from(width));
+    let y1 = y1.clamp(0, i64::from(height));
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    out.push(SyncRect {
+        x0: x0 as u32,
+        y0: y0 as u32,
+        x1: x1 as u32,
+        y1: y1 as u32,
+    });
+}
+
+/// Turn a feature's rectangles into a [`SyncGroup`] with the box enclosing
+/// them. A feature that clipped away entirely contributes no group at all,
+/// so the shader never walks an empty one.
+fn push_group(groups: &mut Vec<SyncGroup>, rects: Vec<SyncRect>) {
+    let Some(first) = rects.first().copied() else {
+        return;
+    };
+    let mut bounds = first;
+    for rect in &rects[1..] {
+        bounds.x0 = bounds.x0.min(rect.x0);
+        bounds.y0 = bounds.y0.min(rect.y0);
+        bounds.x1 = bounds.x1.max(rect.x1);
+        bounds.y1 = bounds.y1.max(rect.y1);
+    }
+    groups.push(SyncGroup { bounds, rects });
+}
+
+/// `message` in the 5x7 font of [`glyph`], as rectangles rather than pixels:
+/// each row of each glyph becomes one rect per *run* of lit cells, so an `E`
+/// costs seven rects instead of twenty-three set pixels. The merge is what
+/// keeps a twelve-character line inside [`MAX_SYNC_RECTS`].
+fn text_rects(
+    message: &str,
+    x: i64,
+    y: i64,
+    scale: i64,
+    width: u32,
+    height: u32,
+    out: &mut Vec<SyncRect>,
+) {
+    let mut pen = x;
+    for c in message.chars() {
+        let rows = glyph(c.to_ascii_uppercase());
+        for (row_index, row) in rows.iter().enumerate() {
+            let mut run: Option<usize> = None;
+            // The trailing space closes a run that reaches the last column.
+            for (column, cell) in row.chars().chain(std::iter::once(' ')).enumerate() {
+                if cell == '#' {
+                    run.get_or_insert(column);
+                } else if let Some(start) = run.take() {
+                    let y0 = y + row_index as i64 * scale;
+                    push_rect(
+                        out,
+                        pen + start as i64 * scale,
+                        y0,
+                        pen + column as i64 * scale,
+                        y0 + scale,
+                        width,
+                        height,
+                    );
+                }
+            }
+        }
+        pen += 6 * scale;
+    }
+}
+
+/// The tiled path's stand-in for [`TestPattern::Sync`].
+///
+/// `suede blend` overlays are painted once per configure and never again
+/// (see the `overlay` module), so a counter drawn here would
+/// freeze on whatever number it started at — which looks exactly like two
+/// projectors locked in step, the one answer this pattern must never give
+/// by accident. It shows two dashes and says what to change instead.
+fn sync_unavailable(rgb: &mut [u8], width: u32, height: u32) {
+    let (w, h) = (i64::from(width), i64::from(height));
+    let digit_h = ((h * 9) / 10).min((w * 9 / 10) * 10 / 11).max(1);
+    let digit_w = (digit_h / 2).max(1);
+    let gap = (digit_h / 10).max(1);
+    let block_x = (w - (2 * digit_w + gap)) / 2;
+    let block_y = (h - digit_h) / 2;
+    let thickness = (digit_h / 8).max(1);
+    let mut dashes = Vec::new();
+    for index in 0..2 {
+        let (x0, y0, x1, y1) = segment_rect(
+            6,
+            block_x + index * (digit_w + gap),
+            block_y,
+            digit_w,
+            digit_h,
+            thickness,
+        );
+        push_rect(&mut dashes, x0, y0, x1, y1, width, height);
+    }
+    for rect in &dashes {
+        for y in rect.y0..rect.y1 {
+            for x in rect.x0..rect.x1 {
+                put(rgb, width, x as i32, y as i32, [255, 255, 255]);
+            }
+        }
+    }
+    let message = "SYNC NEEDS THE SLICER";
+    let scale = ((width as i32 * 4 / 5) / (6 * message.len() as i32)).max(1);
+    let text_x = (width as i32 - text_width(message, scale)) / 2;
+    let text_y = (block_y + digit_h * 3 / 4) as i32;
+    text(rgb, width, height, text_x, text_y, scale, message);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -763,6 +1153,266 @@ mod tests {
             let mut out = format!("P6 {w} {h} 255 ").into_bytes();
             out.extend_from_slice(&rgb);
             let file = format!("{dir}-{pattern:?}-{name}.ppm").to_lowercase();
+            std::fs::write(&file, out).unwrap();
+            eprintln!("wrote {file}");
+        }
+    }
+
+    // --- sync counter -----------------------------------------------------
+
+    /// Where the ones digit of a `1920x1080` sync frame sits, worked out here
+    /// from the same rules `sync_rects` documents rather than read back out
+    /// of it — so a change to the layout has to be a deliberate one.
+    fn ones_digit_box(width: u32, height: u32) -> (i64, i64, i64, i64, i64) {
+        let (w, h) = (i64::from(width), i64::from(height));
+        let digit_h = ((h * 9) / 10).min((w * 9 / 10) * 10 / 11).max(1);
+        let digit_w = (digit_h / 2).max(1);
+        let gap = (digit_h / 10).max(1);
+        let block_x = (w - (2 * digit_w + gap)) / 2;
+        let block_y = (h - digit_h) / 2;
+        let thickness = (digit_h / 8).max(1);
+        (
+            block_x + digit_w + gap,
+            block_y,
+            digit_w,
+            digit_h,
+            thickness,
+        )
+    }
+
+    fn lit(groups: &[SyncGroup], x: i64, y: i64) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        groups
+            .iter()
+            .any(|group| group.rects.iter().any(|r| r.contains(x as u32, y as u32)))
+    }
+
+    #[test]
+    fn every_digit_lights_exactly_the_seven_segment_set_it_should() {
+        // The classic truth table, written out here independently of
+        // `DIGIT_SEGMENTS` and in reading order A..G, so this test is a
+        // check on that constant and not a copy of it.
+        let expected: [&str; 10] = [
+            "ABCDEF",  // 0
+            "BC",      // 1
+            "ABDEG",   // 2
+            "ABCDG",   // 3
+            "BCFG",    // 4
+            "ACDFG",   // 5
+            "ACDEFG",  // 6
+            "ABC",     // 7
+            "ABCDEFG", // 8
+            "ABCDFG",  // 9
+        ];
+        let (width, height) = (1920u32, 1080u32);
+        let (x, y, w, h, t) = ones_digit_box(width, height);
+        // One point per segment, at the middle of where that bar must lie.
+        let probes = [
+            ('A', x + w / 2, y + t / 2),
+            ('B', x + w - t / 2, y + h / 4),
+            ('C', x + w - t / 2, y + 3 * h / 4),
+            ('D', x + w / 2, y + h - t / 2),
+            ('E', x + t / 2, y + 3 * h / 4),
+            ('F', x + t / 2, y + h / 4),
+            ('G', x + w / 2, y + h / 2),
+        ];
+        for (digit, set) in expected.iter().enumerate() {
+            let groups = sync_rects(width, height, digit as u32, "DP-1", 0);
+            for (segment, px, py) in probes {
+                assert_eq!(
+                    lit(&groups, px, py),
+                    set.contains(segment),
+                    "digit {digit}, segment {segment} at ({px},{py})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_binary_strip_reads_most_significant_bit_first() {
+        let (width, height) = (1920u32, 1080u32);
+        // Alternating bits, so a reversed strip fails as loudly as a
+        // rotated one, plus a value whose top bit is set.
+        for frame in [0xaaaau32, 0x5555, 0x8001, 0x0000, 0xffff] {
+            let groups = sync_rects(width, height, frame, "DP-1", 0);
+            let (w, h) = (i64::from(width), i64::from(height));
+            let inset = (w / 100).max(2);
+            let digit_h = ((h * 9) / 10).min((w * 9 / 10) * 10 / 11).max(1);
+            let digit_w = (digit_h / 2).max(1);
+            let gap = (digit_h / 10).max(1);
+            let block_x = (w - (2 * digit_w + gap)) / 2;
+            let block_y = (h - digit_h) / 2;
+            let pitch = (digit_h / 16).max(2);
+            let margin = (w - (block_x + 2 * digit_w + gap) - 2 * inset).max(2);
+            let cell = pitch.min(margin).max(1);
+            let strip_x = w - inset - cell;
+            let strip_y = block_y + (digit_h - pitch * 16) / 2;
+            for bit in 0..16i64 {
+                // The centre of a cell is lit for a one and hollow for a
+                // zero — the one sample that tells filled from outlined.
+                let centre = (strip_x + cell / 2, strip_y + bit * pitch + cell / 2);
+                let set = (frame >> (15 - bit as u32)) & 1 == 1;
+                assert_eq!(
+                    lit(&groups, centre.0, centre.1),
+                    set,
+                    "frame {frame:#06x}, strip row {bit}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_counter_wraps_at_a_hundred_and_ignores_the_high_bits() {
+        // 42 and 142 must be the same two digits, and differ only in the
+        // strip — which is exactly what makes the strip worth drawing.
+        let a = sync_rects(1920, 1080, 42, "DP-1", 7);
+        let b = sync_rects(1920, 1080, 142, "DP-1", 7);
+        assert_eq!(a[0], b[0], "the digits");
+        assert_ne!(a[1], b[1], "the strip");
+    }
+
+    #[test]
+    fn the_same_arguments_always_produce_the_same_rectangles() {
+        let once = sync_rects(1920, 1080, 37, "HDMI-A-1", 1234);
+        let twice = sync_rects(1920, 1080, 37, "HDMI-A-1", 1234);
+        assert_eq!(once, twice);
+        // And the output name is the only thing that varies between two
+        // presenters in the same cycle: the counter itself must not.
+        let other = sync_rects(1920, 1080, 37, "DP-2", 1234);
+        assert_eq!(once[0], other[0], "the digits");
+        assert_eq!(once[1], other[1], "the strip");
+    }
+
+    #[test]
+    fn every_rectangle_lies_inside_the_output() {
+        // Including sizes far outside anything a projector does, because
+        // the renderers index their buffers with these numbers unchecked.
+        for &(width, height) in &[
+            (1920u32, 1080u32),
+            (1280, 720),
+            (3840, 2160),
+            (1080, 1920),
+            (64, 64),
+            (17, 9),
+            (1, 1),
+        ] {
+            for frame in [0u32, 1, 99, 100, 65535, u32::MAX] {
+                for output in ["DP-1", "", "A-VERY-LONG-CONNECTOR-NAME"] {
+                    let groups = sync_rects(width, height, frame, output, u64::MAX);
+                    for group in &groups {
+                        assert!(!group.rects.is_empty(), "{width}x{height}: empty group");
+                        for rect in &group.rects {
+                            assert!(rect.x0 < rect.x1 && rect.y0 < rect.y1, "{rect:?}");
+                            assert!(
+                                rect.x1 <= width && rect.y1 <= height,
+                                "{rect:?} escapes {width}x{height}"
+                            );
+                            assert!(
+                                rect.x0 >= group.bounds.x0
+                                    && rect.y0 >= group.bounds.y0
+                                    && rect.x1 <= group.bounds.x1
+                                    && rect.y1 <= group.bounds.y1,
+                                "{rect:?} escapes its group bounds {:?}",
+                                group.bounds
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sync_rects_stay_under_the_advertised_ceiling() {
+        // `gpu.rs` allocates one fixed buffer per output from
+        // `MAX_SYNC_RECTS`, so this is the constant's only guarantee.
+        let mut worst = 0usize;
+        for &(width, height) in &[(1920u32, 1080u32), (3840, 2160), (1280, 800)] {
+            for frame in [0u32, 0x8888, 0xaaaa, u32::MAX, 88] {
+                // `M` and `W` are the font's busiest glyphs — three runs in
+                // a five-cell row — so a name of them is the worst case.
+                for output in ["MWMWMWMWMWMWMWMW", "DP-1"] {
+                    let count: usize = sync_rects(width, height, frame, output, u64::MAX)
+                        .iter()
+                        .map(|group| group.rects.len())
+                        .sum();
+                    worst = worst.max(count);
+                    assert!(
+                        count <= MAX_SYNC_RECTS,
+                        "{count} rects at {width}x{height} exceeds {MAX_SYNC_RECTS}"
+                    );
+                }
+            }
+        }
+        assert!(
+            worst > 100,
+            "the sweep never got near the ceiling ({worst})"
+        );
+    }
+
+    #[test]
+    fn the_tiled_fallback_says_so_instead_of_freezing_a_counter() {
+        let rgb = render(
+            1920,
+            1080,
+            &spec(
+                TestPattern::Sync,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+            ),
+        );
+        // The middle bar of the left dash is lit...
+        let (x, y, w, h, t) = ones_digit_box(1920, 1080);
+        let gap = (h / 10).max(1);
+        let left = x - w - gap;
+        assert_eq!(
+            pixel(&rgb, 1920, (left + w / 2) as i32, (y + h / 2) as i32),
+            [255, 255, 255]
+        );
+        // ...and the top bar, which every digit except 1 and 4 would light,
+        // is not: this is a dash, not a frozen number.
+        assert_eq!(
+            pixel(&rgb, 1920, (left + w / 2) as i32, (y + t / 2) as i32),
+            [0, 0, 0]
+        );
+    }
+
+    /// Not a test: the sync counter's frames as PPMs, for the same reason
+    /// `write_patterns` exists — the layout is a picture, and whether the
+    /// name runs into the digits is not something an assertion sees.
+    ///
+    ///     SUEDE_WRITE_PATTERN=/tmp/p cargo test -- --ignored write_sync_frames
+    #[test]
+    #[ignore]
+    fn write_sync_frames() {
+        let Ok(dir) = std::env::var("SUEDE_WRITE_PATTERN") else {
+            return;
+        };
+        for (name, w, h, frame) in [
+            ("DP-1", 1920u32, 1080u32, 42u32),
+            ("HDMI-A-1", 1920, 1080, 7),
+            ("DP-2", 1280, 800, 99),
+            ("DP-3", 1080, 1920, 3),
+        ] {
+            let mut rgb = vec![0u8; w as usize * h as usize * 3];
+            for group in sync_rects(w, h, frame, name, 123_456) {
+                for rect in group.rects {
+                    for y in rect.y0..rect.y1 {
+                        for x in rect.x0..rect.x1 {
+                            put(&mut rgb, w, x as i32, y as i32, [255, 255, 255]);
+                        }
+                    }
+                }
+            }
+            let mut out = format!("P6 {w} {h} 255 ").into_bytes();
+            out.extend_from_slice(&rgb);
+            let file = format!("{dir}-sync-{name}-{frame}.ppm").to_lowercase();
             std::fs::write(&file, out).unwrap();
             eprintln!("wrote {file}");
         }

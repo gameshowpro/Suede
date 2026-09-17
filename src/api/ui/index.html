@@ -279,6 +279,7 @@ window.addEventListener("error", (event) => {
             <option value="black">Black — tune the black-level lift</option>
             <option value="gamma">Gamma — measure the projector gamma</option>
             <option value="identify">Identify — name each output, for sorting cables</option>
+            <option value="sync">Sync — animated frame counter, for a high-speed camera</option>
           </select>
         </div>
         <p class="hint">Shown immediately on every display in the layout;
@@ -396,13 +397,20 @@ window.addEventListener("error", (event) => {
           content is drawing.</p>
         <table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table>
         <table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
-          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th>
+          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
         <p class="hint" id="pj-timing-hint">Measured by the slicer over each
           10 s interval from the compositor's presentation timestamps.
           Offset is how far apart the displays showed the same frame; a
-          straddle is a frame they showed on different refreshes. Healthy: a
-          steady offset of a few milliseconds and no straddles.</p>
+          straddle is a frame they showed on different refreshes. A gate
+          hold is a commit the wall delayed past a canvas period waiting for
+          an output to report presenting the previous frame — the others
+          repeated a frame rather than move on without it. Lag is a
+          per-output histogram (zero/one/two/three-or-more) of how many whole
+          refreshes behind the earliest output this one presented — read it
+          against a photograph to tell a presentation-path slip from the
+          display's own processing latency. Healthy: a steady offset of a few
+          milliseconds and no straddles.</p>
       </div>
     </div>
   </section>
@@ -1965,6 +1973,9 @@ function renderProjectionTiming() {
     ["Offset between displays", offset +
       (s.presentationFeedback ? "" : " (no presentation feedback from the compositor)")],
     ["Straddles", flagged(s.straddles)],
+    // Not styled as a fault: a hold is the gate doing its job, at the cost
+    // of one repeated frame. Worth seeing, not worth alarming about.
+    ["Gate holds", String(s.gateHolds)],
     ["Superseded frames", flagged(s.framesSuperseded)],
     ["Stalls", flagged(s.stalls)],
     ["Per frame", `waiting ${num(s.perFrameMs.waiting)} ms · ` +
@@ -1984,11 +1995,18 @@ function renderProjectionTiming() {
   // see OutputTiming.phaseMs/phaseSpreadMs on the daemon side.
   const phaseCell = (o) => o.phaseMs == null ? "—" :
     `${o.phaseMs > 0 ? "+" : ""}${num(o.phaseMs)} ms ± ${num(o.phaseSpreadMs / 2)}`;
+  // Compact zero/one/two/more histogram — see OutputTiming.lagFrames on the
+  // daemon side. "—" when nothing has presented at all this interval.
+  const lagCell = (lag) => {
+    const total = lag.zero + lag.one + lag.two + lag.more;
+    return total === 0 ? "—" : `${lag.zero}·${lag.one}·${lag.two}·${lag.more}`;
+  };
   $("pj-timing-outputs").innerHTML = s.outputs.map((o) =>
     `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
     `<td>${o.discarded}</td><td class="mono">${o.zeroCopyPresented}/${o.presented}</td>` +
     `<td class="mono">${trimHz(o.refreshHz)}</td>` +
-    `<td class="mono">${phaseCell(o)}</td></tr>`).join("");
+    `<td class="mono">${phaseCell(o)}</td>` +
+    `<td class="mono">${lagCell(o.lagFrames)}</td></tr>`).join("");
 }
 
 for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-renderer", "tp-pattern"]) {

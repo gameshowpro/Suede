@@ -284,11 +284,15 @@ Start sway with direct scanout disabled:
 WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 sway
 ```
 
-`provision.sh` sets this for you. The `direct-scanout` health check warns
-whenever an application is spanning a tiled layout while the running
-compositor was started without it, and its fix writes a systemd drop-in on
-the compositor's unit — you restart the compositor yourself, since that tears
-down every window:
+The login profile `provision.sh` writes does this for you: it derives the
+variable from `allow_overlaps` and `direct_scanout` in `suede.toml` at every
+login, so on a default appliance it is always exported. The `direct-scanout`
+health check warns whenever an application is spanning a tiled layout while
+the running compositor was started without it. Its fix writes a systemd
+drop-in on the compositor's unit — you restart the compositor yourself, since
+that tears down every window — and where sway has no unit, because the login
+profile started it, the fix says so and asks you to restart the session
+instead:
 
 ```bash
 curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,json;print([c for c in json.load(sys.stdin) if c["id"]=="direct-scanout"])'
@@ -310,6 +314,13 @@ each window covers one display, so the buffer and the output match.
     drop-in. A machine showing this symptom while `allow_overlaps` is true is
     telling you something else is wrong: check that the slicer is running at
     all (`GET /api/v1/projection/stats`).
+
+    The one exception is
+    [`direct_scanout = false`](configuration.md#direct-scanout), which asks
+    for the composited arm of the comparison on that same sliced layout: the
+    variable is expected again, and the check and its fix invert back. Since
+    no client spans the physical outputs either way, that costs frame rate,
+    never correctness.
 
 ## A page freezes but the browser keeps running
 

@@ -7,7 +7,7 @@ There are two kinds of configuration, and the split is a hard rule:
 
 ## Bootstrap configuration
 
-Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps` can be overridden by an environment variable, which wins. A missing file means all defaults.
+Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps` and `direct_scanout` can be overridden by an environment variable, which wins — those two describe how the compositor was started, which a variable on Suede's own process cannot change. A missing file means all defaults.
 
 ```toml
 --8<-- "examples/suede.toml"
@@ -22,6 +22,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `power` | `SUEDE_POWER` | `[]` (none) | Host power operations this appliance may perform — see [Host power control](#host-power) |
 | `allowed_programs` | `SUEDE_ALLOWED_PROGRAMS` | the browsers Suede knows how to drive | Programs applications may launch — see [Allowed programs](#allowed-programs) |
 | `allow_overlaps` | — | `false` | Whether outputs may overlap in canvas space, and so which display path this machine runs — see [Overlapping layouts and direct scanout](#direct-scanout) |
+| `direct_scanout` | — | `true` | Whether the compositor may flip the slicer's buffers straight to the display controllers; only meaningful with `allow_overlaps = true` — see [Overlapping layouts and direct scanout](#direct-scanout) |
 
 ### Host power control {: #host-power }
 
@@ -120,11 +121,12 @@ restart timer, which could never do anything but fail again.
 
 ### Overlapping layouts and direct scanout {: #direct-scanout }
 
-An appliance runs one of two display paths, and this key is where it says
-which. It is a fact about how the machine's compositor was started, which is
-why it lives in the bootstrap file and has no environment override: a client
-writing it through the API would only be claiming an environment that is
-already fixed.
+An appliance runs one of two display paths, and `allow_overlaps` is where it
+says which; `direct_scanout` then decides, within the second path, whether the
+compositor flips the slicer's buffers or composites them. Both are facts about
+how the machine's compositor was started, which is why they live in the
+bootstrap file and have no environment override: a client writing them through
+the API would only be claiming an environment that is already fixed.
 
 === "`allow_overlaps = false` (default)"
 
@@ -146,6 +148,11 @@ already fixed.
     and every screen shows the same part of it. `provision.sh` exports it,
     and the `direct-scanout` health check warns when it is missing.
 
+    `direct_scanout` means nothing here, and writing `direct_scanout = true`
+    beside it is refused at startup, naming both keys: it asks for exactly
+    the arrangement that mirrors. Leaving the key out is not an error — its
+    default is `true`, and a default cannot be a request.
+
 === "`allow_overlaps = true`"
 
     Every layout of two or more outputs goes through the slicer, overlapping
@@ -156,19 +163,60 @@ already fixed.
     a display path a driver cannot mirror by mistake; `projection.blend`
     still governs the ramps wherever the layout does overlap.
 
-    Here the compositor must run **without**
-    `WLR_SCENE_DISABLE_DIRECT_SCANOUT`: no client ever spans the physical
-    outputs, so the mirroring bug cannot happen, and the variable costs a
-    full-screen compositor pass per output per frame for nothing. The
-    `direct-scanout` check inverts to match — it warns while the variable is
-    set, and its fix removes the drop-in that sets it. Neither fix ever
-    restarts sway: that would tear down every window on every display.
+    With `direct_scanout` at its default `true`, the compositor must run
+    **without** `WLR_SCENE_DISABLE_DIRECT_SCANOUT`: no client ever spans the
+    physical outputs, so the mirroring bug cannot happen, and the variable
+    costs a full-screen compositor pass per output per frame for nothing.
+    The `direct-scanout` check inverts to match — it warns while the variable
+    is set, and its fix removes the drop-in that sets it.
 
-A single-output layout is never sliced in either mode.
+=== "`allow_overlaps = true`, `direct_scanout = false`"
 
-`provision.sh --allow-overlaps` provisions the second path whole: it starts
-sway without the variable and writes `allow_overlaps = true` into the user's
-`suede.toml`. The two halves must agree, which is why one flag writes both.
+    The same sliced layout, deliberately composited instead of flipped: the
+    compositor must run **with** `WLR_SCENE_DISABLE_DIRECT_SCANOUT` again,
+    and the check and its fix invert once more — the fix writes the drop-in
+    rather than removing it.
+
+    This is the comparison arm, not a lesser mode. Direct scanout removes one
+    full-screen compositor pass per output per frame, but it also changes how
+    long the compositor holds each buffer and when the flip happens, and on
+    one machine it cost more compositor CPU than it saved. The key exists so
+    that is measurable on the machine in front of you rather than argued
+    about.
+
+A single-output layout is never sliced in any of the three.
+
+No fix ever restarts sway: that would tear down every window on every display.
+And on an appliance provisioned by `provision.sh` there is usually no unit to
+write a drop-in on at all — sway is started by the login profile on tty1, and
+that profile block derives `WLR_SCENE_DISABLE_DIRECT_SCANOUT` from these two
+keys every time it runs. There, restarting the session *is* the fix.
+
+`provision.sh --allow-overlaps` writes `allow_overlaps = true` into the user's
+`suede.toml`, and `--no-direct-scanout` writes `direct_scanout = false` beside
+it. Neither exports anything itself; the profile block reads the file.
+
+#### Comparing the two {: #scanout-ab }
+
+With `allow_overlaps = true`, flipping `direct_scanout` and restarting sway
+switches between a flipped and a composited wall while nothing else about the
+machine changes. Show the `sync` test pattern (see
+[Test patterns](#projection-test-patterns)) so the measurement is of the
+presentation path alone, let it settle, then read `GET /projection/stats`
+under each arm and compare:
+
+| What to read | Scanned out | Composited |
+|---|---|---|
+| `zeroCopyPresented` vs `presented`, per output | every frame, or the buffers are not being flipped at all | zero, always |
+| `straddles` | outputs showing one frame on different refreshes | same — a difference here is the flip's timing, not the blend |
+| `lagFrames`, per output | which display is behind, and by how many whole frames | same, and a lag that survives both arms is the display, not Suede |
+| compositor CPU (`ps -o %cpu` on sway) | one full-screen pass per output per frame less — in principle | the baseline to beat |
+
+A `zeroCopyPresented` of zero while `direct_scanout` is true means the
+compositor refused to flip: the buffer is the wrong size or format for the
+display controller, the output is scaled, or the variable is still set
+somewhere. Check the `direct-scanout` health check first — it compares the
+running compositor against these keys and says which way they disagree.
 
 ## Desired state
 
@@ -515,12 +563,14 @@ entirely yours.
     on the compositor. Without it, some drivers show the same part of the
     window on every display instead of spanning — see
     [troubleshooting](troubleshooting.md#a-spanned-window-mirrors-instead-of-spanning).
-    `provision.sh` sets it, and the `direct-scanout` health check warns if it
-    is missing.
+    The login profile `provision.sh` writes exports it — it derives the
+    variable from these keys at every login — and the `direct-scanout` health
+    check warns if it is missing.
 
     With `allow_overlaps = true` the rule is exactly inverted: no client spans
     the physical outputs, each display scans out its own slice, and the
-    variable must *not* be set. See
+    variable must *not* be set — unless `direct_scanout = false` asks for the
+    composited arm of the comparison, which inverts it once more. See
     [Overlapping layouts and direct scanout](#direct-scanout).
 
 !!! tip "Give the outputs matching heights"
@@ -905,7 +955,9 @@ this: sway tiles it directly, at zero cost. On an overlapping one there is
 no second path, so every layout of two or more outputs is sliced — the
 same capture, the same presenters, simply with no intersections, so no
 ramps. That is not free, and it is not meant to be: it buys each display a
-private, output-sized buffer the display controller can flip on its own.
+private, output-sized buffer the display controller can flip on its own —
+which it will, unless [`direct_scanout = false`](#direct-scanout) asks sway
+to composite the slices instead.
 
 ```json
 "projection": { "blend": true, "gamma": 2.2, "blackLift": 0.04 }
@@ -916,7 +968,7 @@ private, output-sized buffer the display controller can flip on its own.
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
-| `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify` - or null for content |
+| `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](#refresh-rates) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](#renderer) |
 
@@ -975,15 +1027,34 @@ running above the display controller can close that gap — it is inherent to
 any computer driving more than one display, not a bug in this one.
 
 What the slicer does about it: it commits a frame to every output together,
-and does not commit the next one until every output has reported taking the
-previous frame (a `wl_surface.frame` callback), so a commit can never land
-between one output finishing its render and another starting. The canvas
-keeps rendering on its own clock regardless; whatever is newest when the
-gate opens is what gets shown, dropped or repeated identically on every
-output when the two clocks beat against each other. An output that stops
-answering frame callbacks for 300 ms is dropped from the gate, so a display
-that has gone to sleep cannot freeze the rest of the wall — and it counts as
-a stall.
+and does not commit the next one until every output has reported that the
+previous frame reached the glass — the compositor's own `wp_presentation`
+feedback, which is the page flip itself. Anchoring to the flip is what makes
+the timing work: every commit then goes out just after a vblank, as far from
+the next deadline as a commit can be, so each frame has a whole refresh
+period in which to be rendered and flipped rather than a sliver of one. A
+head whose flip does land a refresh late holds the gate for that refresh and
+the other outputs repeat a frame — which is the trade on purpose, a repeat
+on every display being better than a mismatch between them. The canvas keeps
+rendering on its own clock regardless; whatever is newest when the gate opens
+is what gets shown, dropped or repeated identically on every output when the
+two clocks beat against each other. An output that reports nothing for 300 ms
+is dropped from the gate, so a display that has gone to sleep cannot freeze
+the rest of the wall — and it counts as a stall.
+
+The gate used to wait on `wl_surface.frame` callbacks instead, and that was
+not enough. wlroots sends a frame callback when it *commits* an output's
+frame, before the flip lands, so a head whose flip misses the driver's
+deadline and lands a vblank late answers on time and the gate opens anyway.
+Measured on a three-projector NVIDIA rig with the `sync` test pattern: every
+output presented every frame at 60 Hz — 600 presented apiece, no discards,
+no stalls — while `wp_presentation` reported the outputs a full refresh
+period apart, steadily, for 30 to 60 seconds at a stretch, on both the
+composited and the direct-scanout path. Every output taking every frame while
+one of them is a whole frame behind is the signature of a gate watching the
+wrong event. Where a compositor offers no `wp_presentation` at all the slicer
+still falls back to frame callbacks, since pacing on the earlier signal beats
+not pacing.
 
 `freeRun` turns the gate off: each output takes the newest available frame
 the moment it is ready, independently of the others. It exists for
@@ -998,7 +1069,7 @@ would starve it.
 Measuring it: `GET /projection/stats` (and the `projection_stats_changed`
 event) report the inter-output presentation offset (mean/max milliseconds,
 read from `wp_presentation`), straddles (frames the outputs showed on
-different refreshes), superseded frames, stalls, and per-output
+different refreshes), gate holds, superseded frames, stalls, and per-output
 presented/discarded counts, zero-copy presented count, and measured refresh,
 alongside the canvas and presented frame rates and the per-frame cost
 breakdown. The web UI shows all of this in the Projection panel. A non-zero
@@ -1006,12 +1077,27 @@ breakdown. The web UI shows all of this in the Projection panel. A non-zero
 straight out to the display controller for at least one frame this interval,
 with no compositing pass in between. A steady offset of a few milliseconds with
 zero straddles is what a healthy wall looks like; straddles that rise over
-time mean commits are landing between two outputs' renders. Each output's
+time mean commits are landing between two outputs' renders. `gateHolds`
+counts the commit cycles the wall delayed past a canvas period waiting for an
+output that had not yet reported presenting the previous frame: zero on a
+healthy wall, where every output's feedback is back well before the next
+frame is due, and a rising count when one head's flips are landing a refresh
+later than the rest. It is the price of staying together, not a fault —
+each hold is one frame repeated identically on every output — so read it
+beside `straddles`, which is what the holds are buying. Each output's
 `phaseMs` is its vblank phase relative to the first output, circular-mean'd
 over the interval: a value that stays put from one report to the next means
 the two heads are locked at a fixed offset (a synchronised mode-set could
 align them), while one that wanders means independent clocks that only
-hardware sync can fix.
+hardware sync can fix. Each output's `lagFrames` is a histogram
+(`zero`/`one`/`two`/`more`) of how many whole refresh periods behind the
+earliest presenting output that output landed, per snapshot with at least two
+presenters — built purely from `wp_presentation` timestamps, i.e. the flip,
+so a display's own processing latency after the flip is invisible to it. Read
+it against a photograph: a camera showing an output visibly behind while its
+`lagFrames` reads all-zero means the lag lives in the display, not the
+presentation path; non-zero `one`/`two`/`more` counts on that output mean the
+presentation path itself is delivering it a stale frame.
 
 The `output-phase` health check reads exactly that field and warns when any
 output is more than 1.0 ms from the first. It was written from a
@@ -1169,9 +1255,23 @@ right tool for checking a rig before committing to a layout.
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |
+| `sync` | Measuring output-to-output presentation sync with a camera. Every output shows the *same* two-digit counter, drawn by the blending component itself and advanced once per present cycle, with a 16-bit binary strip of the same counter beside it, the output's name top left and the stats snapshot id bottom left. Photograph two or more outputs in one exposure at **1/1000 s or faster**; on DLP projectors take **two consecutive frames**, because the colour wheel can leave a single exposure showing part of two refreshes. Report, per output, the number showing — or "two numbers visible" when an output straddles a refresh. Needs `allowOverlaps = true`. |
 
 The gamma chart assumes the output runs at scale 1 (its stripes are
 single-pixel rows); the other patterns have no such constraint.
+
+`sync` is the only animated pattern, and the only one that needs the
+blending component's slicer: it is drawn per frame through exactly the path
+content takes, which is what makes a photograph of it a measurement of that
+path rather than of a browser. On an appliance with `allowOverlaps = false`
+sway tiles the layout directly and the per-output overlays are painted once,
+so there is nothing to animate — those outputs show `--` and the words
+`sync needs the slicer` instead of a counter frozen at one number, which
+would read as perfect sync. Read the photograph against `straddles` and
+`zeroCopyPresented` in `GET /api/v1/projection/stats` for the same interval:
+matching digits with `straddles` at 0 means the outputs are in step, while
+differing digits with `straddles` at 0 means the compositor's flip reports
+and the light on the wall disagree.
 
 !!! warning "Keep an output at position 0,0"
     Sway anchors a spanned (`fullscreen global`) surface at the layout

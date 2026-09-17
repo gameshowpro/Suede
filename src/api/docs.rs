@@ -145,6 +145,7 @@ impl Modify for SecurityAddon {
         crate::model::CaptureIntervals,
         crate::model::PresentationOffset,
         crate::model::OutputTiming,
+        crate::model::LagFrames,
         crate::model::PackageVersion,
         crate::model::SystemInfo,
         crate::model::CheckStatus,
