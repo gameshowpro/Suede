@@ -35,7 +35,7 @@ sudo apt install ./suede_1.2.4-1_arm64.deb
 
 `postinst` reloads unit definitions and restarts a running instance; it never enables anything or edits a user's session. Desired state lives in `$XDG_STATE_HOME` and is untouched by package operations, so configuration survives upgrades by construction. Re-running `provision.sh` is safe but only needed when the provisioning itself changed.
 
-`postinst` also grants `/usr/bin/suede` the `cap_sys_nice+ep` file capability (via `setcap`, from the `libcap2-bin` Recommends) so the slicer's GPU blend can negotiate a realtime Vulkan queue priority instead of the driver's unprivileged "medium" default — see [Where the blend runs](../configuration.md#renderer). dpkg does not preserve file capabilities across an upgrade, so this reapplies on every `configure`, not just first install.
+`postinst` also grants `/usr/bin/suede` the `cap_sys_nice+ep` file capability (via `setcap`, from the `libcap2-bin` Recommends) so the slicer's GPU blend can negotiate a realtime Vulkan queue priority instead of the driver's unprivileged "medium" default — see [Where the blend runs](../how-it-works.md#where-the-blend-runs). dpkg does not preserve file capabilities across an upgrade, so this reapplies on every `configure`, not just first install.
 
 The package declares **no relationship to a browser**. Suede resolves whichever
 of `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,

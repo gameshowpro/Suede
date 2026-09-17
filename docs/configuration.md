@@ -196,27 +196,11 @@ keys every time it runs. There, restarting the session *is* the fix.
 `suede.toml`, and `--no-direct-scanout` writes `direct_scanout = false` beside
 it. Neither exports anything itself; the profile block reads the file.
 
-#### Comparing the two {: #scanout-ab }
-
 With `allow_overlaps = true`, flipping `direct_scanout` and restarting sway
 switches between a flipped and a composited wall while nothing else about the
-machine changes. Show the `sync` test pattern (see
-[Test patterns](#projection-test-patterns)) so the measurement is of the
-presentation path alone, let it settle, then read `GET /projection/stats`
-under each arm and compare:
-
-| What to read | Scanned out | Composited |
-|---|---|---|
-| `zeroCopyPresented` vs `presented`, per output | every frame, or the buffers are not being flipped at all | zero, always |
-| `straddles` | outputs showing one frame on different refreshes | same — a difference here is the flip's timing, not the blend |
-| `lagFrames`, per output | which display is behind, and by how many whole frames | same, and a lag that survives both arms is the display, not Suede |
-| compositor CPU (`ps -o %cpu` on sway) | one full-screen pass per output per frame less — in principle | the baseline to beat |
-
-A `zeroCopyPresented` of zero while `direct_scanout` is true means the
-compositor refused to flip: the buffer is the wrong size or format for the
-display controller, the output is scaled, or the variable is still set
-somewhere. Check the `direct-scanout` health check first — it compares the
-running compositor against these keys and says which way they disagree.
+machine changes, which is what makes the two directly comparable. [Comparing
+the two](how-it-works.md#comparing-the-two) is the procedure, and what to read
+in `GET /projection/stats` under each arm.
 
 ## Desired state
 
@@ -263,6 +247,13 @@ Every field you specify must match. A configured output that is not currently co
 #### Refresh rates {: #refresh-rates }
 
 A requested `refreshHz` is resolved against the modes the display advertises. An exact match within 0.01 Hz wins. Otherwise the nearest advertised rate within 1 Hz is selected and applied as the display advertises it: asking for 60 Hz on a display offering 59.951 Hz selects 59.951 and reports no divergence. Only a resolution the display does not offer, or a refresh rate more than 1 Hz from any advertised rate, raises `mode_unsupported`.
+
+Two active displays running at different rates drift a whole frame apart
+over time, so the `refresh-rates` health check warns whenever they are not
+all at the same rate, and names a rate they all advertise when one exists.
+What that drift looks like on a blended wall, and what the slicer does about
+the difference that remains even at a shared rate, is in [Keeping the
+displays in step](how-it-works.md#keeping-the-displays-in-step).
 
 #### Connectors, not displays {: #connectors-not-displays }
 
@@ -933,21 +924,14 @@ like any other invalid write. Outputs with no configured `mode` or
 `position` take their geometry from observation and are exempt from the
 check.
 
-Sway never sees any of this. It is always handed a plain edge-to-edge tiling
-(sway cannot render overlapping outputs distinctly — its single global
-coordinate space gives every output the same pixels in a shared region,
-measured on hardware). Instead:
-
-1. The active app renders once into a **headless canvas** the size of the
-   layout's bounding box.
-2. The **slicer** (`suede slice`, one process per installation) captures the canvas
-   each frame, cuts out each projector's configured rectangle — intersecting
-   regions are cut into *both* neighbours — applies the gamma-shaped blend
-   ramps and black lift per pixel, and presents each slice fullscreen on its
-   own output. The loop is damage-driven; a static page costs nothing.
-
-Superimposed on the surface, the two copies of every seam sum to constant
-luminance (measured: worst deviation 0.008 across a 160 px seam).
+Sway never sees the overlaps. It is handed a plain edge-to-edge tiling, and
+the overlapping picture is made above it: the active app renders once into a
+headless canvas the size of the layout, and the slicer cuts that canvas into
+one blended, output-sized slice per projector — the two copies of every seam
+summing to constant luminance on the surface. [The path of a
+frame](how-it-works.md#the-path-of-a-frame) follows that pipeline stage by
+stage, with what each stage costs and what a stall in each looks like in
+`GET /projection/stats`.
 
 What happens to a layout with **no** overlaps depends on
 [`allow_overlaps`](#direct-scanout). On a tiling appliance it skips all of
@@ -969,14 +953,34 @@ to composite the slices instead.
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
 | `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
-| `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](#refresh-rates) |
-| `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](#renderer) |
+| `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
+| `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
 
 Slicing engages whenever the configured layout overlaps, with or without
 this section — and on an `allow_overlaps` appliance whenever two or more
 outputs take part at all; the section adds the blending. A single-output
 layout is never sliced either way. A full overlap (a stacked projector, a
 mirror) is duplicated at full strength and never ramped.
+
+`renderer` chooses which pipeline the slicer blends with. `auto`, the
+default, keeps every pixel on the GPU wherever the compositor and the driver
+allow it, and falls back — logged, with the reason — to a shared-memory
+capture and a CPU blend where they do not. `cpu` always takes that fallback;
+`gpu` forces the GPU path and is a **startup error** when it is not actually
+available, so a rig that must never fall back silently can say so. What the
+two paths cost, the queue priority the GPU path negotiates, and the
+arithmetic behind the ramps and `blackLift` are in [Where the blend
+runs](how-it-works.md#where-the-blend-runs).
+
+`freeRun` turns off the gate that keeps the wall in step: each output then
+takes the newest frame the moment it is ready, independently of the others.
+It is for installations that cannot be brought to a shared refresh rate; the
+gate it disables, the trade that makes, and how to measure the result are in
+[Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step).
+
+Canvas mode requires sway's headless backend
+(`WLR_BACKENDS=drm,libinput,headless`, set by provisioning); without it Suede
+reports `headless_unavailable` and tiles the layout unsliced.
 
 !!! info "`testPattern` needs no overlaps"
     It is the one field here that is not about blending. Patterns are drawn
@@ -1006,198 +1010,6 @@ corner of every tile: legible in a photograph, useless from across a room.
 Here the name is scaled to the display, so it can be read at a glance, and
 the background colour means two projectors are never confused even when the
 text is too far away to make out.
-
-#### Keeping the displays in step {: #refresh-rates }
-
-Two outputs mode-set at different rates drift apart: at 60.000 Hz and
-59.939 Hz they are a whole frame out of step roughly every 16 seconds, and a
-camera with a fast enough shutter catches it — one display's frame counter
-running one ahead of the other's, for the fraction of a second it takes the
-slower one to catch up. The `refresh-rates` health check warns whenever the
-active displays are not all running at the same rate, and names a rate they
-all advertise when one exists. This is the case it was written for: on the
-rig where it was first noticed, both projectors advertised 60 Hz and
-59.94 Hz, and the configuration had simply picked one of each.
-
-Even with both outputs mode-set to the same rate, a fast shutter always
-catches a window of up to one frame where one output has flipped to the next
-buffer and the other has not. Outputs on a GPU without genlock hardware have
-independent vblank phase, fixed the moment the mode is set, and nothing
-running above the display controller can close that gap — it is inherent to
-any computer driving more than one display, not a bug in this one.
-
-What the slicer does about it: it commits a frame to every output together,
-and does not commit the next one until every output has reported that the
-previous frame reached the glass — the compositor's own `wp_presentation`
-feedback, which is the page flip itself. Anchoring to the flip is what makes
-the timing work: every commit then goes out just after a vblank, as far from
-the next deadline as a commit can be, so each frame has a whole refresh
-period in which to be rendered and flipped rather than a sliver of one. A
-head whose flip does land a refresh late holds the gate for that refresh and
-the other outputs repeat a frame — which is the trade on purpose, a repeat
-on every display being better than a mismatch between them. The canvas keeps
-rendering on its own clock regardless; whatever is newest when the gate opens
-is what gets shown, dropped or repeated identically on every output when the
-two clocks beat against each other. An output that reports nothing for 300 ms
-is dropped from the gate, so a display that has gone to sleep cannot freeze
-the rest of the wall — and it counts as a stall.
-
-The gate used to wait on `wl_surface.frame` callbacks instead, and that was
-not enough. wlroots sends a frame callback when it *commits* an output's
-frame, before the flip lands, so a head whose flip misses the driver's
-deadline and lands a vblank late answers on time and the gate opens anyway.
-Measured on a three-projector NVIDIA rig with the `sync` test pattern: every
-output presented every frame at 60 Hz — 600 presented apiece, no discards,
-no stalls — while `wp_presentation` reported the outputs a full refresh
-period apart, steadily, for 30 to 60 seconds at a stretch, on both the
-composited and the direct-scanout path. Every output taking every frame while
-one of them is a whole frame behind is the signature of a gate watching the
-wrong event. Where a compositor offers no `wp_presentation` at all the slicer
-still falls back to frame callbacks, since pacing on the earlier signal beats
-not pacing.
-
-`freeRun` turns the gate off: each output takes the newest available frame
-the moment it is ready, independently of the others. It exists for
-installations that cannot be brought to a shared rate; the trade is that the
-wall stops being in step, in exchange for every output running as smoothly
-as it can on its own.
-
-The canvas output itself is given the participating outputs' refresh rate —
-the fastest of them, when they differ, since a canvas slower than an output
-would starve it.
-
-Measuring it: `GET /projection/stats` (and the `projection_stats_changed`
-event) report the inter-output presentation offset (mean/max milliseconds,
-read from `wp_presentation`), straddles (frames the outputs showed on
-different refreshes), gate holds, superseded frames, stalls, and per-output
-presented/discarded counts, zero-copy presented count, and measured refresh,
-alongside the canvas and presented frame rates and the per-frame cost
-breakdown. The web UI shows all of this in the Projection panel. A non-zero
-`zeroCopyPresented` proves the compositor scanned that output's buffer
-straight out to the display controller for at least one frame this interval,
-with no compositing pass in between. A steady offset of a few milliseconds with
-zero straddles is what a healthy wall looks like; straddles that rise over
-time mean commits are landing between two outputs' renders. `gateHolds`
-counts the commit cycles the wall delayed past a canvas period waiting for an
-output that had not yet reported presenting the previous frame: zero on a
-healthy wall, where every output's feedback is back well before the next
-frame is due, and a rising count when one head's flips are landing a refresh
-later than the rest. It is the price of staying together, not a fault —
-each hold is one frame repeated identically on every output — so read it
-beside `straddles`, which is what the holds are buying. Each output's
-`phaseMs` is its vblank phase relative to the first output, circular-mean'd
-over the interval: a value that stays put from one report to the next means
-the two heads are locked at a fixed offset (a synchronised mode-set could
-align them), while one that wanders means independent clocks that only
-hardware sync can fix. Each output's `lagFrames` is a histogram
-(`zero`/`one`/`two`/`more`) of how many whole refresh periods behind the
-earliest presenting output that output landed, per snapshot with at least two
-presenters — built purely from `wp_presentation` timestamps, i.e. the flip,
-so a display's own processing latency after the flip is invisible to it. Read
-it against a photograph: a camera showing an output visibly behind while its
-`lagFrames` reads all-zero means the lag lives in the display, not the
-presentation path; non-zero `one`/`two`/`more` counts on that output mean the
-presentation path itself is delivering it a stale frame.
-
-The `output-phase` health check reads exactly that field and warns when any
-output is more than 1.0 ms from the first. It was written from a
-measurement on a four-projector NVIDIA rig (RTX A1000, sway 1.10.1): outputs
-enabled one `output … enable` at a time left the first head 7.1 ms out of
-phase with the other three, which locked to each other — about 145
-straddled frames per 330 captured. The same four, disabled and then
-re-enabled together in one sway IPC message, landed within 0.03 ms of each
-other — about 20 straddles per 330 at the same rate. A mode-set delivered in
-one IPC message is applied by sway in one backend commit, which is what
-keeps the heads on the same clock; one command per output, even issued back
-to back, is not. Treat that as NVIDIA behaviour rather than a guarantee: the
-same batched re-enable on a Raspberry Pi 5's Broadcom driver narrowed a
-7.5 ms difference to 4.5 ms without closing it, so on hardware that does not
-lock its heads this way the check can still warn after its own fix has run.
-Suede's reconciler always batches an output plan's commands into one message
-for exactly this reason (including its first application after the daemon
-starts), so a fresh boot should already show the outputs in phase — this
-check exists for the drift a hotplug or a partial reconfiguration can still
-introduce.
-
-Its fix disables every active display, waits about a second and a half for
-sway to actually tear them down, and re-enables and fully reconfigures them
-together in that same single IPC message. The wall goes dark for the
-duration — there is no way to move every output to a new phase without
-letting each one restart its raster, and that means going through
-"nothing showing" — so run it between shows, not during one. The check
-itself only re-measures on the slicer's own ten-second interval, so the
-result shows up on the next report after the fix, not immediately.
-
-#### Where the blend runs {: #renderer }
-
-The slicer can composite two ways. The CPU path — shared-memory screencopy,
-a memcpy snapshot, then the blend on the CPU — is the fallback every
-compositor supports. The GPU path keeps every pixel on the GPU instead: the
-compositor blits the canvas straight into a Vulkan image the slicer exported
-as a dmabuf, a fragment shader blends it into each output's own dmabuf, and
-the results are committed as `wl_buffer`s with nothing ever copied to system
-memory. Measured on a four-projector rig (RTX A1000, 3840x2385 canvas): the
-CPU path ran at 32 fps with the GPU sitting at 38% utilisation — the
-compositor's readback of the canvas plus the CPU blend did not fit in one
-canvas frame, so the loop took every second one; the GPU path removes both
-costs.
-
-`renderer: "auto"` (the default) uses the GPU path when the compositor
-offers dmabuf capture (`zwp_linux_dmabuf_v1` version 4, with
-`get_default_feedback` completing) and a Vulkan 1.3 driver initialises with
-everything the shader needs, falling back to the CPU path — logged, with the
-reason — otherwise. `"cpu"` always uses the fallback path. `"gpu"` forces the
-GPU path and is a startup error if it is not actually available, so a rig
-that must never fall back silently can say so. sway satisfies the GPU path's
-requirements on any Mesa driver and on NVIDIA 550 or newer.
-
-`GET /projection/stats` reports which renderer is active, the GPU fence-wait
-cost per frame (`perFrameMs.gpu`, zero on the CPU path), and a capture
-cadence histogram (`captureIntervals`) counting how many canvas periods
-elapsed between successive captures — the direct answer to whether the loop
-is keeping up with every canvas frame or only every second one. The web UI's
-Projection panel shows all three in the Frame timing block.
-
-The GPU path also negotiates a Vulkan queue priority
-(`VK_KHR_global_priority`) — realtime, then high, then medium, whichever the
-driver grants — so the blend can pre-empt a GPU-heavy app on the same device
-instead of queuing behind it. The package grants the capability this needs
-(`cap_sys_nice+ep` on `/usr/bin/suede`) at install time, reapplied on every
-upgrade. `GET /projection/stats` does not report which tier is active; the
-slicer's startup log line does, as `queue priority realtime|high|medium`. On
-a machine that installed the binary another way, grant it by hand and
-restart the service:
-
-```bash
-sudo setcap cap_sys_nice+ep /usr/bin/suede
-systemctl --user restart suede.service
-```
-
-**Blending is a ramp in light, not in signal.** A display raises its input
-signal to a power (its gamma, typically 2.2), so a gradient linear in signal
-leaves a bright band at every seam. Ramps are shaped as `ramp^(1/gamma)`.
-
-**Black-level compensation.** Projector black is not zero light, so seams
-glow on dark scenes. The extra light cannot be removed, so `blackLift`
-brightens everything else to match: `out = lift + (1 - lift) * in`. That is a
-linear remap of the *whole* range — black rises to `lift`, white stays white,
-and the contrast lost is spread across the palette rather than clipped off
-the top.
-
-Set it to the lift that adds **one projector's** worth of black; Suede scales
-it to each region. A point lit by `n` projectors sits at `n` times one
-projector's black, so with `N` the most projectors covering any point of the
-layout, each of the `n` applies `lift × (N − n) / n` — the shortfall, shared
-between the projectors that light it. Two projectors give the familiar rule
-(full lift outside the seam, none inside). A 2×2 grid has three floors, and
-all three are matched: the four-way centre gets nothing, the two-way seams
-`lift`, and single-covered regions `3 × lift`.
-
-Show the `black` test pattern and raise it until the projected image is even.
-
-Canvas mode requires sway's headless backend
-(`WLR_BACKENDS=drm,libinput,headless`, set by provisioning); without it Suede
-reports `headless_unavailable` and tiles the layout unsliced.
 
 #### Backgrounds in canvas mode {: #canvas-backgrounds }
 

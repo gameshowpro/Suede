@@ -46,6 +46,7 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Configuration: configuration.md
+  - How it works: how-it-works.md
   # A static file, not a page: Scalar is built to own a viewport, so the
   # reference is served outside the theme rather than squeezed into its
   # content column. MkDocs copies it through verbatim.
