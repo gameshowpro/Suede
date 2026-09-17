@@ -664,7 +664,7 @@ impl CheckRunner {
             "Displays are in phase",
             status,
             detail,
-            Some("configuration/#refresh-rates"),
+            Some("how-it-works/#keeping-the-displays-in-step"),
         );
         if check.status == CheckStatus::Warn {
             check.fix_available = true;
