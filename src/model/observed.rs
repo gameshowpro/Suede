@@ -732,6 +732,14 @@ pub struct ProjectionStats {
     /// Frames whose outputs presented more than half a refresh period apart —
     /// i.e. shown on different refreshes, a whole-frame mismatch.
     pub straddles: u32,
+    /// Commit cycles the gate held past one canvas period waiting for an
+    /// output that had not yet reported presenting the previous frame — the
+    /// other outputs repeated a frame rather than move on without it. Zero
+    /// on a healthy wall, where every output's presentation feedback is back
+    /// well before the next frame is due; a rising count means one head's
+    /// flips are landing a refresh later than the rest, and names the cost
+    /// of keeping the wall together rather than a fault in it.
+    pub gate_holds: u32,
     /// Which backend this interval's frames were blended on: `"cpu"` or `"gpu"`.
     pub renderer: String,
     /// How many canvas periods elapsed between successive captures reaching
@@ -804,6 +812,28 @@ pub struct OutputTiming {
     /// The spread of that phase within the interval (max − min of the
     /// per-frame value), ms. Near zero means locked; near a period means drifting.
     pub phase_spread_ms: Option<f64>,
+    /// Histogram of how many whole refresh periods this output's
+    /// presentation landed after the earliest output to present the same
+    /// snapshot. Derived purely from `wp_presentation` timestamps — the
+    /// flip — so a display's own processing latency between the flip and
+    /// photons on screen is invisible here: if a camera shows this output
+    /// visibly behind while this reads all-zero, the lag is in the display,
+    /// not the presentation path.
+    pub lag_frames: LagFrames,
+}
+
+/// Histogram of a per-snapshot lag, in whole refresh periods, behind the
+/// earliest output to present that snapshot. Only snapshots that at least
+/// two outputs presented contribute a sample; a lone presenting output has
+/// nothing to lag behind.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LagFrames {
+    pub zero: u32,
+    pub one: u32,
+    pub two: u32,
+    /// Three or more whole refresh periods behind.
+    pub more: u32,
 }
 
 #[cfg(test)]

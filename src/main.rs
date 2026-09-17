@@ -172,6 +172,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         bind = %bootstrap.bind,
         state_dir = %bootstrap.state_dir.display(),
         allow_overlaps = bootstrap.allow_overlaps,
+        direct_scanout = bootstrap.direct_scanout,
         mock = args.mock,
         "starting suede"
     );

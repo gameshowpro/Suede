@@ -59,3 +59,14 @@ docs_base_url = "https://suede.gameshow.pro/"
 # must *not* be set. `provision.sh --allow-overlaps` configures both halves.
 # See configuration.md#direct-scanout.
 # allow_overlaps = false
+
+# Whether the compositor may flip the slicer's buffers straight to the display
+# controllers. Only means anything while allow_overlaps is true — that is the
+# layout where no client spans the physical outputs, so scanning out cannot
+# mirror; an explicit `direct_scanout = true` beside `allow_overlaps = false`
+# is refused at startup rather than re-opening that bug. Setting it false there
+# asks sway to composite each slice instead, which is the arm to compare
+# against when measuring what scanout buys: flip the key, restart the
+# compositor, and watch zeroCopyPresented, straddles and lagFrames in
+# GET /projection/stats. See configuration.md#direct-scanout.
+# direct_scanout = true

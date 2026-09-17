@@ -75,18 +75,97 @@
 //! Filming two outputs at once with a fast shutter used to show the frame
 //! counters off by one much of the time, for two independent reasons. First,
 //! outputs on a GPU without genlock hardware have independent vblank phase,
-//! fixed at mode-set: a commit that lands between output A's render and
-//! output B's render puts frame N on A and N+1 on B. Second, this process
-//! never used to learn when an output had actually taken a commit — it just
-//! committed the next frame whenever the next capture arrived. Both are
-//! addressed by gating commits on `wl_surface.frame` callbacks (see
-//! [`Presenter::frame_pending`] and [`State::can_present`]): the next commit
-//! goes out only once every output has reported taking the previous one, so
-//! it always lands just after the slower output rendered, and both outputs
-//! pick up the same frame at their next render. The canvas keeps rendering on
-//! its own timer regardless; the slicer presents whatever the newest
-//! completed capture is, dropping or repeating frames symmetrically across
-//! every output when the clocks beat against each other.
+//! fixed at mode-set: a commit that lands between output A's flip and output
+//! B's flip puts frame N on A and N+1 on B. Second, this process never used
+//! to learn when an output had actually taken a commit — it just committed
+//! the next frame whenever the next capture arrived.
+//!
+//! The rule that addresses both: **the next commit to the wall goes out only
+//! once every gated output has reported `presented` (or `discarded`) for the
+//! previous one** — `wp_presentation_feedback`, the flip itself. See
+//! [`GateState`], [`State::gate_open`] and [`Presenter::feedback_pending_for`].
+//! Anchoring to the flip is what makes the timing work out: every commit
+//! then lands a fraction of a millisecond *after* a vblank, which is as far
+//! from the next deadline as a commit can be, so a frame has a whole refresh
+//! period in which to be rendered and flipped rather than a sliver. When one
+//! head's flip does land a refresh late, it holds the gate for that refresh
+//! and the other outputs repeat a frame — which is the trade this is for: a
+//! repeat on every output beats a mismatch between them.
+//!
+//! **Why frame callbacks were not enough.** The gate was anchored to
+//! `wl_surface.frame` until 2026-09-17, and it never held. wlroots sends
+//! frame callbacks when it *commits* an output's frame, before the page flip
+//! lands, so a head whose flip misses the driver's deadline and lands a
+//! vblank late answers the callback exactly on time and the gate opens
+//! anyway. Measured on `brain` (test-log Entry 2) with the `sync` pattern:
+//! all three outputs presented every frame at 60 fps — `presented 600` each,
+//! no discards, no stalls — while `wp_presentation` reported a mean offset
+//! of exactly one refresh period, held for 30–60 seconds at a time, on both
+//! the composited and the direct-scanout path. Every output taking every
+//! frame while one of them is a whole frame behind is precisely the
+//! signature of a gate that is watching the wrong event. Frame callbacks are
+//! kept as the fallback for a compositor that offers no `wp_presentation` at
+//! all (none of the reference machines is one): pacing on the earlier signal
+//! is still better than not pacing.
+//!
+//! An output that answers neither within [`STALL_TIMEOUT`] is dropped from
+//! the gate — it still receives commits, so it is current the moment it
+//! comes back, but it stops holding anyone else up. That is what keeps a
+//! DPMS-off projector from freezing the wall, and it applies to the feedback
+//! wait exactly as it applied to the callback wait.
+//!
+//! What the gate decides is *when* the newest frame is committed, not which
+//! one: the canvas keeps rendering on its own clock regardless, and the
+//! slicer presents whatever the newest completed capture is, dropping or
+//! repeating frames symmetrically across every output when the clocks beat
+//! against each other. `gateHolds` in the periodic report counts the cycles
+//! where that wait ran past a canvas period — the wall's own measure of how
+//! often it repeated a frame to stay together. `free_run` turns the
+//! cross-output half of the rule off entirely (see [`State::gate_open`]);
+//! each output still waits for its own answer before taking another frame,
+//! which is the same anti-race the gate began as.
+//!
+//! ## Sync pattern
+//!
+//! [`crate::model::TestPattern::Sync`] is the one test pattern this module
+//! draws itself, per frame, through the present path above rather than once
+//! into a static buffer — see `run_sync`. It exists because the question
+//! "are these two projectors showing the same frame?" had, until it, no
+//! answer that was about Suede. The way it was asked before was to point a
+//! high-speed camera at a browser page whose cells all count in step; a
+//! photograph of two outputs showing different numbers then implicates the
+//! whole chain — Chromium's own render and present, sway's composite, the
+//! flip — with no way to say which link is the loose one. A counter drawn
+//! here has the browser taken out of it: the picture leaves this process,
+//! goes through the compositor, and reaches the plane, and nothing else
+//! touches it. So the same photograph, of the same two projectors, becomes a
+//! measurement of *this* path, and is comparable frame for frame between
+//! direct scanout on and off.
+//!
+//! Read it against `straddles` in the same interval's report line, which
+//! counts how often the compositor's own presentation feedback put two
+//! outputs on different refreshes. The two together say more than either
+//! alone:
+//!
+//! - **Same digits on every output, `straddles` 0** — in step, and the
+//!   driver's flip reports agree with the light. This is the answer the
+//!   gate exists to produce.
+//! - **Digits differ, `straddles` 0** — the frames were committed and
+//!   reported as one, and the glass says otherwise: the disagreement is
+//!   below the compositor, in the flip timing or the panel, not in this
+//!   loop's gating. This is the case the pattern was built to be able to
+//!   state, because the counters were the only witness to it.
+//! - **Digits differ, `straddles` non-zero** — the loop already knew; the
+//!   photograph is confirming the count, not adding to it.
+//!
+//! The binary strip beside the digits carries the low sixteen bits of the
+//! same counter, which is what makes a one-frame difference readable when a
+//! DLP projector's colour wheel has smeared the digits across the exposure —
+//! and what distinguishes 99 → 00 from a stall. Photograph two consecutive
+//! frames on DLP for the same reason. The pattern needs the slicer, so it
+//! needs `allow_overlaps = true`; the tiled path's static overlays show a
+//! placeholder saying so rather than a counter frozen at whatever number it
+//! started on, which would read as perfect sync.
 //!
 //! ## Direct scanout
 //!
@@ -144,7 +223,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
@@ -180,9 +259,11 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 };
 
 use super::blend::{pixel_transfer, Coverage, OverlaySpec, SlicerSpec};
+use super::pattern::{SyncGroup, SyncRect};
 use super::{dmabuf, gpu};
 use crate::model::{
-    CaptureIntervals, FrameCost, OutputTiming, PresentationOffset, ProjectionStats, Renderer,
+    CaptureIntervals, FrameCost, LagFrames, OutputTiming, PresentationOffset, ProjectionStats,
+    Renderer, TestPattern,
 };
 
 /// DRM fourccs the GPU present path asks for, in preference order — see the
@@ -245,12 +326,31 @@ fn present_slots(backend: Option<Backend>) -> usize {
 /// respawns the slicer on its next pass, which is the retry policy.
 const MAX_FAILURES: u32 = 3;
 
-/// How long an output may leave a `wl_surface.frame` callback unanswered
-/// before it is dropped from the gate. Long enough that a normal compositor
-/// hiccup or a momentarily busy GPU never trips it; short enough that a
-/// DPMS-off or otherwise unrendering output does not freeze the rest of the
-/// wall for more than a third of a second.
+/// How long an output may leave the gate's readiness signal unanswered — a
+/// `wp_presentation_feedback`, or a `wl_surface.frame` callback where the
+/// compositor offers no `wp_presentation` — before it is dropped from the
+/// gate. Long enough that a normal compositor hiccup or a momentarily busy
+/// GPU never trips it; short enough that a DPMS-off or otherwise
+/// unpresenting output does not freeze the rest of the wall for more than a
+/// third of a second.
 const STALL_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// How long the `sync` loop waits for the gate, in canvas periods, before
+/// committing the next frame without it.
+///
+/// The gate is that loop's clock (see the module doc's "Presentation
+/// gating"), and a clock that can stop is not one: an output whose feedback
+/// is merely late — a mode-set settling, a compositor hiccup — must not
+/// freeze the counter for the third of a second [`STALL_TIMEOUT`] takes to
+/// drop it out. One and a half periods is past any healthy wall's gate wait
+/// (whose commits land a fraction of a period after the slowest head's
+/// flip) and well short of the stall timeout, so the pattern keeps moving
+/// at roughly the canvas rate while a straggler is being given its chance.
+const GATE_FALLBACK_PERIODS: f64 = 1.5;
+
+/// A commit cycle's floor, in canvas periods: the gate may open sooner, but
+/// the wall never commits faster than the canvas produces frames.
+const GATE_FLOOR_PERIODS: f64 = 1.0;
 
 /// Feedback answers required in one interval before "none of them were
 /// `Presented`" is trusted as a signal rather than noise. On a four-projector
@@ -346,16 +446,31 @@ struct Presenter {
     /// This presenter's region of the canvas.
     source: crate::model::Rect,
     /// A `wl_surface.frame` callback is outstanding: the compositor has not
-    /// yet told us this output took the last commit. Presenting again before
-    /// this clears is exactly the race that puts frame N on one output and
-    /// N+1 on another — see the module comment.
+    /// yet told us it *committed* an output frame carrying our last commit.
+    /// The gate's fallback signal, used where the compositor offers no
+    /// `wp_presentation` — see the module doc's "Presentation gating" for
+    /// why it is the fallback and not the primary.
     frame_pending: bool,
     /// When `frame_pending` was set, for the stall timeout.
     pending_since: Option<Instant>,
-    /// This output stopped answering its frame callback — most often DPMS
-    /// off, or a monitor that was unplugged without sway noticing yet. It is
-    /// still sent commits, so it has fresh content the moment it comes back,
-    /// but it no longer holds up the other outputs' gate.
+    /// The snapshot id of the `wp_presentation_feedback` this presenter is
+    /// waiting on, `None` when it owes no answer. The gate's primary signal:
+    /// it clears on `presented`/`discarded`, i.e. once the flip has actually
+    /// landed (or been abandoned), which a frame callback does not wait for.
+    ///
+    /// Carries the id of the *oldest* unanswered commit rather than a bare
+    /// flag: a gated output only ever has one outstanding at a time, but an
+    /// output the stall rule has dropped keeps being committed to without
+    /// the gate waiting for it, and matching each answer to the wait it
+    /// belongs to is what lets such an output rejoin the gate when it
+    /// recovers. See `commit_sent`.
+    feedback_pending_for: Option<u64>,
+    /// When `feedback_pending_for` was set, for the stall timeout.
+    feedback_since: Option<Instant>,
+    /// This output stopped answering the gate's readiness signal — most
+    /// often DPMS off, or a monitor that was unplugged without sway noticing
+    /// yet. It is still sent commits, so it has fresh content the moment it
+    /// comes back, but it no longer holds up the other outputs' gate.
     stalled: bool,
     /// The latest snapshot has not been committed to this output yet.
     stale: bool,
@@ -412,6 +527,14 @@ struct Capture {
     /// again, a fresh `blend()` has already moved this on to the slot it
     /// just read instead. `None` before the first successful blend.
     last_blended_slot: Option<usize>,
+    /// The slot holding the newest *complete* capture, waiting for the gate
+    /// to let it out. Set the moment a `Ready` lands and taken by the blend
+    /// that consumes it, so a capture that arrives while the gate is shut is
+    /// the one that goes out when the gate opens — rather than the older
+    /// frame `last_blended_slot` still points at. Always the complement of
+    /// `gpu_slot` (the slot the compositor is writing into), so blending
+    /// from it never races the capture in flight. GPU path only.
+    pending_slot: Option<usize>,
     /// Offered linux-dmabuf layout, when the compositor advertises one
     /// alongside the shm buffer: (format, width, height).
     dmabuf_offer: Option<(u32, u32, u32)>,
@@ -482,6 +605,9 @@ struct FrameStats {
     /// this went from 0 to hundreds per interval on `brain` until the GPU
     /// path grew a third slot ([`GPU_PRESENT_SLOTS`]).
     buffer_reuse: u32,
+    /// Commit cycles the gate held past one canvas period waiting for a
+    /// straggler — see [`ProjectionStats::gate_holds`].
+    gate_holds: u32,
     /// GPU path only: `gpu.blend()`'s fence-wait, summed across every call
     /// this interval. Zero on the CPU path, which never waits on a fence.
     gpu: Duration,
@@ -506,6 +632,7 @@ impl FrameStats {
             superseded: 0,
             stalls: 0,
             buffer_reuse: 0,
+            gate_holds: 0,
             gpu: Duration::ZERO,
             capture_intervals: CaptureIntervals::default(),
         }
@@ -579,6 +706,10 @@ struct OutputAccum {
     zero_copy_presented: u32,
     /// `None` until a `Presented` event carries a non-zero refresh.
     refresh_ns: Option<u32>,
+    /// Histogram of this output's lag behind the earliest output to present
+    /// the same snapshot, in whole refresh periods — see
+    /// [`crate::model::LagFrames`].
+    lag_frames: LagFrames,
 }
 
 /// What settling a fully-answered snapshot's slots works out to. Pure and
@@ -602,6 +733,13 @@ struct Settled {
     /// output 0 itself did not present this snapshot, since there is nothing
     /// to measure the others against.
     phase_samples: Vec<(usize, i64, u32)>,
+    /// One entry per presented output whose own refresh is known:
+    /// `(index, lag_frames)`, where `lag_frames` is that output's timestamp
+    /// minus the earliest presenting output's, divided by its own refresh
+    /// and rounded to the nearest whole period, clamped to 3 ("three or
+    /// more"). Empty whenever fewer than two outputs presented this
+    /// snapshot — a lone presenter has nothing to lag behind.
+    lag_frames: Vec<(usize, u32)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -763,11 +901,32 @@ fn settle(slots: &[Slot]) -> Settled {
         }
     }
 
+    // Per-output lag behind the earliest output to present this snapshot, in
+    // whole refresh periods. A lone presenter has nothing to lag behind, so
+    // this only fires alongside `offset_ns` (both require two-plus
+    // presenters); unlike phase, it is not relative to output 0 specifically
+    // — it is relative to whichever output happened to present first.
+    let mut lag_frames = Vec::new();
+    if presented.len() >= 2 {
+        let earliest_at_ns = presented
+            .iter()
+            .map(|&(_, at_ns, _)| at_ns)
+            .min()
+            .unwrap_or(0);
+        for &(index, at_ns, refresh_ns) in &presented {
+            if let Some(refresh_ns) = refresh_ns {
+                let lag = ((at_ns - earliest_at_ns) as f64 / f64::from(refresh_ns)).round() as u32;
+                lag_frames.push((index, lag.min(3)));
+            }
+        }
+    }
+
     Settled {
         outcomes,
         offset_ns,
         straddle,
         phase_samples,
+        lag_frames,
     }
 }
 
@@ -890,6 +1049,16 @@ impl Timing {
                 accum.add(reduced_ns, period_ns);
             }
         }
+        for (index, lag) in settled.lag_frames {
+            if let Some(accum) = self.per_output.get_mut(index) {
+                match lag {
+                    0 => accum.lag_frames.zero += 1,
+                    1 => accum.lag_frames.one += 1,
+                    2 => accum.lag_frames.two += 1,
+                    _ => accum.lag_frames.more += 1,
+                }
+            }
+        }
     }
 
     /// Snapshot the interval's figures and reset the counters (but not the
@@ -925,6 +1094,7 @@ impl Timing {
             accum.presented = 0;
             accum.discarded = 0;
             accum.zero_copy_presented = 0;
+            accum.lag_frames = LagFrames::default();
         }
         self.offset_sum_ms = 0.0;
         self.offset_max_ms = 0.0;
@@ -1001,6 +1171,172 @@ impl DeadIntervalTracker {
     }
 }
 
+// --- the presentation gate ------------------------------------------------
+
+/// Which signal the gate is anchored to. See the module doc's "Presentation
+/// gating" section for why the two are not interchangeable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateSignal {
+    /// The compositor offers `wp_presentation`: the gate waits for
+    /// `presented`/`discarded`, which is the flip itself.
+    Presentation,
+    /// No `wp_presentation` at all: the gate falls back to
+    /// `wl_surface.frame`, which is the compositor's output *commit* and
+    /// therefore earlier — and blind to a flip that lands a vblank late.
+    FrameCallback,
+}
+
+impl GateSignal {
+    /// What to call this signal in an operator-facing message.
+    fn answer_name(self) -> &'static str {
+        match self {
+            GateSignal::Presentation => "presentation feedback",
+            GateSignal::FrameCallback => "frame callbacks",
+        }
+    }
+}
+
+/// Which signal the gate uses, given whether the compositor offers
+/// `wp_presentation`. Trivial, and named anyway so the fallback rule has one
+/// definition and one test rather than an `is_some()` at each use.
+fn gate_signal(presentation_feedback: bool) -> GateSignal {
+    if presentation_feedback {
+        GateSignal::Presentation
+    } else {
+        GateSignal::FrameCallback
+    }
+}
+
+/// One presenter's outstanding answer for the previous commit, as the gate
+/// sees it — lifted off [`Presenter`] so the rule below can be exercised
+/// without a compositor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GateEntry {
+    /// This presenter still owes an answer for the commit it was last sent.
+    waiting: bool,
+    /// How long it has owed it; `Duration::ZERO` when `waiting` is false.
+    waited: Duration,
+    /// Already dropped out of the gate by an earlier stall decision.
+    stalled: bool,
+}
+
+impl GateEntry {
+    /// Nothing outstanding, as far as the gate is concerned: either the
+    /// answer came back, or this presenter has been dropped out of the gate
+    /// — already (`stalled`) or by this very call, because it has owed its
+    /// answer for longer than `limit`.
+    fn answered(&self, limit: Duration) -> bool {
+        !self.waiting || self.stalled || self.waited > limit
+    }
+}
+
+/// Build one presenter's gate entry from both signals' waits, picking
+/// whichever the gate is anchored to. `frame`/`feedback` are `Some(waited)`
+/// while that signal's answer is outstanding and `None` once it is in.
+fn gate_entry(
+    signal: GateSignal,
+    frame: Option<Duration>,
+    feedback: Option<Duration>,
+    stalled: bool,
+) -> GateEntry {
+    let waited = match signal {
+        GateSignal::Presentation => feedback,
+        GateSignal::FrameCallback => frame,
+    };
+    GateEntry {
+        waiting: waited.is_some(),
+        waited: waited.unwrap_or_default(),
+        stalled,
+    }
+}
+
+/// The locked-mode gate: every presenter's outstanding answer for the
+/// previous commit, plus how long one of them may go unanswered before the
+/// wall stops waiting for it.
+///
+/// Kept as a value rather than a method on [`State`] so the rule — which is
+/// the whole of this module's pacing policy — is one testable thing.
+#[derive(Debug, Clone, PartialEq)]
+struct GateState {
+    entries: Vec<GateEntry>,
+    /// [`STALL_TIMEOUT`] in the running slicer.
+    limit: Duration,
+}
+
+impl GateState {
+    fn new(entries: Vec<GateEntry>, limit: Duration) -> Self {
+        Self { entries, limit }
+    }
+
+    /// Whether the wall may commit its next frame: every presenter has
+    /// answered for the previous one, or has been waited on long enough.
+    ///
+    /// A wall with no presenters at all is trivially open — there is nobody
+    /// to wait for, and reporting it shut would spin the loop.
+    fn all_answered(&self) -> bool {
+        self.entries.iter().all(|entry| entry.answered(self.limit))
+    }
+
+    /// The presenters that have just run past `limit` without answering and
+    /// are not yet marked stalled, with how long each has been waiting —
+    /// the ones `State::new_snapshot` drops out of the gate and counts as
+    /// stalls.
+    fn newly_stalled(&self) -> Vec<(usize, Duration)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.waiting && !entry.stalled && entry.waited > self.limit)
+            .map(|(index, entry)| (index, entry.waited))
+            .collect()
+    }
+}
+
+impl Presenter {
+    /// This presenter's outstanding answer under `signal`, as of `now`.
+    fn gate_entry(&self, signal: GateSignal, now: Instant) -> GateEntry {
+        let since = |set: bool, at: Option<Instant>| {
+            set.then(|| {
+                at.map(|at| now.saturating_duration_since(at))
+                    .unwrap_or_default()
+            })
+        };
+        gate_entry(
+            signal,
+            since(self.frame_pending, self.pending_since),
+            since(self.feedback_pending_for.is_some(), self.feedback_since),
+            self.stalled,
+        )
+    }
+
+    /// Whether this presenter alone is ready for another commit. The gate's
+    /// per-output half: free-run asks only this, locked mode asks it of
+    /// every presenter at once through [`GateState::all_answered`].
+    fn gate_ready(&self, signal: GateSignal) -> bool {
+        self.gate_entry(signal, Instant::now())
+            .answered(STALL_TIMEOUT)
+    }
+
+    /// Record that a commit carrying `snapshot_id` has just gone out to this
+    /// presenter, with `feedback` true when a `wp_presentation_feedback` was
+    /// requested alongside its `wl_surface.frame` callback.
+    ///
+    /// The feedback wait tracks the *oldest* unanswered commit, not the
+    /// newest: a presenter the stall rule has dropped keeps being committed
+    /// to without the gate waiting for it, so advancing the wait on every
+    /// commit would leave its answers permanently one id behind the wait
+    /// they are matched against — and an output that had recovered would
+    /// never be let back into the gate.
+    fn commit_sent(&mut self, snapshot_id: u64, feedback: bool) {
+        let now = Instant::now();
+        self.frame_pending = true;
+        self.pending_since = Some(now);
+        if feedback && self.feedback_pending_for.is_none() {
+            self.feedback_pending_for = Some(snapshot_id);
+            self.feedback_since = Some(now);
+        }
+    }
+}
+
 struct State {
     /// Third element: this output's current-mode refresh in mHz, from
     /// `wl_output`'s `Mode` event — used only to size the canvas period for
@@ -1040,9 +1376,11 @@ struct State {
     /// From `SlicerSpec.renderer`; see `decide_backend` for how this turns
     /// into `Capture.backend`.
     renderer: Renderer,
-    /// `None` when the compositor does not offer `wp_presentation` — the
-    /// gating logic works identically either way, only the measurements it
-    /// is possible to report differ.
+    /// `None` when the compositor does not offer `wp_presentation`. This is
+    /// what [`gate_signal`] reads: with it the gate waits for the flip,
+    /// without it for the compositor's output commit. Every reference
+    /// machine offers it; the fallback exists so a compositor that does not
+    /// still paces rather than free-runs.
     presentation: Option<WpPresentation>,
     timing: Timing,
     stats: FrameStats,
@@ -1073,6 +1411,12 @@ struct State {
     /// When the previous capture's `Ready` was handled, for the interval
     /// histogram.
     last_capture_at: Option<Instant>,
+    /// When the gate was first seen holding a frame the wall was otherwise
+    /// ready to commit, since the last commit cycle. `None` between the
+    /// commit that cleared it and the next time the gate is found shut with
+    /// something to show — which, on a healthy wall, is never. See
+    /// [`ProjectionStats::gate_holds`].
+    gate_blocked_since: Option<Instant>,
 }
 
 impl State {
@@ -1080,32 +1424,60 @@ impl State {
         self.presenters.iter().all(|p| p.configured.is_some())
     }
 
-    /// Whether there is a stale snapshot at least one presentation policy
-    /// permits showing right now.
-    ///
-    /// Locked (`!free_run`): every presenter must be ready before any of
-    /// them may show a newer frame than its neighbours — a partial commit
-    /// here is exactly the race the gate exists to close. Free-run: an
-    /// output takes the newest frame the instant it can, without regard for
-    /// its neighbours' pace, because it was configured that way precisely
-    /// because it cannot share one.
-    fn can_present(&self) -> bool {
-        if self.free_run {
+    /// Which readiness signal this run's gate is anchored to — presentation
+    /// feedback wherever the compositor offers `wp_presentation`, frame
+    /// callbacks otherwise.
+    fn gate_signal(&self) -> GateSignal {
+        gate_signal(self.presentation.is_some())
+    }
+
+    /// The locked-mode gate as it stands right now.
+    fn gate_state(&self, now: Instant) -> GateState {
+        let signal = self.gate_signal();
+        GateState::new(
             self.presenters
                 .iter()
-                .any(|p| p.stale && (!p.frame_pending || p.stalled))
+                .map(|p| p.gate_entry(signal, now))
+                .collect(),
+            STALL_TIMEOUT,
+        )
+    }
+
+    /// Whether the gate permits a commit right now, regardless of whether
+    /// there is anything new to show.
+    ///
+    /// Locked (`!free_run`): every presenter must have answered for the
+    /// previous commit before any of them may take a newer frame than its
+    /// neighbours — a partial commit here is exactly the race the gate
+    /// exists to close. Free-run: one ready presenter is enough, because
+    /// each takes the newest frame the instant it can, without regard for
+    /// its neighbours' pace.
+    fn gate_open(&self) -> bool {
+        if self.free_run {
+            let signal = self.gate_signal();
+            self.presenters.iter().any(|p| p.gate_ready(signal))
         } else {
-            self.presenters.iter().any(|p| p.stale)
-                && self
-                    .presenters
-                    .iter()
-                    .all(|p| !p.frame_pending || p.stalled)
+            self.gate_state(Instant::now()).all_answered()
         }
     }
 
-    /// A fresh canvas capture is ready to show: mark every presenter due to
-    /// take it, and drop any output that has stopped answering its frame
-    /// callback so it cannot freeze the rest of the wall.
+    /// Whether there is a stale snapshot at least one presentation policy
+    /// permits showing right now: the gate is open *and* somebody has
+    /// something newer to show.
+    fn can_present(&self) -> bool {
+        if self.free_run {
+            let signal = self.gate_signal();
+            self.presenters
+                .iter()
+                .any(|p| p.stale && p.gate_ready(signal))
+        } else {
+            self.presenters.iter().any(|p| p.stale) && self.gate_open()
+        }
+    }
+
+    /// A fresh frame is ready to show: mark every presenter due to take it,
+    /// and drop any output that has stopped answering the gate's readiness
+    /// signal so it cannot freeze the rest of the wall.
     fn new_snapshot(&mut self) {
         // If every presenter is still waiting on the snapshot this one is
         // about to replace, no output ever showed it at all.
@@ -1113,22 +1485,48 @@ impl State {
             self.stats.superseded += 1;
         }
         self.timing.snapshot_id += 1;
+        let answer = self.gate_signal().answer_name();
+        let newly_stalled = self.gate_state(Instant::now()).newly_stalled();
         for presenter in &mut self.presenters {
             presenter.stale = true;
-            if presenter.frame_pending && !presenter.stalled {
-                if let Some(elapsed) = presenter.pending_since.map(|since| since.elapsed()) {
-                    if elapsed > STALL_TIMEOUT {
-                        eprintln!(
-                            "slicer: output {} stopped answering frame callbacks after {:.0} ms; \
-                             dropping it from the gate until it recovers",
-                            presenter.name,
-                            elapsed.as_secs_f64() * 1000.0,
-                        );
-                        presenter.stalled = true;
-                        self.stats.stalls += 1;
-                    }
-                }
-            }
+        }
+        for (index, waited) in newly_stalled {
+            let Some(presenter) = self.presenters.get_mut(index) else {
+                continue;
+            };
+            eprintln!(
+                "slicer: output {} stopped answering {answer} after {:.0} ms; \
+                 dropping it from the gate until it recovers",
+                presenter.name,
+                waited.as_secs_f64() * 1000.0,
+            );
+            presenter.stalled = true;
+            self.stats.stalls += 1;
+        }
+    }
+
+    /// Note that the wall has a frame it would commit right now but for the
+    /// gate. Idempotent within one commit cycle: the *first* such
+    /// observation is the one [`ProjectionStats::gate_holds`] measures from.
+    fn note_gate_blocked(&mut self) {
+        if self.gate_blocked_since.is_none() {
+            self.gate_blocked_since = Some(Instant::now());
+        }
+    }
+
+    /// Close off a commit cycle: if the gate had been holding a ready frame,
+    /// decide whether that wait was long enough to count as a hold.
+    ///
+    /// `forced` is the `sync` loop's fallback commit (see
+    /// [`GATE_FALLBACK_PERIODS`]) — the gate never opened at all, which is a
+    /// hold however briefly it was measured.
+    fn note_commit_cycle(&mut self, forced: bool) {
+        let Some(since) = self.gate_blocked_since.take() else {
+            return;
+        };
+        let held_ms = since.elapsed().as_secs_f64() * 1000.0;
+        if forced || held_ms > self.canvas_period_ms {
+            self.stats.gate_holds += 1;
         }
     }
 
@@ -1169,6 +1567,7 @@ impl State {
                     refresh_hz: accum.refresh_ns.map(|ns| 1_000_000_000.0 / f64::from(ns)),
                     phase_ms,
                     phase_spread_ms,
+                    lag_frames: accum.lag_frames,
                 },
             )
             .collect();
@@ -1230,9 +1629,9 @@ impl State {
         eprintln!(
             "slicer: {canvas_fps:.1} fps captured, {presented_fps:.1} fps presented, over \
              {:.0}s per frame: waiting {:.1} ms, snapshot {:.1} ms, requesting {:.1} ms, \
-             blending {:.1} ms; superseded {}, stalls {}, straddles {}, buffer reuse {}, \
-             offset {offset_text}, phase {phase_text}, renderer {renderer_name}, gpu {:.1} ms, \
-             intervals 1:{} 2:{} 3:{} 4+:{}",
+             blending {:.1} ms; superseded {}, stalls {}, straddles {}, gate holds {}, \
+             buffer reuse {}, offset {offset_text}, phase {phase_text}, \
+             renderer {renderer_name}, gpu {:.1} ms, intervals 1:{} 2:{} 3:{} 4+:{}",
             elapsed.as_secs_f64(),
             per_ms(self.stats.waiting),
             per_ms(self.stats.snapshot),
@@ -1241,6 +1640,7 @@ impl State {
             self.stats.superseded,
             self.stats.stalls,
             interval.straddles,
+            self.stats.gate_holds,
             self.stats.buffer_reuse,
             per_ms(self.stats.gpu),
             ci.one,
@@ -1273,6 +1673,7 @@ impl State {
                 .offset
                 .map(|(mean, max)| PresentationOffset { mean, max }),
             straddles: interval.straddles,
+            gate_holds: self.stats.gate_holds,
             renderer: renderer_name.to_string(),
             capture_intervals: ci,
             outputs,
@@ -1325,6 +1726,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         dmabuf_feedback: None,
         canvas_period_ms: 1000.0 / 60.0,
         last_capture_at: None,
+        gate_blocked_since: None,
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
@@ -1374,9 +1776,12 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
 
     // GPU/dmabuf negotiation, once, before anything else needs to know the
     // backend — see the module doc's negotiation notes. Skipped entirely
-    // for a test pattern, which never captures at all and draws straight
-    // into shm-backed presenter buffers regardless of `renderer`.
-    if spec.pattern.is_none() && spec.renderer != Renderer::Cpu {
+    // for a *static* test pattern, which never captures at all and draws
+    // straight into shm-backed presenter buffers regardless of `renderer`.
+    // The `sync` pattern is not static: it presents every frame, through
+    // whichever backend content would have used, because what it measures
+    // is that backend's path to the glass.
+    if !spec.pattern.is_some_and(|pattern| !animated(pattern)) && spec.renderer != Renderer::Cpu {
         match negotiate_gpu(dmabuf.as_ref(), &mut state, &mut queue, &handle) {
             Ok((gpu, formats)) => {
                 state.gpu = Some(gpu);
@@ -1444,6 +1849,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             source: slice.source,
             frame_pending: false,
             pending_since: None,
+            feedback_pending_for: None,
+            feedback_since: None,
             stalled: false,
             stale: false,
         });
@@ -1481,6 +1888,18 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     }
 
     if let Some(pattern) = spec.pattern {
+        if animated(pattern) {
+            // Presents every frame through the normal path, so it shares
+            // nothing below but the presenters themselves.
+            return run_sync(
+                &connection,
+                &mut queue,
+                &mut state,
+                &shm,
+                dmabuf.as_ref(),
+                &handle,
+            );
+        }
         // A test pattern is drawn by poking pixels directly (see
         // `present_pattern`), so it always needs a CPU-mapped buffer — the
         // GPU path never enters into it regardless of `renderer` (and
@@ -1616,6 +2035,13 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 current.destroy();
                 let filled_slot = state.capture.gpu_slot;
                 state.capture.gpu_slot = (filled_slot + 1) % GPU_CAPTURE_SLOTS;
+                // The newest complete frame, held for the gate rather than
+                // blended here: whether it goes out now or in a moment is
+                // the gate's decision, made once at the bottom of the loop
+                // for both backends. Arming the *next* capture still
+                // happens right away — that is what keeps the pipeline
+                // full, and it is independent of when this frame is shown.
+                state.capture.pending_slot = Some(filled_slot);
 
                 let requesting_from = Instant::now();
                 if !arm_copy(
@@ -1632,12 +2058,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 current = next;
                 next = request_capture(&mut state, &screencopy, &source, &handle);
 
-                let blending_from = Instant::now();
-                let due = gpu_blend_due(&mut state, filled_slot, dmabuf.as_ref(), &handle);
-                state.stats.blending += blending_from.elapsed();
-
-                if !due.is_empty() {
-                    gpu_present_due(&mut state, &handle, &due);
+                // Present images follow a mid-run resize on every capture,
+                // not only on the ones the gate lets out — `gpu_blend_due`
+                // used to be the only place this happened, and it no longer
+                // runs on a gated cycle.
+                if let Some(dmabuf) = dmabuf.as_ref() {
+                    for index in 0..state.presenters.len() {
+                        ensure_gpu_present_buffers(&mut state, dmabuf, &handle, index);
+                    }
                 }
             } else {
                 // Copy the frame out and hand the buffer straight back, so the
@@ -1668,8 +2096,16 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
 
         if state.can_present() {
             let blending_from = Instant::now();
+            let before = state.stats.presented;
             present_frame(&mut state, &handle);
             state.stats.blending += blending_from.elapsed();
+            if state.stats.presented > before {
+                state.note_commit_cycle(false);
+            }
+        } else if state.presenters.iter().any(|p| p.stale) {
+            // A frame is waiting and the gate is shut: from here to the
+            // commit that eventually goes out is what `gateHolds` measures.
+            state.note_gate_blocked();
         }
 
         state.report_stats_if_due();
@@ -1879,13 +2315,31 @@ fn gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Result<
             "capture format {format:#010x} has no Vulkan-importable modifier"
         ));
     }
+    present_format_available(gpu, &state.gpu_formats)
+}
+
+/// Everything [`gpu_availability`] checks except the parts about capture —
+/// the requirements of a run that *draws* its own frames rather than
+/// capturing them. See `decide_sync_backend`.
+fn sync_gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Result<(), String> {
+    if dmabuf.is_none() {
+        return Err("compositor does not offer zwp_linux_dmabuf_v1 version 4".to_string());
+    }
+    let Some(gpu) = state.gpu.as_ref() else {
+        return Err(state
+            .gpu_error
+            .clone()
+            .unwrap_or_else(|| "no Vulkan device available".to_string()));
+    };
+    present_format_available(gpu, &state.gpu_formats)
+}
+
+/// Whether a Present image can be allocated at all — the half of the GPU
+/// path's requirements that has nothing to do with where the pixels came
+/// from, and so the only half the `sync` pattern needs.
+fn present_format_available(gpu: &gpu::Gpu, formats: &DmabufFormats) -> Result<(), String> {
     let present_ok = [FOURCC_XR24, FOURCC_XB24].into_iter().any(|fourcc| {
-        let modifiers = state
-            .gpu_formats
-            .all
-            .get(&fourcc)
-            .cloned()
-            .unwrap_or_default();
+        let modifiers = formats.all.get(&fourcc).cloned().unwrap_or_default();
         !gpu.supported_modifiers(fourcc, &modifiers, gpu::Usage::Present)
             .is_empty()
     });
@@ -2521,13 +2975,10 @@ fn record_capture_interval(state: &mut State) {
     state.last_capture_at = Some(now);
 }
 
-/// Backend dispatch for the two present_frame implementations below. Called
-/// from the generic `can_present()`-driven sites in `run`'s loop; the GPU
-/// path's own primary call sites (inside the `Ready` handling) call
-/// `gpu_blend_due`/`gpu_present_due` directly instead, so on that path this
-/// is specifically the free-run safety net described on `gpu_blend_due`'s
-/// and `present_frame_gpu`'s own docs: a straggler whose frame callback
-/// cleared after the primary blend already ran this cycle.
+/// Backend dispatch for the two present_frame implementations below. The
+/// single `can_present()`-driven site in `run`'s loop — both backends go
+/// through it, so the gate decides when a capture is blended and committed
+/// whichever renderer produced it.
 fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
     match state.capture.backend {
         Some(Backend::Gpu) => present_frame_gpu(state, handle),
@@ -2535,14 +2986,24 @@ fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
     }
 }
 
-/// The free-run safety net `gpu_blend_due` leaves `stale` set for: reads
-/// `Capture.last_blended_slot`, the one capture image guaranteed not to be
-/// what the compositor is currently writing into (that is always the
-/// *other* slot — see `Capture.gpu_slot`'s doc), and blends whichever
-/// presenter(s) are now ready from it.
+/// GPU path: blend the newest complete capture into whichever presenters are
+/// due and commit them.
+///
+/// The image blended from is `Capture.pending_slot` — the capture a `Ready`
+/// most recently completed and the gate has been holding — falling back to
+/// `Capture.last_blended_slot` when there is no fresh capture waiting, which
+/// is the free-run case of a straggler whose readiness cleared after this
+/// cycle's frame already went out to its neighbours. Either is guaranteed
+/// not to be the image the compositor is currently writing into: that is
+/// always the *other* slot (see `Capture.gpu_slot`'s doc).
 fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
-    let Some(slot) = state.capture.last_blended_slot else {
-        // Nothing has been blended yet this run: clear `stale` the same way
+    let slot = state
+        .capture
+        .pending_slot
+        .take()
+        .or(state.capture.last_blended_slot);
+    let Some(slot) = slot else {
+        // Nothing has been captured yet this run: clear `stale` the same way
         // `gpu_blend_due` would, so a presenter that somehow raced ahead of
         // the very first capture cannot spin `can_present()` forever.
         for presenter in &mut state.presenters {
@@ -2550,7 +3011,7 @@ fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
         }
         return;
     };
-    let due = gpu_blend_due(state, slot, None, handle);
+    let due = gpu_blend_due(state, slot);
     if !due.is_empty() {
         gpu_present_due(state, handle, &due);
     }
@@ -2562,33 +3023,18 @@ fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
 /// frame-loop comment on why the caller must arm the *other* slot, not this
 /// one, before calling this.
 ///
-/// A free-run presenter that is not yet ready (still holding an outstanding
-/// `wl_surface.frame` callback) is left `stale`, not cleared: `capture_slot`
-/// stays intact for a whole extra cycle after this call returns (see
-/// `Capture.last_blended_slot`), so `present_frame_gpu`'s safety-net call
-/// can still pick it up the moment that presenter's callback clears,
-/// instead of only ever catching the *next* capture the way a single image
-/// had to. Every other presenter's `stale` is cleared here, due or not —
-/// locked mode only ever calls this once every presenter is ready (see
+/// A free-run presenter that is not yet ready (still owing the gate's
+/// readiness signal for its last commit) is left `stale`, not cleared:
+/// `capture_slot` stays intact for a whole extra cycle after this call
+/// returns (see `Capture.last_blended_slot`), so `present_frame_gpu`'s next
+/// call can still pick it up the moment that presenter answers, instead of
+/// only ever catching the *next* capture the way a single image had to.
+/// Every other presenter's `stale` is cleared here, due or not — locked
+/// mode only ever calls this once every presenter has answered (see
 /// `can_present`), so a configured presenter that was not due simply had
 /// nothing new to show and is not owed a re-blend later.
-///
-/// `dmabuf_proxy`, when given, also resizes any presenter whose surface was
-/// reconfigured to a new size since its GPU buffers were created — `None`
-/// (from `present_frame_gpu`'s safety-net call) simply skips that, since by
-/// then the primary call from `run`'s loop has already had the chance to.
-fn gpu_blend_due(
-    state: &mut State,
-    capture_slot: usize,
-    dmabuf_proxy: Option<&ZwpLinuxDmabufV1>,
-    handle: &QueueHandle<State>,
-) -> Vec<Due> {
-    if let Some(dmabuf_proxy) = dmabuf_proxy {
-        for index in 0..state.presenters.len() {
-            ensure_gpu_present_buffers(state, dmabuf_proxy, handle, index);
-        }
-    }
-
+fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
+    let signal = state.gate_signal();
     let State {
         capture,
         presenters,
@@ -2612,8 +3058,7 @@ fn gpu_blend_due(
             presenter.stale = false;
             continue;
         }
-        let ready = !presenter.frame_pending || presenter.stalled;
-        if *free_run && !ready {
+        if *free_run && !presenter.gate_ready(signal) {
             // Left `stale` — see the doc above.
             continue;
         }
@@ -2696,12 +3141,14 @@ fn gpu_present_due(state: &mut State, handle: &QueueHandle<State>, due: &[Due]) 
         // fires no earlier than the *next* commit's contents are shown, so
         // asking after commit would describe the wrong frame.
         presenter.surface.frame(handle, d.index);
-        presenter.frame_pending = true;
-        presenter.pending_since = Some(Instant::now());
         if let Some(presentation) = presentation.as_ref() {
             timing.request(snapshot_id, d.index);
             presentation.feedback(&presenter.surface, handle, (d.index, snapshot_id));
         }
+        // Both waits armed together, right before the commit they describe:
+        // whichever of them the gate is anchored to is what holds the next
+        // commit back until this one has landed.
+        presenter.commit_sent(snapshot_id, presentation.is_some());
         presenter.surface.commit();
         committed_any = true;
     }
@@ -2721,6 +3168,7 @@ fn gpu_present_due(state: &mut State, handle: &QueueHandle<State>, due: &[Due]) 
 /// moving at all. CPU path only — see `present_frame_gpu` for the GPU path's
 /// equivalent.
 fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
+    let signal = state.gate_signal();
     // Split-borrow: the canvas is read while presenter buffers are written,
     // and the presentation bookkeeping is independent of both.
     let State {
@@ -2772,8 +3220,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         // only reaches here once every presenter is already ready; free-run
         // needs the check here too, because presenters arrive at this loop
         // at different points in their own cycle.
-        let ready = !presenter.frame_pending || presenter.stalled;
-        let due = presenter.stale && (!*free_run || ready);
+        let due = presenter.stale && (!*free_run || presenter.gate_ready(signal));
         if !due {
             continue;
         }
@@ -2861,13 +3308,12 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         // fires no earlier than the *next* commit's contents are shown, so
         // asking after commit would describe the wrong frame.
         presenter.surface.frame(handle, index);
-        presenter.frame_pending = true;
-        presenter.pending_since = Some(Instant::now());
         presenter.stale = false;
         if let Some(presentation) = presentation.as_ref() {
             timing.request(snapshot_id, index);
             presentation.feedback(&presenter.surface, handle, (index, snapshot_id));
         }
+        presenter.commit_sent(snapshot_id, presentation.is_some());
         presenter.surface.commit();
         committed_any = true;
     }
@@ -2985,6 +3431,515 @@ fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::
             .surface
             .damage_buffer(0, 0, width as i32, height as i32);
         presenter.surface.commit();
+    }
+}
+
+// --- the `sync` test pattern ----------------------------------------------
+
+/// Whether a pattern is drawn per frame by the slicer rather than once into
+/// a static buffer. See the module doc's "Sync pattern" section.
+fn animated(pattern: TestPattern) -> bool {
+    match pattern {
+        TestPattern::Sync => true,
+        TestPattern::Grid
+        | TestPattern::White
+        | TestPattern::Black
+        | TestPattern::Gamma
+        | TestPattern::Identify => false,
+    }
+}
+
+/// The `sync` pattern's frame loop: the content loop with the capture taken
+/// out and the gate left to set the pace.
+///
+/// Everything that decides *when* a frame reaches an output is deliberately
+/// unchanged — the all-outputs gate, `free_run`, the buffer rotation,
+/// `wl_surface.frame`, `wp_presentation_feedback`, `snapshot_id`, the
+/// ten-second report and `GET /projection/stats` — because that machinery is
+/// exactly what this pattern exists to photograph. What is gone is the
+/// canvas: there is nothing to capture, so nothing stands in for the
+/// screencopy `Ready` that would otherwise mark a new frame's arrival.
+///
+/// What marks it instead is the gate itself: a cycle commits as soon as
+/// every output has reported presenting the previous one, which puts the
+/// commit a fraction of a millisecond after the slowest head's vblank and
+/// therefore a whole refresh short of the next deadline. The canvas period
+/// (`State.canvas_period_ms`, which falls back to 60 Hz for an output that
+/// reports none — a headless canvas legitimately may) survives only at the
+/// two edges: as a floor, so the pattern never runs faster than the canvas
+/// rate it claims to run at, and as a deadline ([`GATE_FALLBACK_PERIODS`]),
+/// so an output whose feedback is merely late cannot stop the counter. A
+/// free-running timer was the primary clock until 2026-09-17 and is not any
+/// more: see the module doc's "Presentation gating" for the measurement
+/// that moved it. `canvasFps` is now the commit rate, which on a healthy
+/// wall is the refresh.
+fn run_sync(
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    shm: &WlShm,
+    dmabuf: Option<&ZwpLinuxDmabufV1>,
+    handle: &QueueHandle<State>,
+) -> anyhow::Result<()> {
+    state.capture.backend = Some(decide_sync_backend(state, dmabuf)?);
+    create_present_buffers(state, shm, dmabuf, handle)?;
+    match state.capture.backend {
+        Some(Backend::Gpu) => {
+            let gpu = state
+                .gpu
+                .as_ref()
+                .expect("Backend::Gpu implies state.gpu is Some");
+            eprintln!("slicer: renderer gpu ({}), sync pattern", gpu.describe());
+        }
+        Some(Backend::Cpu) | None => eprintln!("slicer: renderer cpu (shm), sync pattern"),
+    }
+
+    let period = Duration::from_secs_f64(state.canvas_period_ms / 1000.0);
+    let floor_step = period.mul_f64(GATE_FLOOR_PERIODS);
+    let fallback_step = period.mul_f64(GATE_FALLBACK_PERIODS);
+    eprintln!(
+        "slicer: sync pattern paced by the gate ({}), floored at {:.2} Hz ({:.2} ms, the \
+         canvas output's refresh) and forced after {:.2} ms",
+        state.gate_signal().answer_name(),
+        1000.0 / state.canvas_period_ms,
+        state.canvas_period_ms,
+        fallback_step.as_secs_f64() * 1000.0,
+    );
+
+    // One value per present cycle, shared by every output committed in it —
+    // the whole measurement rests on that, so it is incremented here and
+    // nowhere else.
+    let mut frame: u32 = 0;
+    // Nothing has been committed yet, so the first frame goes out at once.
+    let mut floor = Instant::now();
+    let mut force = floor;
+    loop {
+        // Sleep to whichever the loop is actually waiting for: the floor
+        // when the gate is already open (there is nothing to wait for but
+        // the canvas rate), the fallback deadline when it is not (an event
+        // will almost always arrive first and cut the wait short).
+        let deadline = if state.gate_open() { floor } else { force };
+        let waiting_from = Instant::now();
+        dispatch_until(connection, queue, state, deadline)?;
+        state.stats.waiting += waiting_from.elapsed();
+        if state.closed {
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let open = state.gate_open();
+        if now >= floor && !open {
+            // Past the floor with the gate still shut: the wall would commit
+            // right now if a straggler had answered. See `gateHolds`.
+            state.note_gate_blocked();
+        }
+        // The gate is this loop's clock; the fallback is what keeps a clock
+        // that has stopped from stopping the pattern with it.
+        let forced = now >= force && !open;
+        if now >= floor && (open || forced) {
+            record_capture_interval(state);
+            state.stats.captured += 1;
+            state.new_snapshot();
+            // Once a cycle, the same place the content loop does it: an
+            // output whose mode changed under us needs Present images of
+            // the new size before anything is drawn into them.
+            if state.capture.backend == Some(Backend::Gpu) {
+                if let Some(dmabuf) = dmabuf {
+                    for index in 0..state.presenters.len() {
+                        ensure_gpu_present_buffers(state, dmabuf, handle, index);
+                    }
+                }
+            }
+            let blending_from = Instant::now();
+            if present_sync(state, handle, frame) {
+                frame = frame.wrapping_add(1);
+            }
+            state.stats.blending += blending_from.elapsed();
+            state.note_commit_cycle(forced);
+            // Both deadlines run from the commit, not from a fixed grid: the
+            // whole point is that the commits follow the flips rather than a
+            // clock of this loop's own.
+            floor = now + floor_step;
+            force = now + fallback_step;
+        }
+
+        state.report_stats_if_due();
+        if state.closed {
+            return Ok(());
+        }
+    }
+}
+
+/// `decide_backend` for a run with no capture: the same `Auto`/`Cpu`/`Gpu`
+/// policy and the same fatal case, against `sync_gpu_availability`'s
+/// shorter list of requirements.
+fn decide_sync_backend(
+    state: &State,
+    dmabuf: Option<&ZwpLinuxDmabufV1>,
+) -> anyhow::Result<Backend> {
+    if state.renderer == Renderer::Cpu {
+        return Ok(Backend::Cpu);
+    }
+    match sync_gpu_availability(state, dmabuf) {
+        Ok(()) => Ok(Backend::Gpu),
+        Err(reason) => {
+            if state.renderer == Renderer::Gpu {
+                anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
+            }
+            eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
+            Ok(Backend::Cpu)
+        }
+    }
+}
+
+/// Dispatch Wayland events until `deadline`, or until something arrives,
+/// whichever is first.
+///
+/// `blocking_dispatch`, which the content loop uses, has no deadline — the
+/// canvas's own `Ready` is what wakes it. This loop has no canvas, so it has
+/// to wake itself: flush, arm a read, and poll the connection's fd with the
+/// time left on the tick. Returning early on any event is deliberate and
+/// costs nothing: the caller re-checks both the clock and the gate on every
+/// pass, and events on this connection are frame callbacks and presentation
+/// feedback — a handful per output per frame, not a stream.
+fn dispatch_until(
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    queue.flush()?;
+    // `None` means events are already queued; there is nothing to wait for.
+    let Some(guard) = queue.prepare_read() else {
+        queue.dispatch_pending(state)?;
+        return Ok(());
+    };
+    let millis = deadline
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .min(i32::MAX as u128) as i32;
+    let mut poll_fd = libc::pollfd {
+        fd: connection.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // Safety: one fully initialised `pollfd` naming a socket this
+    // `Connection` owns and outlives the call; `poll` writes `revents` and
+    // nothing else.
+    let ready = unsafe { libc::poll(&mut poll_fd, 1, millis) };
+    if ready > 0 {
+        // A spurious wakeup (or a racing dispatch from elsewhere) leaves
+        // nothing to read; that is not an error, just an empty pass.
+        if let Err(error) = guard.read() {
+            if !matches!(
+                &error,
+                wayland_client::backend::WaylandError::Io(io)
+                    if io.kind() == std::io::ErrorKind::WouldBlock
+            ) {
+                return Err(error.into());
+            }
+        }
+    } else {
+        // Timed out, or interrupted by a signal. Either way the guard must
+        // be released before anything else touches the queue.
+        drop(guard);
+    }
+    queue.dispatch_pending(state)?;
+    Ok(())
+}
+
+/// Draw and commit one `sync` frame. `true` when at least one output took
+/// it, which is what advances the counter.
+fn present_sync(state: &mut State, handle: &QueueHandle<State>, frame: u32) -> bool {
+    let due = sync_due(state);
+    if due.is_empty() {
+        return false;
+    }
+    match state.capture.backend {
+        Some(Backend::Gpu) => present_sync_gpu(state, handle, frame, due),
+        _ => present_sync_cpu(state, handle, frame, due),
+    }
+}
+
+/// Which presenters are owed this cycle's frame, and which buffer slot each
+/// takes — the selection `present_frame_cpu` and `gpu_blend_due` both make,
+/// in one place because with no canvas there is nothing else for the two
+/// paths to differ about.
+///
+/// Locked mode reaches here only once every presenter is ready (see
+/// `can_present`), so every stale presenter is committed together. Free-run
+/// leaves a presenter that is still holding a frame callback `stale`, so it
+/// is picked up on the pass where its callback clears — and then shows that
+/// pass's counter, not this one's. That is free-run behaving as documented,
+/// and it is why a sync photograph is taken with the gate on.
+fn sync_due(state: &mut State) -> Vec<Due> {
+    let signal = state.gate_signal();
+    let State {
+        presenters,
+        free_run,
+        stats,
+        capture,
+        ..
+    } = state;
+    let gpu = capture.backend == Some(Backend::Gpu);
+    let mut due = Vec::new();
+    for (index, presenter) in presenters.iter_mut().enumerate() {
+        if presenter.configured.is_none() || !presenter.stale {
+            presenter.stale = false;
+            continue;
+        }
+        if *free_run && !presenter.gate_ready(signal) {
+            continue;
+        }
+        presenter.stale = false;
+        let len = if gpu {
+            presenter.gpu_buffers.len()
+        } else {
+            presenter.buffers.len()
+        };
+        if len == 0 {
+            continue;
+        }
+        let slot = (0..len)
+            .map(|step| (presenter.next_buffer + step) % len)
+            .find(|&candidate| !presenter.busy[candidate])
+            .unwrap_or_else(|| {
+                stats.buffer_reuse += 1;
+                presenter.next_buffer % len
+            });
+        presenter.next_buffer = (slot + 1) % len;
+        presenter.busy[slot] = true;
+        due.push(Due { index, slot });
+    }
+    due
+}
+
+/// CPU path: rasterise the rect list into each due presenter's next free shm
+/// slot and commit it exactly as `present_frame_cpu` commits a slice of the
+/// canvas — the same rotation, the same frame callback, the same
+/// presentation-feedback request.
+fn present_sync_cpu(
+    state: &mut State,
+    handle: &QueueHandle<State>,
+    frame: u32,
+    due: Vec<Due>,
+) -> bool {
+    let State {
+        presenters,
+        timing,
+        presentation,
+        ..
+    } = state;
+    let snapshot_id = timing.snapshot_id;
+    let mut committed_any = false;
+    for d in &due {
+        let presenter = &mut presenters[d.index];
+        let Some((width, height)) = presenter.configured else {
+            continue;
+        };
+        let groups = super::pattern::sync_rects(width, height, frame, &presenter.name, snapshot_id);
+        let rects: Vec<SyncRect> = groups
+            .iter()
+            .flat_map(|group| group.rects.iter().copied())
+            .collect();
+        {
+            // Split-borrow: the transfer table is read while this
+            // presenter's buffer is written.
+            let Presenter {
+                transfer, buffers, ..
+            } = presenter;
+            let (_, map) = &mut buffers[d.slot];
+            let paint = SyncPaint {
+                transfer,
+                rects: &rects,
+                width,
+            };
+            let row_bytes = width as usize * 4;
+            // From the buffer, not only from `configured`: a surface that
+            // was reconfigured larger mid-run still has its old shm buffer
+            // (the CPU path never reallocates one), and painting the
+            // configured height into it would be an out-of-bounds slice.
+            // The picture is wrong for that one frame either way; it must
+            // not also be a panic.
+            let height = height.min((map.len() / row_bytes.max(1)) as u32);
+            let painted = &mut map[..height as usize * row_bytes];
+            let workers = blend_workers(height);
+            if workers <= 1 {
+                paint.rows(painted, 0, height);
+            } else {
+                let band = height.div_ceil(workers);
+                std::thread::scope(|scope| {
+                    for (index, chunk) in painted.chunks_mut(band as usize * row_bytes).enumerate()
+                    {
+                        let paint = &paint;
+                        let first = index as u32 * band;
+                        let count = band.min(height - first);
+                        scope.spawn(move || paint.rows(chunk, first, count));
+                    }
+                });
+            }
+        }
+
+        let (buffer, _) = &presenter.buffers[d.slot];
+        presenter.surface.attach(Some(buffer), 0, 0);
+        presenter
+            .surface
+            .damage_buffer(0, 0, width as i32, height as i32);
+        // Requested before `commit`, per wl_surface.frame — same reasoning
+        // as `present_frame_cpu`.
+        presenter.surface.frame(handle, d.index);
+        if let Some(presentation) = presentation.as_ref() {
+            timing.request(snapshot_id, d.index);
+            presentation.feedback(&presenter.surface, handle, (d.index, snapshot_id));
+        }
+        presenter.commit_sent(snapshot_id, presentation.is_some());
+        presenter.surface.commit();
+        committed_any = true;
+    }
+    if committed_any {
+        state.stats.presented += 1;
+    }
+    committed_any
+}
+
+/// GPU path: upload each due output's shapes, draw them into the Present
+/// dmabufs with one submit, and commit through `gpu_present_due` — the same
+/// images and the same commit path content uses, which is what keeps
+/// `zeroCopyPresented` at n/n while the pattern is showing.
+fn present_sync_gpu(
+    state: &mut State,
+    handle: &QueueHandle<State>,
+    frame: u32,
+    due: Vec<Due>,
+) -> bool {
+    let snapshot_id = state.timing.snapshot_id;
+    let State {
+        presenters, gpu, ..
+    } = state;
+    let Some(gpu) = gpu.as_mut() else {
+        return false;
+    };
+    for d in &due {
+        let presenter = &presenters[d.index];
+        let Some((width, height)) = presenter.configured else {
+            continue;
+        };
+        let groups = super::pattern::sync_rects(width, height, frame, &presenter.name, snapshot_id);
+        let (count, items) = sync_shape_items(&groups);
+        if let Err(error) = gpu.set_sync_shapes(d.index, count, &items) {
+            eprintln!(
+                "slicer: output {}: uploading the sync pattern failed: {error:#}",
+                presenter.name
+            );
+        }
+    }
+    let jobs: Vec<gpu::BlendJob<'_>> = due
+        .iter()
+        .filter_map(|d| {
+            let presenter = &presenters[d.index];
+            let (_, image) = presenter.gpu_buffers.get(d.slot)?;
+            Some(gpu::BlendJob {
+                target: image,
+                output: d.index,
+                // Unused in sync mode — the shader takes its colour from the
+                // shape list, not from a canvas — but carried so a job is
+                // one thing whichever mode built it.
+                source_x: presenter.source.x.max(0) as u32,
+                source_y: presenter.source.y.max(0) as u32,
+            })
+        })
+        .collect();
+    match gpu.sync(&jobs) {
+        Ok(duration) => {
+            state.stats.gpu += duration;
+            gpu_present_due(state, handle, &due);
+            true
+        }
+        Err(error) => {
+            eprintln!("slicer: gpu.sync failed: {error:#}");
+            for d in &due {
+                state.presenters[d.index].busy[d.slot] = false;
+            }
+            false
+        }
+    }
+}
+
+/// Pack [`SyncGroup`]s into the flat `uvec4` array `blend.frag`'s `Shapes`
+/// block walks: per group, the bounding box `(x0, y0, x1, y1)`, then
+/// `(rect_count, next_group_index, 0, 0)`, then the rectangles. Returns the
+/// group count alongside, for the draw's push constants.
+///
+/// The `next` link is what lets groups vary in length without the shader
+/// needing a second array or a stride: it reads the header, decides whether
+/// the pixel is in the box at all, and jumps.
+fn sync_shape_items(groups: &[SyncGroup]) -> (u32, Vec<[u32; 4]>) {
+    let mut items =
+        Vec::with_capacity(groups.len() * 2 + groups.iter().map(|g| g.rects.len()).sum::<usize>());
+    for group in groups {
+        items.push([
+            group.bounds.x0,
+            group.bounds.y0,
+            group.bounds.x1,
+            group.bounds.y1,
+        ]);
+        let header = items.len();
+        items.push([group.rects.len() as u32, 0, 0, 0]);
+        for rect in &group.rects {
+            items.push([rect.x0, rect.y0, rect.x1, rect.y1]);
+        }
+        items[header][1] = items.len() as u32;
+    }
+    (groups.len() as u32, items)
+}
+
+/// Everything a `sync` rasterising worker needs that does not vary between
+/// rows — [`Blend`]'s counterpart for a pattern with no canvas behind it.
+struct SyncPaint<'a> {
+    transfer: &'a [(u16, u8)],
+    rects: &'a [SyncRect],
+    width: u32,
+}
+
+impl SyncPaint<'_> {
+    /// Paint `count` destination rows, `dst` starting at row `first`.
+    ///
+    /// Black everywhere, then white inside every rectangle that crosses the
+    /// row — with the same fixed-point transfer `Blend::rows` applies, so
+    /// ramps and black lift shape the counter exactly as they shape content
+    /// and the two renderers produce the same bytes. Black is not zero once
+    /// the lift is on: `out = ((a*0)>>8) + b` is `b`.
+    fn rows(&self, dst: &mut [u8], first: u32, count: u32) {
+        let row_bytes = self.width as usize * 4;
+        for y in 0..count {
+            let target = first + y;
+            let dst_row = y as usize * row_bytes;
+            let transfer_row = target as usize * self.width as usize;
+            for x in 0..self.width as usize {
+                let (_, b) = self
+                    .transfer
+                    .get(transfer_row + x)
+                    .copied()
+                    .unwrap_or((256, 0));
+                dst[dst_row + x * 4..dst_row + x * 4 + 4].copy_from_slice(&[b, b, b, 255]);
+            }
+            for rect in self.rects {
+                if target < rect.y0 || target >= rect.y1 {
+                    continue;
+                }
+                let from = rect.x0 as usize;
+                let to = (rect.x1 as usize).min(self.width as usize);
+                for x in from..to {
+                    let (a, b) = self
+                        .transfer
+                        .get(transfer_row + x)
+                        .copied()
+                        .unwrap_or((256, 0));
+                    let v = (((u32::from(a) * 255) >> 8) + u32::from(b)).min(255) as u8;
+                    dst[dst_row + x * 4..dst_row + x * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+                }
+            }
+        }
     }
 }
 
@@ -3200,15 +4155,22 @@ impl Dispatch<WlCallback, usize> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // `Done` is the callback's only event: the output took the commit
-        // this callback was requested for. Clearing `stalled` here as well
-        // as `frame_pending` is what lets an output rejoin the gate the
-        // moment it starts answering again.
+        // `Done` is the callback's only event: the compositor committed an
+        // output frame carrying the commit this callback was requested for.
+        // Not the flip — see the module doc's "Presentation gating" — so
+        // this only opens the gate where there is no `wp_presentation` to
+        // anchor it to, and only then does it clear `stalled` (the flag that
+        // lets an output rejoin the gate once it answers again): an output
+        // that has stopped presenting while still answering frame callbacks
+        // must not bounce in and out of the gate every frame.
         if let wl_callback::Event::Done { .. } = event {
+            let gated_on_callbacks = state.presentation.is_none();
             if let Some(presenter) = state.presenters.get_mut(*index) {
                 presenter.frame_pending = false;
-                presenter.stalled = false;
                 presenter.pending_since = None;
+                if gated_on_callbacks {
+                    presenter.stalled = false;
+                }
             }
         }
     }
@@ -3267,6 +4229,31 @@ impl Dispatch<WpPresentationFeedback, (usize, u64)> for State {
         _: &QueueHandle<Self>,
     ) {
         let (index, snapshot_id) = *data;
+        // Either answer ends this presenter's wait — the protocol promises
+        // exactly one of them per feedback object, and the gate cares that
+        // the commit is resolved, not that it was shown. `>=` rather than
+        // `==` because a *stalled* output is committed to without the gate
+        // waiting for it, so it can have more than one answer outstanding;
+        // an answer older than the wait in hand must not end it.
+        if matches!(
+            &event,
+            wp_presentation_feedback::Event::Presented { .. }
+                | wp_presentation_feedback::Event::Discarded
+        ) {
+            let gated_on_feedback = state.presentation.is_some();
+            if let Some(presenter) = state.presenters.get_mut(index) {
+                if presenter
+                    .feedback_pending_for
+                    .is_some_and(|pending| snapshot_id >= pending)
+                {
+                    presenter.feedback_pending_for = None;
+                    presenter.feedback_since = None;
+                    if gated_on_feedback {
+                        presenter.stalled = false;
+                    }
+                }
+            }
+        }
         match event {
             wp_presentation_feedback::Event::Presented {
                 tv_sec_hi,
@@ -3649,6 +4636,86 @@ mod tests {
         assert!(settled.phase_samples.is_empty());
     }
 
+    // --- per-output lag in frames ----------------------------------------
+
+    /// Builds a `Presented` slot at an exact nanosecond timestamp, unlike
+    /// `presented`/`presented_with` above which only offer millisecond
+    /// precision — needed here to land exactly on refresh-period multiples.
+    fn presented_at_ns(at_ns: u64, refresh_ns: u32) -> Slot {
+        Slot::Presented {
+            at_ns,
+            refresh_ns,
+            zero_copy: false,
+        }
+    }
+
+    #[test]
+    fn two_outputs_one_refresh_apart_lag_one_on_the_later_output() {
+        let refresh_ns = REFRESH_60HZ_NS as u32;
+        let settled = settle(&[
+            presented_at_ns(0, refresh_ns),
+            presented_at_ns(u64::from(refresh_ns), refresh_ns),
+        ]);
+        assert_eq!(settled.lag_frames, vec![(0, 0), (1, 1)]);
+    }
+
+    #[test]
+    fn three_outputs_one_two_refreshes_behind() {
+        let refresh_ns = REFRESH_60HZ_NS as u32;
+        let settled = settle(&[
+            presented_at_ns(0, refresh_ns),
+            presented_at_ns(u64::from(refresh_ns), refresh_ns),
+            presented_at_ns(2 * u64::from(refresh_ns), refresh_ns),
+        ]);
+        assert_eq!(settled.lag_frames, vec![(0, 0), (1, 1), (2, 2)]);
+    }
+
+    #[test]
+    fn a_lone_presenter_contributes_no_lag_samples() {
+        let settled = settle(&[presented(1000, 60.0)]);
+        assert!(settled.lag_frames.is_empty());
+    }
+
+    #[test]
+    fn a_lag_of_three_or_more_refreshes_clamps_to_the_more_bucket() {
+        let refresh_ns = REFRESH_60HZ_NS as u32;
+        let settled = settle(&[
+            presented_at_ns(0, refresh_ns),
+            presented_at_ns(5 * u64::from(refresh_ns), refresh_ns),
+        ]);
+        assert_eq!(settled.lag_frames, vec![(0, 0), (1, 3)]);
+    }
+
+    #[test]
+    fn the_lag_histogram_resets_between_report_intervals() {
+        let refresh_ns = REFRESH_60HZ_NS as u32;
+        let mut timing = Timing::new(2);
+        timing.request(1, 0);
+        timing.request(1, 1);
+        timing.presented(1, 0, 0, refresh_ns, false);
+        timing.presented(1, 1, u64::from(refresh_ns), refresh_ns, false);
+        assert_eq!(timing.per_output[1].lag_frames.one, 1);
+
+        let interval = timing.drain_interval();
+        assert_eq!(interval.outputs[1].lag_frames.one, 1);
+        assert_eq!(timing.per_output[1].lag_frames, LagFrames::default());
+
+        // A second interval with no lagging presentation must not carry the
+        // first interval's `one` tally forward.
+        timing.request(2, 0);
+        timing.request(2, 1);
+        timing.presented(2, 0, 0, refresh_ns, false);
+        timing.presented(2, 1, 0, refresh_ns, false);
+        let interval = timing.drain_interval();
+        assert_eq!(
+            interval.outputs[1].lag_frames,
+            LagFrames {
+                zero: 1,
+                ..LagFrames::default()
+            }
+        );
+    }
+
     // --- self-heal: the dead-interval predicate -------------------------
 
     #[test]
@@ -3711,6 +4778,121 @@ mod tests {
         assert!(interval_is_dead(true, 30, 0));
     }
 
+    // --- the presentation gate -------------------------------------------
+
+    /// An entry with nothing outstanding: this presenter has answered.
+    fn answered_entry() -> GateEntry {
+        GateEntry {
+            waiting: false,
+            waited: Duration::ZERO,
+            stalled: false,
+        }
+    }
+
+    /// An entry that has owed its answer for `waited`.
+    fn waiting_entry(waited: Duration) -> GateEntry {
+        GateEntry {
+            waiting: true,
+            waited,
+            stalled: false,
+        }
+    }
+
+    #[test]
+    fn the_gate_is_open_once_every_output_has_answered() {
+        let gate = GateState::new(vec![answered_entry(); 3], STALL_TIMEOUT);
+        assert!(gate.all_answered(), "nobody owes an answer");
+        assert!(gate.newly_stalled().is_empty());
+    }
+
+    #[test]
+    fn one_outstanding_output_holds_the_gate_shut() {
+        // The whole point: two heads have flipped, the third has not, and
+        // the wall waits rather than letting the two run a frame ahead.
+        let gate = GateState::new(
+            vec![
+                answered_entry(),
+                answered_entry(),
+                waiting_entry(Duration::from_millis(8)),
+            ],
+            STALL_TIMEOUT,
+        );
+        assert!(!gate.all_answered());
+        assert!(
+            gate.newly_stalled().is_empty(),
+            "8 ms is an ordinary wait, not a stall"
+        );
+    }
+
+    #[test]
+    fn an_output_that_never_answers_is_dropped_from_the_gate_and_counted() {
+        // A DPMS-off projector must not freeze the rest of the wall: past
+        // the timeout it stops being waited for, and it is named so the
+        // stall shows up in the stats.
+        let waited = STALL_TIMEOUT + Duration::from_millis(1);
+        let gate = GateState::new(vec![answered_entry(), waiting_entry(waited)], STALL_TIMEOUT);
+        assert!(
+            gate.all_answered(),
+            "the straggler no longer holds the gate"
+        );
+        assert_eq!(gate.newly_stalled(), vec![(1, waited)]);
+    }
+
+    #[test]
+    fn an_already_stalled_output_is_neither_waited_for_nor_counted_again() {
+        // It is still being committed to, so it still owes an answer — but
+        // the stall was counted when it was first dropped, and counting it
+        // once per frame afterwards would say the wall is failing sixty
+        // times a second.
+        let entry = GateEntry {
+            waiting: true,
+            waited: Duration::from_secs(5),
+            stalled: true,
+        };
+        let gate = GateState::new(vec![answered_entry(), entry], STALL_TIMEOUT);
+        assert!(gate.all_answered());
+        assert!(gate.newly_stalled().is_empty());
+    }
+
+    #[test]
+    fn an_empty_wall_never_holds_the_gate_shut() {
+        // No presenters, nobody to wait for. Reporting this shut would spin
+        // the frame loop at full CPU presenting nothing.
+        assert!(GateState::new(Vec::new(), STALL_TIMEOUT).all_answered());
+    }
+
+    #[test]
+    fn without_wp_presentation_the_gate_falls_back_to_frame_callbacks() {
+        // The signal the compositor offers decides which wait is consulted,
+        // and the other one is not merely preferred — it is ignored.
+        assert_eq!(gate_signal(true), GateSignal::Presentation);
+        assert_eq!(gate_signal(false), GateSignal::FrameCallback);
+
+        let frame = Some(Duration::from_millis(4));
+        let feedback = None;
+        assert!(
+            !gate_entry(GateSignal::FrameCallback, frame, feedback, false).answered(STALL_TIMEOUT),
+            "a compositor with no wp_presentation still waits for the callback"
+        );
+        assert!(
+            gate_entry(GateSignal::Presentation, frame, feedback, false).answered(STALL_TIMEOUT),
+            "with feedback in hand an outstanding callback is not what the gate waits on"
+        );
+
+        // And the other way round: the callback came back, the flip has not.
+        // This is the case `brain` was failing — every output answering its
+        // callback while one was a whole refresh behind.
+        let late_flip = Some(Duration::from_millis(12));
+        assert!(
+            !gate_entry(GateSignal::Presentation, None, late_flip, false).answered(STALL_TIMEOUT),
+            "the flip has not landed, so the gate holds"
+        );
+        assert!(
+            gate_entry(GateSignal::FrameCallback, None, late_flip, false).answered(STALL_TIMEOUT),
+            "the callback gate sees nothing outstanding — which is why it never held"
+        );
+    }
+
     // --- self-heal: noticing an output's global disappear ----------------
 
     /// A `State` with no real Wayland objects at all — every field that
@@ -3740,6 +4922,7 @@ mod tests {
             dmabuf_feedback: None,
             canvas_period_ms: 1000.0 / 60.0,
             last_capture_at: None,
+            gate_blocked_since: None,
         }
     }
 
@@ -3985,5 +5168,159 @@ mod tests {
         assert_eq!(fourcc_name(FOURCC_XR24), "XR24");
         assert_eq!(fourcc_name(FOURCC_XB24), "XB24");
         assert_eq!(fourcc_name(0), "????");
+    }
+
+    // --- the `sync` test pattern -----------------------------------------
+
+    /// `blend.frag`'s `Shapes` walk, in Rust: read a group's bounding box,
+    /// test it, walk that group's rectangles only if the pixel is inside,
+    /// then follow the header's `next` link. Written from the shader rather
+    /// than from `sync_shape_items`, so the two have to agree for the tests
+    /// below to pass.
+    fn shader_walk(items: &[[u32; 4]], groups: u32, x: u32, y: u32) -> bool {
+        let mut index = 0usize;
+        for _ in 0..groups {
+            let box_ = items[index];
+            let head = items[index + 1];
+            if x >= box_[0] && x < box_[2] && y >= box_[1] && y < box_[3] {
+                for rect in 0..head[0] as usize {
+                    let r = items[index + 2 + rect];
+                    if x >= r[0] && x < r[2] && y >= r[1] && y < r[3] {
+                        return true;
+                    }
+                }
+            }
+            index = head[1] as usize;
+        }
+        false
+    }
+
+    #[test]
+    fn the_packed_shape_list_lights_exactly_the_rectangles_it_was_built_from() {
+        // Small enough to check every pixel, large enough that the pattern
+        // still has all four of its features.
+        let (width, height) = (320u32, 200u32);
+        let groups = super::super::pattern::sync_rects(width, height, 57, "DP-1", 9_000);
+        let (count, items) = sync_shape_items(&groups);
+        assert_eq!(count as usize, groups.len());
+        for y in 0..height {
+            for x in 0..width {
+                let expected = groups
+                    .iter()
+                    .any(|group| group.rects.iter().any(|rect| rect.contains(x, y)));
+                assert_eq!(
+                    shader_walk(&items, count, x, y),
+                    expected,
+                    "pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_last_groups_next_link_points_past_the_end() {
+        // The walk reads `next` on every group including the last, so the
+        // link has to be the length rather than anything clever.
+        let groups = super::super::pattern::sync_rects(640, 480, 3, "DP-2", 1);
+        let (count, items) = sync_shape_items(&groups);
+        let mut index = 0usize;
+        for _ in 0..count {
+            index = items[index + 1][1] as usize;
+        }
+        assert_eq!(index, items.len());
+    }
+
+    #[test]
+    fn the_cpu_rasteriser_and_the_shader_produce_the_same_bytes() {
+        // The measurement is only comparable between renderers if they draw
+        // the identical frame, so this checks the two halves of that claim
+        // against each other with a transfer that is neither identity nor
+        // uniform: a ramp across the width with a black lift under it.
+        let (width, height) = (96u32, 64u32);
+        let transfer: Vec<(u16, u8)> = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let a = 64 + (x as u16 * 192) / width as u16;
+                    let b = ((y * 24) / height) as u8;
+                    (a, b)
+                })
+            })
+            .collect();
+        let groups = super::super::pattern::sync_rects(width, height, 88, "DP-9", 42);
+        let rects: Vec<SyncRect> = groups
+            .iter()
+            .flat_map(|group| group.rects.iter().copied())
+            .collect();
+        let (count, items) = sync_shape_items(&groups);
+
+        let mut painted = vec![0u8; width as usize * height as usize * 4];
+        SyncPaint {
+            transfer: &transfer,
+            rects: &rects,
+            width,
+        }
+        .rows(&mut painted, 0, height);
+
+        for y in 0..height {
+            for x in 0..width {
+                let (a, b) = transfer[(y * width + x) as usize];
+                // What `blend.frag` computes: white or black, then the same
+                // fixed-point transfer.
+                let input = if shader_walk(&items, count, x, y) {
+                    255u32
+                } else {
+                    0
+                };
+                let expected = (((u32::from(a) * input) >> 8) + u32::from(b)).min(255) as u8;
+                let offset = ((y * width + x) * 4) as usize;
+                assert_eq!(
+                    &painted[offset..offset + 4],
+                    &[expected, expected, expected, 255],
+                    "pixel ({x},{y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_banded_rasterise_matches_a_single_pass_one() {
+        // The CPU path splits the rows across scoped threads exactly as the
+        // content blend does, so a rect that straddles a band boundary must
+        // come out the same either way.
+        let (width, height) = (64u32, 48u32);
+        let transfer = vec![(256u16, 0u8); (width * height) as usize];
+        let rects: Vec<SyncRect> = super::super::pattern::sync_rects(width, height, 7, "DP-1", 5)
+            .iter()
+            .flat_map(|group| group.rects.iter().copied())
+            .collect();
+        let paint = SyncPaint {
+            transfer: &transfer,
+            rects: &rects,
+            width,
+        };
+        let mut whole = vec![0u8; width as usize * height as usize * 4];
+        paint.rows(&mut whole, 0, height);
+        let mut banded = vec![0u8; whole.len()];
+        let band = 7u32;
+        let row_bytes = width as usize * 4;
+        for (index, chunk) in banded.chunks_mut(band as usize * row_bytes).enumerate() {
+            let first = index as u32 * band;
+            paint.rows(chunk, first, band.min(height - first));
+        }
+        assert_eq!(whole, banded);
+    }
+
+    #[test]
+    fn only_the_sync_pattern_is_animated() {
+        assert!(animated(TestPattern::Sync));
+        for pattern in [
+            TestPattern::Grid,
+            TestPattern::White,
+            TestPattern::Black,
+            TestPattern::Gamma,
+            TestPattern::Identify,
+        ] {
+            assert!(!animated(pattern), "{pattern:?} must stay one-shot");
+        }
     }
 }

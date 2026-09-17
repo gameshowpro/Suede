@@ -81,12 +81,15 @@ It is idempotent, so re-running it after an upgrade is safe. It will:
 
 Sway is started with direct scanout disabled, because on the default display
 path one application window spans every display and some drivers otherwise
-show the same part of it on each. For an edge-blended installation, where the
-projectors' beams overlap and Suede slices a canvas into them instead, pass
-`--allow-overlaps`: sway is then started *with* direct scanout and
-`allow_overlaps = true` is written into `~/.config/suede/suede.toml`. The two
-halves must agree, which is why one flag writes both — see [Overlapping
-layouts and direct scanout](configuration.md#direct-scanout).
+show the same part of it on each. The login block the script writes does not
+decide that once: it reads `allow_overlaps` and `direct_scanout` from
+`~/.config/suede/suede.toml` every time it starts Sway, so editing the file
+and restarting the session is enough — which matters here, where Sway is a
+login shell rather than a systemd unit. For an edge-blended installation,
+where the projectors' beams overlap and Suede slices a canvas into them
+instead, pass `--allow-overlaps`, and add `--no-direct-scanout` to have Sway
+composite those slices instead of flipping them. See [Overlapping layouts and
+direct scanout](configuration.md#direct-scanout).
 
 It warns rather than proceeds silently in two cases worth knowing about: if
 something else on the machine already starts Sway — two compositors cannot

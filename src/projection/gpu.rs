@@ -108,6 +108,16 @@ const FOURCC_AB24: u32 = 0x3432_4241; // ABGR8888
 /// daemon manages (four projectors today), cheap to size for even if unused.
 const MAX_OUTPUTS: usize = 8;
 
+/// `uvec4` slots in each output's `sync`-pattern shape buffer.
+///
+/// Fixed rather than grown on demand because the pattern is redrawn every
+/// frame and a reallocation mid-run would mean rewriting a descriptor
+/// between a commit and its scanout. 1024 slots is 16 KiB an output — a
+/// rounding error against one output-sized image — and comfortably above
+/// what `pattern::sync_rects` can emit, which
+/// `the_shape_buffer_holds_the_worst_case_sync_frame` asserts.
+const SYNC_SHAPE_SLOTS: usize = 1024;
+
 /// A GPU image whose memory is exported as a dmabuf, for a Wayland client to
 /// wrap in a `wl_buffer`. Single memory plane.
 pub struct DmabufImage {
@@ -183,6 +193,35 @@ impl QueuePriority {
     }
 }
 
+/// Where a draw's colour comes from: the captured canvas, or the `sync`
+/// test pattern's own shape list.
+///
+/// One code path records both because everything around the colour — the
+/// per-output transfer, the viewport, the target's queue-family acquire and
+/// release, the fence — must be identical, or the pattern would stop
+/// measuring the path content actually takes.
+enum Source<'a> {
+    Canvas {
+        image: &'a DmabufImage,
+        /// The canvas is stored bottom-up (screencopy's flag).
+        y_invert: bool,
+    },
+    Sync,
+}
+
+/// A 1x1 image that stands in for the canvas while `sync()` draws.
+///
+/// `blend.frag` names the canvas texture unconditionally, so binding 0 must
+/// hold a valid image view even on the branch that never samples it —
+/// Vulkan requires every *statically used* descriptor to be valid, and a
+/// branch the shader does not take at runtime is still a static use. Created
+/// on the first `sync()` call and never on a run that only ever blends.
+struct PlaceholderImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+}
+
 /// One slice to blend this frame.
 pub struct BlendJob<'a> {
     pub target: &'a DmabufImage,
@@ -251,7 +290,7 @@ const REQUIRED_DEVICE_EXTENSIONS: [&CStr; 5] = [
 ];
 
 /// A device's push constants, `#[repr(C)]` to match `blend.frag`'s
-/// `PushConstants` block byte for byte (six tightly-packed `u32`s need no
+/// `PushConstants` block byte for byte (eight tightly-packed `u32`s need no
 /// explicit padding on either side). Field order matters: it is the byte
 /// layout.
 #[repr(C)]
@@ -263,6 +302,12 @@ struct PushConstants {
     height: u32,
     canvas_height: u32,
     y_invert: u32,
+    /// 0 blends the canvas; 1 draws the `sync` pattern from the shape
+    /// buffer. See [`Source`].
+    mode: u32,
+    /// How many shape groups the shader should walk in mode 1; ignored in
+    /// mode 0.
+    groups: u32,
 }
 
 /// Resources kept per output index from the first `set_transfer` call
@@ -277,7 +322,25 @@ struct OutputResources {
     /// Persistently mapped — the memory is HOST_COHERENT, so no flush and
     /// no repeated map/unmap is needed to update it.
     mapped: *mut u8,
+    /// The `sync` pattern's shape buffer for this output, bound at 3 and
+    /// [`SYNC_SHAPE_SLOTS`] long for the life of the output — created
+    /// alongside the first transfer table and carried across every later
+    /// reallocation of it, so binding 3 is written exactly once.
+    shapes: HostBuffer,
+    /// How many shape groups `set_sync_shapes` last wrote, for the draw's
+    /// push constants.
+    sync_groups: u32,
     descriptor_set: vk::DescriptorSet,
+}
+
+/// A host-visible, host-coherent, persistently mapped buffer — what both
+/// per-output SSBOs are. Pulled out because the two want identical
+/// allocation and identical teardown and differ only in size.
+struct HostBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    mapped: *mut u8,
+    bytes: vk::DeviceSize,
 }
 
 // Safety: `mapped` is the only field that is not automatically `Send` (a raw
@@ -285,8 +348,10 @@ struct OutputResources {
 // struct via `memory`, is never aliased, and `Gpu` (the only place this type
 // lives) is itself required to be `Send`, not `Sync` — so it is only ever
 // touched from whichever single thread currently owns the `Gpu` it belongs
-// to, exactly like every other field here.
+// to, exactly like every other field here. `HostBuffer` is the same
+// argument, one level down.
 unsafe impl Send for OutputResources {}
+unsafe impl Send for HostBuffer {}
 
 struct PipelineState {
     format: vk::Format,
@@ -317,7 +382,11 @@ pub struct Gpu {
     /// Identity of the canvas image every currently-allocated descriptor
     /// set's binding 0 is pointed at, so `blend()` can tell whether it needs
     /// rewriting without doing it every frame — see the note on `blend()`.
+    /// In `sync()` mode this is the placeholder below, and the same
+    /// change-detection keeps the rewrite to once per mode switch.
     last_canvas: Option<vk::Image>,
+    /// Built on the first `sync()` call; see [`PlaceholderImage`].
+    placeholder: Option<PlaceholderImage>,
 }
 
 impl Gpu {
@@ -537,7 +606,11 @@ impl Gpu {
         // image sampler — see the module doc on naga). Binding 1: the
         // sampler, baked in as immutable since it is always this one
         // nearest/clamp sampler, so it never needs a descriptor write.
-        // Binding 2: the per-output transfer table.
+        // Binding 2: the per-output transfer table. Binding 3: the
+        // per-output `sync` pattern shapes (see `set_sync_shapes`), which
+        // every set carries whether or not that pattern is ever shown —
+        // `blend.frag` names the buffer unconditionally, so the descriptor
+        // has to be valid even on the runs whose shader never reads it.
         let immutable_samplers = [sampler];
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -552,6 +625,11 @@ impl Gpu {
                 .immutable_samplers(&immutable_samplers),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
@@ -570,9 +648,10 @@ impl Gpu {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::SAMPLER)
                 .descriptor_count(MAX_OUTPUTS as u32),
+            // Two per set: the transfer table and the sync shapes.
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_BUFFER)
-                .descriptor_count(MAX_OUTPUTS as u32),
+                .descriptor_count(2 * MAX_OUTPUTS as u32),
         ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(MAX_OUTPUTS as u32)
@@ -626,6 +705,7 @@ impl Gpu {
             fence,
             outputs: Vec::new(),
             last_canvas: None,
+            placeholder: None,
         })
     }
 
@@ -1067,11 +1147,14 @@ impl Gpu {
     }
 
     /// (Re)allocate output `index`'s transfer SSBO to hold `bytes`,
-    /// allocating its descriptor set too on the very first call for that
-    /// index, and point the set's binding 2 at the new buffer. Tears down
-    /// the previous buffer/memory, if any, only after the new one is fully
-    /// working — a failure here leaves the old (smaller, but valid) buffer
-    /// in place rather than leaving the output with none at all.
+    /// allocating its descriptor set and its fixed-size `sync` shape buffer
+    /// too on the very first call for that index, and point the set's
+    /// bindings at them. Tears down the previous transfer buffer, if any,
+    /// only after the new one is fully working — a failure here leaves the
+    /// old (smaller, but valid) buffer in place rather than leaving the
+    /// output with none at all. The shape buffer is a fixed
+    /// [`SYNC_SHAPE_SLOTS`] and is carried straight across, so binding 3 is
+    /// written exactly once per output.
     fn allocate_output(
         &mut self,
         device: &Arc<DeviceState>,
@@ -1079,71 +1162,13 @@ impl Gpu {
         bytes: vk::DeviceSize,
     ) -> anyhow::Result<()> {
         let dev = &device.device;
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(bytes)
-            .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        // Safety: no pNext chain.
-        let buffer = unsafe { dev.create_buffer(&buffer_info, None) }.context("vkCreateBuffer")?;
-
-        let requirements = unsafe { dev.get_buffer_memory_requirements(buffer) };
-        let memory_properties = unsafe {
-            device
-                .instance
-                .get_physical_device_memory_properties(device.physical_device)
-        };
-        let memory_type_index = match memory_type_index(
-            &memory_properties,
-            requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) {
-            Some(index) => index,
-            None => {
-                // Safety: `buffer` was just created and is not bound to
-                // anything.
-                unsafe { dev.destroy_buffer(buffer, None) };
-                bail!("no HOST_VISIBLE|HOST_COHERENT memory type for the transfer table");
-            }
-        };
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
-            .memory_type_index(memory_type_index);
-        let memory = match unsafe { dev.allocate_memory(&allocate_info, None) } {
-            Ok(memory) => memory,
-            Err(error) => {
-                // Safety: `buffer` was just created and is not bound to
-                // anything.
-                unsafe { dev.destroy_buffer(buffer, None) };
-                return Err(error).context("vkAllocateMemory");
-            }
-        };
-        if let Err(error) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
-            // Safety: both were just created and neither is referenced
-            // anywhere else yet.
-            unsafe {
-                dev.destroy_buffer(buffer, None);
-                dev.free_memory(memory, None);
-            }
-            return Err(error).context("vkBindBufferMemory");
-        }
-        let mapped = match unsafe { dev.map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty()) }
-        {
-            Ok(ptr) => ptr.cast::<u8>(),
-            Err(error) => {
-                // Safety: both were just created and neither is referenced
-                // anywhere else yet.
-                unsafe {
-                    dev.destroy_buffer(buffer, None);
-                    dev.free_memory(memory, None);
-                }
-                return Err(error).context("vkMapMemory");
-            }
-        };
+        let table = allocate_host_buffer(device, bytes).context("the transfer table")?;
 
         // One descriptor set per output, allocated the first time this
         // index is seen and reused for the life of the `Gpu` after that;
         // only binding 2 (this buffer) ever needs rewriting from here.
-        let descriptor_set = match self.outputs.get(index).and_then(|entry| entry.as_ref()) {
+        let existing = self.outputs.get(index).and_then(|entry| entry.as_ref());
+        let descriptor_set = match existing {
             Some(existing) => existing.descriptor_set,
             None => {
                 let set_layouts = [self.descriptor_set_layout];
@@ -1156,11 +1181,7 @@ impl Gpu {
                 let sets = match unsafe { dev.allocate_descriptor_sets(&allocate_info) } {
                     Ok(sets) => sets,
                     Err(error) => {
-                        unsafe {
-                            dev.unmap_memory(memory);
-                            dev.destroy_buffer(buffer, None);
-                            dev.free_memory(memory, None);
-                        }
+                        table.destroy(dev);
                         return Err(error).context("vkAllocateDescriptorSets");
                     }
                 };
@@ -1168,39 +1189,218 @@ impl Gpu {
             }
         };
 
-        let buffer_infos = [vk::DescriptorBufferInfo::default()
-            .buffer(buffer)
+        // Only on the first call for this index: an output that is merely
+        // growing its transfer table keeps the shape buffer it already has.
+        let fresh_shapes = match existing {
+            Some(_) => None,
+            None => {
+                let slot_bytes =
+                    (SYNC_SHAPE_SLOTS * std::mem::size_of::<[u32; 4]>()) as vk::DeviceSize;
+                match allocate_host_buffer(device, slot_bytes) {
+                    Ok(shapes) => Some(shapes),
+                    Err(error) => {
+                        table.destroy(dev);
+                        return Err(error).context("the sync pattern's shape buffer");
+                    }
+                }
+            }
+        };
+
+        let table_infos = [vk::DescriptorBufferInfo::default()
+            .buffer(table.buffer)
             .offset(0)
             .range(bytes)];
-        let write = vk::WriteDescriptorSet::default()
+        let mut writes = vec![vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
             .dst_binding(2)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&buffer_infos);
-        // Safety: `buffer_infos` outlives the call; `descriptor_set` was
-        // just allocated, or already existed, from `self.descriptor_pool`.
-        unsafe { dev.update_descriptor_sets(&[write], &[]) };
-
-        if let Some(old) = self.outputs[index].take() {
-            // Safety: the descriptor set was just repointed at the new
-            // buffer above, so nothing references `old.buffer`/`old.memory`
-            // any longer. Unmapping before freeing matches host memory's
-            // lifetime rule (a mapping must not outlive the memory it maps).
-            unsafe {
-                dev.unmap_memory(old.memory);
-                dev.destroy_buffer(old.buffer, None);
-                dev.free_memory(old.memory, None);
-            }
+            .buffer_info(&table_infos)];
+        let shape_infos = fresh_shapes
+            .as_ref()
+            .map(|shapes| {
+                [vk::DescriptorBufferInfo::default()
+                    .buffer(shapes.buffer)
+                    .offset(0)
+                    .range(shapes.bytes)]
+            })
+            .unwrap_or_default();
+        if fresh_shapes.is_some() {
+            writes.push(
+                vk::WriteDescriptorSet::default()
+                    .dst_set(descriptor_set)
+                    .dst_binding(3)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(&shape_infos),
+            );
         }
+        // Safety: both info arrays outlive the call; `descriptor_set` was
+        // just allocated, or already existed, from `self.descriptor_pool`.
+        unsafe { dev.update_descriptor_sets(&writes, &[]) };
+
+        let (shapes, sync_groups) = match self.outputs[index].take() {
+            Some(old) => {
+                // Safety: the descriptor set was just repointed at the new
+                // buffer above, so nothing references `old.buffer`/
+                // `old.memory` any longer. Unmapping before freeing matches
+                // host memory's lifetime rule (a mapping must not outlive
+                // the memory it maps). `old.shapes` is *not* destroyed: it
+                // is moved into the replacement below, binding 3 and all.
+                unsafe {
+                    dev.unmap_memory(old.memory);
+                    dev.destroy_buffer(old.buffer, None);
+                    dev.free_memory(old.memory, None);
+                }
+                (old.shapes, old.sync_groups)
+            }
+            None => (
+                fresh_shapes.expect("a previously unseen index allocated its shape buffer above"),
+                0,
+            ),
+        };
 
         self.outputs[index] = Some(OutputResources {
-            buffer,
-            memory,
+            buffer: table.buffer,
+            memory: table.memory,
             capacity: bytes,
-            mapped,
+            mapped: table.mapped,
+            shapes,
+            sync_groups,
             descriptor_set,
         });
         Ok(())
+    }
+
+    /// Upload output `index`'s `sync`-pattern geometry for this frame, as
+    /// the fragment shader reads it: `groups` bounding-box/header pairs and
+    /// the rectangles between them, packed by the caller (see
+    /// `slicer.rs`'s `sync_shape_items`, and the layout comment on
+    /// `blend.frag`'s `Shapes` block). Cheap enough to call every frame —
+    /// it is a memcpy of a few kilobytes into a persistently mapped,
+    /// host-coherent buffer, with no descriptor write and no reallocation.
+    pub fn set_sync_shapes(
+        &mut self,
+        index: usize,
+        groups: u32,
+        items: &[[u32; 4]],
+    ) -> anyhow::Result<()> {
+        if items.len() > SYNC_SHAPE_SLOTS {
+            bail!(
+                "set_sync_shapes: {} items exceeds the {SYNC_SHAPE_SLOTS}-slot shape buffer",
+                items.len()
+            );
+        }
+        let output = self
+            .outputs
+            .get_mut(index)
+            .and_then(|entry| entry.as_mut())
+            .ok_or_else(|| {
+                anyhow!(
+                    "set_sync_shapes: no resources for output {index} (call set_transfer first)"
+                )
+            })?;
+        // Safety: `output.shapes.mapped` addresses `SYNC_SHAPE_SLOTS`
+        // items' worth of HOST_COHERENT memory, mapped for the whole life
+        // of `output.shapes.memory`, and the length was just bounded
+        // against that. No flush is needed and nothing else writes here.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                items.as_ptr().cast::<u8>(),
+                output.shapes.mapped,
+                std::mem::size_of_val(items),
+            );
+        }
+        output.sync_groups = groups;
+        Ok(())
+    }
+
+    /// The 1x1 stand-in for binding 0 while `sync()` draws, created on
+    /// first use — see [`PlaceholderImage`] for why it has to exist at all.
+    ///
+    /// Plain `OPTIMAL` tiling and device-local memory: it is never exported,
+    /// never imported, and never sampled, so none of the dmabuf machinery
+    /// `create_image` carries applies. It is created with
+    /// `COLOR_ATTACHMENT` beside `SAMPLED` purely so `transition_to_general`
+    /// — shared with the Present images — describes it accurately.
+    fn ensure_placeholder(&mut self) -> anyhow::Result<(vk::Image, vk::ImageView)> {
+        if let Some(existing) = &self.placeholder {
+            return Ok((existing.image, existing.view));
+        }
+        let device = &self.device.device;
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: 1,
+                height: 1,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // Safety: no pNext chain.
+        let image = unsafe { device.create_image(&image_info, None) }
+            .context("vkCreateImage (sync placeholder)")?;
+        let mut cleanup = Cleanup {
+            device,
+            image,
+            memory: None,
+            view: None,
+        };
+
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        // Safety: read-only query.
+        let memory_properties = unsafe {
+            self.device
+                .instance
+                .get_physical_device_memory_properties(self.device.physical_device)
+        };
+        let memory_type_index = memory_type_index(
+            &memory_properties,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| anyhow!("no DEVICE_LOCAL memory type fits a 1x1 image"))?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type_index);
+        // Safety: no pNext chain.
+        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
+            .context("vkAllocateMemory (sync placeholder)")?;
+        cleanup.memory = Some(memory);
+        // Safety: `image` was just created and is not yet bound; `memory`
+        // was sized and typed from its own requirements.
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .context("vkBindImageMemory (sync placeholder)")?;
+
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(color_subresource_range());
+        // Safety: `image` is bound to memory; the view is destroyed before
+        // the image in both `Cleanup::drop` and `Gpu::drop`.
+        let view = unsafe { device.create_image_view(&view_info, None) }
+            .context("vkCreateImageView (sync placeholder)")?;
+        cleanup.view = Some(view);
+
+        // A descriptor's image layout must match the image's actual layout,
+        // and `render` writes binding 0 as GENERAL like every other image
+        // here.
+        self.transition_to_general(image)
+            .context("sync placeholder UNDEFINED -> GENERAL transition")?;
+
+        cleanup.defuse();
+        self.placeholder = Some(PlaceholderImage {
+            image,
+            memory,
+            view,
+        });
+        Ok((image, view))
     }
 
     /// Build the graphics pipeline for `format`, the first time any target
@@ -1288,9 +1488,45 @@ impl Gpu {
         y_invert: bool,
         jobs: &[BlendJob<'_>],
     ) -> anyhow::Result<Duration> {
+        self.render(
+            Source::Canvas {
+                image: canvas,
+                y_invert,
+            },
+            jobs,
+        )
+    }
+
+    /// Draw the `sync` test pattern into every job's target from the shapes
+    /// last given to [`Gpu::set_sync_shapes`], and wait the same way
+    /// [`Gpu::blend`] does.
+    ///
+    /// Deliberately the identical submit, fence and barrier sequence: the
+    /// pattern exists to measure how long a frame takes to reach the glass,
+    /// so anything it did differently from content would be measuring
+    /// something else.
+    pub fn sync(&mut self, jobs: &[BlendJob<'_>]) -> anyhow::Result<Duration> {
+        self.render(Source::Sync, jobs)
+    }
+
+    fn render(&mut self, source: Source<'_>, jobs: &[BlendJob<'_>]) -> anyhow::Result<Duration> {
         if jobs.is_empty() {
             return Ok(Duration::ZERO);
         }
+        // Binding 0 wants a valid view either way — see `PlaceholderImage`.
+        let (canvas_image, canvas_view, canvas_height, y_invert, mode) = match source {
+            Source::Canvas { image, y_invert } => (
+                image.image,
+                image.view,
+                image.height,
+                u32::from(y_invert),
+                0u32,
+            ),
+            Source::Sync => {
+                let (image, view) = self.ensure_placeholder()?;
+                (image, view, 0, 0, 1)
+            }
+        };
         let format = jobs[0].target.format;
         self.ensure_pipeline(format)?;
         let pipeline_handle = self
@@ -1307,9 +1543,9 @@ impl Gpu {
         // the canvas image changed since the last call — the common case
         // (a steady capture image, different slices/targets each frame)
         // then costs this function nothing but the barriers and draws.
-        if self.last_canvas != Some(canvas.image) {
+        if self.last_canvas != Some(canvas_image) {
             let canvas_info = [vk::DescriptorImageInfo::default()
-                .image_view(canvas.view)
+                .image_view(canvas_view)
                 .image_layout(vk::ImageLayout::GENERAL)];
             let writes: Vec<vk::WriteDescriptorSet> = self
                 .outputs
@@ -1329,7 +1565,7 @@ impl Gpu {
                 // in `allocate_output` and still exists.
                 unsafe { device.update_descriptor_sets(&writes, &[]) };
             }
-            self.last_canvas = Some(canvas.image);
+            self.last_canvas = Some(canvas_image);
         }
 
         // Safety: `self.command_buffer`'s pool was created with
@@ -1347,27 +1583,30 @@ impl Gpu {
 
         // Acquire the canvas from the compositor's queue family — see the
         // module doc: layout stays GENERAL on both sides, only ownership
-        // moves.
-        let acquire_canvas = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::empty())
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .dst_queue_family_index(queue_family)
-            .image(canvas.image)
-            .subresource_range(color_subresource);
-        // Safety: recording into `self.command_buffer`, which just began.
-        unsafe {
-            device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[acquire_canvas],
-            );
+        // moves. Skipped in `sync` mode, whose stand-in image the compositor
+        // has never seen and so cannot own.
+        if mode == 0 {
+            let acquire_canvas = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .dst_queue_family_index(queue_family)
+                .image(canvas_image)
+                .subresource_range(color_subresource);
+            // Safety: recording into `self.command_buffer`, which just began.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[acquire_canvas],
+                );
+            }
         }
 
         for job in jobs {
@@ -1468,10 +1707,12 @@ impl Gpu {
                 source_y: job.source_y,
                 width: job.target.width,
                 height: job.target.height,
-                canvas_height: canvas.height,
-                y_invert: u32::from(y_invert),
+                canvas_height,
+                y_invert,
+                mode,
+                groups: output.sync_groups,
             };
-            // Safety: `PushConstants` is `#[repr(C)]` and plain data (six
+            // Safety: `PushConstants` is `#[repr(C)]` and plain data (eight
             // `u32`s, no padding), and this byte view does not outlive the
             // call.
             let push_constant_bytes = unsafe {
@@ -1514,25 +1755,29 @@ impl Gpu {
             }
         }
 
-        let release_canvas = vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::SHADER_READ)
-            .dst_access_mask(vk::AccessFlags::empty())
-            .old_layout(vk::ImageLayout::GENERAL)
-            .new_layout(vk::ImageLayout::GENERAL)
-            .src_queue_family_index(queue_family)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-            .image(canvas.image)
-            .subresource_range(color_subresource);
-        unsafe {
-            device.cmd_pipeline_barrier(
-                self.command_buffer,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[release_canvas],
-            );
+        // The other half of the acquire above, and skipped for the same
+        // reason: the placeholder is never handed back to anyone.
+        if mode == 0 {
+            let release_canvas = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(queue_family)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .image(canvas_image)
+                .subresource_range(color_subresource);
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[release_canvas],
+                );
+            }
         }
 
         unsafe { device.end_command_buffer(self.command_buffer) }.context("vkEndCommandBuffer")?;
@@ -1588,6 +1833,12 @@ impl Drop for Gpu {
                 device.unmap_memory(output.memory);
                 device.destroy_buffer(output.buffer, None);
                 device.free_memory(output.memory, None);
+                output.shapes.destroy(device);
+            }
+            if let Some(placeholder) = self.placeholder.take() {
+                device.destroy_image_view(placeholder.view, None);
+                device.destroy_image(placeholder.image, None);
+                device.free_memory(placeholder.memory, None);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -1681,6 +1932,102 @@ fn format_for_fourcc(fourcc: u32) -> anyhow::Result<vk::Format> {
 /// blend.rs produces up to 256), so it never collides with `b`'s low byte.
 fn pack_transfer(a: u16, b: u8) -> u32 {
     (u32::from(a) << 8) | u32::from(b)
+}
+
+impl HostBuffer {
+    /// Unmap and destroy, in the order Vulkan requires (a mapping must not
+    /// outlive the memory it maps, and a buffer must go before the memory
+    /// it is bound to). Used both on the failure paths of
+    /// `allocate_output` and from `Gpu::drop`.
+    ///
+    /// # Safety
+    /// Nothing may still reference this buffer: no descriptor pointing at
+    /// it, and no submission in flight that reads it.
+    fn destroy(&self, device: &ash::Device) {
+        unsafe {
+            device.unmap_memory(self.memory);
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// A HOST_VISIBLE|HOST_COHERENT storage buffer of `bytes`, bound and mapped
+/// for its whole life. Both per-output SSBOs — the transfer table and the
+/// `sync` shape list — are written by the CPU every time they change and
+/// read by the fragment shader, which is exactly this shape; keeping one
+/// allocator for both is what keeps their teardown identical too.
+///
+/// Cleans up after itself on every failure path, so a caller that gets an
+/// `Err` has leaked nothing.
+fn allocate_host_buffer(
+    device: &Arc<DeviceState>,
+    bytes: vk::DeviceSize,
+) -> anyhow::Result<HostBuffer> {
+    let dev = &device.device;
+    let buffer_info = vk::BufferCreateInfo::default()
+        .size(bytes)
+        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    // Safety: no pNext chain.
+    let buffer = unsafe { dev.create_buffer(&buffer_info, None) }.context("vkCreateBuffer")?;
+
+    let requirements = unsafe { dev.get_buffer_memory_requirements(buffer) };
+    let memory_properties = unsafe {
+        device
+            .instance
+            .get_physical_device_memory_properties(device.physical_device)
+    };
+    let memory_type_index = match memory_type_index(
+        &memory_properties,
+        requirements.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    ) {
+        Some(index) => index,
+        None => {
+            // Safety: `buffer` was just created and is not bound to anything.
+            unsafe { dev.destroy_buffer(buffer, None) };
+            bail!("no HOST_VISIBLE|HOST_COHERENT memory type for a {bytes}-byte storage buffer");
+        }
+    };
+    let allocate_info = vk::MemoryAllocateInfo::default()
+        .allocation_size(requirements.size)
+        .memory_type_index(memory_type_index);
+    let memory = match unsafe { dev.allocate_memory(&allocate_info, None) } {
+        Ok(memory) => memory,
+        Err(error) => {
+            // Safety: `buffer` was just created and is not bound to anything.
+            unsafe { dev.destroy_buffer(buffer, None) };
+            return Err(error).context("vkAllocateMemory");
+        }
+    };
+    if let Err(error) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
+        // Safety: both were just created and neither is referenced anywhere
+        // else yet.
+        unsafe {
+            dev.destroy_buffer(buffer, None);
+            dev.free_memory(memory, None);
+        }
+        return Err(error).context("vkBindBufferMemory");
+    }
+    let mapped = match unsafe { dev.map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty()) } {
+        Ok(ptr) => ptr.cast::<u8>(),
+        Err(error) => {
+            // Safety: both were just created and neither is referenced
+            // anywhere else yet.
+            unsafe {
+                dev.destroy_buffer(buffer, None);
+                dev.free_memory(memory, None);
+            }
+            return Err(error).context("vkMapMemory");
+        }
+    };
+    Ok(HostBuffer {
+        buffer,
+        memory,
+        mapped,
+        bytes,
+    })
 }
 
 /// The first memory type (by index — the order `VkPhysicalDeviceMemoryProperties`
@@ -1978,9 +2325,25 @@ mod tests {
     }
 
     #[test]
-    fn push_constants_are_24_bytes() {
-        assert_eq!(std::mem::size_of::<PushConstants>(), 24);
+    fn push_constants_are_32_bytes() {
+        assert_eq!(std::mem::size_of::<PushConstants>(), 32);
         assert_eq!(std::mem::align_of::<PushConstants>(), 4);
+        // Vulkan guarantees only 128 bytes of push constants, and a device
+        // that offers exactly that must still take this block.
+        assert!(std::mem::size_of::<PushConstants>() <= 128);
+    }
+
+    #[test]
+    fn the_shape_buffer_holds_the_worst_case_sync_frame() {
+        // `set_sync_shapes` refuses anything longer, and the slicer has no
+        // fallback for that refusal — so the two constants have to be
+        // checked against each other rather than assumed compatible.
+        let groups = 8usize;
+        let worst = groups * 2 + crate::projection::pattern::MAX_SYNC_RECTS;
+        assert!(
+            worst <= SYNC_SHAPE_SLOTS,
+            "a worst-case sync frame is {worst} items but the buffer holds {SYNC_SHAPE_SLOTS}"
+        );
     }
 
     #[test]

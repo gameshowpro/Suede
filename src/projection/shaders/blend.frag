@@ -10,7 +10,8 @@
 // combined image samplers: `uniform sampler2D canvas;` fails with "Not
 // implemented: variable qualifier". `gpu.rs` matches this with an immutable
 // sampler baked into the descriptor set layout at binding 1, so only the
-// texture (binding 0) and the transfer SSBO (binding 2) are ever written.
+// texture (binding 0), the transfer SSBO (binding 2) and the sync pattern's
+// shape SSBO (binding 3) are ever written.
 #version 450
 
 layout(set = 0, binding = 0) uniform texture2D canvas;
@@ -23,6 +24,18 @@ layout(set = 0, binding = 2, std430) readonly buffer Transfer {
     uint table[];
 };
 
+// The `sync` test pattern's geometry: white rectangles on black, in
+// output-local pixels, half-open (`x0 <= x < x1`). Laid out as `pc.groups`
+// variable-length groups, each of which is a bounding box
+// `(x0, y0, x1, y1)`, then `(rect_count, next_group_index, 0, 0)`, then that
+// many rectangles — see `set_sync_shapes` in gpu.rs and `sync_rects` in
+// pattern.rs, which builds it. The bounding box is what keeps this cheap: a
+// black pixel, which is almost all of them, costs four comparisons per
+// group rather than four per rectangle.
+layout(set = 0, binding = 3, std430) readonly buffer Shapes {
+    uvec4 shapes[];
+};
+
 layout(push_constant) uniform PushConstants {
     uint source_x;
     uint source_y;
@@ -30,6 +43,9 @@ layout(push_constant) uniform PushConstants {
     uint height;
     uint canvas_height;
     uint y_invert;
+    // 0: blend the canvas. 1: draw the `sync` pattern from `shapes`.
+    uint mode;
+    uint groups;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -39,15 +55,43 @@ void main() {
     // call set, so it is already 0..width-1, 0..height-1 in output-local
     // coordinates — no per-job uniform needed for that part.
     ivec2 p = ivec2(gl_FragCoord.xy);
-    int cy = int(pc.source_y) + p.y;
-    if (pc.y_invert != 0u) {
-        cy = int(pc.canvas_height) - 1 - cy;
+    uvec3 c;
+    if (pc.mode == 1u) {
+        uvec2 q = uvec2(p);
+        uint lit = 0u;
+        uint i = 0u;
+        for (uint g = 0u; g < pc.groups; ++g) {
+            uvec4 box = shapes[i];
+            uvec4 head = shapes[i + 1u];
+            if (q.x >= box.x && q.x < box.z && q.y >= box.y && q.y < box.w) {
+                for (uint r = 0u; r < head.x; ++r) {
+                    uvec4 s = shapes[i + 2u + r];
+                    if (q.x >= s.x && q.x < s.z && q.y >= s.y && q.y < s.w) {
+                        lit = 1u;
+                        break;
+                    }
+                }
+            }
+            if (lit != 0u) {
+                break;
+            }
+            i = head.y;
+        }
+        // Full white or full black, so the transfer below is the only thing
+        // between this and the projector — which is the point: the ramps and
+        // the black lift shape the counter exactly as they shape content.
+        c = uvec3(lit * 255u);
+    } else {
+        int cy = int(pc.source_y) + p.y;
+        if (pc.y_invert != 0u) {
+            cy = int(pc.canvas_height) - 1 - cy;
+        }
+        vec4 t = texelFetch(sampler2D(canvas, canvasSampler), ivec2(int(pc.source_x) + p.x, cy), 0);
+        // Same fixed-point shade as `Blend::rows`: `out = min((a*in)>>8 + b, 255)`
+        // per channel, rounding the sampled float back to the byte it came from
+        // first so both paths start from the identical integer.
+        c = uvec3(round(t.rgb * 255.0));
     }
-    vec4 t = texelFetch(sampler2D(canvas, canvasSampler), ivec2(int(pc.source_x) + p.x, cy), 0);
-    // Same fixed-point shade as `Blend::rows`: `out = min((a*in)>>8 + b, 255)`
-    // per channel, rounding the sampled float back to the byte it came from
-    // first so both paths start from the identical integer.
-    uvec3 c = uvec3(round(t.rgb * 255.0));
     uint ab = table[p.y * pc.width + p.x];
     uint a = ab >> 8u;
     uint b = ab & 0xffu;

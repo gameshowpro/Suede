@@ -1,9 +1,12 @@
 //! Bootstrap configuration: everything that must be known before the API can serve.
 //!
 //! Read once at startup from `$XDG_CONFIG_HOME/suede/suede.toml`; every value
-//! but [`BootstrapConfig::allow_overlaps`] is overridable by a `SUEDE_*`
-//! environment variable, which wins. Everything else is desired state, owned
-//! by the API (see [`crate::state`]).
+//! but [`BootstrapConfig::allow_overlaps`] and
+//! [`BootstrapConfig::direct_scanout`] is overridable by a `SUEDE_*`
+//! environment variable, which wins. Those two describe how the compositor
+//! was started, which an environment variable on *Suede's* process cannot
+//! change. Everything else is desired state, owned by the API (see
+//! [`crate::state`]).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -34,6 +37,12 @@ struct FileConfig {
     /// two, and they mean opposite things.
     allowed_programs: Option<Vec<String>>,
     allow_overlaps: Option<bool>,
+    /// `Option`, not a bare `bool`, so an *explicit* `direct_scanout = true`
+    /// can be told apart from an absent key. They resolve to the same value
+    /// — true is the default — but only the explicit one is refused when
+    /// `allow_overlaps` is false, where scanning out is not safe; an absent
+    /// key must never turn an upgrade into a startup failure.
+    direct_scanout: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +99,24 @@ pub struct BootstrapConfig {
     /// machine's compositor was started, which the API cannot change: a client
     /// writing it would only claim an environment that is already fixed.
     pub allow_overlaps: bool,
+    /// Whether the compositor may flip the slicer's buffers straight to the
+    /// display controllers — the A/B half of [`Self::allow_overlaps`].
+    ///
+    /// Defaults to `true`, and only means anything while `allow_overlaps` is
+    /// true: that is the layout where no client spans the physical outputs,
+    /// so scanning out cannot mirror. Setting it `false` there asks the
+    /// compositor to composite each slice instead, which is the arm to
+    /// compare against when measuring what scanout actually buys — flip the
+    /// key, restart the compositor, and read `zeroCopyPresented`, straddles
+    /// and `lagFrames` from `GET /projection/stats`.
+    ///
+    /// An *explicit* `direct_scanout = true` alongside `allow_overlaps =
+    /// false` is refused at startup (see
+    /// [`ConfigError::DirectScanoutWithoutOverlaps`]): there one window spans
+    /// every output, and scanning that out mirrors instead of spanning on
+    /// some drivers. The key being absent is not refused, because true is
+    /// simply its default.
+    pub direct_scanout: bool,
 }
 
 impl Default for BootstrapConfig {
@@ -104,6 +131,7 @@ impl Default for BootstrapConfig {
             power: Vec::new(),
             allowed_programs: default_allowed_programs(),
             allow_overlaps: false,
+            direct_scanout: true,
         }
     }
 }
@@ -162,6 +190,19 @@ pub enum ConfigError {
         PowerVerb::ALL.iter().map(PowerVerb::as_str).collect::<Vec<_>>().join(", ")
     )]
     PowerVerb { value: String },
+    /// Only the slicer's layout can be scanned out safely, so asking for
+    /// scanout on a tiling appliance is a request that cannot be honoured —
+    /// and honouring it anyway would re-open the mirroring bug on the very
+    /// machines the default protects. Refused rather than ignored: an
+    /// operator who wrote the key meant something by it.
+    #[error(
+        "direct_scanout = true needs allow_overlaps = true, but allow_overlaps is false. \
+         With allow_overlaps = false sway tiles the layout and one window spans every \
+         output; scanning that window out makes some drivers show the same part of it \
+         on each display. Set allow_overlaps = true to project through the slicer, or \
+         remove direct_scanout — it only has an effect there."
+    )]
+    DirectScanoutWithoutOverlaps,
 }
 
 impl BootstrapConfig {
@@ -213,6 +254,13 @@ impl BootstrapConfig {
         config.allowed_programs =
             allowed_programs_source(file.allowed_programs).unwrap_or_else(default_allowed_programs);
         config.allow_overlaps = file.allow_overlaps.unwrap_or(false);
+        // An absent key resolves to the same `true` as an explicit one; only
+        // the explicit one is an error on a tiling appliance, because only it
+        // says the operator wanted something the machine cannot do.
+        if file.direct_scanout == Some(true) && !config.allow_overlaps {
+            return Err(ConfigError::DirectScanoutWithoutOverlaps);
+        }
+        config.direct_scanout = file.direct_scanout.unwrap_or(true);
 
         Ok(config)
     }
@@ -220,6 +268,16 @@ impl BootstrapConfig {
     /// True when a bearer token is configured, which also disables the web UI.
     pub fn auth_enabled(&self) -> bool {
         self.token.is_some()
+    }
+
+    /// Whether the compositor is expected to run *with* direct scanout — that
+    /// is, started without `WLR_SCENE_DISABLE_DIRECT_SCANOUT`.
+    ///
+    /// The one place the two keys are combined, so the health check, the
+    /// startup log and `provision.sh`'s login-time derivation cannot reach
+    /// different conclusions about the same file.
+    pub fn scanout_expected(&self) -> bool {
+        self.allow_overlaps && self.direct_scanout
     }
 
     /// Whether this appliance is permitted to perform `verb`.
@@ -461,6 +519,52 @@ mod tests {
         // A misspelling is refused outright rather than silently leaving the
         // machine on the other display path.
         std::fs::write(&path, "allow_overlap = true\n").unwrap();
+        assert!(BootstrapConfig::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn direct_scanout_defaults_to_on_and_only_means_anything_with_overlaps() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+
+        // Absent: true, and on a tiling appliance that is not an error — an
+        // upgrade must not start failing on a file nobody edited.
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(config.direct_scanout);
+        assert!(!config.scanout_expected());
+
+        std::fs::write(&path, "allow_overlaps = true\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert!(config.direct_scanout);
+        assert!(config.scanout_expected());
+
+        // The A/B's other arm: slice every layout, but have the compositor
+        // composite the slices instead of flipping them.
+        std::fs::write(&path, "allow_overlaps = true\ndirect_scanout = false\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert!(!config.direct_scanout);
+        assert!(!config.scanout_expected());
+
+        // Explicitly on, with the slicer: allowed, and the same as absent.
+        std::fs::write(&path, "allow_overlaps = true\ndirect_scanout = true\n").unwrap();
+        assert!(BootstrapConfig::load(Some(&path))
+            .unwrap()
+            .scanout_expected());
+
+        // Explicitly on while sway tiles: refused, naming both keys, because
+        // the spanning window it would scan out is the mirroring bug.
+        std::fs::write(&path, "direct_scanout = true\n").unwrap();
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("direct_scanout = true"), "{error}");
+        assert!(error.contains("allow_overlaps"), "{error}");
+
+        // Off while sway tiles is merely redundant, not wrong.
+        std::fs::write(&path, "allow_overlaps = false\ndirect_scanout = false\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert!(!config.scanout_expected());
+
+        std::fs::write(&path, "direct_scanouts = false\n").unwrap();
         assert!(BootstrapConfig::load(Some(&path)).is_err());
     }
 

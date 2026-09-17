@@ -17,6 +17,53 @@ for script in packaging/provision.sh packaging/postinst scripts/*.sh; do
 done
 
 echo
+echo "provision.sh --help lists every option it accepts"
+HELP="$(bash packaging/provision.sh --help 2>&1)"
+for option in $(grep -oE '^\s+--[a-z-]+\)' packaging/provision.sh | tr -d ' )'); do
+  if grep -qF -- "$option" <<<"$HELP"; then ok "$option"; else bad "$option is undocumented"; fi
+done
+
+echo
+echo "The login profile derives direct scanout from suede.toml"
+# The block provision.sh writes into ~/.bash_profile reads the two bootstrap
+# keys at every login, and on an appliance where sway is not a systemd unit it
+# is the only thing that can follow the file — so it has to agree, case for
+# case, with BootstrapConfig::scanout_expected in src/config.rs.
+SCANOUT_SNIPPET="$(sed -n "/<<'SCANOUT_EOF'/,/^SCANOUT_EOF$/p" packaging/provision.sh | sed '1d;$d')"
+[[ -n "$SCANOUT_SNIPPET" ]] || bad "could not find the SCANOUT_EOF block in provision.sh"
+scanout_for() {  # $1 = suede.toml contents, empty for no file at all
+  local home
+  home="$(mktemp -d)"
+  if [[ -n "$1" ]]; then
+    mkdir -p "$home/.config/suede"
+    printf '%s\n' "$1" > "$home/.config/suede/suede.toml"
+  fi
+  (
+    HOME="$home"
+    unset WLR_SCENE_DISABLE_DIRECT_SCANOUT
+    eval "$SCANOUT_SNIPPET"
+    echo "${WLR_SCENE_DISABLE_DIRECT_SCANOUT:-unset}"
+  )
+  rm -rf "$home"
+}
+expect_scanout() {  # $1 = label, $2 = toml, $3 = expected value of the variable
+  local got
+  got="$(scanout_for "$2")"
+  if [[ "$got" == "$3" ]]; then ok "$1 -> $3"; else bad "$1 -> $got (expected $3)"; fi
+}
+# Anything but "the slicer owns every output and scanout was not turned off"
+# exports the variable, because a spanning window scanned out mirrors.
+expect_scanout "no suede.toml"                  ""                                             1
+expect_scanout "allow_overlaps = false"         "allow_overlaps = false"                       1
+expect_scanout "allow_overlaps commented out"   "# allow_overlaps = true"                      1
+expect_scanout "direct_scanout = false alone"   "direct_scanout = false"                       1
+expect_scanout "allow_overlaps = true"          "allow_overlaps = true"                        unset
+expect_scanout "both keys true"                 "allow_overlaps = true
+direct_scanout = true"                                                                         unset
+expect_scanout "scanout turned off for the A/B" "allow_overlaps = true
+direct_scanout = false"                                                                        1
+
+echo
 echo "Packaged assets exist"
 python3 - <<'PY' || exit 1
 import re, sys, pathlib

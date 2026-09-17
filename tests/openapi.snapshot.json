@@ -900,6 +900,39 @@
         ],
         "type": "object"
       },
+      "LagFrames": {
+        "description": "Histogram of a per-snapshot lag, in whole refresh periods, behind the\nearliest output to present that snapshot. Only snapshots that at least\ntwo outputs presented contribute a sample; a lone presenting output has\nnothing to lag behind.",
+        "properties": {
+          "more": {
+            "description": "Three or more whole refresh periods behind.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "one": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "two": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "zero": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "zero",
+          "one",
+          "two",
+          "more"
+        ],
+        "type": "object"
+      },
       "LastMeasurement": {
         "description": "The stored measurement, as `GET /apps/capabilities/last` serves it.",
         "properties": {
@@ -1334,6 +1367,10 @@
             "minimum": 0,
             "type": "integer"
           },
+          "lagFrames": {
+            "$ref": "#/components/schemas/LagFrames",
+            "description": "Histogram of how many whole refresh periods this output's\npresentation landed after the earliest output to present the same\nsnapshot. Derived purely from `wp_presentation` timestamps — the\nflip — so a display's own processing latency between the flip and\nphotons on screen is invisible here: if a camera shows this output\nvisibly behind while this reads all-zero, the lag is in the display,\nnot the presentation path."
+          },
           "name": {
             "type": "string"
           },
@@ -1377,7 +1414,8 @@
           "name",
           "presented",
           "discarded",
-          "zeroCopyPresented"
+          "zeroCopyPresented",
+          "lagFrames"
         ],
         "type": "object"
       },
@@ -1645,6 +1683,12 @@
             "description": "Whether outputs were taking frames at their own pace (see ProjectionConfig.free_run).",
             "type": "boolean"
           },
+          "gateHolds": {
+            "description": "Commit cycles the gate held past one canvas period waiting for an\noutput that had not yet reported presenting the previous frame — the\nother outputs repeated a frame rather than move on without it. Zero\non a healthy wall, where every output's presentation feedback is back\nwell before the next frame is due; a rising count means one head's\nflips are landing a refresh later than the rest, and names the cost\nof keeping the wall together rather than a fault in it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
           "intervalSeconds": {
             "format": "double",
             "type": "number"
@@ -1712,6 +1756,7 @@
           "perFrameMs",
           "presentationFeedback",
           "straddles",
+          "gateHolds",
           "renderer",
           "captureIntervals",
           "outputs"
@@ -2027,7 +2072,8 @@
           "white",
           "black",
           "gamma",
-          "identify"
+          "identify",
+          "sync"
         ],
         "type": "string"
       },

@@ -503,11 +503,18 @@ impl CheckRunner {
     /// the Nvidia proprietary driver; the workaround is
     /// `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`.
     ///
-    /// Slicing (`allow_overlaps = true`): no client ever spans the physical
-    /// outputs. The app renders into the headless canvas and each display is
-    /// handed one private, output-sized slicer buffer — the textbook scanout
-    /// case, and immune to that mirroring bug. The variable then costs a
-    /// full-screen compositor pass per output per frame and buys nothing.
+    /// Slicing (`allow_overlaps = true`, `direct_scanout = true`, the
+    /// default): no client ever spans the physical outputs. The app renders
+    /// into the headless canvas and each display is handed one private,
+    /// output-sized slicer buffer — the textbook scanout case, and immune to
+    /// that mirroring bug. The variable then costs a full-screen compositor
+    /// pass per output per frame and buys nothing.
+    ///
+    /// Slicing with `direct_scanout = false`: the same layout, deliberately
+    /// composited instead of flipped, so the two can be measured against each
+    /// other. The expectation flips back to the variable being set, and this
+    /// check is what says whether the running compositor actually agrees —
+    /// otherwise the A/B compares a machine with itself.
     fn check_direct_scanout(&self) -> Check {
         let spanning: Vec<String> = self
             .store
@@ -521,19 +528,15 @@ impl CheckRunner {
         let disabled = compositor_env("WLR_SCENE_DISABLE_DIRECT_SCANOUT")
             .is_some_and(|value| value != "0" && !value.is_empty());
 
-        let allow_overlaps = self.bootstrap.allow_overlaps;
-        let (status, detail) = judge_direct_scanout(allow_overlaps, &spanning, disabled);
+        let expectation = ScanoutExpectation::of(&self.bootstrap);
+        let (status, detail) = judge_direct_scanout(expectation, &spanning, disabled);
 
         let mut check = self.check(
             ids::DIRECT_SCANOUT,
-            if allow_overlaps {
-                "Projectors scan out directly"
-            } else {
-                "Spanning renders across outputs"
-            },
+            expectation.title(),
             status,
             detail,
-            Some(if allow_overlaps {
+            Some(if expectation.allow_overlaps {
                 "configuration/#direct-scanout"
             } else {
                 "troubleshooting/#a-spanned-window-mirrors-instead-of-spanning"
@@ -541,7 +544,7 @@ impl CheckRunner {
         );
         if check.status != CheckStatus::Pass {
             check.fix_available = true;
-            check.fix_description = Some(if allow_overlaps {
+            check.fix_description = Some(if expectation.scanout_expected() {
                 "Remove the systemd drop-in that sets \
                  WLR_SCENE_DISABLE_DIRECT_SCANOUT on the compositor's unit. You then \
                  restart the compositor yourself, since that tears down every window."
@@ -1467,33 +1470,44 @@ impl CheckRunner {
         Ok(format!("started {}", started.join(", ")))
     }
 
-    /// Make the compositor's `WLR_SCENE_DISABLE_DIRECT_SCANOUT` match the
-    /// display path this appliance runs: set it where sway tiles the layout
-    /// itself, remove it where the slicer gives each display its own buffer.
+    /// Make the compositor's `WLR_SCENE_DISABLE_DIRECT_SCANOUT` match what
+    /// `allow_overlaps` and `direct_scanout` ask for: remove it where the
+    /// slicer owns every display and scanout is wanted, set it everywhere
+    /// else.
     ///
     /// The variable has to be in the *compositor's* environment, not Suede's,
     /// so the only thing Suede can do without privileges is write (or delete)
     /// a systemd drop-in and ask for a restart. It never restarts sway
     /// itself: that would tear down every window on every display.
     async fn fix_direct_scanout(&self) -> ApiResult<String> {
+        let scanout_expected = self.bootstrap.scanout_expected();
         let Some(unit) = compositor_unit() else {
-            return Err(ApiError::Validation(if self.bootstrap.allow_overlaps {
+            // No unit is the normal case on an appliance provisioned by
+            // provision.sh, where sway is started from the login profile on
+            // tty1. There the profile block derives this variable from
+            // suede.toml itself, so the keys are already the answer and the
+            // only missing step is a session that has read them again.
+            return Err(ApiError::Validation(format!(
                 "the compositor is not running as a systemd user unit, so Suede cannot \
-                 change its environment. Remove WLR_SCENE_DISABLE_DIRECT_SCANOUT wherever \
-                 sway is started (provision.sh omits it when given --allow-overlaps)."
-                    .to_string()
-            } else {
-                "the compositor is not running as a systemd user unit, so Suede cannot \
-                 set its environment. Add WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 wherever \
-                 sway is started (provision.sh does this for a standard install)."
-                    .to_string()
-            }));
+                 {} its environment. Where provision.sh starts sway from the login \
+                 profile on tty1, that profile block derives \
+                 WLR_SCENE_DISABLE_DIRECT_SCANOUT from allow_overlaps and direct_scanout \
+                 in ~/.config/suede/suede.toml every time it runs: restart the session \
+                 so the profile block re-reads suede.toml (log out of tty1, or reboot). \
+                 If sway is started some other way, {} there.",
+                if scanout_expected { "change" } else { "set" },
+                if scanout_expected {
+                    "remove the variable"
+                } else {
+                    "set WLR_SCENE_DISABLE_DIRECT_SCANOUT=1"
+                }
+            )));
         };
 
         let dir = self.bootstrap.systemd_user_dir.join(format!("{unit}.d"));
         let path = dir.join("10-suede-scanout.conf");
 
-        if self.bootstrap.allow_overlaps {
+        if scanout_expected {
             // Only the drop-in Suede itself writes is removed. An operator who
             // set the variable somewhere else — the unit, the profile — is
             // told where to look rather than having their file deleted.
@@ -1753,60 +1767,153 @@ fn first_line(text: &str) -> String {
     text.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// What the `direct-scanout` check should be saying, given the display path
-/// this appliance runs, which apps span, and whether the compositor was
-/// started with `WLR_SCENE_DISABLE_DIRECT_SCANOUT`. Pure, so the whole
-/// matrix is table-testable.
+/// The compositor setting the two `suede.toml` keys ask for, and the keys
+/// themselves — carried together so the check's detail can name what
+/// produced the expectation instead of asserting it out of nowhere.
 ///
-/// The two modes want opposite things from the same variable — see
+/// Derived in exactly one place, [`crate::config::BootstrapConfig::scanout_expected`],
+/// so this type and `provision.sh`'s login-time derivation cannot drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScanoutExpectation {
+    allow_overlaps: bool,
+    direct_scanout: bool,
+}
+
+impl ScanoutExpectation {
+    fn of(bootstrap: &BootstrapConfig) -> Self {
+        Self {
+            allow_overlaps: bootstrap.allow_overlaps,
+            direct_scanout: bootstrap.direct_scanout,
+        }
+    }
+
+    /// Whether the compositor should have been started *without*
+    /// `WLR_SCENE_DISABLE_DIRECT_SCANOUT`.
+    fn scanout_expected(self) -> bool {
+        self.allow_overlaps && self.direct_scanout
+    }
+
+    /// The keys, as they would be written in the file. `direct_scanout` is
+    /// named only where it means something: while `allow_overlaps` is false
+    /// it cannot be true (the daemon refuses to start on that pair), so
+    /// printing its default beside a tiling appliance would read as a
+    /// contradiction.
+    fn keys(self) -> String {
+        if self.allow_overlaps {
+            format!(
+                "allow_overlaps = true, direct_scanout = {}",
+                self.direct_scanout
+            )
+        } else {
+            "allow_overlaps = false".to_string()
+        }
+    }
+
+    /// One clause naming the keys and what they ask of the compositor, which
+    /// every detail string below opens with.
+    fn expects(self) -> String {
+        format!(
+            "{}: the compositor should run with direct scanout {}",
+            self.keys(),
+            if self.scanout_expected() {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )
+    }
+
+    fn title(self) -> &'static str {
+        match (self.allow_overlaps, self.direct_scanout) {
+            (false, _) => "Spanning renders across outputs",
+            (true, true) => "Projectors scan out directly",
+            (true, false) => "Direct scanout is off by request",
+        }
+    }
+}
+
+/// What the `direct-scanout` check should be saying, given what the two keys
+/// ask for, which apps span, and whether the compositor was started with
+/// `WLR_SCENE_DISABLE_DIRECT_SCANOUT`. Pure, so the whole matrix is
+/// table-testable.
+///
+/// The modes want opposite things from the same variable — see
 /// [`CheckRunner::check_direct_scanout`] for why.
 fn judge_direct_scanout(
-    allow_overlaps: bool,
+    expectation: ScanoutExpectation,
     spanning: &[String],
     disabled: bool,
 ) -> (CheckStatus, String) {
-    if allow_overlaps {
+    if expectation.allow_overlaps {
         // Nothing spans the physical outputs here, so which apps are enabled
         // does not enter into it: the slicer gives every display its own
         // buffer either way, and the only question is whether the compositor
         // is allowed to flip it.
-        return if disabled {
-            (
+        return match (expectation.scanout_expected(), disabled) {
+            (true, true) => (
                 CheckStatus::Warn,
-                "the compositor was started with WLR_SCENE_DISABLE_DIRECT_SCANOUT set, \
-                 but this appliance slices every layout, so no window ever spans two \
-                 displays and the mirroring bug that variable works around cannot \
-                 happen. Every projector pays a compositor pass for nothing; remove \
-                 the drop-in and restart the compositor."
-                    .to_string(),
-            )
-        } else {
-            (
+                format!(
+                    "{}, but it was started with WLR_SCENE_DISABLE_DIRECT_SCANOUT set. \
+                     This appliance slices every layout, so no window ever spans two \
+                     displays and the mirroring bug that variable works around cannot \
+                     happen. Every projector pays a compositor pass for nothing; remove \
+                     the drop-in and restart the compositor.",
+                    expectation.expects()
+                ),
+            ),
+            (true, false) => (
                 CheckStatus::Pass,
-                "direct scanout is enabled, so each projector's slice can be flipped \
-                 straight to the display"
-                    .to_string(),
-            )
+                format!(
+                    "{}: direct scanout is enabled, so each projector's slice can be \
+                     flipped straight to the display",
+                    expectation.keys()
+                ),
+            ),
+            (false, true) => (
+                CheckStatus::Pass,
+                format!(
+                    "{}: WLR_SCENE_DISABLE_DIRECT_SCANOUT is set, so sway composites \
+                     every slice — the comparison arm this machine was asked for",
+                    expectation.keys()
+                ),
+            ),
+            (false, false) => (
+                CheckStatus::Warn,
+                format!(
+                    "{}, but WLR_SCENE_DISABLE_DIRECT_SCANOUT is not set, so the \
+                     compositor is still flipping each slice straight to the display \
+                     and the comparison is not in effect. Set the variable and restart \
+                     the compositor, or remove direct_scanout from suede.toml.",
+                    expectation.expects()
+                ),
+            ),
         };
     }
 
     match (spanning.is_empty(), disabled) {
         (_, true) => (
             CheckStatus::Pass,
-            "direct scanout is disabled, so a spanned window covers every output".to_string(),
+            format!(
+                "{}: direct scanout is disabled, so a spanned window covers every output",
+                expectation.keys()
+            ),
         ),
         (true, false) => (
             CheckStatus::Pass,
-            "no app spans outputs, so direct scanout is harmless".to_string(),
+            format!(
+                "{}: no app spans outputs, so direct scanout is harmless",
+                expectation.keys()
+            ),
         ),
         (false, false) => (
             CheckStatus::Warn,
             format!(
-                "{} spans every output, but the compositor was started with direct \
-                 scanout enabled. On some drivers (notably Nvidia's) this makes each \
-                 display show the same part of the window instead of its own — the \
+                "{}, but {} spans every output and the compositor was started with \
+                 direct scanout enabled. On some drivers (notably Nvidia's) this makes \
+                 each display show the same part of the window instead of its own — the \
                  window is the right size, it simply renders wrong. Start sway with \
                  WLR_SCENE_DISABLE_DIRECT_SCANOUT=1.",
+                expectation.expects(),
                 spanning.join(", ")
             ),
         ),
@@ -2402,6 +2509,7 @@ fn group_name_in(text: &str, gid: u32) -> Option<String> {
 mod tests {
     use super::*;
     use crate::audio::mock::MockAudio;
+    use crate::model::LagFrames;
     use crate::sway::mock::MockSway;
 
     #[test]
@@ -2488,12 +2596,14 @@ mod tests {
         )
     }
 
-    /// The same runner, on an appliance whose layouts may overlap — the one
-    /// bootstrap flag that inverts the `direct-scanout` check.
-    fn runner_allowing_overlaps(state_dir: std::path::PathBuf) -> CheckRunner {
+    /// The same runner, on an appliance that slices every layout, with
+    /// `direct_scanout` as given — the two bootstrap keys that decide what
+    /// the `direct-scanout` check expects of the compositor.
+    fn runner_slicing(state_dir: std::path::PathBuf, direct_scanout: bool) -> CheckRunner {
         let runner = runner(state_dir);
         let bootstrap = Arc::new(BootstrapConfig {
             allow_overlaps: true,
+            direct_scanout,
             ..(*runner.bootstrap).clone()
         });
         CheckRunner {
@@ -2502,46 +2612,96 @@ mod tests {
         }
     }
 
+    /// The expectation a `suede.toml` with these keys produces. `false` for
+    /// `allow_overlaps` is the tiling appliance, where `direct_scanout` can
+    /// only be its default (the daemon refuses to start on an explicit true).
+    fn expectation(allow_overlaps: bool, direct_scanout: bool) -> ScanoutExpectation {
+        ScanoutExpectation {
+            allow_overlaps,
+            direct_scanout,
+        }
+    }
+
     #[test]
     fn a_tiling_appliance_wants_direct_scanout_disabled() {
+        let tiling = expectation(false, true);
         let spanning = vec!["wall".to_string()];
 
         // The variable set is the whole point of a tiling appliance, whether
         // or not anything currently spans.
-        let (status, detail) = judge_direct_scanout(false, &spanning, true);
+        let (status, detail) = judge_direct_scanout(tiling, &spanning, true);
         assert_eq!(status, CheckStatus::Pass);
         assert!(detail.contains("disabled"), "{detail}");
-        assert_eq!(judge_direct_scanout(false, &[], true).0, CheckStatus::Pass);
+        assert_eq!(judge_direct_scanout(tiling, &[], true).0, CheckStatus::Pass);
 
         // Unset with nothing spanning is harmless: no client covers two
         // displays, so there is nothing to mirror.
-        let (status, detail) = judge_direct_scanout(false, &[], false);
+        let (status, detail) = judge_direct_scanout(tiling, &[], false);
         assert_eq!(status, CheckStatus::Pass);
         assert!(detail.contains("no app spans"), "{detail}");
 
         // Unset with a spanning app is the bug this check was written for,
         // and it names the app.
-        let (status, detail) = judge_direct_scanout(false, &spanning, false);
+        let (status, detail) = judge_direct_scanout(tiling, &spanning, false);
         assert_eq!(status, CheckStatus::Warn);
         assert!(detail.contains("wall"), "{detail}");
         assert!(
             detail.contains("WLR_SCENE_DISABLE_DIRECT_SCANOUT=1"),
             "{detail}"
         );
+
+        // Only `allow_overlaps` is named: `direct_scanout` has no meaning
+        // here, and printing its default would read as a contradiction.
+        for detail in [
+            judge_direct_scanout(tiling, &spanning, true).1,
+            judge_direct_scanout(tiling, &spanning, false).1,
+        ] {
+            assert!(detail.contains("allow_overlaps = false"), "{detail}");
+            assert!(!detail.contains("direct_scanout"), "{detail}");
+        }
     }
 
     #[test]
     fn a_slicing_appliance_wants_direct_scanout_left_alone() {
         // Exactly inverted, and spanning apps do not enter into it: the app
         // spans the headless canvas, never the physical outputs.
+        let slicing = expectation(true, true);
         for spanning in [vec![], vec!["wall".to_string()]] {
-            let (status, detail) = judge_direct_scanout(true, &spanning, true);
+            let (status, detail) = judge_direct_scanout(slicing, &spanning, true);
             assert_eq!(status, CheckStatus::Warn, "{detail}");
             assert!(detail.contains("compositor pass"), "{detail}");
             assert!(!detail.contains("wall"), "{detail}");
 
-            let (status, detail) = judge_direct_scanout(true, &spanning, false);
+            let (status, detail) = judge_direct_scanout(slicing, &spanning, false);
             assert_eq!(status, CheckStatus::Pass, "{detail}");
+        }
+    }
+
+    /// `direct_scanout = false` is the other arm of the A/B: the same sliced
+    /// layout, composited instead of flipped. The expectation inverts again,
+    /// so a machine that has not actually been restarted into it is a warning
+    /// rather than a silent comparison of the machine with itself.
+    #[test]
+    fn the_a_b_switch_inverts_the_expectation_again() {
+        let off = expectation(true, false);
+
+        let (status, detail) = judge_direct_scanout(off, &[], true);
+        assert_eq!(status, CheckStatus::Pass, "{detail}");
+        assert!(detail.contains("composites every slice"), "{detail}");
+
+        let (status, detail) = judge_direct_scanout(off, &[], false);
+        assert_eq!(status, CheckStatus::Warn, "{detail}");
+        assert!(detail.contains("not in effect"), "{detail}");
+
+        // Every verdict says which pair of keys produced the expectation.
+        for (expected, disabled) in [(true, true), (true, false), (false, true), (false, false)] {
+            let detail = judge_direct_scanout(expectation(true, expected), &[], disabled).1;
+            assert!(
+                detail.contains(&format!(
+                    "allow_overlaps = true, direct_scanout = {expected}"
+                )),
+                "{detail}"
+            );
         }
     }
 
@@ -2559,7 +2719,7 @@ mod tests {
             tiling.docs_url
         );
 
-        let slicing = runner_allowing_overlaps(dir.path().to_path_buf()).check_direct_scanout();
+        let slicing = runner_slicing(dir.path().to_path_buf(), true).check_direct_scanout();
         assert_eq!(slicing.title, "Projectors scan out directly");
         assert!(
             slicing
@@ -2568,6 +2728,19 @@ mod tests {
                 .is_some_and(|url| url.ends_with("#direct-scanout")),
             "{:?}",
             slicing.docs_url
+        );
+
+        // The A/B's other arm is the same page, under a title that does not
+        // claim the projectors are scanning out when they were asked not to.
+        let composited = runner_slicing(dir.path().to_path_buf(), false).check_direct_scanout();
+        assert_eq!(composited.title, "Direct scanout is off by request");
+        assert!(
+            composited
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("#direct-scanout")),
+            "{:?}",
+            composited.docs_url
         );
     }
 
@@ -3152,6 +3325,7 @@ mod tests {
             refresh_hz: Some(60.0),
             phase_ms,
             phase_spread_ms: Some(0.1),
+            lag_frames: LagFrames::default(),
         }
     }
 
@@ -3174,6 +3348,7 @@ mod tests {
             presentation_feedback,
             offset_ms: None,
             straddles: 0,
+            gate_holds: 0,
             renderer: "cpu".to_string(),
             capture_intervals: crate::model::CaptureIntervals::default(),
             outputs,
@@ -3405,16 +3580,23 @@ mod tests {
     #[tokio::test]
     async fn the_scanout_fix_reports_when_it_cannot_help() {
         // With no compositor running as a unit, the fix must explain what to do
-        // rather than silently writing a drop-in nothing will read.
+        // rather than silently writing a drop-in nothing will read. That is the
+        // ordinary case on an appliance provisioned by provision.sh: sway comes
+        // from the login profile on tty1, and only that profile can follow
+        // suede.toml — so the message has to send the operator at the session,
+        // not at a unit that does not exist.
         let dir = tempfile::tempdir().unwrap();
-        let result = runner(dir.path().to_path_buf())
-            .fix(ids::DIRECT_SCANOUT)
-            .await;
-        if let Err(error) = result {
-            assert!(matches!(error, ApiError::Validation(_)));
-            assert!(error
-                .to_string()
-                .contains("WLR_SCENE_DISABLE_DIRECT_SCANOUT"));
+        for direct_scanout in [true, false] {
+            let result = runner_slicing(dir.path().to_path_buf(), direct_scanout)
+                .fix(ids::DIRECT_SCANOUT)
+                .await;
+            if let Err(error) = result {
+                assert!(matches!(error, ApiError::Validation(_)));
+                let text = error.to_string();
+                assert!(text.contains("WLR_SCENE_DISABLE_DIRECT_SCANOUT"), "{text}");
+                assert!(text.contains("restart the session"), "{text}");
+                assert!(text.contains("suede.toml"), "{text}");
+            }
         }
     }
 
