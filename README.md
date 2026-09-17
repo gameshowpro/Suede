@@ -145,6 +145,7 @@ curl -N http://media-server:9088/api/v1/events
 
 - [Getting started](https://suede.gameshow.pro/getting-started/) - installation, provisioning, and first run.
 - [Configuration reference](https://suede.gameshow.pro/configuration/) - every section of the desired-state document.
+- [How it works](https://suede.gameshow.pro/how-it-works/) - the projection pipeline: the path of a frame, where the blend runs, and how the displays are kept in step.
 - [API reference](https://suede.gameshow.pro/api/) - the full REST + SSE API, browsable via Scalar.
 - [Troubleshooting](https://suede.gameshow.pro/troubleshooting/) - failure modes and the health checks that catch them.
 

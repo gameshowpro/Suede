@@ -65,6 +65,7 @@ Then open `http://<machine>:9088/` from another computer. The bundled web UI wal
 
 [Full installation guide :material-arrow-right:](getting-started.md){ .md-button .md-button--primary }
 [Configuration reference :material-arrow-right:](configuration.md){ .md-button }
+[How it works :material-arrow-right:](how-it-works.md){ .md-button }
 
 ## Where it came from
 
