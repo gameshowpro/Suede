@@ -387,6 +387,9 @@ fn glyph(c: char) -> [&'static str; 7] {
         '.' => [
             "     ", "     ", "     ", "     ", "     ", " ##  ", " ##  ",
         ],
+        ':' => [
+            "     ", " ##  ", " ##  ", "     ", " ##  ", " ##  ", "     ",
+        ],
         'A' => [
             " ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #",
         ],
@@ -499,20 +502,27 @@ const DIGIT_SEGMENTS: [u8; 10] = [
     0b1101111, // 9: A B C D F G
 ];
 
-/// The most glyphs [`sync_rects`] will draw for a name or an id, so the rect
-/// count has a ceiling the GPU path's fixed-size buffer can be sized against
-/// — see [`MAX_SYNC_RECTS`]. A connector name is never this long; a snapshot
-/// id would need a century of frames to be.
+/// The most glyphs [`sync_rects`] will draw for a name or a snapshot id, so
+/// the rect count has a ceiling the GPU path's fixed-size buffer can be
+/// sized against — see [`MAX_SYNC_RECTS`]. A connector name is never this
+/// long; a snapshot id would need a century of frames to be.
 const SYNC_TEXT_LIMIT: usize = 12;
 
+/// The most glyphs the bottom-left clock line can run to: a truncated
+/// `S<snapshot>`, a space, and the twelve fixed characters of
+/// `HH:MM:SS.mmm`. The time half never varies in length, so this is an
+/// equality in practice rather than a bound.
+const SYNC_CLOCK_LIMIT: usize = SYNC_TEXT_LIMIT + 1 + "HH:MM:SS.mmm".len();
+
 /// The ceiling [`sync_rects`] guarantees it stays under, whatever the size,
-/// the counter value, the output name or the snapshot id: 14 digit segments,
-/// 16 strip cells of at most four rects each, and two runs of
-/// [`SYNC_TEXT_LIMIT`] glyphs whose 5x7 cells merge into at most three
-/// horizontal runs per row. Rounded up, and asserted by
+/// the counter value, the output name, the snapshot id or the time: 14 digit
+/// segments, 16 strip cells of at most four rects each, 4 coarse bit cells
+/// of at most four rects each, and the name and clock lines' glyphs, whose
+/// 5x7 cells merge into at most three horizontal runs per row. Asserted by
 /// `sync_rects_stay_under_the_advertised_ceiling`, so `gpu.rs` can allocate
 /// one fixed buffer per output and never grow it.
-pub const MAX_SYNC_RECTS: usize = 14 + 16 * 4 + 2 * SYNC_TEXT_LIMIT * 7 * 3;
+pub const MAX_SYNC_RECTS: usize =
+    14 + 16 * 4 + 4 * 4 + (SYNC_TEXT_LIMIT + SYNC_CLOCK_LIMIT) * 7 * 3;
 
 /// One filled white rectangle of the sync pattern, in output-local pixels
 /// and half-open: a pixel is lit when `x0 <= x < x1 && y0 <= y < y1`.
@@ -575,21 +585,34 @@ pub struct SyncGroup {
 ///   strip still reads when a projector's colour wheel has smeared the
 ///   digits across the exposure — and it disambiguates the wrap from 99 to
 ///   00.
+/// - **Four large cells along the bottom edge**, the low four bits of the
+///   counter with the most significant at the left, filled for one and
+///   hollow for zero. The strip's cells are a sixteenth of a digit's height,
+///   which is small in a camera frame holding four projectors at once; these
+///   are a twelfth of the output's *width* each, so a frame transition — and
+///   a lag of up to fifteen frames — can be read out of a video by
+///   thresholding four boxes, at any framing where the wall fills the frame.
 /// - **The output's name**, top left, so a photograph of two projectors
 ///   needs no notes about which is which.
-/// - **The snapshot id**, bottom left and small, so a frame in a photograph
-///   can be matched to the ten-second `GET /projection/stats` interval that
-///   reported its straddles.
+/// - **The snapshot id and a UTC wall clock**, `S<id> HH:MM:SS.mmm`, bottom
+///   left and as large as the room beside the bit row allows. One legible
+///   frame anchors a whole video clip to the ten-second
+///   `GET /projection/stats` interval that reported its straddles and to the
+///   journal, both of which are Unix time — which a counter alone cannot do.
 ///
 /// `frame` is the slicer's present-cycle counter; every output in one cycle
 /// is drawn with the same value, so any difference a camera sees is the
-/// presentation path's, not the pattern's.
+/// presentation path's, not the pattern's. `unix_ms` is milliseconds since
+/// the Unix epoch, sampled once per cycle for the same reason and formatted
+/// here rather than passed in as text, so the function stays pure and the
+/// clock cannot differ between two outputs of one frame.
 pub fn sync_rects(
     width: u32,
     height: u32,
     frame: u32,
     output: &str,
     snapshot: u64,
+    unix_ms: u64,
 ) -> Vec<SyncGroup> {
     let (w, h) = (i64::from(width), i64::from(height));
     if w <= 0 || h <= 0 {
@@ -645,33 +668,17 @@ pub fn sync_rects(
         // number is written.
         let set = (frame >> (15 - bit as u32)) & 1 == 1;
         let (x0, y0) = (strip_x, strip_y + bit * pitch);
-        let (x1, y1) = (x0 + cell, y0 + cell);
-        if set {
-            push_rect(&mut strip, x0, y0, x1, y1, width, height);
-        } else {
-            // Hollow, as four thin bars: a shader that only knows how to
-            // test filled rectangles can still draw an outline.
-            push_rect(&mut strip, x0, y0, x1, y0 + border, width, height);
-            push_rect(&mut strip, x0, y1 - border, x1, y1, width, height);
-            push_rect(
-                &mut strip,
-                x0,
-                y0 + border,
-                x0 + border,
-                y1 - border,
-                width,
-                height,
-            );
-            push_rect(
-                &mut strip,
-                x1 - border,
-                y0 + border,
-                x1,
-                y1 - border,
-                width,
-                height,
-            );
-        }
+        push_cell(
+            &mut strip,
+            set,
+            x0,
+            y0,
+            x0 + cell,
+            y0 + cell,
+            border,
+            width,
+            height,
+        );
     }
     push_group(&mut groups, strip);
 
@@ -698,24 +705,78 @@ pub fn sync_rects(
         push_group(&mut groups, rects);
     }
 
-    // The snapshot id, bottom left and deliberately small: it is read off a
-    // photograph afterwards, never from the room.
-    let label: String = format!("S{snapshot}")
-        .chars()
-        .take(SYNC_TEXT_LIMIT)
-        .collect();
-    let small = (h / 200).max(1);
-    let mut id = Vec::new();
+    // The band below everything else, which the clock and the coarse bits
+    // share. On a 16:9 or 16:10 output the digits take 90 % of the height,
+    // so this is about 5 % of it — and that, not the width, is what ends up
+    // capping the clock's scale there.
+    let content_bottom = (block_y + digit_h).max(strip_y + 15 * pitch + cell);
+    // The band keeps a margin of its own rather than `inset`: `inset` is a
+    // hundredth of the *width*, which is a fair left margin and an
+    // extravagant bottom one on a wide output — and this band is the one
+    // place in the layout where vertical room is scarce enough for the
+    // difference to cost a whole scale step.
+    let foot = (h / 100).max(2);
+    let band_bottom = h - foot;
+    let band_h = (band_bottom - content_bottom).max(0);
+
+    // The low four bits of the counter, bottom right, one cell per bit with
+    // bit 3 at the left. Sized off the *width* rather than the digit height:
+    // in a camera frame wide enough to hold four projectors the 16-bit strip
+    // is a few pixels a cell, and these are the cells a script can threshold
+    // without resolving anything. Hollow for zero, exactly as the strip is,
+    // so one reading rule covers both.
+    let bit_w = (w / 12).max(1);
+    let bit_gap = (bit_w / 8).max(1);
+    let bit_pitch = bit_w + bit_gap;
+    // Flattened to the band rather than kept square: the band is shallow on
+    // a widescreen output, and a wide short cell thresholds just as well.
+    // A foot's clearance is kept above the row — and only above this row,
+    // which is the one feature that sits directly under the digit block: a
+    // filled cell touching a lit bottom bar would read as one tall blob to
+    // a camera, and to a threshold box registered a pixel out. The clock
+    // has the left margin to itself and needs no such gap.
+    let bit_h = bit_w.min(band_h - foot).max(1);
+    let bits_x = w - inset - (3 * bit_pitch + bit_w);
+    let bits_y = band_bottom - bit_h;
+    let bit_border = (bit_w.min(bit_h) / 5).max(1);
+    let mut bits = Vec::new();
+    for bit in 0..4i64 {
+        let set = (frame >> (3 - bit as u32)) & 1 == 1;
+        let x0 = bits_x + bit * bit_pitch;
+        push_cell(
+            &mut bits,
+            set,
+            x0,
+            bits_y,
+            x0 + bit_w,
+            bits_y + bit_h,
+            bit_border,
+            width,
+            height,
+        );
+    }
+    push_group(&mut groups, bits);
+
+    // The snapshot id and the time of day in UTC, bottom left, as large as
+    // the line will go: it is read off a video frame now, not off a still,
+    // and it is what ties the clip to the stats log and the journal.
+    let label = clock_label(snapshot, unix_ms);
+    let line = 6 * label.chars().count().max(1) as i64;
+    // The width the line has is measured to the bit row, not to the output's
+    // edge, because the two share the band; the height it has is the band,
+    // which is what keeps it clear of the digits and the strip.
+    let clock_scale = ((bits_x - 2 * inset).max(1) / line).min(band_h / 7).max(1);
+    let mut clock = Vec::new();
     text_rects(
         &label,
         inset,
-        h - inset - 7 * small,
-        small,
+        band_bottom - 7 * clock_scale,
+        clock_scale,
         width,
         height,
-        &mut id,
+        &mut clock,
     );
-    push_group(&mut groups, id);
+    push_group(&mut groups, clock);
 
     groups
 }
@@ -736,6 +797,75 @@ fn segment_rect(segment: u32, x: i64, y: i64, w: i64, h: i64, t: i64) -> (i64, i
         5 => (x, y + t, x + t, mid0),              // F, top left
         _ => (x + t, mid0, x + w - t, mid1),       // G, middle
     }
+}
+
+/// The bottom-left line: the snapshot id, truncated to [`SYNC_TEXT_LIMIT`],
+/// and the UTC time of day `unix_ms` lands on, as `HH:MM:SS.mmm`.
+///
+/// `(ms / 1000) % 86400` is the whole of the calendar arithmetic, and
+/// deliberately: the date is already in the journal and in the stats log,
+/// the operator is lining a video clip up against them, and a timezone or a
+/// crate would only add a way for the two to disagree. Split out from
+/// [`sync_rects`] so the formatting can be checked without going through a
+/// rectangle.
+fn clock_label(snapshot: u64, unix_ms: u64) -> String {
+    let id: String = format!("S{snapshot}")
+        .chars()
+        .take(SYNC_TEXT_LIMIT)
+        .collect();
+    let second_of_day = (unix_ms / 1000) % 86_400;
+    let label = format!(
+        "{id} {:02}:{:02}:{:02}.{:03}",
+        second_of_day / 3600,
+        (second_of_day / 60) % 60,
+        second_of_day % 60,
+        unix_ms % 1000,
+    );
+    debug_assert!(label.chars().count() <= SYNC_CLOCK_LIMIT);
+    label
+}
+
+/// One cell of a binary readout: filled for a one, and for a zero an outline
+/// drawn as four thin bars, because a shader that only knows how to test
+/// filled rectangles still has to be able to draw a hollow box. Shared by
+/// the sixteen-bit strip and the four coarse bits so the two cannot drift
+/// into reading differently.
+#[allow(clippy::too_many_arguments)]
+fn push_cell(
+    out: &mut Vec<SyncRect>,
+    set: bool,
+    x0: i64,
+    y0: i64,
+    x1: i64,
+    y1: i64,
+    border: i64,
+    width: u32,
+    height: u32,
+) {
+    if set {
+        push_rect(out, x0, y0, x1, y1, width, height);
+        return;
+    }
+    push_rect(out, x0, y0, x1, y0 + border, width, height);
+    push_rect(out, x0, y1 - border, x1, y1, width, height);
+    push_rect(
+        out,
+        x0,
+        y0 + border,
+        x0 + border,
+        y1 - border,
+        width,
+        height,
+    );
+    push_rect(
+        out,
+        x1 - border,
+        y0 + border,
+        x1,
+        y1 - border,
+        width,
+        height,
+    );
 }
 
 /// Clip a rectangle to the output and keep it if anything is left. Every
@@ -1180,6 +1310,11 @@ mod tests {
         )
     }
 
+    /// A fixed instant for every test that is not about the clock itself:
+    /// 2023-11-14T22:13:20.000Z, so the line has the shape it has in the
+    /// field rather than the all-zero one midnight would give.
+    const CLOCK: u64 = 1_700_000_000_000;
+
     fn lit(groups: &[SyncGroup], x: i64, y: i64) -> bool {
         if x < 0 || y < 0 {
             return false;
@@ -1219,7 +1354,7 @@ mod tests {
             ('G', x + w / 2, y + h / 2),
         ];
         for (digit, set) in expected.iter().enumerate() {
-            let groups = sync_rects(width, height, digit as u32, "DP-1", 0);
+            let groups = sync_rects(width, height, digit as u32, "DP-1", 0, CLOCK);
             for (segment, px, py) in probes {
                 assert_eq!(
                     lit(&groups, px, py),
@@ -1236,7 +1371,7 @@ mod tests {
         // Alternating bits, so a reversed strip fails as loudly as a
         // rotated one, plus a value whose top bit is set.
         for frame in [0xaaaau32, 0x5555, 0x8001, 0x0000, 0xffff] {
-            let groups = sync_rects(width, height, frame, "DP-1", 0);
+            let groups = sync_rects(width, height, frame, "DP-1", 0, CLOCK);
             let (w, h) = (i64::from(width), i64::from(height));
             let inset = (w / 100).max(2);
             let digit_h = ((h * 9) / 10).min((w * 9 / 10) * 10 / 11).max(1);
@@ -1263,24 +1398,252 @@ mod tests {
         }
     }
 
+    /// Where the four coarse bit cells sit, worked out here from the rules
+    /// `sync_rects` documents rather than read back out of it — so moving
+    /// the row has to be a deliberate change, exactly as for the digits.
+    fn coarse_bit_boxes(width: u32, height: u32) -> [(i64, i64, i64, i64); 4] {
+        let (w, h) = (i64::from(width), i64::from(height));
+        let inset = (w / 100).max(2);
+        let digit_h = ((h * 9) / 10).min((w * 9 / 10) * 10 / 11).max(1);
+        let digit_w = (digit_h / 2).max(1);
+        let gap = (digit_h / 10).max(1);
+        let block_x = (w - (2 * digit_w + gap)) / 2;
+        let block_y = (h - digit_h) / 2;
+        let pitch = (digit_h / 16).max(2);
+        let margin = (w - (block_x + 2 * digit_w + gap) - 2 * inset).max(2);
+        let cell = pitch.min(margin).max(1);
+        let strip_y = block_y + (digit_h - pitch * 16) / 2;
+        let content_bottom = (block_y + digit_h).max(strip_y + 15 * pitch + cell);
+        let band_bottom = h - (h / 100).max(2);
+        let band_h = (band_bottom - content_bottom).max(0);
+        let bit_w = (w / 12).max(1);
+        let bit_gap = (bit_w / 8).max(1);
+        let bit_pitch = bit_w + bit_gap;
+        let bit_h = bit_w.min(band_h - (h / 100).max(2)).max(1);
+        let bits_x = w - inset - (3 * bit_pitch + bit_w);
+        let bits_y = band_bottom - bit_h;
+        std::array::from_fn(|bit| {
+            let x0 = bits_x + bit as i64 * bit_pitch;
+            (x0, bits_y, x0 + bit_w, bits_y + bit_h)
+        })
+    }
+
+    #[test]
+    fn the_four_coarse_bits_read_the_low_nibble_most_significant_first() {
+        let (width, height) = (1920u32, 1200u32);
+        let boxes = coarse_bit_boxes(width, height);
+        // Exhaustive over the nibble rather than sampled — there are only
+        // sixteen — and with high bits piled on top, which the row exists
+        // to ignore.
+        for nibble in 0..16u32 {
+            for high in [0u32, 0x10, 0xfff0, 0xffff_fff0] {
+                let frame = nibble | high;
+                let groups = sync_rects(width, height, frame, "DP-1", 9_000, CLOCK);
+                for (bit, &(x0, y0, x1, y1)) in boxes.iter().enumerate() {
+                    let set = (nibble >> (3 - bit as u32)) & 1 == 1;
+                    // The centre tells filled from outlined...
+                    assert_eq!(
+                        lit(&groups, (x0 + x1) / 2, (y0 + y1) / 2),
+                        set,
+                        "frame {frame:#x}, cell {bit}"
+                    );
+                    // ...and the top edge is lit either way, which is what
+                    // separates a zero from a cell that was never drawn.
+                    assert!(
+                        lit(&groups, (x0 + x1) / 2, y0),
+                        "frame {frame:#x}, cell {bit}: no outline"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_coarse_bit_cell_is_about_a_twelfth_of_the_output_wide() {
+        // The point of the row is that it survives a camera framing the
+        // whole wall, so its size is a promise about the output's width and
+        // not an accident of the digit height.
+        for &(width, height) in &[(1920u32, 1200u32), (3840, 2160), (800, 1200)] {
+            let boxes = coarse_bit_boxes(width, height);
+            let cell_w = boxes[0].2 - boxes[0].0;
+            assert!(
+                (cell_w - i64::from(width) / 12).abs() <= 1,
+                "{width}x{height}: a cell is {cell_w} px, not a twelfth of {width}"
+            );
+            // Four of them, left to right, in order and not overlapping.
+            for pair in boxes.windows(2) {
+                assert!(pair[0].2 <= pair[1].0, "{width}x{height}: cells collide");
+            }
+            assert!(
+                boxes[3].2 <= i64::from(width),
+                "{width}x{height}: the row runs off the edge"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clock_reads_utc_time_of_day_to_the_millisecond() {
+        for (ms, expected) in [
+            (0u64, "S7 00:00:00.000"),           // the epoch itself
+            (12 * 3_600_000, "S7 12:00:00.000"), // noon
+            (86_400_000 - 1, "S7 23:59:59.999"), // the last ms of a day
+            (86_400_000, "S7 00:00:00.000"),     // and the wrap past it
+            (1_700_000_000_000, "S7 22:13:20.000"),
+            (1_700_000_000_123, "S7 22:13:20.123"), // sub-second
+            (1_700_000_000_007, "S7 22:13:20.007"), // zero-padded
+        ] {
+            assert_eq!(clock_label(7, ms), expected, "{ms} ms since the epoch");
+        }
+        // A runaway snapshot id truncates; the time never does, because the
+        // time is what a video clip is lined up by.
+        let widest = clock_label(u64::MAX, 1_700_000_000_123);
+        assert_eq!(widest, "S18446744073 22:13:20.123");
+        assert_eq!(widest.chars().count(), SYNC_CLOCK_LIMIT);
+    }
+
+    #[test]
+    fn every_character_the_clock_line_uses_has_a_glyph() {
+        // The colon in particular: the font grew one for this line, and a
+        // missing glyph renders as a blank rather than as an error.
+        for snapshot in [0u64, 9_000, u64::MAX] {
+            for ms in [0u64, 1_700_000_000_123, u64::MAX] {
+                for c in clock_label(snapshot, ms).chars().filter(|c| *c != ' ') {
+                    assert!(
+                        glyph(c).iter().any(|row| row.contains('#')),
+                        "{c:?} draws nothing"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_clock_line_is_the_largest_that_fits() {
+        // The contract is "as big as the room allows", so the check is that
+        // one step larger would not fit — either past the bit row beside it
+        // or out of the band under the digits.
+        for &(width, height) in &[
+            (1920u32, 1080u32),
+            (1920, 1200),
+            (3840, 2160),
+            (2560, 1440),
+            (800, 1200),
+        ] {
+            let groups = sync_rects(width, height, 42, "DP-1", 9_000, CLOCK);
+            let clock = groups.last().expect("a clock group");
+            let boxes = coarse_bit_boxes(width, height);
+            let band_bottom = boxes[0].3;
+            let content_bottom = i64::from(groups[0].bounds.y1.max(groups[1].bounds.y1));
+            let band_h = band_bottom - content_bottom;
+            let inset = (i64::from(width) / 100).max(2);
+            let room = (boxes[0].0 - 2 * inset).max(1);
+            let line = 6 * clock_label(9_000, CLOCK).chars().count() as i64;
+
+            // Every glyph of the line has a lit top and bottom row, so the
+            // box is exactly seven cells tall and this is the scale.
+            let scale = i64::from(clock.bounds.y1 - clock.bounds.y0) / 7;
+            assert!(scale >= 1, "{width}x{height}: the clock vanished");
+            assert!(
+                7 * scale <= band_h && line * scale <= room,
+                "{width}x{height}: scale {scale} does not fit"
+            );
+            assert!(
+                7 * (scale + 1) > band_h || line * (scale + 1) > room,
+                "{width}x{height}: scale {scale} leaves a whole step unused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clock_line_is_sized_for_video_rather_than_for_a_still() {
+        // The old snapshot label was `h / 200` tall whatever it said. On the
+        // shapes a projector actually runs — where the band under the digits,
+        // not the width, is what binds — this line carries a clock as well
+        // and is still no smaller.
+        for &(width, height) in &[(1920u32, 1080u32), (1920, 1200), (3840, 2160), (2560, 1440)] {
+            let groups = sync_rects(width, height, 42, "DP-1", 9_000, CLOCK);
+            let clock = groups.last().expect("a clock group");
+            let glyph_h = clock.bounds.y1 - clock.bounds.y0;
+            assert!(
+                glyph_h >= 7 * (height / 200),
+                "{width}x{height}: the clock is {glyph_h} px tall, no better than the old label"
+            );
+            // And it is a line, not a stamp: wide enough to be worth the band.
+            assert!(
+                clock.bounds.x1 - clock.bounds.x0 > width / 5,
+                "{width}x{height}: the clock spans only {} px",
+                clock.bounds.x1 - clock.bounds.x0
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_features_of_a_sync_frame_share_a_pixel() {
+        // The groups are the shader's early-out boxes, so keeping them
+        // disjoint is not only about legibility: it is what lets a script
+        // threshold one feature without catching the edge of another.
+        for &(width, height) in &[
+            (1920u32, 1080u32),
+            (1920, 1200),
+            (3840, 2160),
+            (2560, 1440),
+            (1280, 800),
+            (800, 1200),
+            (1080, 1920),
+        ] {
+            for frame in [0u32, 8, 88, 0xffff, u32::MAX] {
+                for (output, snapshot) in [("DP-1", 0u64), ("MWMWMWMWMWMWMWMW", u64::MAX)] {
+                    let groups = sync_rects(width, height, frame, output, snapshot, CLOCK);
+                    for (i, a) in groups.iter().enumerate() {
+                        for (j, b) in groups.iter().enumerate().skip(i + 1) {
+                            let apart = a.bounds.x1 <= b.bounds.x0
+                                || b.bounds.x1 <= a.bounds.x0
+                                || a.bounds.y1 <= b.bounds.y0
+                                || b.bounds.y1 <= a.bounds.y0;
+                            assert!(
+                                apart,
+                                "{width}x{height} frame {frame:#x} {output}: \
+                                 group {i} {:?} overlaps group {j} {:?}",
+                                a.bounds, b.bounds
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_clock_changes_when_the_time_does() {
+        // Two outputs of one cycle are handed the same instant, so a clock
+        // that moved anything else would make the pattern itself a source
+        // of difference between them.
+        let a = sync_rects(1920, 1200, 37, "DP-1", 9, 1_700_000_000_000);
+        let b = sync_rects(1920, 1200, 37, "DP-1", 9, 1_700_000_000_500);
+        assert_eq!(a.len(), b.len());
+        let last = a.len() - 1;
+        assert_eq!(a[..last], b[..last], "everything but the clock");
+        assert_ne!(a[last], b[last], "the clock");
+    }
+
     #[test]
     fn the_counter_wraps_at_a_hundred_and_ignores_the_high_bits() {
         // 42 and 142 must be the same two digits, and differ only in the
         // strip — which is exactly what makes the strip worth drawing.
-        let a = sync_rects(1920, 1080, 42, "DP-1", 7);
-        let b = sync_rects(1920, 1080, 142, "DP-1", 7);
+        let a = sync_rects(1920, 1080, 42, "DP-1", 7, CLOCK);
+        let b = sync_rects(1920, 1080, 142, "DP-1", 7, CLOCK);
         assert_eq!(a[0], b[0], "the digits");
         assert_ne!(a[1], b[1], "the strip");
     }
 
     #[test]
     fn the_same_arguments_always_produce_the_same_rectangles() {
-        let once = sync_rects(1920, 1080, 37, "HDMI-A-1", 1234);
-        let twice = sync_rects(1920, 1080, 37, "HDMI-A-1", 1234);
+        let once = sync_rects(1920, 1080, 37, "HDMI-A-1", 1234, CLOCK);
+        let twice = sync_rects(1920, 1080, 37, "HDMI-A-1", 1234, CLOCK);
         assert_eq!(once, twice);
         // And the output name is the only thing that varies between two
         // presenters in the same cycle: the counter itself must not.
-        let other = sync_rects(1920, 1080, 37, "DP-2", 1234);
+        let other = sync_rects(1920, 1080, 37, "DP-2", 1234, CLOCK);
         assert_eq!(once[0], other[0], "the digits");
         assert_eq!(once[1], other[1], "the strip");
     }
@@ -1300,7 +1663,7 @@ mod tests {
         ] {
             for frame in [0u32, 1, 99, 100, 65535, u32::MAX] {
                 for output in ["DP-1", "", "A-VERY-LONG-CONNECTOR-NAME"] {
-                    let groups = sync_rects(width, height, frame, output, u64::MAX);
+                    let groups = sync_rects(width, height, frame, output, u64::MAX, CLOCK);
                     for group in &groups {
                         assert!(!group.rects.is_empty(), "{width}x{height}: empty group");
                         for rect in &group.rects {
@@ -1334,7 +1697,7 @@ mod tests {
                 // `M` and `W` are the font's busiest glyphs — three runs in
                 // a five-cell row — so a name of them is the worst case.
                 for output in ["MWMWMWMWMWMWMWMW", "DP-1"] {
-                    let count: usize = sync_rects(width, height, frame, output, u64::MAX)
+                    let count: usize = sync_rects(width, height, frame, output, u64::MAX, u64::MAX)
                         .iter()
                         .map(|group| group.rects.len())
                         .sum();
@@ -1401,7 +1764,7 @@ mod tests {
             ("DP-3", 1080, 1920, 3),
         ] {
             let mut rgb = vec![0u8; w as usize * h as usize * 3];
-            for group in sync_rects(w, h, frame, name, 123_456) {
+            for group in sync_rects(w, h, frame, name, 123_456, CLOCK) {
                 for rect in group.rects {
                     for y in rect.y0..rect.y1 {
                         for x in rect.x0..rect.x1 {

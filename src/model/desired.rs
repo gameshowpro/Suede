@@ -177,6 +177,14 @@ pub enum TestPattern {
     /// measurement of Suede's own presentation path, with no browser in it.
     /// Needs `allowOverlaps = true` (the slicer): the tiled path's static
     /// overlays cannot animate and show a placeholder instead.
+    ///
+    /// Each output carries two digits of the counter, a 16-bit binary strip
+    /// of it beside them, four large cells along the bottom edge holding its
+    /// low four bits, the output's name top left, and the snapshot id with a
+    /// UTC `HH:MM:SS.mmm` clock bottom left. The digits and the strip are for
+    /// reading off a still; the four big cells and the clock are for a video
+    /// clip a script measures frame by frame, and for tying that clip back to
+    /// the stats log and the journal.
     Sync,
 }
 

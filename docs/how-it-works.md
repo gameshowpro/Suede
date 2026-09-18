@@ -72,29 +72,29 @@ flowchart TB
 
     subgraph slicer ["slicer (suede slice)"]
         GATE["Gate: wait until every output<br/>has presented the last frame"]:::wait
-        BLEND["Blend shader, one draw per output<br/>fence wait = the slicer's turn on the GPU queue"]:::gpu
-        COMMIT["Commit N layer surfaces<br/>together"]:::cpu
+        BLEND["Blend shader, one draw per head,<br/>each into that head's own scanout-ready dmabuf<br/>fence wait = the slicer's turn on the GPU queue"]:::gpu
+        COMMIT["Commit all N layer surfaces<br/>in one go"]:::cpu
         GATE --> BLEND --> COMMIT
     end
 
-    subgraph sway2 ["sway: each physical output"]
+    subgraph sway2 ["sway: one independent branch per head (N of these)"]
         DS{"direct scanout?"}
-        OCOMP["Composite the output<br/>(one render pass per output)"]:::gpu
-        KMS["Atomic commit to KMS<br/>(NVIDIA: userspace-heavy)"]:::cpu
+        OCOMP["Composite into this head's own<br/>framebuffer (one render pass)"]:::gpu
+        KMS["Atomic commit to this head's CRTC<br/>(NVIDIA: userspace-heavy)"]:::cpu
         DS -- "no (composited arm)" --> OCOMP --> KMS
         DS -- "yes (direct_scanout)" --> KMS
     end
 
-    subgraph hw ["display controller and projectors"]
+    subgraph hw ["display controller and projector (N of these)"]
         FLIP["Page flip at the driver's deadline<br/>before vblank"]:::hw
-        VB["Vblank 59.95 Hz, one per head,<br/>phase fixed at mode-set"]:::hw
+        VB["Vblank 59.95 Hz, own clock per head,<br/>phase fixed at mode-set"]:::hw
         FLIP --> VB
     end
 
     FC -- "wl_surface.commit (dmabuf),<br/>only when the page changed" --> SC
     CAP -- "ready" --> GATE
     CAPCPU -.-> GATE
-    COMMIT --> DS
+    COMMIT -- "one finished dmabuf per head" --> DS
     KMS --> FLIP
     VB -- "wp_presentation feedback<br/>(opens the gate)" --> GATE
     VB -- "frame callback" --> FC
@@ -105,6 +105,41 @@ Two things drive the whole loop from the right-hand end: the vblank, which
 paces Chromium through the canvas output's frame callback and paces the
 slicer through presentation feedback, and the page's own decision to change
 something, without which nothing upstream of the gate runs at all.
+
+### One branch per head {: #one-branch-per-head }
+
+The two right-hand boxes are drawn once but happen *N* times, once per
+projector, and this is the part of the picture most often imagined wrongly.
+There is no stage anywhere that reassembles the slices into a single image of
+the whole wall. There is no such image, and there is no hardware that could
+scan one out.
+
+A display controller drives one head from one framebuffer. Four projectors
+means four CRTCs, four framebuffers, four independently queued page flips and
+four vblanks running off four clocks that nothing in software can lock
+together. So the slicer's per-projector buffers are not an intermediate
+representation that gets flattened downstream — **they are the final scanout
+buffers**, and there are as many of them as there are heads because the
+hardware takes exactly one each.
+
+That is also why direct scanout is worth having and why it can only ever
+remove one pass rather than a whole stage. The blend shader already writes
+each head's finished pixels — ramp, black lift and all — straight into a
+buffer allocated from the DRM format modifiers the compositor flagged as
+scanout-capable, and commits it to a fullscreen, opaque, exactly-output-sized
+layer surface. Composited, sway then runs a render pass over an image that is
+already a pixel-exact picture of what that projector should show, to produce
+another one. Scanned out, it flips the slicer's buffer to the CRTC plane and
+that pass does not happen. `zeroCopyPresented` equalling `presented` is the
+compositor's own confirmation that nothing touched those pixels between the
+shader and the glass.
+
+The four heads keeping step is a separate problem from the four buffers, and
+it is not solved by the buffers being finished early — it is solved by
+[the gate](#keeping-the-displays-in-step), because each of those four flips is
+queued against its own deadline.
+
+### One cycle, and where it stalls {: #one-cycle }
 
 One cycle in time, on a healthy wall at full rate:
 
@@ -157,6 +192,99 @@ The slicer itself is rarely the limit: its blend is a trivial shader and
 its CPU work is a few commits per frame. When the wall is slow, the answer
 is almost always in the first two rows or the fence, and the stats say
 which.
+
+### What is left to copy {: #what-is-left-to-copy }
+
+With direct scanout on, the copy at the *end* of the pipeline is gone. The
+ones that remain are all at the beginning, between the page and the slicer,
+and they are there because of what Wayland will and will not let one client
+do to another.
+
+Chromium renders into a headless canvas output. sway composites that output.
+Then the slicer asks for a screencopy, and the compositor blits the result
+into the Vulkan image the slicer exported as a dmabuf. That is two GPU passes
+over the whole canvas before the blend shader has done anything — at the
+four-projector rig's 3840x2385 canvas, around 150 MB of memory traffic per
+frame, which is a fraction of a millisecond of pure bandwidth each and one to
+two milliseconds of GPU time once the passes' own overheads are counted.
+
+They cannot simply be skipped. No Wayland protocol lets one client read
+another client's buffer; a compositor that allowed it would have no way to
+distinguish a projection system from a screen-scraper. Screencopy of an
+output is the sanctioned mechanism, and it is a copy by construction.
+
+Whether removing them would help is a separate question from whether they
+exist, and the measurements say: barely. From a four-projector session, mean
+`perFrameMs` over each take, under an idle page and under a GPU-saturating
+one:
+
+| | `blending` | `gpu` | `canvasFps` |
+|---|---|---|---|
+| idle, scanned out | 5.60 | 5.24 | 59.6 |
+| idle, composited | 5.45 | 5.08 | 59.9 |
+| **loaded, scanned out** | **14.31** | 5.98 | 43.3 |
+| **loaded, composited** | **14.09** | 5.56 | 42.9 |
+
+`blending` includes the fence wait — the slicer's turn on a queue it shares
+with the page. It nearly triples under load, and it is the same on both arms
+to within noise, which is the direct confirmation that scanout changes
+nothing about the slicer's own work and only changes what the compositor does
+afterwards. What costs the frame under load is contention for one GPU, not
+the number of passes over the canvas. Removing an upstream pass would hand
+back a slice of the same contended resource: real, and nowhere near the
+several-fold gain that would be needed to hold 60.
+
+### Blue sky: embedding the browser {: #embedding-the-browser }
+
+The obvious way around a rule about *other* processes' buffers is to stop
+being another process. If Chromium ran inside the slicer, its rendered
+framebuffer would be ours to read, and the blend shader could sample it
+directly: no headless canvas output, no composite of it, no screencopy, no
+capture slots, no `ready` event to trust without a fence.
+
+The mechanism exists. The Chromium Embedded Framework's off-screen rendering
+mode has an accelerated path whose paint callback hands back a shared texture
+rather than a CPU bitmap, and on Linux that arrives as dmabuf plane file
+descriptors plus a DRM format modifier — precisely the shape the slicer
+already imports into Vulkan today. Nothing about the blend, the gate, the
+present pool or direct scanout would need to change; only where the canvas
+comes from.
+
+The costs are not technical, which is what makes them hard.
+
+- **Shipping a browser.** CEF is a couple of hundred megabytes of prebuilt
+  binaries per architecture, and the appliance targets x86_64 and aarch64.
+- **Owning its security cadence.** Today Chromium comes from the distribution
+  and is patched by it. Vendored in-process, Suede becomes responsible for
+  shipping browser security updates on Chromium's roughly four-weekly clock,
+  to every appliance, for as long as it is deployed. This is the single
+  biggest reason not to do it.
+- **Losing crash isolation.** A browser that dies today is a supervisor event:
+  the daemon and the rest of the wall survive and it is restarted. CEF keeps
+  renderers in their own processes, but the browser process would be ours.
+- **Bindings.** The Rust bindings to CEF are third-party, thin, and tied to
+  particular CEF releases. Expect substantial unsafe FFI, maintained by us.
+- **It would not replace the capture path.** A Suede app may be
+  [`chromium-kiosk`, `firefox-kiosk`, or `exec`](configuration.md#applications)
+  — an arbitrary Wayland client. Embedding covers the first of the three, so
+  this adds a second pipeline beside the existing one rather than retiring it.
+
+**Is there a WebView2 for Linux?** Not really, and it is the right question.
+What makes WebView2 attractive on Windows is that the Edge runtime is
+installed and updated by the system, so an application embeds a browser
+without shipping or patching one — exactly the cost that sinks this idea.
+Linux has no equivalent: CEF is a library you vendor, and WebKitGTK, which
+*is* system-installed and does have an offscreen path, is not Chromium, so
+pages would render differently from the browser everything here is authored
+and tested against. If a system-provided Chromium runtime with a stable
+zero-copy offscreen ABI ever appears, this becomes worth revisiting.
+
+**Verdict: not now.** It would buy one to two milliseconds a frame in a
+budget whose problem under load is a fourteen-millisecond fence wait caused
+by sharing a GPU with the page. The lever with the better ratio is the
+opposite one — fewer pixels for a GPU-bound page, not fewer copies of them.
+Revisit if the capture path itself ever shows up as the measured bottleneck,
+which on current evidence it does not.
 
 ## Where the blend runs {: #where-the-blend-runs }
 
@@ -321,6 +449,18 @@ it against a photograph: a camera showing an output visibly behind while its
 `lagFrames` reads all-zero means the lag lives in the display, not the
 presentation path; non-zero `one`/`two`/`more` counts on that output mean the
 presentation path itself is delivering it a stale frame.
+
+The `sync` pattern is built for that comparison on video as well as on a
+still. Besides the two big digits and the 16-bit strip, each output carries
+four large cells along its bottom edge — the counter's low four bits, most
+significant at the left, each about a twelfth of the output wide — and a UTC
+`HH:MM:SS.mmm` clock bottom left beside the snapshot id. A high-speed clip of
+the whole wall can then be measured by script rather than by eye: threshold
+four boxes per output to get its frame transitions and its lag up to 15
+frames, and read the clock off any one legible frame to line the clip up with
+`GET /projection/stats` and the journal, which are Unix time too. The clock is
+sampled once per present cycle, so every output of a frame shows the same
+millisecond — a difference there would be the pattern's, not the wall's.
 
 The `output-phase` health check reads exactly that field and warns when any
 output is more than 1.0 ms from the first. It was written from a
