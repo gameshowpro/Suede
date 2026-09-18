@@ -3655,9 +3655,17 @@ fn present_sync(state: &mut State, handle: &QueueHandle<State>, frame: u32) -> b
     if due.is_empty() {
         return false;
     }
+    // Sampled once, here, and handed to every output of this cycle: the
+    // clock is there to be read off one video frame of the whole wall, so
+    // two outputs showing different milliseconds would be a defect of the
+    // pattern rather than a measurement. A clock stepped before 1970 is not
+    // worth a branch further down, so it reads as midnight.
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
     match state.capture.backend {
-        Some(Backend::Gpu) => present_sync_gpu(state, handle, frame, due),
-        _ => present_sync_cpu(state, handle, frame, due),
+        Some(Backend::Gpu) => present_sync_gpu(state, handle, frame, unix_ms, due),
+        _ => present_sync_cpu(state, handle, frame, unix_ms, due),
     }
 }
 
@@ -3722,6 +3730,7 @@ fn present_sync_cpu(
     state: &mut State,
     handle: &QueueHandle<State>,
     frame: u32,
+    unix_ms: u64,
     due: Vec<Due>,
 ) -> bool {
     let State {
@@ -3737,7 +3746,8 @@ fn present_sync_cpu(
         let Some((width, height)) = presenter.configured else {
             continue;
         };
-        let groups = super::pattern::sync_rects(width, height, frame, &presenter.name, snapshot_id);
+        let groups =
+            super::pattern::sync_rects(width, height, frame, &presenter.name, snapshot_id, unix_ms);
         let rects: Vec<SyncRect> = groups
             .iter()
             .flat_map(|group| group.rects.iter().copied())
@@ -3810,6 +3820,7 @@ fn present_sync_gpu(
     state: &mut State,
     handle: &QueueHandle<State>,
     frame: u32,
+    unix_ms: u64,
     due: Vec<Due>,
 ) -> bool {
     let snapshot_id = state.timing.snapshot_id;
@@ -3824,7 +3835,8 @@ fn present_sync_gpu(
         let Some((width, height)) = presenter.configured else {
             continue;
         };
-        let groups = super::pattern::sync_rects(width, height, frame, &presenter.name, snapshot_id);
+        let groups =
+            super::pattern::sync_rects(width, height, frame, &presenter.name, snapshot_id, unix_ms);
         let (count, items) = sync_shape_items(&groups);
         if let Err(error) = gpu.set_sync_shapes(d.index, count, &items) {
             eprintln!(
@@ -5200,7 +5212,8 @@ mod tests {
         // Small enough to check every pixel, large enough that the pattern
         // still has all four of its features.
         let (width, height) = (320u32, 200u32);
-        let groups = super::super::pattern::sync_rects(width, height, 57, "DP-1", 9_000);
+        let groups =
+            super::super::pattern::sync_rects(width, height, 57, "DP-1", 9_000, 1_700_000_000_000);
         let (count, items) = sync_shape_items(&groups);
         assert_eq!(count as usize, groups.len());
         for y in 0..height {
@@ -5221,7 +5234,7 @@ mod tests {
     fn the_last_groups_next_link_points_past_the_end() {
         // The walk reads `next` on every group including the last, so the
         // link has to be the length rather than anything clever.
-        let groups = super::super::pattern::sync_rects(640, 480, 3, "DP-2", 1);
+        let groups = super::super::pattern::sync_rects(640, 480, 3, "DP-2", 1, 1_700_000_000_000);
         let (count, items) = sync_shape_items(&groups);
         let mut index = 0usize;
         for _ in 0..count {
@@ -5246,7 +5259,8 @@ mod tests {
                 })
             })
             .collect();
-        let groups = super::super::pattern::sync_rects(width, height, 88, "DP-9", 42);
+        let groups =
+            super::super::pattern::sync_rects(width, height, 88, "DP-9", 42, 1_700_000_000_000);
         let rects: Vec<SyncRect> = groups
             .iter()
             .flat_map(|group| group.rects.iter().copied())
@@ -5289,10 +5303,11 @@ mod tests {
         // come out the same either way.
         let (width, height) = (64u32, 48u32);
         let transfer = vec![(256u16, 0u8); (width * height) as usize];
-        let rects: Vec<SyncRect> = super::super::pattern::sync_rects(width, height, 7, "DP-1", 5)
-            .iter()
-            .flat_map(|group| group.rects.iter().copied())
-            .collect();
+        let rects: Vec<SyncRect> =
+            super::super::pattern::sync_rects(width, height, 7, "DP-1", 5, 1_700_000_000_000)
+                .iter()
+                .flat_map(|group| group.rects.iter().copied())
+                .collect();
         let paint = SyncPaint {
             transfer: &transfer,
             rects: &rects,

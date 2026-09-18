@@ -1067,7 +1067,7 @@ right tool for checking a rig before committing to a layout.
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |
-| `sync` | Measuring output-to-output presentation sync with a camera. Every output shows the *same* two-digit counter, drawn by the blending component itself and advanced once per present cycle, with a 16-bit binary strip of the same counter beside it, the output's name top left and the stats snapshot id bottom left. Photograph two or more outputs in one exposure at **1/1000 s or faster**; on DLP projectors take **two consecutive frames**, because the colour wheel can leave a single exposure showing part of two refreshes. Report, per output, the number showing — or "two numbers visible" when an output straddles a refresh. Needs `allowOverlaps = true`. |
+| `sync` | Measuring output-to-output presentation sync with a camera. Every output shows the *same* two-digit counter, drawn by the blending component itself and advanced once per present cycle, with a 16-bit binary strip of the same counter beside it, four large cells along the bottom edge carrying the counter's low four bits (most significant at the left, filled for one and hollow for zero), the output's name top left, and the stats snapshot id with a UTC `HH:MM:SS.mmm` clock bottom left. Photograph two or more outputs in one exposure at **1/1000 s or faster**; on DLP projectors take **two consecutive frames**, because the colour wheel can leave a single exposure showing part of two refreshes. Report, per output, the number showing — or "two numbers visible" when an output straddles a refresh. Needs `allowOverlaps = true`. |
 
 The gamma chart assumes the output runs at scale 1 (its stripes are
 single-pixel rows); the other patterns have no such constraint.
@@ -1084,6 +1084,16 @@ would read as perfect sync. Read the photograph against `straddles` and
 matching digits with `straddles` at 0 means the outputs are in step, while
 differing digits with `straddles` at 0 means the compositor's flip reports
 and the light on the wall disagree.
+
+For a *video* rather than a still — a high-speed clip of the whole wall,
+measured offline by script — read the four big bottom cells instead of the
+digits: they are each about a twelfth of the output wide, so they threshold
+at any framing that fits four projectors in shot, and they give the frame
+transitions and a lag of up to 15 frames without resolving anything smaller.
+The bottom-left clock is UTC time of day to the millisecond, sampled once per
+present cycle and therefore identical on every output of a frame; one legible
+frame of the clip is enough to line the whole clip up against the stats log
+and the journal, which are Unix time too.
 
 !!! warning "Keep an output at position 0,0"
     Sway anchors a spanned (`fullscreen global`) surface at the layout
