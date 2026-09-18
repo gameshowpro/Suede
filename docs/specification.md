@@ -342,7 +342,7 @@ Three dependency choices changed during implementation. Each preserves a guarant
 2. **The `pipewire` crate → `pw-dump` / `pw-cli`.** The crate links against `libpipewire-0.3`, which would add a build-time native dependency, break the "only libc" property asserted under [Packaging](#packaging-install-and-upgrade), and require a PipeWire-equipped arm64 sysroot for `cross` builds. The CLI tools provide the same capabilities — enumeration, change notification, null sink creation — with no build dependency. `pw-dump --monitor` is used purely as a change *trigger*, exactly as Sway's detail-free `output` event is, with a one-shot `pw-dump` supplying the authoritative list.
 3. **The web UI ships without a build step.** Rather than TypeScript compiled to static assets, it is one self-contained HTML file embedded with `include_str!`. A reference client's value is in being readable and exercising every endpoint; requiring an npm toolchain in CI to ship it is a poor trade. `rust-embed` is unnecessary at this size.
 
-Two behaviours were also refined against the specification once real runs exposed them:
+Two behaviors were also refined against the specification once real runs exposed them:
 
 - **Windowless apps.** An `exec` launcher that pins no output is not expected to map a window, so it reaches `running` on spawn and is exempt from the 15-second window timeout. Browser presets, and any app that pins an output, still must produce a window.
 - **Halting.** An app whose restart policy declines a relaunch is explicitly halted, not merely left in `crashed`. Without that, the next reconciliation pass would start it again — `never` would have meant "always".

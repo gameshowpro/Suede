@@ -2,7 +2,7 @@
 
 **Suede** and the Suede name and logo are trademarks of Barjonas LLC.
 
-The [licence](LICENSE) grants rights in copyright and patents. It grants no
+The [license](LICENSE) grants rights in copyright and patents. It grants no
 rights in the name. This is deliberate and it is normal practice: it means a
 copy of Suede can be identified as such, and something that is *not* Suede
 cannot claim to be.
@@ -14,7 +14,7 @@ cannot claim to be.
   without implying that it is endorsed by or affiliated with us.
 - Use the name in documentation, articles, talks, tutorials, comparisons and
   reviews, favourable or not.
-- Keep the name in an unmodified copy you redistribute under the licence.
+- Keep the name in an unmodified copy you redistribute under the license.
 - Use it in the name of a plugin, integration or tool, where the name makes
   clear that yours is the product and Suede is what it works with —
   "Suede exporter for Foo", not "Foo Suede".
@@ -32,7 +32,7 @@ cannot claim to be.
 
 ## Why this is here
 
-A licence controls copying; a trademark controls naming. Without a trademark
+A license controls copying; a trademark controls naming. Without a trademark
 notice, a fork could be distributed under a different set of terms while still
 calling itself Suede, and nobody downstream could tell which one they had.
 Asserting the name is what keeps "Suede" meaning one thing.

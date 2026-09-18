@@ -165,17 +165,17 @@ stating plainly: the [PolyForm Small Business License 1.0.0](LICENSE) permits
 use for the benefit of a company with fewer than 100 people and under
 USD 1,000,000 of revenue in the prior tax year. Individuals, hobbyists,
 schools, charities and small production companies are inside that and owe
-nothing. Larger organisations need a
-[commercial licence](COMMERCIAL.md) — same code, nothing withheld.
+nothing. Larger organizations need a
+[commercial license](COMMERCIAL.md) — same code, nothing withheld.
 
 Forks inherit these terms, because they are derivative works.
 
-"Suede" is a trademark; the licence covers copyright and patents, not the
+"Suede" is a trademark; the license covers copyright and patents, not the
 name. See [TRADEMARKS.md](TRADEMARKS.md) for what that does and does not
 allow, which is more permissive than people usually expect.
 
 Contributions are welcome and are asked for under a grant that allows both
-licences — see [CONTRIBUTING.md](CONTRIBUTING.md) for why.
+licenses — see [CONTRIBUTING.md](CONTRIBUTING.md) for why.
 
 Copyright © 2026 Barjonas LLC. Commercial enquiries:
 <https://barjonas.com/#contact>

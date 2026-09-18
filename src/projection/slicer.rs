@@ -2514,7 +2514,7 @@ struct PresentModifiers {
 /// its caller's. Empty when the two share nothing (or the compositor flagged
 /// no scanout tranche for this fourcc at all), and the caller then allocates
 /// from `supported` whole: a buffer that cannot be scanned out still
-/// composites correctly, which is exactly today's behaviour.
+/// composites correctly, which is exactly today's behavior.
 fn scanout_modifiers(supported: &[u64], scanout: &[u64]) -> Vec<u64> {
     supported
         .iter()
@@ -4189,7 +4189,7 @@ impl Dispatch<WlCallback, usize> for State {
 }
 
 /// Presenter buffers only — every capture buffer (both GPU-path capture
-/// images and the shm capture buffer) keeps the `()` behaviour below via
+/// images and the shm capture buffer) keeps the `()` behavior below via
 /// `delegate_noop!`: nothing needs to know which one a `wl_buffer.release`
 /// belongs to, since a capture buffer's readiness is learned from
 /// screencopy's own `Ready`/`Failed` events, not from `wl_buffer.release`.

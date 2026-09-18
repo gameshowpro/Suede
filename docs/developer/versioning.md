@@ -52,13 +52,13 @@ The second row catches the case that is easiest to under-call. Moving the
 default API port from 9080 to 9088 changed no schema and refused no document,
 so it looks like a patch — but an appliance that nobody logs into comes back
 after the upgrade on a port its operator is not expecting, which is
-indistinguishable from the box being dead. Behaviour an unattended machine
+indistinguishable from the box being dead. Behavior an unattended machine
 depends on is part of the contract, the same as a field name.
 
 Suede is an appliance daemon, not a library, so nobody resolves against its
 version as a dependency. What the number is *for* is telling an operator
 whether an upgrade can break the box they already configured — which is why
-the table is about documents and behaviour, not about how much code moved.
+the table is about documents and behavior, not about how much code moved.
 
 ### While the major is 0
 

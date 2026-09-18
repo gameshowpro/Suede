@@ -472,7 +472,7 @@ re-enabled together in one sway IPC message, landed within 0.03 ms of each
 other — about 20 straddles per 330 at the same rate. A mode-set delivered in
 one IPC message is applied by sway in one backend commit, which is what
 keeps the heads on the same clock; one command per output, even issued back
-to back, is not. Treat that as NVIDIA behaviour rather than a guarantee: the
+to back, is not. Treat that as NVIDIA behavior rather than a guarantee: the
 same batched re-enable on a Raspberry Pi 5's Broadcom driver narrowed a
 7.5 ms difference to 4.5 ms without closing it, so on hardware that does not
 lock its heads this way the check can still warn after its own fix has run.

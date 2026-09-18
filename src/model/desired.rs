@@ -1037,7 +1037,7 @@ impl Launcher {
     }
 }
 
-/// Restart behaviour after an application exits.
+/// Restart behavior after an application exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RestartPolicyKind {

@@ -219,7 +219,7 @@ browser is a **snap**, and a confined snap may write anywhere in `$HOME`
 Current versions of Suede do not choose a snap at all, so this only appears
 when one was named deliberately with `launcher.program`, and even then the
 profile is placed under `~/snap/<name>/common/suede-profiles/<app>` so it
-works. If you are seeing it, either the daemon predates that behaviour or
+works. If you are seeing it, either the daemon predates that behavior or
 something else is passing `--user-data-dir`. Check which binary is actually
 being launched:
 

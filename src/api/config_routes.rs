@@ -17,7 +17,7 @@ use crate::model::{
     Settings,
 };
 
-/// Optional blocking behaviour for writes.
+/// Optional blocking behavior for writes.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct WaitQuery {
