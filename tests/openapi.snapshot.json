@@ -1637,9 +1637,229 @@
         },
         "type": "object"
       },
+      "ProjectionControlFailure": {
+        "description": "A rejected revision or a closed control channel, retained until a newer\nsuccessful update supersedes it.",
+        "properties": {
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
+      "ProjectionControlOutputStatus": {
+        "description": "The latest lifecycle generation reported for one named output.",
+        "properties": {
+          "appliedGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "builtGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "presentedGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "samplingMode": {
+            "description": "Filled when the slicer reports its effective sampling path.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "submittedGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "ProjectionControlStatus": {
+        "description": "Observed progress of the complete snapshots sent to the slicer.",
+        "properties": {
+          "acceptedGeneration": {
+            "description": "Highest accepted generation reported by this child.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "appliedGeneration": {
+            "description": "Highest generation installed as a complete render revision.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "buildMs": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "builtGeneration": {
+            "description": "Highest generation built for any affected output.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "effectiveMode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effectiveRenderer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Renderer"
+              }
+            ]
+          },
+          "lastFailure": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectionControlFailure"
+              }
+            ]
+          },
+          "outputs": {
+            "description": "Per-output lifecycle prevents global submitted/presented values from\nimplying an atomic wall-wide flip.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectionControlOutputStatus"
+            },
+            "type": "array"
+          },
+          "presentedGeneration": {
+            "description": "Highest generation presented by any output. Independent heads need\nnot physically present a generation at the same instant.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "requestedGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "requestedMode": {
+            "description": "Requested operator mode and the mode the negotiated pipeline runs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requestedRenderer": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Renderer",
+                "description": "Renderer requested by configuration and renderer actually negotiated\nby the running child. These are separate because Auto may fall back."
+              }
+            ]
+          },
+          "session": {
+            "description": "Session of the currently running child, when it has accepted a live\ncontrol message.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "submittedGeneration": {
+            "description": "Highest generation submitted by any output. This does not mean all\noutputs have submitted it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "uploadMs": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "warpAvailable": {
+            "description": "Whether the selected capture/presentation pipeline can apply a warp.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "warpReason": {
+            "description": "Why warp is unavailable, including a known remediation when the child\ncan provide one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ProjectionReport": {
         "description": "What the projection pipeline is doing right now, as served by `GET\n/projection/stats` and `projection_stats_changed`.\n\nAdded 2026-09-15: a four-projector bench had a slicer that was\ndemonstrably alive (`pgrep -f \"suede slice\"` found it, and it had logged\nits startup line) but had produced no frames, because the frame loop is\ndamage-driven and the active page was a static image. The endpoint used\nto be `ProjectionStats | null`, and that `null` was reported for \"no\nslicer at all\" and \"slicer running but silent\" alike — which is exactly\nhow a running slicer got diagnosed as not running. `running` is tracked\nseparately from whatever the slicer has or has not reported, so the two\nsituations are no longer the same value.",
         "properties": {
+          "control": {
+            "$ref": "#/components/schemas/ProjectionControlStatus",
+            "description": "Lifecycle of the most recent live slicer update.  This is independent\nof frame-interval statistics: a static canvas can apply a revision\nbefore it has any ten-second interval to report."
+          },
           "lastInterval": {
             "oneOf": [
               {
@@ -1870,7 +2090,7 @@
         "type": "object"
       },
       "RestartPolicyKind": {
-        "description": "Restart behaviour after an application exits.",
+        "description": "Restart behavior after an application exits.",
         "enum": [
           "always",
           "on-failure",

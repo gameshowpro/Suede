@@ -12,6 +12,7 @@
 //! the configuration schema is not, so every build speaks the same API.
 
 pub mod blend;
+pub mod control;
 #[cfg(unix)]
 mod dmabuf;
 #[cfg(unix)]
@@ -22,8 +23,16 @@ pub mod overlay;
 pub mod pattern;
 #[cfg(unix)]
 pub mod slicer;
+pub mod warp;
 
 pub use blend::{
-    canvas_plan, overlay_specs, CanvasPlan, OverlaySpec, Participant, SlicerSpec, Slicing,
+    canvas_plan, canvas_plan_with_warp_activation, overlay_specs, CanvasPlan, OverlaySpec,
+    Participant, SlicerSpec, Slicing,
 };
 pub use manager::BlendManager;
+
+#[cfg(all(unix, test))]
+#[allow(dead_code)] // Retained research fixtures; never linked into production.
+mod warp_spike;
+#[cfg(unix)]
+mod warp_update;

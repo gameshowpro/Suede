@@ -443,6 +443,11 @@ struct Presenter {
     /// row-major at the configured size. Two-dimensional because seams can
     /// run on any edge — a grid corner is the product of two ramps.
     transfer: Vec<(u16, u8)>,
+    warp: Option<super::warp::Warp>,
+    /// Research revision carried by this output, independent of source frames.
+    warp_revision: u64,
+    warp_reported_revision: Option<u64>,
+    warp_submitted_revision: Option<u64>,
     /// This presenter's region of the canvas.
     source: crate::model::Rect,
     /// A `wl_surface.frame` callback is outstanding: the compositor has not
@@ -1417,6 +1422,19 @@ struct State {
     /// something to show — which, on a healthy wall, is never. See
     /// [`ProjectionStats::gate_holds`].
     gate_blocked_since: Option<Instant>,
+    warp_updates: Option<super::warp_update::Controller>,
+    warp_available: bool,
+    /// Immutable diagnostic sources; each output retains its connector labels.
+    static_canvases: Vec<gpu::StaticCanvas>,
+    /// A failed draw keeps the retained source dirty and retries on a bounded timer.
+    gpu_retry_after: Option<Instant>,
+}
+
+/// Never draw into a buffer still owned by the compositor.
+fn free_present_slot(busy: &[bool], next: usize) -> Option<usize> {
+    (0..busy.len())
+        .map(|step| (next + step) % busy.len())
+        .find(|&slot| !busy[slot])
 }
 
 impl State {
@@ -1465,13 +1483,26 @@ impl State {
     /// permits showing right now: the gate is open *and* somebody has
     /// something newer to show.
     fn can_present(&self) -> bool {
+        if self.gpu_retry_after.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
         if self.free_run {
             let signal = self.gate_signal();
+            self.presenters.iter().any(|p| {
+                p.stale
+                    && p.gate_ready(signal)
+                    && free_present_slot(&p.busy, p.next_buffer).is_some()
+            })
+        } else {
             self.presenters
                 .iter()
-                .any(|p| p.stale && p.gate_ready(signal))
-        } else {
-            self.presenters.iter().any(|p| p.stale) && self.gate_open()
+                .any(|p| p.stale && free_present_slot(&p.busy, p.next_buffer).is_some())
+                && self
+                    .presenters
+                    .iter()
+                    .filter(|p| p.stale && !p.stalled)
+                    .all(|p| free_present_slot(&p.busy, p.next_buffer).is_some())
+                && self.gate_open()
         }
     }
 
@@ -1688,6 +1719,17 @@ impl State {
 }
 
 pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
+    let nonexact = requested_warp(spec)?;
+    if nonexact && spec.renderer == Renderer::Cpu {
+        report_capability(
+            spec,
+            Renderer::Cpu,
+            false,
+            Some("renderer:cpu supports rectangles only".into()),
+            true,
+        );
+        anyhow::bail!("warp_unavailable: renderer:cpu supports rectangles only");
+    }
     let connection = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<State>(&connection)?;
     let handle = queue.handle();
@@ -1727,6 +1769,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         canvas_period_ms: 1000.0 / 60.0,
         last_capture_at: None,
         gate_blocked_since: None,
+        warp_updates: None,
+        warp_available: false,
+        static_canvases: Vec::new(),
+        gpu_retry_after: None,
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
@@ -1774,14 +1820,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         .map(|mhz| 1_000_000.0 / f64::from(mhz))
         .unwrap_or(1000.0 / 60.0);
 
-    // GPU/dmabuf negotiation, once, before anything else needs to know the
-    // backend — see the module doc's negotiation notes. Skipped entirely
-    // for a *static* test pattern, which never captures at all and draws
-    // straight into shm-backed presenter buffers regardless of `renderer`.
-    // The `sync` pattern is not static: it presents every frame, through
-    // whichever backend content would have used, because what it measures
-    // is that backend's path to the glass.
-    if !spec.pattern.is_some_and(|pattern| !animated(pattern)) && spec.renderer != Renderer::Cpu {
+    // Negotiate for content and every pattern; forced GPU failures stay explicit.
+    if spec.renderer != Renderer::Cpu {
         match negotiate_gpu(dmabuf.as_ref(), &mut state, &mut queue, &handle) {
             Ok((gpu, formats)) => {
                 state.gpu = Some(gpu);
@@ -1789,6 +1829,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             }
             Err(reason) => {
                 if spec.renderer == Renderer::Gpu {
+                    report_capability(spec, Renderer::Gpu, false, Some(reason.clone()), nonexact);
                     anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
                 }
                 state.gpu_error = Some(reason);
@@ -1846,6 +1887,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             busy: Vec::new(),
             next_buffer: 0,
             transfer: Vec::new(),
+            warp: None,
+            warp_revision: 0,
+            warp_reported_revision: None,
+            warp_submitted_revision: None,
             source: slice.source,
             frame_pending: false,
             pending_since: None,
@@ -1861,6 +1906,17 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         if state.closed {
             return Ok(());
         }
+    }
+    if state.gpu.is_some() {
+        super::warp_update::validate_initial(
+            spec,
+            &state
+                .presenters
+                .iter()
+                .map(|p| p.configured.unwrap())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(anyhow::Error::msg)?;
     }
     // How much black each region of the canvas is receiving. Derived from
     // every slice, because how much a projector must lift depends on how many
@@ -1888,36 +1944,52 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     }
 
     if let Some(pattern) = spec.pattern {
+        state.capture.backend = Some(
+            decide_sync_backend(&mut state, dmabuf.as_ref(), !animated(pattern)).inspect_err(
+                |error| {
+                    report_capability(
+                        spec,
+                        spec.renderer,
+                        false,
+                        Some(error.to_string()),
+                        nonexact,
+                    )
+                },
+            )?,
+        );
+        create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
+        if !animated(pattern) && state.capture.backend == Some(Backend::Gpu) {
+            state.static_canvases = build_static_canvases(&mut state, spec, pattern)?;
+        }
+        initialize_warp_control(spec, &connection, &mut queue, &mut state)?;
         if animated(pattern) {
-            // Presents every frame through the normal path, so it shares
-            // nothing below but the presenters themselves.
             return run_sync(
                 &connection,
                 &mut queue,
                 &mut state,
-                &shm,
                 dmabuf.as_ref(),
                 &handle,
             );
         }
-        // A test pattern is drawn by poking pixels directly (see
-        // `present_pattern`), so it always needs a CPU-mapped buffer — the
-        // GPU path never enters into it regardless of `renderer` (and
-        // `negotiate_gpu` was skipped above for exactly this reason).
-        for (index, presenter) in state.presenters.iter_mut().enumerate() {
-            let (width, height) = presenter.configured.unwrap();
-            // Always the shm count, whatever `renderer` says: a pattern is
-            // poked pixel by pixel into a mapped buffer, so this is the CPU
-            // path even when the GPU one was available.
-            for slot in 0..CPU_PRESENT_SLOTS {
-                presenter
-                    .buffers
-                    .push(shm_buffer(&shm, &handle, width, height, (index, slot))?);
+        if state.capture.backend == Some(Backend::Gpu) {
+            state.new_snapshot();
+            loop {
+                apply_warp_updates(&mut state)?;
+                if state.closed {
+                    return Ok(());
+                }
+                if state.can_present() {
+                    present_frame_gpu(&mut state, &handle);
+                }
+                dispatch_until(
+                    &connection,
+                    &mut queue,
+                    &mut state,
+                    Instant::now() + Duration::from_secs(60),
+                )?;
             }
-            presenter.busy = vec![false; presenter.buffers.len()];
         }
         present_pattern(&mut state, spec, pattern);
-        // Static image: nothing further to do but stay alive.
         loop {
             queue.blocking_dispatch(&mut state)?;
             if state.closed {
@@ -1951,26 +2023,60 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // concurrently with the first wait, exactly as it does every loop
     // iteration below.
     let mut current = request_capture(&mut state, &screencopy, &source, &handle);
-    if !arm_copy(
-        &mut state,
-        &mut queue,
-        &shm,
-        dmabuf.as_ref(),
-        &handle,
-        &current,
-    )? {
-        return Ok(());
+    loop {
+        if !arm_copy(
+            &mut state,
+            &mut queue,
+            &shm,
+            dmabuf.as_ref(),
+            &handle,
+            &current,
+        )
+        .inspect_err(|error| {
+            report_capability(
+                spec,
+                spec.renderer,
+                false,
+                Some(error.to_string()),
+                nonexact,
+            )
+        })? {
+            return Ok(());
+        }
+        if !state.capture.failed {
+            break;
+        }
+        current.destroy();
+        failures += 1;
+        anyhow::ensure!(
+            failures < MAX_FAILURES,
+            "initial screencopy failed {failures} times"
+        );
+        state.capture.failed = false;
+        current = request_capture(&mut state, &screencopy, &source, &handle);
     }
     // The backend (and, on the GPU path, the capture image) is decided as
     // of the `arm_copy` above — now create presenter buffers of the right
     // kind for it, before the first capture can possibly complete.
     create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
+    initialize_warp_control(spec, &connection, &mut queue, &mut state)?;
     let mut next = request_capture(&mut state, &screencopy, &source, &handle);
 
     loop {
         let waiting_from = Instant::now();
+        apply_warp_updates(&mut state)?;
         while !state.capture.ready && !state.capture.failed && !state.can_present() {
-            queue.blocking_dispatch(&mut state)?;
+            if state.warp_updates.is_some() || state.gpu_retry_after.is_some() {
+                dispatch_until(
+                    &connection,
+                    &mut queue,
+                    &mut state,
+                    Instant::now() + Duration::from_secs(60),
+                )?;
+                apply_warp_updates(&mut state)?;
+            } else {
+                queue.blocking_dispatch(&mut state)?;
+            }
             if state.closed {
                 current.destroy();
                 next.destroy();
@@ -2123,6 +2229,298 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     }
 }
 
+fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
+    let mut requested = false;
+    for slice in &spec.slices {
+        anyhow::ensure!(
+            slice.source.width > 0 && slice.source.height > 0,
+            "source dimensions must be positive"
+        );
+        if let Some(geometry) = &slice.geometry {
+            requested |= geometry
+                .warp(slice.source.width as u32, slice.source.height as u32)
+                .map_err(anyhow::Error::msg)?
+                .is_some();
+        }
+    }
+    Ok(requested)
+}
+
+fn report_capability(
+    spec: &SlicerSpec,
+    effective_renderer: Renderer,
+    available: bool,
+    reason: Option<String>,
+    requested: bool,
+) {
+    let event = super::control::ControlEvent::new(
+        spec.control_session.clone(),
+        0,
+        super::control::ControlEventKind::Capability {
+            requested_renderer: spec.renderer,
+            effective_renderer,
+            warp_available: available,
+            reason,
+            requested_mode: if requested { "warp" } else { "simple" }.into(),
+            effective_mode: if requested && available {
+                "warp"
+            } else {
+                "simple"
+            }
+            .into(),
+        },
+    );
+    println!("{}", serde_json::to_string(&event).unwrap());
+    let _ = std::io::stdout().flush();
+}
+
+/// Startup capability reflects the selected source and allocated image, not
+/// merely a successfully created Vulkan sampler. Public mode persistence is
+/// intentionally separate from this internal slicer contract.
+fn initialize_warp_control(
+    spec: &SlicerSpec,
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+) -> anyhow::Result<()> {
+    let requested = requested_warp(spec)?;
+    let effective = if state.capture.backend == Some(Backend::Gpu) {
+        Renderer::Gpu
+    } else {
+        Renderer::Cpu
+    };
+    let reason = if effective == Renderer::Cpu {
+        Some(
+            state
+                .gpu_error
+                .clone()
+                .unwrap_or_else(|| "selected CPU pipeline supports rectangles only".into()),
+        )
+    } else if spec.pattern.is_none()
+        && state
+            .capture
+            .gpu_images
+            .first()
+            .is_none_or(|(image, _)| !image.linear_filter_supported())
+    {
+        Some("capture format/modifier does not support linear filtering".into())
+    } else {
+        None
+    };
+    state.warp_available = reason.is_none();
+    report_capability(
+        spec,
+        effective,
+        state.warp_available,
+        reason.clone(),
+        requested,
+    );
+    if requested && !state.warp_available {
+        anyhow::bail!("warp_unavailable: {}", reason.unwrap());
+    }
+    if effective == Renderer::Cpu {
+        return Ok(());
+    }
+    let controller = super::warp_update::Controller::new(
+        spec,
+        state
+            .presenters
+            .iter()
+            .map(|p| p.configured.unwrap())
+            .collect(),
+        blend_workers(u32::MAX) as usize,
+    )
+    .map_err(anyhow::Error::msg)?;
+    controller.read_stdin()?;
+    state.warp_updates = Some(controller);
+    // Initial matrices and tables must exist before any submission. Later
+    // edits build off-thread and retain the current complete generation.
+    while !state.warp_updates.as_ref().unwrap().initialized() {
+        apply_warp_updates(state)?;
+        if state.warp_updates.as_ref().unwrap().initialized() {
+            break;
+        }
+        dispatch_until(
+            connection,
+            queue,
+            state,
+            Instant::now() + Duration::from_secs(60),
+        )?;
+        anyhow::ensure!(!state.closed, "output closed during initial warp build");
+    }
+    Ok(())
+}
+
+/// Each diagnostic canvas retains the legacy per-output labels/chart placement.
+/// It is uploaded once, then sampled through the same warp/transfer shader as
+/// content. Pins never regenerate these sources. Gamma chart gamma changes are
+/// source changes and therefore require a topology restart.
+fn build_static_canvases(
+    state: &mut State,
+    spec: &SlicerSpec,
+    pattern: TestPattern,
+) -> anyhow::Result<Vec<gpu::StaticCanvas>> {
+    anyhow::ensure!(
+        spec.canvas_width > 0 && spec.canvas_height > 0,
+        "invalid canvas dimensions"
+    );
+    let pixels = spec.canvas_width as u64 * spec.canvas_height as u64;
+    anyhow::ensure!(
+        pixels > 0 && pixels.saturating_mul(spec.slices.len() as u64) <= 64_000_000,
+        "static pattern canvases exceed the 64 megapixel resource limit"
+    );
+    let gpu = state.gpu.as_mut().expect("GPU pattern backend");
+    let mut canvases = Vec::with_capacity(spec.slices.len());
+    for slice in &spec.slices {
+        let rgba = static_pattern_rgba(spec, slice, pattern)?;
+        canvases.push(gpu.upload_static_canvas_rgba(
+            spec.canvas_width as u32,
+            spec.canvas_height as u32,
+            &rgba,
+        )?);
+    }
+    Ok(canvases)
+}
+
+fn static_pattern_rgba(
+    spec: &SlicerSpec,
+    slice: &super::blend::SliceSpec,
+    pattern: TestPattern,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        spec.canvas_width > 0
+            && spec.canvas_height > 0
+            && spec.canvas_width as u64 * spec.canvas_height as u64 <= 64_000_000,
+        "invalid static canvas dimensions"
+    );
+    let rect = slice.source;
+    anyhow::ensure!(
+        rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0,
+        "invalid static pattern source rectangle"
+    );
+    let (width, height) = (rect.width as u32, rect.height as u32);
+    anyhow::ensure!(
+        u64::from(width) * u64::from(height) <= 32_000_000,
+        "static pattern output exceeds the 32 megapixel limit"
+    );
+    let fake = OverlaySpec {
+        output: slice.output.clone(),
+        gamma: spec.gamma,
+        black_lift: 0.0,
+        rect,
+        pattern: Some(pattern),
+        ramps: Vec::new(),
+    };
+    let rgb = super::pattern::render(width, height, &fake);
+    let mut rgba = vec![0; spec.canvas_width as usize * spec.canvas_height as usize * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    for y in 0..height.min((spec.canvas_height as u32).saturating_sub(rect.y as u32)) {
+        for x in 0..width.min((spec.canvas_width as u32).saturating_sub(rect.x as u32)) {
+            let src = (y as usize * width as usize + x as usize) * 3;
+            let dst = ((y as usize + rect.y as usize) * spec.canvas_width as usize
+                + x as usize
+                + rect.x as usize)
+                * 4;
+            rgba[dst..dst + 3].copy_from_slice(&rgb[src..src + 3]);
+        }
+    }
+    Ok(rgba)
+}
+
+/// Install only between synchronous GPU submissions: Gpu::blend/sync have
+/// already waited their fence, so no SSBO reader remains in flight.
+/// Stage the complete affected set before changing any active matrix/table.
+fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
+    let Some(controller) = state.warp_updates.as_mut() else {
+        return Ok(());
+    };
+    let prepared = controller.poll();
+    anyhow::ensure!(
+        !controller.requires_restart(),
+        "control version mismatch; restarting slicer"
+    );
+    let Some(mut prepared) = prepared else {
+        return Ok(());
+    };
+    let validated = prepared.outputs.iter().all(|output| {
+        state
+            .presenters
+            .get(output.index)
+            .is_some_and(|p| p.name == output.name && p.configured == Some(output.size))
+    });
+    let upload = Instant::now();
+    let result = if !validated {
+        Err(anyhow::anyhow!("output topology changed; restart required"))
+    } else if prepared.outputs.iter().any(|o| o.warp.is_some()) && !state.warp_available {
+        Err(anyhow::anyhow!(
+            "warp_unavailable: negotiated pipeline supports rectangles only"
+        ))
+    } else if let Some(gpu) = state.gpu.as_mut() {
+        let updates: Vec<_> = prepared
+            .outputs
+            .iter()
+            .map(|o| gpu::TransferUpdate {
+                index: o.index,
+                width: o.size.0,
+                height: o.size.1,
+                table: &o.table,
+            })
+            .collect();
+        gpu.replace_transfers(&updates)
+    } else {
+        Err(anyhow::anyhow!("GPU unavailable"))
+    };
+    let upload_ms = upload.elapsed().as_secs_f64() * 1000.0;
+    if let Err(error) = result {
+        state
+            .warp_updates
+            .as_ref()
+            .unwrap()
+            .reject(prepared.generation, error.to_string());
+        if !validated || !state.warp_updates.as_ref().unwrap().initialized() {
+            return Err(error);
+        }
+        return Ok(());
+    }
+    let changed: Vec<_> = prepared.outputs.iter().map(|o| o.name.clone()).collect();
+    let sampling_modes = prepared
+        .outputs
+        .iter()
+        .map(|o| {
+            (
+                o.name.clone(),
+                if o.warp.is_some() {
+                    "bilinear"
+                } else {
+                    "exact"
+                }
+                .to_string(),
+            )
+        })
+        .collect();
+    for output in &mut prepared.outputs {
+        let presenter = &mut state.presenters[output.index];
+        presenter.transfer = std::mem::take(&mut output.table);
+        presenter.warp = output.warp.take();
+        presenter.warp_revision = prepared.generation;
+        presenter.stale = true;
+    }
+    let controller = state.warp_updates.as_mut().unwrap();
+    controller.installed(&prepared);
+    controller.event(
+        prepared.generation,
+        super::control::ControlEventKind::Applied {
+            outputs: changed,
+            sampling_modes,
+            build_ms: Some(prepared.build_ms),
+            upload_ms: Some(upload_ms),
+        },
+    );
+    Ok(())
+}
+
 /// Ask the compositor for the canvas's next damaged frame.
 ///
 /// Sends only. The compositor answers with the buffer layout it wants, which
@@ -2260,7 +2658,7 @@ fn ensure_capture_buffer(
 /// possible when `Renderer::Gpu` was forced and the GPU path turns out not
 /// to be available, which is fatal (the slicer exits, the daemon respawns
 /// it on its next reconcile).
-fn decide_backend(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> anyhow::Result<Backend> {
+fn decide_backend(state: &mut State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> anyhow::Result<Backend> {
     if state.renderer == Renderer::Cpu {
         return Ok(Backend::Cpu);
     }
@@ -2271,6 +2669,7 @@ fn decide_backend(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> anyhow::R
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
+            state.gpu_error = Some(reason);
             Ok(Backend::Cpu)
         }
     }
@@ -2448,7 +2847,10 @@ fn ensure_gpu_capture_buffer(
     };
     if stale {
         let modifiers = gpu_formats.all.get(&format).cloned().unwrap_or_default();
-        let supported = gpu.supported_modifiers(format, &modifiers, gpu::Usage::Capture);
+        let mut supported = gpu.supported_capture_modifiers(format, &modifiers, true);
+        if supported.is_empty() && !state.warp_available {
+            supported = gpu.supported_capture_modifiers(format, &modifiers, false);
+        }
         if supported.is_empty() {
             anyhow::bail!(
                 "no Vulkan-importable modifier for capture format {format:#010x} \
@@ -3001,7 +3403,8 @@ fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
         .capture
         .pending_slot
         .take()
-        .or(state.capture.last_blended_slot);
+        .or(state.capture.last_blended_slot)
+        .or_else(|| (!state.static_canvases.is_empty()).then_some(0));
     let Some(slot) = slot else {
         // Nothing has been captured yet this run: clear `stale` the same way
         // `gpu_blend_due` would, so a presenter that somehow raced ahead of
@@ -3041,14 +3444,17 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
         free_run,
         stats,
         gpu,
+        gpu_retry_after,
+        static_canvases,
         ..
     } = state;
-    let Some((canvas_image, _)) = capture.gpu_images.get(capture_slot) else {
+    let canvas_image = capture.gpu_images.get(capture_slot).map(|(image, _)| image);
+    if canvas_image.is_none() && static_canvases.is_empty() {
         for presenter in presenters.iter_mut() {
             presenter.stale = false;
         }
         return Vec::new();
-    };
+    }
     let y_invert = capture.y_invert;
 
     let mut due = Vec::new();
@@ -3067,13 +3473,12 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
         if len == 0 {
             continue;
         }
-        let slot = (0..len)
-            .map(|step| (presenter.next_buffer + step) % len)
-            .find(|&candidate| !presenter.busy[candidate])
-            .unwrap_or_else(|| {
-                stats.buffer_reuse += 1;
-                presenter.next_buffer % len
-            });
+        let Some(slot) = free_present_slot(&presenter.busy, presenter.next_buffer) else {
+            // A released slot is required even when the presentation gate is
+            // open. Keep this generation dirty until wl_buffer.release wakes us.
+            presenter.stale = true;
+            continue;
+        };
         presenter.next_buffer = (slot + 1) % len;
         presenter.busy[slot] = true;
         due.push(Due { index, slot });
@@ -3092,6 +3497,7 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
                 output: d.index,
                 source_x: presenter.source.x.max(0) as u32,
                 source_y: presenter.source.y.max(0) as u32,
+                warp: presenter.warp.as_ref(),
             }
         })
         .collect();
@@ -3099,8 +3505,17 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
     let gpu = gpu
         .as_mut()
         .expect("Backend::Gpu implies state.gpu is Some");
-    match gpu.blend(canvas_image, y_invert, &jobs) {
+    let result = if static_canvases.is_empty() {
+        gpu.blend(canvas_image.unwrap(), y_invert, &jobs)
+    } else {
+        jobs.iter().try_fold(Duration::ZERO, |total, job| {
+            gpu.blend_static(&static_canvases[job.output], std::slice::from_ref(job))
+                .map(|duration| total + duration)
+        })
+    };
+    match result {
         Ok(duration) => {
+            *gpu_retry_after = None;
             stats.gpu += duration;
             capture.last_blended_slot = Some(capture_slot);
             due
@@ -3109,7 +3524,12 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
             eprintln!("slicer: gpu.blend failed: {error:#}");
             for d in &due {
                 presenters[d.index].busy[d.slot] = false;
+                presenters[d.index].stale = true;
             }
+            // Retain the complete source even if this was its first draw.
+            // This slot remains protected by the existing capture ownership.
+            capture.last_blended_slot = Some(capture_slot);
+            *gpu_retry_after = Some(Instant::now() + Duration::from_millis(10));
             Vec::new()
         }
     }
@@ -3125,6 +3545,7 @@ fn gpu_present_due(state: &mut State, handle: &QueueHandle<State>, due: &[Due]) 
         timing,
         presentation,
         stats,
+        warp_updates,
         ..
     } = state;
     let snapshot_id = timing.snapshot_id;
@@ -3143,13 +3564,31 @@ fn gpu_present_due(state: &mut State, handle: &QueueHandle<State>, due: &[Due]) 
         presenter.surface.frame(handle, d.index);
         if let Some(presentation) = presentation.as_ref() {
             timing.request(snapshot_id, d.index);
-            presentation.feedback(&presenter.surface, handle, (d.index, snapshot_id));
+            presentation.feedback(
+                &presenter.surface,
+                handle,
+                (d.index, snapshot_id, presenter.warp_revision),
+            );
         }
         // Both waits armed together, right before the commit they describe:
         // whichever of them the gate is anchored to is what holds the next
         // commit back until this one has landed.
         presenter.commit_sent(snapshot_id, presentation.is_some());
         presenter.surface.commit();
+        if presenter
+            .warp_submitted_revision
+            .is_none_or(|r| presenter.warp_revision > r)
+        {
+            presenter.warp_submitted_revision = Some(presenter.warp_revision);
+            if let Some(controller) = warp_updates.as_ref() {
+                controller.event(
+                    presenter.warp_revision,
+                    super::control::ControlEventKind::Submitted {
+                        outputs: vec![presenter.name.clone()],
+                    },
+                );
+            }
+        }
         committed_any = true;
     }
     if committed_any {
@@ -3237,22 +3676,14 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
             continue;
         }
 
-        // Choose a buffer the compositor is not currently holding, starting
-        // the search at `next_buffer` so the slots keep rotating in the
-        // common case. Falling back to reusing a busy one only happens when
-        // an output has fallen behind on releases — a stall, in practice —
-        // and is counted so it shows up as non-zero if it ever happens
-        // without one. The loop is written for any pool length; the two
-        // paths size their pools differently (see [`CPU_PRESENT_SLOTS`] and
-        // [`GPU_PRESENT_SLOTS`]).
         let len = presenter.buffers.len();
-        let slot = (0..len)
-            .map(|step| (presenter.next_buffer + step) % len)
-            .find(|&candidate| !presenter.busy[candidate])
-            .unwrap_or_else(|| {
-                stats.buffer_reuse += 1;
-                presenter.next_buffer % len
-            });
+        // Rotate only through released buffers.
+        let Some(slot) = free_present_slot(&presenter.busy, presenter.next_buffer) else {
+            // A released slot is required even when the presentation gate is
+            // open. Keep this generation dirty until wl_buffer.release wakes us.
+            presenter.stale = true;
+            continue;
+        };
         presenter.next_buffer = (slot + 1) % len;
         presenter.busy[slot] = true;
 
@@ -3311,7 +3742,11 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         presenter.stale = false;
         if let Some(presentation) = presentation.as_ref() {
             timing.request(snapshot_id, index);
-            presentation.feedback(&presenter.surface, handle, (index, snapshot_id));
+            presentation.feedback(
+                &presenter.surface,
+                handle,
+                (index, snapshot_id, presenter.warp_revision),
+            );
         }
         presenter.commit_sent(snapshot_id, presentation.is_some());
         presenter.surface.commit();
@@ -3477,12 +3912,9 @@ fn run_sync(
     connection: &Connection,
     queue: &mut wayland_client::EventQueue<State>,
     state: &mut State,
-    shm: &WlShm,
     dmabuf: Option<&ZwpLinuxDmabufV1>,
     handle: &QueueHandle<State>,
 ) -> anyhow::Result<()> {
-    state.capture.backend = Some(decide_sync_backend(state, dmabuf)?);
-    create_present_buffers(state, shm, dmabuf, handle)?;
     match state.capture.backend {
         Some(Backend::Gpu) => {
             let gpu = state
@@ -3514,6 +3946,7 @@ fn run_sync(
     let mut floor = Instant::now();
     let mut force = floor;
     loop {
+        apply_warp_updates(state)?;
         // Sleep to whichever the loop is actually waiting for: the floor
         // when the gate is already open (there is nothing to wait for but
         // the canvas rate), the fallback deadline when it is not (an event
@@ -3574,19 +4007,28 @@ fn run_sync(
 /// policy and the same fatal case, against `sync_gpu_availability`'s
 /// shorter list of requirements.
 fn decide_sync_backend(
-    state: &State,
+    state: &mut State,
     dmabuf: Option<&ZwpLinuxDmabufV1>,
+    static_canvas: bool,
 ) -> anyhow::Result<Backend> {
     if state.renderer == Renderer::Cpu {
         return Ok(Backend::Cpu);
     }
-    match sync_gpu_availability(state, dmabuf) {
+    let availability = sync_gpu_availability(state, dmabuf).and_then(|()| {
+        if static_canvas && !state.gpu.as_ref().unwrap().static_canvas_supported() {
+            Err("GPU static canvas format lacks sampled linear filtering or upload support".into())
+        } else {
+            Ok(())
+        }
+    });
+    match availability {
         Ok(()) => Ok(Backend::Gpu),
         Err(reason) => {
             if state.renderer == Renderer::Gpu {
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
+            state.gpu_error = Some(reason);
             Ok(Backend::Cpu)
         }
     }
@@ -3614,20 +4056,30 @@ fn dispatch_until(
         queue.dispatch_pending(state)?;
         return Ok(());
     };
+    let deadline = state
+        .gpu_retry_after
+        .filter(|at| *at > Instant::now())
+        .map_or(deadline, |retry| deadline.min(retry));
     let millis = deadline
         .saturating_duration_since(Instant::now())
         .as_millis()
         .min(i32::MAX as u128) as i32;
-    let mut poll_fd = libc::pollfd {
-        fd: connection.as_fd().as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // Safety: one fully initialised `pollfd` naming a socket this
-    // `Connection` owns and outlives the call; `poll` writes `revents` and
-    // nothing else.
-    let ready = unsafe { libc::poll(&mut poll_fd, 1, millis) };
-    if ready > 0 {
+    let mut poll_fds = [
+        libc::pollfd {
+            fd: connection.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: state.warp_updates.as_ref().map_or(-1, |c| c.fd()),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    // Safety: both initialized descriptors are owned for the duration of
+    // the call. A negative control fd is ignored by poll.
+    let ready = unsafe { libc::poll(poll_fds.as_mut_ptr(), poll_fds.len() as _, millis) };
+    if ready > 0 && poll_fds[0].revents != 0 {
         // A spurious wakeup (or a racing dispatch from elsewhere) leaves
         // nothing to read; that is not an error, just an empty pass.
         if let Err(error) = guard.read() {
@@ -3681,11 +4133,18 @@ fn present_sync(state: &mut State, handle: &QueueHandle<State>, frame: u32) -> b
 /// pass's counter, not this one's. That is free-run behaving as documented,
 /// and it is why a sync photograph is taken with the gate on.
 fn sync_due(state: &mut State) -> Vec<Due> {
+    if !state.free_run
+        && state
+            .presenters
+            .iter()
+            .any(|p| p.stale && !p.stalled && free_present_slot(&p.busy, p.next_buffer).is_none())
+    {
+        return Vec::new();
+    }
     let signal = state.gate_signal();
     let State {
         presenters,
         free_run,
-        stats,
         capture,
         ..
     } = state;
@@ -3708,13 +4167,12 @@ fn sync_due(state: &mut State) -> Vec<Due> {
         if len == 0 {
             continue;
         }
-        let slot = (0..len)
-            .map(|step| (presenter.next_buffer + step) % len)
-            .find(|&candidate| !presenter.busy[candidate])
-            .unwrap_or_else(|| {
-                stats.buffer_reuse += 1;
-                presenter.next_buffer % len
-            });
+        let Some(slot) = free_present_slot(&presenter.busy, presenter.next_buffer) else {
+            // A released slot is required even when the presentation gate is
+            // open. Keep this generation dirty until wl_buffer.release wakes us.
+            presenter.stale = true;
+            continue;
+        };
         presenter.next_buffer = (slot + 1) % len;
         presenter.busy[slot] = true;
         due.push(Due { index, slot });
@@ -3800,7 +4258,11 @@ fn present_sync_cpu(
         presenter.surface.frame(handle, d.index);
         if let Some(presentation) = presentation.as_ref() {
             timing.request(snapshot_id, d.index);
-            presentation.feedback(&presenter.surface, handle, (d.index, snapshot_id));
+            presentation.feedback(
+                &presenter.surface,
+                handle,
+                (d.index, snapshot_id, presenter.warp_revision),
+            );
         }
         presenter.commit_sent(snapshot_id, presentation.is_some());
         presenter.surface.commit();
@@ -3858,6 +4320,7 @@ fn present_sync_gpu(
                 // one thing whichever mode built it.
                 source_x: presenter.source.x.max(0) as u32,
                 source_y: presenter.source.y.max(0) as u32,
+                warp: presenter.warp.as_ref(),
             })
         })
         .collect();
@@ -4084,6 +4547,18 @@ impl Dispatch<ZwlrLayerSurfaceV1, usize> for State {
                 layer_surface.ack_configure(serial);
                 let compositor = state.compositor.clone();
                 if let Some(presenter) = state.presenters.get_mut(*index) {
+                    if state.warp_updates.is_some()
+                        && presenter
+                            .configured
+                            .is_some_and(|size| size != (width, height))
+                    {
+                        eprintln!(
+                            "slicer: output {} resized; restarting geometry topology",
+                            presenter.name
+                        );
+                        state.closed = true;
+                        return;
+                    }
                     presenter.configured = Some((width, height));
                     // A surface wlroots knows is fully opaque is one it may
                     // flip straight to the plane instead of compositing:
@@ -4231,16 +4706,16 @@ impl Dispatch<WpPresentation, ()> for State {
     }
 }
 
-impl Dispatch<WpPresentationFeedback, (usize, u64)> for State {
+impl Dispatch<WpPresentationFeedback, (usize, u64, u64)> for State {
     fn event(
         state: &mut Self,
         _: &WpPresentationFeedback,
         event: wp_presentation_feedback::Event,
-        data: &(usize, u64),
+        data: &(usize, u64, u64),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        let (index, snapshot_id) = *data;
+        let (index, snapshot_id, warp_revision) = *data;
         // Either answer ends this presenter's wait — the protocol promises
         // exactly one of them per feedback object, and the gate cares that
         // the commit is resolved, not that it was shown. `>=` rather than
@@ -4285,6 +4760,24 @@ impl Dispatch<WpPresentationFeedback, (usize, u64)> for State {
                     .into_result()
                     .map(|f| f.contains(wp_presentation_feedback::Kind::ZeroCopy))
                     .unwrap_or(false);
+                if let Some(presenter) = state.presenters.get_mut(index) {
+                    if presenter
+                        .warp_reported_revision
+                        .is_none_or(|r| warp_revision > r)
+                    {
+                        presenter.warp_reported_revision = Some(warp_revision);
+                        // Journal time is feedback receipt, not the compositor's
+                        // clock domain or camera-measured optical latency.
+                        if let Some(controller) = &state.warp_updates {
+                            controller.event(
+                                warp_revision,
+                                super::control::ControlEventKind::Presented {
+                                    outputs: vec![presenter.name.clone()],
+                                },
+                            );
+                        }
+                    }
+                }
                 state
                     .timing
                     .presented(snapshot_id, index, at_ns, refresh, zero_copy);
@@ -4935,6 +5428,10 @@ mod tests {
             canvas_period_ms: 1000.0 / 60.0,
             last_capture_at: None,
             gate_blocked_since: None,
+            warp_updates: None,
+            warp_available: false,
+            static_canvases: Vec::new(),
+            gpu_retry_after: None,
         }
     }
 
@@ -5337,5 +5834,184 @@ mod tests {
         ] {
             assert!(!animated(pattern), "{pattern:?} must stay one-shot");
         }
+    }
+    #[test]
+    fn slow_buffer_release_never_selects_an_owned_slot() {
+        let mut busy = vec![true; GPU_PRESENT_SLOTS];
+        for next in 0..12 {
+            assert_eq!(free_present_slot(&busy, next), None);
+        }
+        busy[1] = false;
+        assert_eq!(free_present_slot(&busy, 2), Some(1));
+        busy[1] = true;
+        busy[0] = false;
+        assert_eq!(free_present_slot(&busy, 2), Some(0));
+        assert_eq!(free_present_slot(&[], 0), None);
+    }
+
+    fn pattern_spec() -> SlicerSpec {
+        serde_json::from_value(serde_json::json!({
+            "source":"HEADLESS-1", "canvasWidth":320, "canvasHeight":240,
+            "gamma":2.2, "blackLift":0.1, "renderer":"auto",
+            "slices":[{"output":"DP-1","source":{"x":30,"y":20,"width":240,"height":180},"ramps":[]}]
+        })).unwrap()
+    }
+
+    #[test]
+    fn static_canvases_preserve_legacy_pattern_pixels_and_source_selection() {
+        let spec = pattern_spec();
+        let slice = &spec.slices[0];
+        for pattern in [
+            TestPattern::Grid,
+            TestPattern::White,
+            TestPattern::Black,
+            TestPattern::Gamma,
+            TestPattern::Identify,
+        ] {
+            let canvas = static_pattern_rgba(&spec, slice, pattern).unwrap();
+            let legacy = super::super::pattern::render(
+                240,
+                180,
+                &OverlaySpec {
+                    output: slice.output.clone(),
+                    gamma: spec.gamma,
+                    black_lift: 0.0,
+                    rect: slice.source,
+                    pattern: Some(pattern),
+                    ramps: vec![],
+                },
+            );
+            for y in 0..180usize {
+                for x in 0..240usize {
+                    let dst = ((y + 20) * 320 + x + 30) * 4;
+                    let src = (y * 240 + x) * 3;
+                    assert_eq!(
+                        &canvas[dst..dst + 3],
+                        &legacy[src..src + 3],
+                        "{pattern:?} at {x},{y}"
+                    );
+                    assert_eq!(canvas[dst + 3], 255);
+                }
+            }
+            assert_eq!(&canvas[..4], &[0, 0, 0, 255]);
+            let mut warped = slice.clone();
+            warped.geometry = Some(super::super::warp::Geometry {
+                corners: [[10.0, 5.0], [230.0, 0.0], [240.0, 175.0], [0.0, 180.0]],
+                center: [0.4, 0.6],
+            });
+            assert_eq!(
+                canvas,
+                static_pattern_rgba(&spec, &warped, pattern).unwrap(),
+                "pins must not move diagnostic source pixels"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_rejects_warp_before_connecting_and_preserves_identity_support() {
+        let mut spec = pattern_spec();
+        spec.renderer = Renderer::Cpu;
+        assert!(!requested_warp(&spec).unwrap());
+        spec.slices[0].geometry = Some(super::super::warp::Geometry {
+            corners: [[10.0, 5.0], [230.0, 0.0], [240.0, 175.0], [0.0, 180.0]],
+            center: [0.5, 0.5],
+        });
+        assert!(run(&spec)
+            .unwrap_err()
+            .to_string()
+            .contains("warp_unavailable"));
+    }
+    fn lifecycle_state() -> (Connection, std::os::unix::net::UnixStream, State) {
+        let (socket, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(socket).unwrap();
+        let backend = connection.backend().downgrade();
+        let mut state = bare_state(vec![]);
+        state.presenters = (0..2)
+            .map(|i| Presenter {
+                surface: WlSurface::inert(backend.clone()),
+                layer_surface: ZwlrLayerSurfaceV1::inert(backend.clone()),
+                configured: Some((4, 4)),
+                opaque_for: None,
+                output_mode: None,
+                name: format!("OUT-{i}"),
+                buffers: (0..2)
+                    .map(|_| {
+                        (
+                            WlBuffer::inert(backend.clone()),
+                            memmap2::MmapMut::map_anon(64).unwrap(),
+                        )
+                    })
+                    .collect(),
+                gpu_buffers: vec![],
+                busy: vec![false; 2],
+                next_buffer: 0,
+                transfer: vec![(256, 0); 16],
+                warp: None,
+                warp_revision: 7,
+                warp_reported_revision: None,
+                warp_submitted_revision: None,
+                source: crate::model::Rect {
+                    x: i * 4,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                },
+                frame_pending: false,
+                pending_since: None,
+                feedback_pending_for: None,
+                feedback_since: None,
+                stalled: false,
+                stale: true,
+            })
+            .collect();
+        (connection, server, state)
+    }
+
+    #[test]
+    fn slow_buffers_hold_locked_generation_and_free_run_keeps_other_output_moving() {
+        let (_connection, _server, mut state) = lifecycle_state();
+        state.presenters[0].busy.fill(true);
+        assert!(!state.can_present());
+        assert!(sync_due(&mut state).is_empty());
+        assert!(state
+            .presenters
+            .iter()
+            .all(|p| p.stale && p.warp_revision == 7));
+        state.free_run = true;
+        assert!(state.can_present());
+        let due = sync_due(&mut state);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].index, 1);
+        assert!(state.presenters[0].stale);
+        state.presenters[0].warp_revision = 9;
+        state.presenters[0].busy[1] = false;
+        let due = sync_due(&mut state);
+        assert_eq!((due[0].index, due[0].slot), (0, 1));
+        assert_eq!(state.presenters[0].warp_revision, 9);
+        assert!(!state.presenters[0].stale);
+    }
+
+    #[test]
+    fn installed_generation_survives_until_first_complete_capture() {
+        let (connection, _server, mut state) = lifecycle_state();
+        state.capture.backend = Some(Backend::Gpu);
+        let queue = connection.new_event_queue::<State>();
+        present_frame_gpu(&mut state, &queue.handle());
+        assert!(state
+            .presenters
+            .iter()
+            .all(|p| !p.stale && p.warp_revision == 7));
+        assert!(state
+            .presenters
+            .iter()
+            .all(|p| p.warp_submitted_revision.is_none()));
+        assert!(!state.can_present());
+        state.timing = Timing::new(2);
+        state.new_snapshot();
+        assert!(state.can_present());
+        assert!(state
+            .presenters
+            .iter()
+            .all(|p| p.stale && p.warp_revision == 7));
     }
 }

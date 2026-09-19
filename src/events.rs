@@ -160,6 +160,7 @@ mod tests {
         let event = ServerEvent::ProjectionStatsChanged(Box::new(crate::model::ProjectionReport {
             running: false,
             last_interval: None,
+            control: Default::default(),
         }));
         assert_eq!(event.name(), "projection_stats_changed");
         assert_eq!(event.data(), serde_json::json!({"running": false}));

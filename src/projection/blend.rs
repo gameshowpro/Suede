@@ -95,6 +95,8 @@ fn area(rect: &Rect) -> i64 {
 pub struct SliceSpec {
     pub output: String,
     pub source: Rect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<super::warp::Geometry>,
     pub ramps: Vec<RampSpec>,
 }
 
@@ -103,6 +105,9 @@ pub struct SliceSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlicerSpec {
+    /// Internal process session; never a persisted configuration revision.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub control_session: String,
     /// Output to capture — the headless canvas.
     pub source: String,
     pub canvas_width: i32,
@@ -167,18 +172,39 @@ pub enum Slicing {
 /// unlit. Deriving any of the geometry from what happens to be plugged in
 /// would make one loose connector reflow the whole installation.
 ///
-/// A single output is never sliced, whichever mode the appliance runs in:
-/// there is nothing to cut up, and a canvas the size of one display bought
-/// with a capture and a blend pass is pure loss.
+/// A single identity output is never sliced: there is nothing to cut up, and
+/// a canvas the size of one display bought with a capture and a blend pass is
+/// pure loss. The internal warp activation seam below is the deliberate
+/// exception: a nonidentity output needs the slicer even with blend off.
 pub fn canvas_plan(
     participants: &[Participant],
     config: Option<&ProjectionConfig>,
     slicing: Slicing,
 ) -> Option<CanvasPlan> {
-    if participants.len() < 2 {
+    canvas_plan_with_warp_activation(participants, config, slicing, false)
+}
+
+/// Derive a canvas plan while an internal caller knows that at least one
+/// destination mapping is nonidentity. Geometry is intentionally only a
+/// boolean here: Phase 1 keeps it out of the public desired-state schema,
+/// while still giving the reconciler a testable activation seam for a direct
+/// slicer fixture. A nonidentity mapping requires slicing even for one output
+/// and even when blend is disabled; identity retains the direct path.
+pub fn canvas_plan_with_warp_activation(
+    participants: &[Participant],
+    config: Option<&ProjectionConfig>,
+    slicing: Slicing,
+    has_nonidentity_warp: bool,
+) -> Option<CanvasPlan> {
+    if participants.is_empty()
+        || participants
+            .iter()
+            .any(|participant| participant.rect.width <= 0 || participant.rect.height <= 0)
+        || (participants.len() < 2 && !has_nonidentity_warp)
+    {
         return None;
     }
-    if slicing == Slicing::WhenOverlapping {
+    if slicing == Slicing::WhenOverlapping && !has_nonidentity_warp {
         let any_overlap = participants.iter().enumerate().any(|(i, a)| {
             participants[i + 1..]
                 .iter()
@@ -279,6 +305,7 @@ pub fn canvas_plan(
         .zip(participants)
         .filter(|((_, _), participant)| participant.connected)
         .map(|(((name, rect), ramps), _)| SliceSpec {
+            geometry: None,
             output: name.clone(),
             source: *rect,
             ramps,
@@ -390,7 +417,7 @@ impl Coverage {
 }
 
 /// The signal transfer for one pixel of a slice, as fixed-point `(a, b)`
-/// where `out = (a·in) >> 8 + b`.
+/// where `out = min(((a * input) >> 8) + b, 255)` for an 8-bit channel.
 ///
 /// Combines the gamma-shaped ramps (inside seams, multiplied where they
 /// overlap at grid corners) with the black-level rescale, so the slicer
@@ -402,12 +429,35 @@ impl Coverage {
 /// centre's black, so it needs a ramp *and* a lift. Only in the plain
 /// two-projector case do they never coincide.
 pub fn pixel_transfer(ramps: &[RampSpec], gamma: f64, lift: f64, x: i32, y: i32) -> (u16, u8) {
-    let transmitted = ramps_attenuation(ramps, x as f64 + 0.5, y as f64 + 0.5)
-        .map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
+    transfer_at(ramps, gamma, lift, x as f64 + 0.5, y as f64 + 0.5, 1.0)
+}
+
+/// Fixed transfer at continuous slice-local source pixel boundaries `(x, y)`.
+/// The caller supplies finite coordinates, positive finite gamma, finite
+/// resolved lift, and output-pixel picture coverage `edge` in `[0, 1]`.
+/// This function adds no half pixel and performs no source or canvas clamping.
+///
+/// With gamma-shaped ramp `r`, stores `a=round(edge*(1-lift)*r*256)` in
+/// `0..=256` and `b=round(edge*lift*255)` in `0..=255`. Lift is clamped to
+/// `[0, 1]`; positive ties round upward. Border coverage attenuates both
+/// coefficients before rounding. Never quantize `r` separately: at `edge=1`
+/// the integer wrapper must preserve the legacy multiplication/rounding order.
+/// GPU storage packs this pair as `(u32::from(a) << 8) | u32::from(b)`:
+/// bits 0..7 are b, bits 8..16 are a, and bits 17..31 are zero.
+pub fn transfer_at(
+    ramps: &[RampSpec],
+    gamma: f64,
+    lift: f64,
+    x: f64,
+    y: f64,
+    edge: f64,
+) -> (u16, u8) {
+    let transmitted =
+        ramps_attenuation(ramps, x, y).map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
     let lift = lift.clamp(0.0, 1.0);
     (
-        ((1.0 - lift) * transmitted * 256.0).round() as u16,
-        (lift * 255.0).round() as u8,
+        (edge * (1.0 - lift) * transmitted * 256.0).round() as u16,
+        (edge * lift * 255.0).round() as u8,
     )
 }
 
@@ -592,6 +642,36 @@ mod tests {
 
     fn blending() -> ProjectionConfig {
         ProjectionConfig::default()
+    }
+
+    #[test]
+    fn nonidentity_activation_slices_one_output_without_enabling_blend() {
+        let config = ProjectionConfig {
+            blend: false,
+            ..ProjectionConfig::default()
+        };
+        let output = [participant("DP-1", 40, 20, 1920, 1080)];
+
+        assert!(canvas_plan(&output, Some(&config), Slicing::WhenOverlapping).is_none());
+        let plan = canvas_plan_with_warp_activation(
+            &output,
+            Some(&config),
+            Slicing::WhenOverlapping,
+            true,
+        )
+        .expect("a nonidentity output needs a slicer even without ramps");
+        assert_eq!((plan.canvas_width, plan.canvas_height), (1920, 1080));
+        assert_eq!(plan.slices.len(), 1);
+        assert!(plan.slices[0].ramps.is_empty());
+        assert_eq!(
+            plan.slices[0].source,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }
+        );
     }
 
     // --- the canvas plan: the layout IS the configuration -----------------
@@ -842,6 +922,19 @@ mod tests {
                 height: 1080
             }
         );
+    }
+
+    #[test]
+    fn warp_activation_rejects_empty_or_negative_rasters() {
+        for (width, height) in [(0, 1080), (1920, 0), (-1, 1080), (1920, -1)] {
+            assert!(canvas_plan_with_warp_activation(
+                &[participant("DP-1", 0, 0, width, height)],
+                None,
+                Slicing::WhenOverlapping,
+                true,
+            )
+            .is_none());
+        }
     }
 
     #[test]
@@ -1161,6 +1254,7 @@ mod tests {
     fn the_slicer_spec_serialises_stably() {
         // The spec crosses a process boundary as JSON; field names are ABI.
         let spec = SlicerSpec {
+            control_session: String::new(),
             source: "HEADLESS-1".into(),
             canvas_width: 3680,
             canvas_height: 1080,
@@ -1170,6 +1264,7 @@ mod tests {
             free_run: false,
             renderer: Renderer::Auto,
             slices: vec![SliceSpec {
+                geometry: None,
                 output: "DP-3".into(),
                 source: Rect {
                     x: 0,
@@ -1194,5 +1289,143 @@ mod tests {
         assert!(json.contains(r#""renderer":"auto""#), "{json}");
         let back: SlicerSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    // Frozen pre-warp arithmetic from dbdd174. Keep independent of the new
+    // continuous evaluator so two new paths agreeing cannot conceal drift.
+    fn legacy_transfer(ramps: &[RampSpec], gamma: f64, lift: f64, x: i32, y: i32) -> (u16, u8) {
+        let transmitted = ramps_attenuation(ramps, x as f64 + 0.5, y as f64 + 0.5)
+            .map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
+        let lift = lift.clamp(0.0, 1.0);
+        (
+            ((1.0 - lift) * transmitted * 256.0).round() as u16,
+            (lift * 255.0).round() as u8,
+        )
+    }
+
+    fn channel((a, b): (u16, u8), input: u32) -> u8 {
+        (((u32::from(a) * input) >> 8) + u32::from(b)).min(255) as u8
+    }
+
+    #[test]
+    fn continuous_identity_retains_legacy_coefficients_and_every_input_byte() {
+        let rect = Rect {
+            x: 2,
+            y: 1,
+            width: 7,
+            height: 5,
+        };
+        let all: Vec<_> = [FadeTo::Left, FadeTo::Right, FadeTo::Top, FadeTo::Bottom]
+            .into_iter()
+            .map(|fade_to| RampSpec { rect, fade_to })
+            .collect();
+        // All ramp directions, multiplied corners, and points outside seams.
+        for ramps in [
+            vec![],
+            vec![all[0].clone()],
+            vec![all[1].clone()],
+            vec![all[2].clone()],
+            vec![all[3].clone()],
+            vec![all[1].clone(), all[3].clone()],
+        ] {
+            for gamma in [1.0, 1.8, 2.2, 2.4, 4.0] {
+                // Include clamp limits, rounding ties, and saturated lift.
+                for lift in [-0.1, 0.0, 0.05, 0.1, 0.5, 0.75, 1.0, 1.1] {
+                    for y in 0..8 {
+                        for x in 0..11 {
+                            let expected = legacy_transfer(&ramps, gamma, lift, x, y);
+                            let actual = transfer_at(
+                                &ramps,
+                                gamma,
+                                lift,
+                                x as f64 + 0.5,
+                                y as f64 + 0.5,
+                                1.0,
+                            );
+                            assert_eq!(actual, expected, "x={x} y={y} gamma={gamma} lift={lift}");
+                            assert_eq!(pixel_transfer(&ramps, gamma, lift, x, y), expected);
+                            for input in 0..=255 {
+                                assert_eq!(channel(actual, input), channel(expected, input));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn continuous_ramps_use_the_fractional_source_point_without_an_added_half_pixel() {
+        let rect = Rect {
+            x: 2,
+            y: 3,
+            width: 4,
+            height: 2,
+        };
+        for (fade_to, expected) in [
+            (FadeTo::Left, 80),
+            (FadeTo::Right, 176),
+            (FadeTo::Top, 32),
+            (FadeTo::Bottom, 224),
+        ] {
+            let ramp = RampSpec { rect, fade_to };
+            assert_eq!(
+                transfer_at(&[ramp], 1.0, 0.0, 3.25, 3.25, 1.0),
+                (expected, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn border_coverage_attenuates_both_terms_before_fixed_point_rounding() {
+        for (edge, lift, expected) in [
+            (0.0, 0.0, (0, 0)),
+            (0.0, 0.5, (0, 0)),
+            (0.0, 1.0, (0, 0)),
+            (0.25, 0.0, (64, 0)),
+            (0.25, 0.5, (32, 32)),
+            (0.5, 0.0, (128, 0)),
+            (0.5, 0.1, (115, 13)),
+            (0.5, 0.5, (64, 64)),
+            (0.5, 1.0, (0, 128)),
+            (1.0, 0.0, (256, 0)),
+            (1.0, 0.1, (230, 26)),
+            (1.0, 1.0, (0, 255)),
+        ] {
+            let actual = transfer_at(&[], 2.2, lift, 0.5, 0.5, edge);
+            assert_eq!(actual, expected);
+            // D2's ideal white level survives lift changes within the legacy
+            // coefficient rounding plus the channel's integer truncation.
+            assert!((f64::from(channel(actual, 255)) - 255.0 * edge).abs() <= 1.5);
+            if edge == 0.0 {
+                for input in 0..=255 {
+                    assert_eq!(channel(actual, input), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_shortfall_can_exceed_one_and_resolved_lift_saturates() {
+        let rects = [(0, 0), (4, 0), (0, 4), (4, 4)].map(|(x, y)| Rect {
+            x,
+            y,
+            width: 8,
+            height: 8,
+        });
+        let coverage = Coverage::new(rects);
+        assert_eq!(coverage.max(), 4);
+        for (x, y, count, lift) in [
+            (1.5, 1.5, 1, 0.75),
+            (5.5, 1.5, 2, 0.25),
+            (5.5, 5.5, 4, 0.0),
+            (20.5, 20.5, 0, 0.0),
+        ] {
+            assert_eq!(coverage.at(x, y), count);
+            assert_eq!(coverage.lift(0.25, x, y), lift);
+        }
+        let saturated = coverage.lift(0.5, 1.5, 1.5);
+        assert_eq!(saturated, 1.0); // k=3, L*k=1.5
+        assert_eq!(transfer_at(&[], 2.2, saturated, 1.5, 1.5, 0.5), (0, 128));
     }
 }

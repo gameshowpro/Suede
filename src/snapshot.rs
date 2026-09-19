@@ -4,7 +4,9 @@
 
 use std::sync::RwLock;
 
-use crate::model::{Output, ProjectionReport, ProjectionStats, Status, Window};
+use crate::model::{
+    Output, ProjectionControlStatus, ProjectionReport, ProjectionStats, Status, Window,
+};
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -21,6 +23,9 @@ pub struct Snapshot {
     /// to read, instead of each guessing it from whether stats have arrived
     /// (see `ProjectionReport` for why that guess was wrong on 2026-09-15).
     slicer_running: RwLock<bool>,
+    /// Live-control progress is distinct from ten-second frame statistics so
+    /// a static source can still show whether a requested edit was installed.
+    projection_control: RwLock<ProjectionControlStatus>,
 }
 
 impl Snapshot {
@@ -107,12 +112,42 @@ impl Snapshot {
         true
     }
 
+    pub fn projection_control(&self) -> ProjectionControlStatus {
+        self.projection_control.read().unwrap().clone()
+    }
+
+    /// Replace control lifecycle state, reporting whether a client needs an
+    /// observed-state update.
+    pub fn set_projection_control(&self, control: ProjectionControlStatus) -> bool {
+        let mut guard = self.projection_control.write().unwrap();
+        if *guard == control {
+            return false;
+        }
+        *guard = control;
+        true
+    }
+
+    /// Mutate control lifecycle state while holding its write lock.  The
+    /// manager records requests while the stdout reader records stages, so
+    /// composing a read-modify-write sequence outside this lock could lose a
+    /// fast acknowledgment.
+    pub fn update_projection_control(
+        &self,
+        update: impl FnOnce(&mut ProjectionControlStatus),
+    ) -> bool {
+        let mut guard = self.projection_control.write().unwrap();
+        let before = guard.clone();
+        update(&mut guard);
+        *guard != before
+    }
+
     /// What `GET /projection/stats` and `projection_stats_changed` serve:
     /// liveness alongside whatever the slicer has most recently reported.
     pub fn projection_report(&self) -> ProjectionReport {
         ProjectionReport {
             running: self.slicer_running(),
             last_interval: self.projection_stats(),
+            control: self.projection_control(),
         }
     }
 

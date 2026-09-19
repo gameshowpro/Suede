@@ -696,6 +696,102 @@ pub struct ProjectionReport {
     /// produced yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_interval: Option<ProjectionStats>,
+    /// Lifecycle of the most recent live slicer update.  This is independent
+    /// of frame-interval statistics: a static canvas can apply a revision
+    /// before it has any ten-second interval to report.
+    #[serde(default, skip_serializing_if = "ProjectionControlStatus::is_empty")]
+    pub control: ProjectionControlStatus,
+}
+
+/// Observed progress of the complete snapshots sent to the slicer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionControlStatus {
+    /// Session of the currently running child, when it has accepted a live
+    /// control message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Renderer requested by configuration and renderer actually negotiated
+    /// by the running child. These are separate because Auto may fall back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_renderer: Option<crate::model::Renderer>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_renderer: Option<crate::model::Renderer>,
+    /// Whether the selected capture/presentation pipeline can apply a warp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warp_available: Option<bool>,
+    /// Why warp is unavailable, including a known remediation when the child
+    /// can provide one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warp_reason: Option<String>,
+    /// Requested operator mode and the mode the negotiated pipeline runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Highest accepted generation reported by this child.
+    pub accepted_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Highest generation built for any affected output.
+    pub built_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Highest generation installed as a complete render revision.
+    pub applied_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Highest generation submitted by any output. This does not mean all
+    /// outputs have submitted it.
+    pub submitted_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Highest generation presented by any output. Independent heads need
+    /// not physically present a generation at the same instant.
+    pub presented_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<ProjectionControlFailure>,
+    /// Per-output lifecycle prevents global submitted/presented values from
+    /// implying an atomic wall-wide flip.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<ProjectionControlOutputStatus>,
+}
+
+/// The latest lifecycle generation reported for one named output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionControlOutputStatus {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted_generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presented_generation: Option<u64>,
+    /// Filled when the slicer reports its effective sampling path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_mode: Option<String>,
+}
+
+impl ProjectionControlStatus {
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// A rejected revision or a closed control channel, retained until a newer
+/// successful update supersedes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionControlFailure {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub reason: String,
 }
 
 /// What the slicer measured over its last reporting interval.

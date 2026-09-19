@@ -512,3 +512,40 @@ compositor refused to flip: the buffer is the wrong size or format for the
 display controller, the output is scaled, or the variable is still set
 somewhere. Check the `direct-scanout` health check first — it compares the
 running compositor against these keys and says which way they disagree.
+
+
+## Warping (pipeline integration in progress)
+
+The internal GPU slicer can pin the four corners of an output's picture and
+move its horizontal and vertical center fractions. Destination pins move the
+picture within that output; they do not change the source rectangle, Chromium
+viewport, or neighboring outputs' crops. This is currently an internal fixture
+and pipeline capability. Public configuration and editing are later work.
+
+For each output pixel, the pipeline inverse-maps the destination into content
+coordinates, samples the source, and applies its precomputed canvas-space
+transfer. The table includes picture-border coverage in both gain and black
+lift. Neutral geometry retains the integer-exact sampling path; nonidentity
+geometry uses bilinear sampling and can soften text. Nonneutral center remaps
+are piecewise linear and can kink diagonals at the remap boundary.
+
+The live GPU control path builds only affected outputs away from rendering,
+stages their tables together, and repaints the retained source on static pages.
+Its status distinguishes requested, built, applied, submitted, and compositor
+presentation-feedback generations. Independent output feedback does not imply
+simultaneous optical visibility. The current presentation gate is unchanged.
+
+The slicer reports requested/effective renderer and mode, warp availability,
+and the reason for a limitation. Auto mode prefers a filter-capable GPU capture;
+CPU and exact-only GPU paths retain rectangular rendering. Unsupported direct
+warp requests are rejected explicitly. Static GPU patterns use uploaded source
+canvases through the same shader, preserving connector labels and calibration
+pixels. A single nonidentity output can use the internal planning/slicing path;
+identity keeps the existing direct path.
+
+The agreed public behavior is forced simple rectangle mode when startup finds
+no warp capability, with separately retained warp settings and a health warning
+for recovery. Persistence and UI integration belong to the later geometry/UI
+phases; this checkpoint supplies the capability evidence and enforcement.
+Public configuration still supplies identity geometry. See the
+[packet 3 record](../research/warp/PACKET3.md) for validation and rollout limits.

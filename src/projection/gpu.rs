@@ -134,6 +134,8 @@ pub struct DmabufImage {
     /// the protocol dups it on send, so one fd per image is enough.
     pub fd: OwnedFd,
     format: vk::Format,
+    /// Filtering support of the actual selected format/modifier.
+    linear_filter: bool,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -141,6 +143,16 @@ pub struct DmabufImage {
     /// `DmabufImage` for many frames after a `blend()` call, possibly past
     /// `Gpu` itself being dropped (a config reload rebuilding it, say).
     device: Arc<DeviceState>,
+}
+
+impl DmabufImage {
+    /// Whether this image's selected DRM modifier supports bilinear sampling.
+    ///
+    /// Capture negotiation uses this after allocation as a final assertion:
+    /// the driver, rather than the candidate list, chooses the modifier.
+    pub fn linear_filter_supported(&self) -> bool {
+        self.linear_filter
+    }
 }
 
 impl Drop for DmabufImage {
@@ -153,6 +165,30 @@ impl Drop for DmabufImage {
         // `Drop` only runs once every image made from it, and `Gpu` itself,
         // are gone. Destroying the view before the image before the memory
         // matches the order `create_image` builds them in.
+        unsafe {
+            self.device.device.destroy_image_view(self.view, None);
+            self.device.device.destroy_image(self.image, None);
+            self.device.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// A private-to-Vulkan, uploaded RGBA canvas used by static projection
+/// patterns. Unlike [`DmabufImage`], it is never offered to Wayland, so it
+/// remains owned by this queue for its entire life.
+pub struct StaticCanvas {
+    width: u32,
+    height: u32,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    device: Arc<DeviceState>,
+}
+
+impl Drop for StaticCanvas {
+    fn drop(&mut self) {
+        // Safety: these handles are exclusively owned by this canvas. Its
+        // DeviceState Arc keeps the Vulkan device alive through teardown.
         unsafe {
             self.device.device.destroy_image_view(self.view, None);
             self.device.device.destroy_image(self.image, None);
@@ -202,11 +238,58 @@ impl QueuePriority {
 /// measuring the path content actually takes.
 enum Source<'a> {
     Canvas {
-        image: &'a DmabufImage,
+        image: CanvasImage<'a>,
         /// The canvas is stored bottom-up (screencopy's flag).
         y_invert: bool,
     },
     Sync,
+}
+
+#[derive(Clone, Copy)]
+enum CanvasImage<'a> {
+    Dmabuf(&'a DmabufImage),
+    Static(&'a StaticCanvas),
+}
+
+impl CanvasImage<'_> {
+    fn image(self) -> vk::Image {
+        match self {
+            Self::Dmabuf(image) => image.image,
+            Self::Static(image) => image.image,
+        }
+    }
+
+    fn view(self) -> vk::ImageView {
+        match self {
+            Self::Dmabuf(image) => image.view,
+            Self::Static(image) => image.view,
+        }
+    }
+
+    fn height(self) -> u32 {
+        match self {
+            Self::Dmabuf(image) => image.height,
+            Self::Static(image) => image.height,
+        }
+    }
+
+    fn foreign_owned(self) -> bool {
+        matches!(self, Self::Dmabuf(_))
+    }
+
+    fn linear_filter_supported(self) -> bool {
+        match self {
+            Self::Dmabuf(image) => image.linear_filter,
+            // Static canvases are locally allocated optimal RGBA images;
+            // upload_static_canvas_rgba verifies linear filtering before
+            // creating one.
+            Self::Static(_) => true,
+        }
+    }
+
+    fn locally_uploaded(self) -> bool {
+        matches!(self, Self::Static(_))
+    }
 }
 
 /// A 1x1 image that stands in for the canvas while `sync()` draws.
@@ -230,6 +313,19 @@ pub struct BlendJob<'a> {
     /// Top-left of this slice in canvas pixels.
     pub source_x: u32,
     pub source_y: u32,
+    /// Inverse sampling; None preserves integer texel fetch. The warp and
+    /// transfer table must describe this target at unit source pixel density.
+    pub warp: Option<&'a super::warp::Warp>,
+}
+
+/// One output-local transfer table in an atomic [`Gpu::replace_transfers`]
+/// update. The table is borrowed only for the duration of the call; the GPU
+/// stages its own inactive buffer before changing any active descriptor.
+pub struct TransferUpdate<'a> {
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub table: &'a [(u16, u8)],
 }
 
 /// Everything that outlives a single `Gpu::new()` call's setup and is shared
@@ -290,9 +386,8 @@ const REQUIRED_DEVICE_EXTENSIONS: [&CStr; 5] = [
 ];
 
 /// A device's push constants, `#[repr(C)]` to match `blend.frag`'s
-/// `PushConstants` block byte for byte (eight tightly-packed `u32`s need no
-/// explicit padding on either side). Field order matters: it is the byte
-/// layout.
+/// `PushConstants` block byte for byte. The legacy eight-u32 prefix is
+/// followed by three vec4 rows and a fully initialized 16-byte control block.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
@@ -308,6 +403,46 @@ struct PushConstants {
     /// How many shape groups the shader should walk in mode 1; ignored in
     /// mode 0.
     groups: u32,
+    inverse_rows: [[f32; 4]; 3],
+    center: [f32; 2],
+    warp_enabled: u32,
+    padding: u32,
+}
+
+impl PushConstants {
+    fn canvas(
+        source: [u32; 2],
+        size: [u32; 2],
+        canvas_height: u32,
+        y_invert: bool,
+        warp: Option<&super::warp::Warp>,
+    ) -> Self {
+        Self {
+            source_x: source[0],
+            source_y: source[1],
+            width: size[0],
+            height: size[1],
+            canvas_height,
+            y_invert: u32::from(y_invert),
+            mode: 0,
+            groups: 0,
+            inverse_rows: warp.map_or([[0.0; 4]; 3], |w| w.inverse_rows()),
+            center: warp.map_or([0.5; 2], |w| w.center()),
+            warp_enabled: u32::from(warp.is_some()),
+            padding: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        // Safety: repr(C), all fields initialized, and no implicit padding.
+        // Layout tests compare every member with the shipped SPIR-V.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
 }
 
 /// Resources kept per output index from the first `set_transfer` call
@@ -316,11 +451,15 @@ struct PushConstants {
 struct OutputResources {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
-    /// Bytes currently backing `buffer`; `set_transfer` only reallocates
-    /// when a wider or taller table no longer fits.
+    /// Bytes currently backing `buffer`; retained for diagnostics and future
+    /// allocation reuse decisions. Replacement always stages a new buffer so
+    /// the active descriptor is never written in place.
+    #[allow(dead_code)]
     capacity: vk::DeviceSize,
+    size: [u32; 2],
     /// Persistently mapped — the memory is HOST_COHERENT, so no flush and
     /// no repeated map/unmap is needed to update it.
+    #[allow(dead_code)]
     mapped: *mut u8,
     /// The `sync` pattern's shape buffer for this output, bound at 3 and
     /// [`SYNC_SHAPE_SLOTS`] long for the life of the output — created
@@ -341,6 +480,16 @@ struct HostBuffer {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     bytes: vk::DeviceSize,
+}
+
+struct StagedTransfer {
+    index: usize,
+    width: u32,
+    height: u32,
+    table: HostBuffer,
+    /// Present only when this is a previously unseen sparse output index.
+    shapes: Option<HostBuffer>,
+    descriptor_set: vk::DescriptorSet,
 }
 
 // Safety: `mapped` is the only field that is not automatically `Send` (a raw
@@ -387,6 +536,15 @@ pub struct Gpu {
     last_canvas: Option<vk::Image>,
     /// Built on the first `sync()` call; see [`PlaceholderImage`].
     placeholder: Option<PlaceholderImage>,
+    /// True only after this instance has submitted work that has not yet been
+    /// observed complete. This keeps a failed command recording from leaving
+    /// later resource replacement waiting forever on an unsignalled fence.
+    fence_in_flight: bool,
+    /// Deterministic post-stage failure used only by the hardware readback
+    /// transaction test. `Some(n)` fails just before staging item `n`, after
+    /// the preceding inactive tables have proved their cleanup path.
+    #[cfg(test)]
+    transfer_stage_fail_after: Option<usize>,
 }
 
 impl Gpu {
@@ -590,8 +748,8 @@ impl Gpu {
         let device = &device_state.device;
 
         let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::NEAREST)
-            .min_filter(vk::Filter::NEAREST)
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
             .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
             .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
@@ -605,7 +763,7 @@ impl Gpu {
         // Binding 0: the canvas, a plain sampled image (not a combined
         // image sampler — see the module doc on naga). Binding 1: the
         // sampler, baked in as immutable since it is always this one
-        // nearest/clamp sampler, so it never needs a descriptor write.
+        // linear/clamp sampler, so it never needs a descriptor write.
         // Binding 2: the per-output transfer table. Binding 3: the
         // per-output `sync` pattern shapes (see `set_sync_shapes`), which
         // every set carries whether or not that pattern is ever shown —
@@ -706,6 +864,9 @@ impl Gpu {
             outputs: Vec::new(),
             last_canvas: None,
             placeholder: None,
+            fence_in_flight: false,
+            #[cfg(test)]
+            transfer_stage_fail_after: None,
         })
     }
 
@@ -740,6 +901,88 @@ impl Gpu {
         if candidates.is_empty() {
             return Vec::new();
         }
+        let modifiers = self.modifier_properties(format);
+        let required_tiling_feature = match usage {
+            Usage::Capture => vk::FormatFeatureFlags::SAMPLED_IMAGE,
+            Usage::Present => vk::FormatFeatureFlags::COLOR_ATTACHMENT,
+        };
+        let usage_flags = image_usage_flags(usage);
+
+        candidates
+            .iter()
+            .copied()
+            .filter(|&modifier| {
+                let tiling_ok = modifiers.iter().any(|properties| {
+                    properties.drm_format_modifier == modifier
+                        && properties.drm_format_modifier_plane_count == 1
+                        && properties
+                            .drm_format_modifier_tiling_features
+                            .contains(required_tiling_feature)
+                });
+                tiling_ok && self.image_format_creatable(format, modifier, usage_flags)
+            })
+            .collect()
+    }
+
+    /// Capture modifiers suitable for the requested sampling policy.
+    ///
+    /// When warping is required, only modifiers advertising linear sampled
+    /// image support are usable. For an exact rectangular capture, retain an
+    /// exact-only fallback but put filtering-capable modifiers first, so a
+    /// later live warp can normally start without rebuilding capture buffers.
+    /// The order within each group remains the compositor's advertised order.
+    pub fn supported_capture_modifiers(
+        &self,
+        fourcc: u32,
+        candidates: &[u64],
+        require_linear_filter: bool,
+    ) -> Vec<u64> {
+        let Ok(format) = format_for_fourcc(fourcc) else {
+            return Vec::new();
+        };
+        let supported = self.supported_modifiers(fourcc, candidates, Usage::Capture);
+        let properties = self.modifier_properties(format);
+        let linear = |modifier| {
+            properties.iter().any(|property| {
+                property.drm_format_modifier == modifier
+                    && property
+                        .drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+            })
+        };
+        if require_linear_filter {
+            supported
+                .into_iter()
+                .filter(|&modifier| linear(modifier))
+                .collect()
+        } else {
+            let (linear, exact_only): (Vec<_>, Vec<_>) = supported
+                .into_iter()
+                .partition(|&modifier| linear(modifier));
+            linear.into_iter().chain(exact_only).collect()
+        }
+    }
+
+    /// Whether this device can use the local RGBA canvas required for static
+    /// GPU patterns. This is intentionally only a format-feature capability
+    /// query: an allocation or upload failure remains a real runtime error,
+    /// never a reason to silently select a different renderer after buffers
+    /// have been created.
+    pub fn static_canvas_supported(&self) -> bool {
+        // Safety: read-only format-property query.
+        let features = unsafe {
+            self.device.instance.get_physical_device_format_properties(
+                self.device.physical_device,
+                vk::Format::R8G8B8A8_UNORM,
+            )
+        }
+        .optimal_tiling_features;
+        static_canvas_features_supported(features)
+    }
+
+    /// Query the format features of each DRM modifier, rather than assuming
+    /// optimal-tiling support applies to a compositor-compatible image.
+    fn modifier_properties(&self, format: vk::Format) -> Vec<vk::DrmFormatModifierPropertiesEXT> {
         let instance = &self.device.instance;
         let physical_device = self.device.physical_device;
 
@@ -772,26 +1015,7 @@ impl Gpu {
             )
         };
 
-        let required_tiling_feature = match usage {
-            Usage::Capture => vk::FormatFeatureFlags::SAMPLED_IMAGE,
-            Usage::Present => vk::FormatFeatureFlags::COLOR_ATTACHMENT,
-        };
-        let usage_flags = image_usage_flags(usage);
-
-        candidates
-            .iter()
-            .copied()
-            .filter(|&modifier| {
-                let tiling_ok = modifiers.iter().any(|properties| {
-                    properties.drm_format_modifier == modifier
-                        && properties.drm_format_modifier_plane_count == 1
-                        && properties
-                            .drm_format_modifier_tiling_features
-                            .contains(required_tiling_feature)
-                });
-                tiling_ok && self.image_format_creatable(format, modifier, usage_flags)
-            })
-            .collect()
+        modifiers
     }
 
     /// Whether the device can actually create+export an image for `format`
@@ -1004,10 +1228,228 @@ impl Gpu {
             offset: layout.offset as u32,
             fd,
             format,
+            linear_filter: self.modifier_properties(format).iter().any(|p| {
+                p.drm_format_modifier == modifier_properties.drm_format_modifier
+                    && p.drm_format_modifier_tiling_features
+                        .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR)
+            }),
             image,
             memory,
             view,
             device: Arc::clone(&self.device),
+        })
+    }
+
+    /// Upload an RGBA8888 static canvas for the normal blend shader.
+    ///
+    /// This is deliberately a local optimal image rather than a fabricated
+    /// dmabuf: static patterns have no compositor writer or reader, so their
+    /// canvas never participates in FOREIGN queue-family ownership transfer.
+    /// The upload completes before this returns, making the returned canvas
+    /// immediately safe to reuse for any number of [`Gpu::blend_static`]
+    /// calls.
+    pub fn upload_static_canvas_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> anyhow::Result<StaticCanvas> {
+        if width == 0 || height == 0 {
+            bail!("upload_static_canvas_rgba: dimensions must be nonzero");
+        }
+        let bytes = width
+            .checked_mul(height)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| anyhow!("upload_static_canvas_rgba: dimensions overflow"))?;
+        let bytes = usize::try_from(bytes)
+            .context("upload_static_canvas_rgba: dimensions do not fit in host memory")?;
+        if pixels.len() != bytes {
+            bail!(
+                "upload_static_canvas_rgba: got {} bytes, expected {width}x{height}x4 = {bytes}",
+                pixels.len()
+            );
+        }
+        if !self.static_canvas_supported() {
+            bail!(
+                "upload_static_canvas_rgba: optimal RGBA canvas lacks sampled linear filtering or transfer-destination support"
+            );
+        }
+        self.wait_for_pending_work()
+            .context("waiting before static canvas upload")?;
+
+        let device_state = Arc::clone(&self.device);
+        let device = &device_state.device;
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // Safety: no pNext chain.
+        let image = unsafe { device.create_image(&image_info, None) }
+            .context("vkCreateImage (static canvas)")?;
+        let mut cleanup = Cleanup {
+            device,
+            image,
+            memory: None,
+            view: None,
+        };
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        // Safety: read-only query.
+        let memory_properties = unsafe {
+            self.device
+                .instance
+                .get_physical_device_memory_properties(self.device.physical_device)
+        };
+        let memory_type = memory_type_index(
+            &memory_properties,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| {
+            anyhow!("no DEVICE_LOCAL memory type fits a {width}x{height} static canvas")
+        })?;
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(requirements.size)
+            .memory_type_index(memory_type);
+        // Safety: no pNext chain.
+        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
+            .context("vkAllocateMemory (static canvas)")?;
+        cleanup.memory = Some(memory);
+        // Safety: `memory` was selected and sized from `image`'s requirements.
+        unsafe { device.bind_image_memory(image, memory, 0) }
+            .context("vkBindImageMemory (static canvas)")?;
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(vk::Format::R8G8B8A8_UNORM)
+            .subresource_range(color_subresource_range());
+        // Safety: the image is bound and the view is cleaned up before it.
+        let view = unsafe { device.create_image_view(&view_info, None) }
+            .context("vkCreateImageView (static canvas)")?;
+        cleanup.view = Some(view);
+
+        let upload = allocate_host_buffer_with_usage(
+            &device_state,
+            bytes as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+        )
+        .context("allocating static canvas upload buffer")?;
+        // Safety: exact-size, mapped HOST_COHERENT upload allocation.
+        unsafe { std::ptr::copy_nonoverlapping(pixels.as_ptr(), upload.mapped, bytes) };
+
+        let upload_result = (|| -> anyhow::Result<()> {
+            // Safety: this command buffer is idle after wait_for_pending_work.
+            unsafe {
+                device.reset_command_buffer(
+                    self.command_buffer,
+                    vk::CommandBufferResetFlags::empty(),
+                )?;
+                device.begin_command_buffer(
+                    self.command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )?;
+                let to_transfer = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(color_subresource_range());
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[to_transfer],
+                );
+                let region = vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    });
+                device.cmd_copy_buffer_to_image(
+                    self.command_buffer,
+                    upload.buffer,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &[region],
+                );
+                let readable = vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(color_subresource_range());
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[readable],
+                );
+                device.end_command_buffer(self.command_buffer)?;
+                device.reset_fences(&[self.fence])?;
+                let command_buffers = [self.command_buffer];
+                device.queue_submit(
+                    self.device.queue,
+                    &[vk::SubmitInfo::default().command_buffers(&command_buffers)],
+                    self.fence,
+                )?;
+            }
+            self.fence_in_flight = true;
+            // Safety: the upload submission above owns this fence.
+            unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }?;
+            self.fence_in_flight = false;
+            Ok(())
+        })();
+        // Safety: the upload is complete on success. On an error after a
+        // successful submit, `fence_in_flight` remains true so Gpu's later
+        // cleanup waits before the staging buffer can be destroyed.
+        if upload_result.is_ok() {
+            upload.destroy(device);
+        } else if self.fence_in_flight {
+            let _ = self.wait_for_pending_work();
+            upload.destroy(device);
+        } else {
+            upload.destroy(device);
+        }
+        upload_result.context("uploading static canvas")?;
+
+        cleanup.defuse();
+        Ok(StaticCanvas {
+            width,
+            height,
+            image,
+            memory,
+            view,
+            device: device_state,
         })
     }
 
@@ -1104,169 +1546,283 @@ impl Gpu {
         height: u32,
         table: &[(u16, u8)],
     ) -> anyhow::Result<()> {
-        if index >= MAX_OUTPUTS {
-            bail!("set_transfer: output index {index} exceeds the {MAX_OUTPUTS}-output descriptor pool");
-        }
-        let expected = width as usize * height as usize;
-        if table.len() != expected {
-            bail!(
-                "set_transfer: table has {} entries, expected {width}x{height} = {expected}",
-                table.len()
-            );
-        }
-        let packed: Vec<u32> = table.iter().map(|&(a, b)| pack_transfer(a, b)).collect();
-        let needed_bytes = (packed.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
-
-        if self.outputs.len() <= index {
-            self.outputs.resize_with(index + 1, || None);
-        }
-        let needs_alloc = match &self.outputs[index] {
-            Some(existing) => existing.capacity < needed_bytes,
-            None => true,
-        };
-        if needs_alloc {
-            let device = Arc::clone(&self.device);
-            self.allocate_output(&device, index, needed_bytes)?;
-        }
-
-        let output = self.outputs[index]
-            .as_ref()
-            .expect("allocated just above, or already present");
-        // Safety: `output.mapped` addresses at least `needed_bytes` (== or
-        // < `output.capacity`) of HOST_COHERENT memory, mapped for the
-        // whole life of `output.memory` — no explicit flush is needed, and
-        // nothing else ever writes through this pointer.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                packed.as_ptr().cast::<u8>(),
-                output.mapped,
-                needed_bytes as usize,
-            );
-        }
-        Ok(())
+        self.replace_transfers(&[TransferUpdate {
+            index,
+            width,
+            height,
+            table,
+        }])
     }
 
-    /// (Re)allocate output `index`'s transfer SSBO to hold `bytes`,
-    /// allocating its descriptor set and its fixed-size `sync` shape buffer
-    /// too on the very first call for that index, and point the set's
-    /// bindings at them. Tears down the previous transfer buffer, if any,
-    /// only after the new one is fully working — a failure here leaves the
-    /// old (smaller, but valid) buffer in place rather than leaving the
-    /// output with none at all. The shape buffer is a fixed
-    /// [`SYNC_SHAPE_SLOTS`] and is carried straight across, so binding 3 is
-    /// written exactly once per output.
-    fn allocate_output(
-        &mut self,
-        device: &Arc<DeviceState>,
-        index: usize,
-        bytes: vk::DeviceSize,
-    ) -> anyhow::Result<()> {
-        let dev = &device.device;
-        let table = allocate_host_buffer(device, bytes).context("the transfer table")?;
+    /// Replace several output-local transfer tables as one bounded resource
+    /// transaction. Every update is validated and uploaded into an inactive
+    /// host-visible buffer before any active descriptor is touched. The last
+    /// completed GPU submission is then awaited before descriptors are
+    /// rebound or old buffers are retired. A failed validation/allocation or
+    /// fence wait leaves every active output unchanged; sparse indices retain
+    /// their existing slots and outputs absent from `updates` are untouched.
+    pub fn replace_transfers(&mut self, updates: &[TransferUpdate<'_>]) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
 
-        // One descriptor set per output, allocated the first time this
-        // index is seen and reused for the life of the `Gpu` after that;
-        // only binding 2 (this buffer) ever needs rewriting from here.
-        let existing = self.outputs.get(index).and_then(|entry| entry.as_ref());
-        let descriptor_set = match existing {
-            Some(existing) => existing.descriptor_set,
-            None => {
-                let set_layouts = [self.descriptor_set_layout];
-                let allocate_info = vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.descriptor_pool)
-                    .set_layouts(&set_layouts);
-                // Safety: `descriptor_pool` was sized for `MAX_OUTPUTS` sets
-                // at construction and `index < MAX_OUTPUTS` was checked in
-                // `set_transfer`; this branch runs at most once per index.
-                let sets = match unsafe { dev.allocate_descriptor_sets(&allocate_info) } {
-                    Ok(sets) => sets,
-                    Err(error) => {
-                        table.destroy(dev);
-                        return Err(error).context("vkAllocateDescriptorSets");
-                    }
-                };
-                sets[0]
+        let mut seen = [false; MAX_OUTPUTS];
+        let mut prepared = Vec::with_capacity(updates.len());
+        for update in updates {
+            if update.index >= MAX_OUTPUTS {
+                bail!(
+                    "replace_transfers: output index {} exceeds the {MAX_OUTPUTS}-output descriptor pool",
+                    update.index
+                );
             }
-        };
+            if seen[update.index] {
+                bail!(
+                    "replace_transfers: output index {} appears more than once",
+                    update.index
+                );
+            }
+            seen[update.index] = true;
+            if update.width == 0 || update.height == 0 {
+                bail!("replace_transfers: dimensions must be nonzero");
+            }
+            let entries = update
+                .width
+                .checked_mul(update.height)
+                .ok_or_else(|| anyhow!("replace_transfers: dimensions overflow"))?;
+            let entries = usize::try_from(entries)
+                .context("replace_transfers: dimensions do not fit in host memory")?;
+            if update.table.len() != entries {
+                bail!(
+                    "replace_transfers: output {} has {} entries, expected {}x{} = {entries}",
+                    update.index,
+                    update.table.len(),
+                    update.width,
+                    update.height
+                );
+            }
+            if update.table.iter().any(|&(a, _)| a > 256) {
+                bail!(
+                    "replace_transfers: output {} has a gain outside 0..=256",
+                    update.index
+                );
+            }
+            let packed: Vec<u32> = update
+                .table
+                .iter()
+                .map(|&(a, b)| pack_transfer(a, b))
+                .collect();
+            let unchanged = self
+                .outputs
+                .get(update.index)
+                .and_then(Option::as_ref)
+                .is_some_and(|output| {
+                    output.size == [update.width, update.height]
+                        && output.capacity
+                            == (packed.len() * std::mem::size_of::<u32>()) as vk::DeviceSize
+                        // Safety: `output.mapped` covers the active table's
+                        // complete capacity and remains mapped for its life.
+                        && unsafe {
+                            std::slice::from_raw_parts(
+                                output.mapped.cast::<u32>(),
+                                packed.len(),
+                            ) == packed.as_slice()
+                        }
+                });
+            if unchanged {
+                continue;
+            }
+            prepared.push((update.index, update.width, update.height, packed));
+        }
 
-        // Only on the first call for this index: an output that is merely
-        // growing its transfer table keeps the shape buffer it already has.
-        let fresh_shapes = match existing {
-            Some(_) => None,
-            None => {
+        if prepared.is_empty() {
+            return Ok(());
+        }
+
+        let device = Arc::clone(&self.device);
+        let dev = &device.device;
+        let mut staged: Vec<StagedTransfer> = Vec::with_capacity(prepared.len());
+        for (index, width, height, packed) in prepared {
+            #[cfg(test)]
+            if self.transfer_stage_fail_after == Some(staged.len()) {
+                self.transfer_stage_fail_after = None;
+                for item in &staged {
+                    item.table.destroy(dev);
+                    if let Some(shapes) = &item.shapes {
+                        shapes.destroy(dev);
+                    }
+                }
+                bail!("replace_transfers: injected staging failure");
+            }
+            let table_bytes = (packed.len() * std::mem::size_of::<u32>()) as vk::DeviceSize;
+            let table = match allocate_host_buffer(&device, table_bytes) {
+                Ok(table) => table,
+                Err(error) => {
+                    for item in &staged {
+                        item.table.destroy(dev);
+                        if let Some(shapes) = &item.shapes {
+                            shapes.destroy(dev);
+                        }
+                    }
+                    return Err(error).context("the transfer table");
+                }
+            };
+            // Safety: `table.mapped` addresses this newly allocated coherent
+            // buffer, which is not referenced by any descriptor yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    packed.as_ptr().cast::<u8>(),
+                    table.mapped,
+                    table_bytes as usize,
+                );
+            }
+            let fresh_shapes = if self.outputs.get(index).and_then(Option::as_ref).is_none() {
                 let slot_bytes =
                     (SYNC_SHAPE_SLOTS * std::mem::size_of::<[u32; 4]>()) as vk::DeviceSize;
-                match allocate_host_buffer(device, slot_bytes) {
+                match allocate_host_buffer(&device, slot_bytes) {
                     Ok(shapes) => Some(shapes),
                     Err(error) => {
                         table.destroy(dev);
+                        for item in &staged {
+                            item.table.destroy(dev);
+                            if let Some(shapes) = &item.shapes {
+                                shapes.destroy(dev);
+                            }
+                        }
                         return Err(error).context("the sync pattern's shape buffer");
                     }
                 }
-            }
-        };
+            } else {
+                None
+            };
+            staged.push(StagedTransfer {
+                index,
+                width,
+                height,
+                table,
+                shapes: fresh_shapes,
+                descriptor_set: vk::DescriptorSet::null(),
+            });
+        }
 
-        let table_infos = [vk::DescriptorBufferInfo::default()
-            .buffer(table.buffer)
-            .offset(0)
-            .range(bytes)];
-        let mut writes = vec![vk::WriteDescriptorSet::default()
-            .dst_set(descriptor_set)
-            .dst_binding(2)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&table_infos)];
-        let shape_infos = fresh_shapes
-            .as_ref()
-            .map(|shapes| {
+        if let Err(error) = self.wait_for_pending_work() {
+            for item in &staged {
+                item.table.destroy(dev);
+                if let Some(shapes) = &item.shapes {
+                    shapes.destroy(dev);
+                }
+            }
+            return Err(error).context("waiting before transfer replacement");
+        }
+
+        let missing = staged.iter().filter(|item| item.shapes.is_some()).count();
+        if missing != 0 {
+            let layouts = vec![self.descriptor_set_layout; missing];
+            let allocate_info = vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(self.descriptor_pool)
+                .set_layouts(&layouts);
+            let sets = match unsafe { dev.allocate_descriptor_sets(&allocate_info) } {
+                Ok(sets) => sets,
+                Err(error) => {
+                    for item in &staged {
+                        item.table.destroy(dev);
+                        if let Some(shapes) = &item.shapes {
+                            shapes.destroy(dev);
+                        }
+                    }
+                    return Err(error).context("vkAllocateDescriptorSets");
+                }
+            };
+            let mut sets = sets.into_iter();
+            for item in staged.iter_mut().filter(|item| item.shapes.is_some()) {
+                item.descriptor_set = sets.next().expect("descriptor count matches");
+            }
+        }
+        for item in &mut staged {
+            if item.descriptor_set == vk::DescriptorSet::null() {
+                item.descriptor_set = self.outputs[item.index]
+                    .as_ref()
+                    .expect("existing output has a descriptor set")
+                    .descriptor_set;
+            }
+        }
+
+        // Build every write before publishing any of them. Vulkan descriptor
+        // updates have no fallible return path, so this is the commit point.
+        let table_infos: Vec<[vk::DescriptorBufferInfo; 1]> = staged
+            .iter()
+            .map(|item| {
                 [vk::DescriptorBufferInfo::default()
-                    .buffer(shapes.buffer)
+                    .buffer(item.table.buffer)
                     .offset(0)
-                    .range(shapes.bytes)]
+                    .range(item.table.bytes)]
             })
-            .unwrap_or_default();
-        if fresh_shapes.is_some() {
+            .collect();
+        let shape_infos: Vec<Option<[vk::DescriptorBufferInfo; 1]>> = staged
+            .iter()
+            .map(|item| {
+                item.shapes.as_ref().map(|shapes| {
+                    [vk::DescriptorBufferInfo::default()
+                        .buffer(shapes.buffer)
+                        .offset(0)
+                        .range(shapes.bytes)]
+                })
+            })
+            .collect();
+        let mut writes = Vec::with_capacity(staged.len() * 2);
+        for (position, item) in staged.iter().enumerate() {
             writes.push(
                 vk::WriteDescriptorSet::default()
-                    .dst_set(descriptor_set)
-                    .dst_binding(3)
+                    .dst_set(item.descriptor_set)
+                    .dst_binding(2)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(&shape_infos),
+                    .buffer_info(&table_infos[position]),
             );
+            if let Some(shape_info) = &shape_infos[position] {
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(item.descriptor_set)
+                        .dst_binding(3)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(shape_info),
+                );
+            }
         }
-        // Safety: both info arrays outlive the call; `descriptor_set` was
-        // just allocated, or already existed, from `self.descriptor_pool`.
+        // Safety: all descriptor and buffer handles belong to `dev`; the
+        // backing info arrays outlive this call. The fence wait above makes
+        // rebinding safe for the previous submission.
         unsafe { dev.update_descriptor_sets(&writes, &[]) };
 
-        let (shapes, sync_groups) = match self.outputs[index].take() {
-            Some(old) => {
-                // Safety: the descriptor set was just repointed at the new
-                // buffer above, so nothing references `old.buffer`/
-                // `old.memory` any longer. Unmapping before freeing matches
-                // host memory's lifetime rule (a mapping must not outlive
-                // the memory it maps). `old.shapes` is *not* destroyed: it
-                // is moved into the replacement below, binding 3 and all.
-                unsafe {
-                    dev.unmap_memory(old.memory);
-                    dev.destroy_buffer(old.buffer, None);
-                    dev.free_memory(old.memory, None);
-                }
-                (old.shapes, old.sync_groups)
+        if let Some(max_index) = staged.iter().map(|item| item.index).max() {
+            if self.outputs.len() <= max_index {
+                self.outputs.resize_with(max_index + 1, || None);
             }
-            None => (
-                fresh_shapes.expect("a previously unseen index allocated its shape buffer above"),
-                0,
-            ),
-        };
-
-        self.outputs[index] = Some(OutputResources {
-            buffer: table.buffer,
-            memory: table.memory,
-            capacity: bytes,
-            mapped: table.mapped,
-            shapes,
-            sync_groups,
-            descriptor_set,
-        });
+        }
+        for mut item in staged {
+            let (shapes, sync_groups) = match self.outputs[item.index].take() {
+                Some(old) => {
+                    // The descriptor now points at `item.table`, and the
+                    // fence wait above proves the old table is no longer in
+                    // use by this queue. Preserve the output's pattern state.
+                    unsafe {
+                        dev.unmap_memory(old.memory);
+                        dev.destroy_buffer(old.buffer, None);
+                        dev.free_memory(old.memory, None);
+                    }
+                    (old.shapes, old.sync_groups)
+                }
+                None => (item.shapes.take().expect("new output has shapes"), 0),
+            };
+            self.outputs[item.index] = Some(OutputResources {
+                buffer: item.table.buffer,
+                memory: item.table.memory,
+                capacity: item.table.bytes,
+                size: [item.width, item.height],
+                mapped: item.table.mapped,
+                shapes,
+                sync_groups,
+                descriptor_set: item.descriptor_set,
+            });
+        }
         Ok(())
     }
 
@@ -1490,8 +2046,47 @@ impl Gpu {
     ) -> anyhow::Result<Duration> {
         self.render(
             Source::Canvas {
-                image: canvas,
+                image: CanvasImage::Dmabuf(canvas),
                 y_invert,
+            },
+            jobs,
+        )
+    }
+
+    /// Blend a canvas previously uploaded with [`Gpu::upload_static_canvas_rgba`]
+    /// into the same Present targets and through the same fence/presentation
+    /// path as a captured canvas.
+    pub fn blend_static(
+        &mut self,
+        canvas: &StaticCanvas,
+        jobs: &[BlendJob<'_>],
+    ) -> anyhow::Result<Duration> {
+        for job in jobs {
+            let right = job
+                .source_x
+                .checked_add(job.target.width)
+                .ok_or_else(|| anyhow!("blend_static: source x extent overflow"))?;
+            let bottom = job
+                .source_y
+                .checked_add(job.target.height)
+                .ok_or_else(|| anyhow!("blend_static: source y extent overflow"))?;
+            if right > canvas.width || bottom > canvas.height {
+                bail!(
+                    "blend_static: output {} source {}x{} at {},{} exceeds {}x{} canvas",
+                    job.output,
+                    job.target.width,
+                    job.target.height,
+                    job.source_x,
+                    job.source_y,
+                    canvas.width,
+                    canvas.height,
+                );
+            }
+        }
+        self.render(
+            Source::Canvas {
+                image: CanvasImage::Static(canvas),
+                y_invert: false,
             },
             jobs,
         )
@@ -1509,22 +2104,66 @@ impl Gpu {
         self.render(Source::Sync, jobs)
     }
 
+    fn wait_for_pending_work(&mut self) -> anyhow::Result<()> {
+        if !self.fence_in_flight {
+            return Ok(());
+        }
+        // Safety: `fence` belongs to this device and is the fence attached to
+        // the only submission that can reference the active output buffers.
+        unsafe {
+            self.device
+                .device
+                .wait_for_fences(&[self.fence], true, u64::MAX)
+        }
+        .context("vkWaitForFences before resource replacement")?;
+        self.fence_in_flight = false;
+        Ok(())
+    }
+
     fn render(&mut self, source: Source<'_>, jobs: &[BlendJob<'_>]) -> anyhow::Result<Duration> {
         if jobs.is_empty() {
             return Ok(Duration::ZERO);
         }
+        self.wait_for_pending_work()?;
+        for job in jobs {
+            if job.target.format != jobs[0].target.format {
+                bail!("blend: all targets must use the same pixel format");
+            }
+            let output = self
+                .outputs
+                .get(job.output)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| anyhow!("blend: no transfer table for output {}", job.output))?;
+            let size = [job.target.width, job.target.height];
+            if output.size != size || job.warp.is_some_and(|w| w.output_size() != size) {
+                bail!("blend: target, warp, and transfer dimensions must agree");
+            }
+            if let Source::Canvas { image, .. } = source {
+                validate_filtering(image.linear_filter_supported(), job.warp.is_some())?;
+            }
+        }
         // Binding 0 wants a valid view either way — see `PlaceholderImage`.
-        let (canvas_image, canvas_view, canvas_height, y_invert, mode) = match source {
+        let (
+            canvas_image,
+            canvas_view,
+            canvas_height,
+            y_invert,
+            mode,
+            foreign_canvas,
+            locally_uploaded_canvas,
+        ) = match source {
             Source::Canvas { image, y_invert } => (
-                image.image,
-                image.view,
-                image.height,
+                image.image(),
+                image.view(),
+                image.height(),
                 u32::from(y_invert),
                 0u32,
+                image.foreign_owned(),
+                image.locally_uploaded(),
             ),
             Source::Sync => {
                 let (image, view) = self.ensure_placeholder()?;
-                (image, view, 0, 0, 1)
+                (image, view, 0, 0, 1, false, false)
             }
         };
         let format = jobs[0].target.format;
@@ -1585,7 +2224,7 @@ impl Gpu {
         // module doc: layout stays GENERAL on both sides, only ownership
         // moves. Skipped in `sync` mode, whose stand-in image the compositor
         // has never seen and so cannot own.
-        if mode == 0 {
+        if foreign_canvas {
             let acquire_canvas = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -1608,25 +2247,39 @@ impl Gpu {
                 );
             }
         }
-
-        for job in jobs {
-            if job.target.format != format {
-                bail!(
-                    "blend: output {}'s target format does not match this call's pipeline \
-                     (every job in one blend() call must share a pixel format)",
-                    job.output
+        if locally_uploaded_canvas {
+            // The upload and this draw are separate queue submissions. Keep
+            // the image in GENERAL, but make the preceding transfer write
+            // explicitly visible to this shader read. Repeated static draws
+            // also remain valid because SHADER_READ is included as a source.
+            let readable_canvas = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(canvas_image)
+                .subresource_range(color_subresource);
+            // Safety: recording into the current command buffer; this local
+            // image is permanently owned by our queue family.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[readable_canvas],
                 );
             }
-            let Some(output) = self
-                .outputs
-                .get(job.output)
-                .and_then(|entry| entry.as_ref())
-            else {
-                bail!(
-                    "blend: no transfer table set for output {} (call set_transfer first)",
-                    job.output
-                );
-            };
+        }
+
+        for job in jobs {
+            let output = self.outputs[job.output]
+                .as_ref()
+                .expect("validated before recording");
 
             let acquire_target = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
@@ -1702,32 +2355,22 @@ impl Gpu {
                     &[],
                 );
             }
-            let push_constants = PushConstants {
-                source_x: job.source_x,
-                source_y: job.source_y,
-                width: job.target.width,
-                height: job.target.height,
+            let mut push_constants = PushConstants::canvas(
+                [job.source_x, job.source_y],
+                [job.target.width, job.target.height],
                 canvas_height,
-                y_invert,
-                mode,
-                groups: output.sync_groups,
-            };
-            // Safety: `PushConstants` is `#[repr(C)]` and plain data (eight
-            // `u32`s, no padding), and this byte view does not outlive the
-            // call.
-            let push_constant_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    std::ptr::addr_of!(push_constants).cast::<u8>(),
-                    std::mem::size_of::<PushConstants>(),
-                )
-            };
+                y_invert != 0,
+                job.warp,
+            );
+            push_constants.mode = mode;
+            push_constants.groups = output.sync_groups;
             unsafe {
                 device.cmd_push_constants(
                     self.command_buffer,
                     self.pipeline_layout,
                     vk::ShaderStageFlags::FRAGMENT,
                     0,
-                    push_constant_bytes,
+                    push_constants.as_bytes(),
                 );
             }
             unsafe { device.cmd_draw(self.command_buffer, 3, 1, 0, 0) };
@@ -1757,7 +2400,7 @@ impl Gpu {
 
         // The other half of the acquire above, and skipped for the same
         // reason: the placeholder is never handed back to anyone.
-        if mode == 0 {
+        if foreign_canvas {
             let release_canvas = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_READ)
                 .dst_access_mask(vk::AccessFlags::empty())
@@ -1792,6 +2435,7 @@ impl Gpu {
         // was just reset and is used by nothing else.
         unsafe { device.queue_submit(self.device.queue, &[submit_info], self.fence) }
             .context("vkQueueSubmit")?;
+        self.fence_in_flight = true;
 
         let wait_from = Instant::now();
         // The compositor reads these images the moment we commit the
@@ -1801,6 +2445,7 @@ impl Gpu {
         // `blend()` returns.
         unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
             .context("vkWaitForFences")?;
+        self.fence_in_flight = false;
         Ok(wait_from.elapsed())
     }
 }
@@ -1934,6 +2579,21 @@ fn pack_transfer(a: u16, b: u8) -> u32 {
     (u32::from(a) << 8) | u32::from(b)
 }
 
+fn validate_filtering(linear_filter: bool, warped: bool) -> anyhow::Result<()> {
+    if warped && !linear_filter {
+        bail!("warp unavailable: capture format/modifier does not support linear filtering");
+    }
+    Ok(())
+}
+
+fn static_canvas_features_supported(features: vk::FormatFeatureFlags) -> bool {
+    features.contains(
+        vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_DST,
+    )
+}
+
 impl HostBuffer {
     /// Unmap and destroy, in the order Vulkan requires (a mapping must not
     /// outlive the memory it maps, and a buffer must go before the memory
@@ -1964,10 +2624,18 @@ fn allocate_host_buffer(
     device: &Arc<DeviceState>,
     bytes: vk::DeviceSize,
 ) -> anyhow::Result<HostBuffer> {
+    allocate_host_buffer_with_usage(device, bytes, vk::BufferUsageFlags::STORAGE_BUFFER)
+}
+
+fn allocate_host_buffer_with_usage(
+    device: &Arc<DeviceState>,
+    bytes: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
+) -> anyhow::Result<HostBuffer> {
     let dev = &device.device;
     let buffer_info = vk::BufferCreateInfo::default()
         .size(bytes)
-        .usage(vk::BufferUsageFlags::STORAGE_BUFFER)
+        .usage(usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
     // Safety: no pNext chain.
     let buffer = unsafe { dev.create_buffer(&buffer_info, None) }.context("vkCreateBuffer")?;
@@ -2084,7 +2752,7 @@ fn missing_requirement(
             Err(error) => {
                 return Some(format!(
                     "vkEnumerateDeviceExtensionProperties failed: {error}"
-                ))
+                ));
             }
         };
     for &required in &REQUIRED_DEVICE_EXTENSIONS {
@@ -2325,8 +2993,26 @@ mod tests {
     }
 
     #[test]
-    fn push_constants_are_32_bytes() {
-        assert_eq!(std::mem::size_of::<PushConstants>(), 32);
+    fn static_canvas_requires_sampling_linear_filtering_and_upload() {
+        let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
+            | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+            | vk::FormatFeatureFlags::TRANSFER_DST;
+        assert!(static_canvas_features_supported(required));
+        assert!(!static_canvas_features_supported(
+            required & !vk::FormatFeatureFlags::TRANSFER_DST
+        ));
+        assert!(!static_canvas_features_supported(
+            required & !vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
+        ));
+    }
+
+    #[test]
+    fn push_constants_match_warp_shader_layout() {
+        assert_eq!(std::mem::size_of::<PushConstants>(), 96);
+        assert_eq!(std::mem::offset_of!(PushConstants, inverse_rows), 32);
+        assert_eq!(std::mem::offset_of!(PushConstants, center), 80);
+        assert_eq!(std::mem::offset_of!(PushConstants, warp_enabled), 88);
+        assert_eq!(std::mem::offset_of!(PushConstants, padding), 92);
         assert_eq!(std::mem::align_of::<PushConstants>(), 4);
         // Vulkan guarantees only 128 bytes of push constants, and a device
         // that offers exactly that must still take this block.
@@ -2429,3 +3115,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gpu_readback.rs"]
+mod readback;

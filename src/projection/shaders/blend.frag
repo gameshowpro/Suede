@@ -1,6 +1,7 @@
 // The GPU half of the slicer's per-pixel transfer, kept integer-exact with
 // the CPU path (`Blend::rows` in slicer.rs) so switching between them never
-// visibly changes a frame. Rebuild with `naga blend.frag blend.frag.spv`
+// visibly changes a frame. Rebuild with
+// `naga --input-kind glsl --shader-stage frag blend.frag blend.frag.spv`
 // (naga is at ~/.cargo/bin/naga in WSL) and check the .spv in alongside this
 // file — the target machines have no shader compiler installed.
 //
@@ -19,7 +20,9 @@ layout(set = 0, binding = 1) uniform sampler canvasSampler;
 
 // `(a, b)` packed as `a << 8 | b`, row-major at this output's size — see
 // `set_transfer` in gpu.rs and `pixel_transfer` in blend.rs, which both
-// produce the fixed-point pair this unpacks.
+// produce the fixed-point pair this unpacks. Bits 0..7: b (0..255),
+// bits 8..16: a (0..256), bits 17..31: zero. Border coverage attenuates
+// both coefficients before rounding; the shader never applies it again.
 layout(set = 0, binding = 2, std430) readonly buffer Transfer {
     uint table[];
 };
@@ -46,6 +49,15 @@ layout(push_constant) uniform PushConstants {
     // 0: blend the canvas. 1: draw the `sync` pattern from `shapes`.
     uint mode;
     uint groups;
+    // When enabled, these are the inverse homography rows from output pixel
+    // boundaries to the source rectangle's unit square.  The fields after
+    // the original eight uints deliberately start at byte 32.
+    vec4 inverse_row0;
+    vec4 inverse_row1;
+    vec4 inverse_row2;
+    vec2 center;
+    uint warp_enabled;
+    uint padding;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -56,32 +68,122 @@ void main() {
     // coordinates — no per-job uniform needed for that part.
     ivec2 p = ivec2(gl_FragCoord.xy);
     uvec3 c;
-    if (pc.mode == 1u) {
-        uvec2 q = uvec2(p);
+    uint ab = table[p.y * pc.width + p.x];
+
+    if (pc.warp_enabled != 0u && ab == 0u) {
+        // A zero transfer entry is outside the covered destination.  Return
+        // before doing any source arithmetic so this path cannot fetch an
+        // invalid canvas coordinate.
+        outColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    vec2 local = vec2(p);
+    bool local_valid = true;
+    if (pc.warp_enabled != 0u) {
+        vec3 h = vec3(dot(pc.inverse_row0.xyz, vec3(gl_FragCoord.xy, 1.0)),
+                      dot(pc.inverse_row1.xyz, vec3(gl_FragCoord.xy, 1.0)),
+                      dot(pc.inverse_row2.xyz, vec3(gl_FragCoord.xy, 1.0)));
+        if (any(isnan(h)) || any(isinf(h)) || abs(h.z) <= 1.0e-7 ||
+            pc.center.x <= 0.0 || pc.center.x >= 1.0 ||
+            pc.center.y <= 0.0 || pc.center.y >= 1.0) {
+            local_valid = false;
+        } else {
+            vec2 s = h.xy / h.z;
+            local = vec2(s.x <= pc.center.x
+                             ? s.x / (2.0 * pc.center.x)
+                             : 0.5 + (s.x - pc.center.x) / (2.0 * (1.0 - pc.center.x)),
+                         s.y <= pc.center.y
+                             ? s.y / (2.0 * pc.center.y)
+                             : 0.5 + (s.y - pc.center.y) / (2.0 * (1.0 - pc.center.y)));
+            local *= vec2(pc.width, pc.height);
+            // A nonzero transfer entry means this destination pixel is
+            // covered.  Clamp its source to a texel center, including when a
+            // partially covered edge maps just outside the source rectangle.
+            // Uncovered pixels took the table==0 return above.
+            local = clamp(local, vec2(0.5),
+                          vec2(float(pc.width) - 0.5, float(pc.height) - 0.5));
+        }
+    }
+
+    if (!local_valid) {
+        outColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    } else if (pc.mode == 1u) {
+        // In warp mode, keep the sync comparisons in signed floating point
+        // until after bounds checks so negative coordinates cannot wrap.
         uint lit = 0u;
         uint i = 0u;
-        for (uint g = 0u; g < pc.groups; ++g) {
-            uvec4 box = shapes[i];
-            uvec4 head = shapes[i + 1u];
-            if (q.x >= box.x && q.x < box.z && q.y >= box.y && q.y < box.w) {
-                for (uint r = 0u; r < head.x; ++r) {
-                    uvec4 s = shapes[i + 2u + r];
-                    if (q.x >= s.x && q.x < s.z && q.y >= s.y && q.y < s.w) {
-                        lit = 1u;
-                        break;
+        if (pc.warp_enabled != 0u) {
+            vec2 qf = local;
+            for (uint g = 0u; g < pc.groups; ++g) {
+                uvec4 box = shapes[i];
+                uvec4 head = shapes[i + 1u];
+                if (qf.x >= float(box.x) && qf.x < float(box.z) &&
+                    qf.y >= float(box.y) && qf.y < float(box.w)) {
+                    for (uint r = 0u; r < head.x; ++r) {
+                        uvec4 s = shapes[i + 2u + r];
+                        if (qf.x >= float(s.x) && qf.x < float(s.z) &&
+                            qf.y >= float(s.y) && qf.y < float(s.w)) {
+                            lit = 1u;
+                            break;
+                        }
                     }
                 }
+                if (lit != 0u) {
+                    break;
+                }
+                i = head.y;
             }
-            if (lit != 0u) {
-                break;
+        } else {
+            uvec2 q = uvec2(p);
+            for (uint g = 0u; g < pc.groups; ++g) {
+                uvec4 box = shapes[i];
+                uvec4 head = shapes[i + 1u];
+                if (q.x >= box.x && q.x < box.z && q.y >= box.y && q.y < box.w) {
+                    for (uint r = 0u; r < head.x; ++r) {
+                        uvec4 s = shapes[i + 2u + r];
+                        if (q.x >= s.x && q.x < s.z && q.y >= s.y && q.y < s.w) {
+                            lit = 1u;
+                            break;
+                        }
+                    }
+                }
+                if (lit != 0u) {
+                    break;
+                }
+                i = head.y;
             }
-            i = head.y;
         }
         // Full white or full black, so the transfer below is the only thing
         // between this and the projector — which is the point: the ramps and
         // the black lift shape the counter exactly as they shape content.
         c = uvec3(lit * 255u);
+    } else if (pc.warp_enabled != 0u) {
+        vec2 source = local + vec2(pc.source_x, pc.source_y);
+        if (pc.y_invert != 0u) {
+            source.y = float(pc.canvas_height) - source.y;
+        }
+        vec2 canvas_size = vec2(textureSize(canvas, 0));
+        if (source.x < 0.5 || source.x > canvas_size.x - 0.5 ||
+            source.y < 0.5 || source.y > canvas_size.y - 0.5) {
+            outColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        } else {
+            vec4 t = textureLod(sampler2D(canvas, canvasSampler),
+                                source / canvas_size, 0.0);
+            c = uvec3(round(t.rgb * 255.0));
+        }
     } else {
+        // Validate unsigned origins before addition or y inversion. An
+        // out-of-canvas pixel is opaque black, including with nonzero lift.
+        uvec2 canvas_size = uvec2(textureSize(canvas, 0));
+        if (pc.source_x >= canvas_size.x || pc.source_y >= canvas_size.y ||
+            uint(p.x) >= canvas_size.x - pc.source_x ||
+            uint(p.y) >= canvas_size.y - pc.source_y) {
+            outColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
         int cy = int(pc.source_y) + p.y;
         if (pc.y_invert != 0u) {
             cy = int(pc.canvas_height) - 1 - cy;
@@ -92,7 +194,6 @@ void main() {
         // first so both paths start from the identical integer.
         c = uvec3(round(t.rgb * 255.0));
     }
-    uint ab = table[p.y * pc.width + p.x];
     uint a = ab >> 8u;
     uint b = ab & 0xffu;
     uvec3 o = min(((a * c) >> 8u) + b, uvec3(255u));

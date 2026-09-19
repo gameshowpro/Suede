@@ -625,6 +625,7 @@ impl Reconciler {
                     // they left.
                     if anything_to_show && !plan.slices.is_empty() {
                         slicer = Some(SlicerSpec {
+                            control_session: String::new(),
                             source: name.clone(),
                             canvas_width: width,
                             canvas_height: height,
@@ -684,6 +685,9 @@ impl Reconciler {
             manager.restart_slicer();
         }
         divergences.extend(manager.sync_slicer(slicer.as_ref()));
+        if let Some(divergence) = warp_unavailable_divergence(&self.snapshot.projection_control()) {
+            divergences.push(divergence);
+        }
         // `sync_slicer` above already reaped a dead child before deciding
         // whether to respawn, so the manager knows definitively whether one
         // is alive now — publish that rather than leaving the API and the
@@ -748,6 +752,18 @@ impl Reconciler {
         &self,
         desired: &crate::model::DesiredState,
     ) -> Option<crate::projection::CanvasPlan> {
+        self.plan_canvas_with_warp(desired, false)
+    }
+
+    /// Phase 1's internal activation seam for direct slicer fixtures. Normal
+    /// reconciliation passes false because the persisted schema has no
+    /// geometry yet; Phase 2 will provide the actual nonidentity decision.
+    #[cfg(feature = "projection")]
+    fn plan_canvas_with_warp(
+        &self,
+        desired: &crate::model::DesiredState,
+        has_nonidentity_warp: bool,
+    ) -> Option<crate::projection::CanvasPlan> {
         use crate::projection::Participant;
         let observed = self.snapshot.outputs();
         let mut participants = Vec::new();
@@ -790,7 +806,7 @@ impl Reconciler {
                 connected: matched.is_some(),
             });
         }
-        crate::projection::canvas_plan(
+        crate::projection::canvas_plan_with_warp_activation(
             &participants,
             desired.projection.as_ref(),
             if self.allow_overlaps {
@@ -798,6 +814,7 @@ impl Reconciler {
             } else {
                 crate::projection::Slicing::WhenOverlapping
             },
+            has_nonidentity_warp,
         )
     }
 
@@ -1244,6 +1261,25 @@ impl Reconciler {
     }
 }
 
+/// Surface a rejected direct warp as reconciliation divergence while keeping
+/// legacy CPU/simple installations quiet. The capability record remains the
+/// richer health/status explanation and survives until the child changes.
+fn warp_unavailable_divergence(
+    control: &crate::model::ProjectionControlStatus,
+) -> Option<Divergence> {
+    (control.warp_available == Some(false) && control.requested_mode.as_deref() == Some("warp"))
+        .then(|| {
+            Divergence::new(
+                "warp_unavailable",
+                "projection",
+                control
+                    .warp_reason
+                    .clone()
+                    .unwrap_or_else(|| "the negotiated pipeline cannot apply warp".to_string()),
+            )
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1318,6 +1354,50 @@ mod tests {
         });
         config.position = Some(Position { x, y: 0 });
         config
+    }
+
+    #[test]
+    fn only_requested_warp_becomes_a_capability_divergence() {
+        let unavailable_warp = crate::model::ProjectionControlStatus {
+            warp_available: Some(false),
+            requested_mode: Some("warp".into()),
+            warp_reason: Some("linear filtering is unavailable".into()),
+            ..Default::default()
+        };
+        let divergence = warp_unavailable_divergence(&unavailable_warp).unwrap();
+        assert_eq!(divergence.kind, "warp_unavailable");
+        assert!(divergence.detail.contains("linear filtering"));
+
+        let cpu_simple = crate::model::ProjectionControlStatus {
+            warp_available: Some(false),
+            requested_mode: Some("simple".into()),
+            ..Default::default()
+        };
+        assert!(warp_unavailable_divergence(&cpu_simple).is_none());
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn nonidentity_planning_seam_activates_a_single_output_without_schema_geometry() {
+        let harness = harness();
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        let mut desired = crate::model::DesiredState::default();
+        desired.outputs.push(configured_output("HDMI-A-1", 0));
+        desired.projection = Some(crate::model::ProjectionConfig {
+            blend: false,
+            ..crate::model::ProjectionConfig::default()
+        });
+
+        assert!(harness.reconciler.plan_canvas(&desired).is_none());
+        let plan = harness
+            .reconciler
+            .plan_canvas_with_warp(&desired, true)
+            .expect("internal nonidentity activation must make one output sliceable");
+        assert_eq!((plan.canvas_width, plan.canvas_height), (1920, 1080));
+        assert_eq!(plan.slices.len(), 1);
+        assert!(plan.slices[0].ramps.is_empty());
     }
 
     fn app(id: &str, output: Option<&str>, audio: Option<AudioConfig>) -> AppConfig {
@@ -1607,6 +1687,7 @@ mod tests {
         harness.supervisor.shutdown().await;
     }
 
+    #[cfg(feature = "projection")]
     #[tokio::test]
     async fn a_missing_canvas_is_a_divergence() {
         let harness = harness();
@@ -1635,6 +1716,7 @@ mod tests {
         harness.supervisor.shutdown().await;
     }
 
+    #[cfg(feature = "projection")]
     #[tokio::test]
     async fn the_canvas_is_created_with_the_shared_refresh_rate() {
         // Both physical outputs run at 60 Hz, so the headless canvas that
@@ -1681,6 +1763,7 @@ mod tests {
         harness.supervisor.shutdown().await;
     }
 
+    #[cfg(feature = "projection")]
     #[tokio::test]
     async fn topology_change_reaches_the_slicer_as_a_forced_restart() {
         // Mirrors the 2026-09-15 bench measurement: the `output-phase`
