@@ -212,7 +212,17 @@ One JSON document, written through `PUT /api/v1/config` or section by section. H
 
 Writes are validated synchronously and return once **persisted**, not once applied — reconciliation may take seconds, or be impossible right now because a display is unplugged. Add `?wait=<seconds>` to block until it settles.
 
-The document carries a server-managed `revision`. Send it back as `If-Match` to make a write conditional; a stale value gets `409 Conflict`.
+The document carries a server-managed persisted `revision`. Full-document
+responses and every configuration write response return it as a quoted `ETag`;
+send that value back as `If-Match` to make a write conditional. They also return
+`X-Config-Generation`, an in-memory generation that changes for every preview,
+save, or revert. Send it back as `If-Config-Generation` when editing a live
+working copy. `X-Config-Epoch` identifies the daemon's current in-memory store;
+send it back as `If-Config-Epoch`. A stale revision, generation, or epoch gets
+`409 Conflict`. Use all three headers for an editor: the revision protects
+saved documents, the generation prevents one client from overwriting another
+client's preview that shares the same saved revision, and the epoch prevents a
+daemon restart from making a reset generation counter look current.
 
 ### Outputs
 
@@ -1155,6 +1165,53 @@ supersedes a live working copy. The web UI uses this grammar for the layout
 and projection editors: every edit is pushed uncommitted as it is made - the
 picture follows the numbers as you type - Save sends the same document with the
 flag set, and Cancel calls revert.
+
+`GET /api/v1/config`, `PUT /api/v1/config`, and `POST /api/v1/config/revert`
+return the exact accepted revision in `ETag` and effective working-copy identity
+in `X-Config-Generation`, plus the store instance in `X-Config-Epoch`. Send all
+three values as `If-Match`, `If-Config-Generation`, and `If-Config-Epoch` on the
+next transition. The comparison and transition are one atomic operation,
+including when another client uses a section endpoint: a late preview, Save, or
+Cancel receives `409` instead of replacing newer work or reviving a preview from
+before a daemon restart.
+
+#### Editing geometry in the web UI {: #geometry-editor }
+
+In **Displays → Projection**, choose an output and select **Warp**. To create
+or deliberately replace its calibration, use **Replace warp settings from
+rectangles**. This uses the server's canonical conversion and leaves the result
+unsaved. Switching simple/warp mode preserves the separate settings.
+
+Drag the four corner handles to place the picture inside the output raster.
+The four center-line handles control two shared fractions: moving either end
+of a line moves its partner. Use the numeric fields for precise coordinates,
+or focus a handle and press an arrow key for a 0.001 step (Shift: 0.01).
+Invalid edits show their reason and retain the last accepted shape. **Reset
+centers** and **Reset pins** are also unsaved edits. Source placement and the
+physical raster footprint have separate controls; destination pin movement
+does not change the selected browser content or its dimensions.
+
+**Save** persists the working document; **Cancel** restores the committed
+version. Previews are serialized with both operations. If another client or a
+daemon restart changes the working copy, the editor keeps your local edits
+and offers **Export local edits** or **Discard local edits and reload**.
+Warp controls require verified capability. CPU fallback shows its reason and
+keeps stored calibration while you edit the simple rectangles; returning to
+verified GPU capability permits restoration.
+
+The canvas panel shows current dimensions and selected-output sampling status.
+Enter aspect, render width, and recorded scale, then choose **Adopt chosen
+dimensions**, or request a recommendation for the current accepted aspect and
+explicitly adopt one of its presets. Adoption can resize and reflow the page.
+Recommendations are approximate, report known and unknown limits, expire when
+their working-copy basis changes, and never apply during a drag.
+
+The editor distinguishes server acceptance from slicer installation using
+`control.appliedConfigGeneration` and the current child session. Numeric
+working-copy generations are scoped to `X-Config-Epoch`; they are not slicer
+control generations. Presentation receipt is reported per output and does not
+measure when the light became visible. Pattern changes and a Save that removes
+a diagnostic pattern preserve the stored geometry and mode.
 
 #### Test patterns {: #projection-test-patterns }
 

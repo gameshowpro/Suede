@@ -95,6 +95,9 @@ mod tests {
             "/wallpapers",
             "/config/revert",
             "/ports",
+            "/projection/convert",
+            "/projection/recommendation",
+            "/projection/stats",
         ] {
             assert!(INDEX.contains(path), "the UI never calls {path}");
         }
@@ -176,6 +179,9 @@ mod tests {
             "AppConfig",
             "Launcher",
             "ProjectionConfig",
+            "CanvasConfig",
+            "OutputGeometry",
+            "CanvasRect",
             "Settings",
             "AudioConfig",
             "HeartbeatConfig",
@@ -251,6 +257,7 @@ mod tests {
             "status_changed",
             "config_changed",
             "checks_changed",
+            "projection_stats_changed",
         ] {
             assert!(INDEX.contains(event), "the UI ignores {event}");
         }

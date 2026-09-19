@@ -754,6 +754,13 @@ pub struct ProjectionControlStatus {
     pub effective_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_generation: Option<u64>,
+    /// Working-copy generation whose effective projection snapshot the
+    /// manager most recently asked this slicer session to realize. This is
+    /// deliberately separate from `requested_generation`: the latter is a
+    /// child-local control sequence, while this identifies the configuration
+    /// response the editor received.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_config_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Highest accepted generation reported by this child.
     pub accepted_generation: Option<u64>,
@@ -763,6 +770,13 @@ pub struct ProjectionControlStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Highest generation installed as a complete render revision.
     pub applied_generation: Option<u64>,
+    /// Working-copy generation whose projection snapshot the slicer has
+    /// installed. It advances only on an `applied` event from the current
+    /// slicer session, or when an unchanged effective snapshot is already
+    /// known to have been installed. It must never be compared with the
+    /// child-local control generations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_config_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     /// Highest generation submitted by any output. This does not mean all
     /// outputs have submitted it.

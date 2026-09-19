@@ -11,13 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 
 use crate::audio::AudioMonitor;
 use crate::events::{EventHub, ServerEvent};
 use crate::model::{ActiveApp, AppState, Divergence, Status, SyncState, Window};
 use crate::snapshot::Snapshot;
-use crate::state::StateStore;
+use crate::state::{ConditionalWriteError, StatePrecondition, StateStore};
 use crate::supervisor::Supervisor;
 use crate::sway::{SwayClient, SwayEvent};
 use crate::wallpapers::WallpaperStore;
@@ -38,14 +38,44 @@ const TICK: Duration = Duration::from_secs(1);
 #[derive(Clone)]
 pub struct ReconcileTrigger {
     sender: mpsc::Sender<&'static str>,
+    projection: Arc<Notify>,
 }
 
 impl ReconcileTrigger {
+    /// Wake projection-only edits without the topology coalescing delay.
+    /// Notify retains at most one permit while a pass is running, so sustained
+    /// dragging cannot queue an unbounded number of reconciliation passes.
+    pub fn request_projection(&self) {
+        self.projection.notify_one();
+    }
+
     /// Request a pass. Never blocks: a pending request already covers this one.
     pub fn request(&self, reason: &'static str) {
         if self.sender.try_send(reason).is_err() {
             tracing::trace!(reason, "reconciliation already pending");
         }
+    }
+}
+
+/// Bounded ordinary requests and a separate coalesced projection wakeup.
+/// A full ordinary queue cannot hide an interactive projection update.
+pub struct ReconcileRequests {
+    ordinary: mpsc::Receiver<&'static str>,
+    projection: Arc<Notify>,
+}
+
+impl ReconcileRequests {
+    #[cfg(test)]
+    pub(crate) fn try_recv(&mut self) -> Result<&'static str, mpsc::error::TryRecvError> {
+        self.ordinary.try_recv()
+    }
+
+    async fn coalesce(&mut self) {
+        tokio::select! {
+            _ = tokio::time::sleep(DEBOUNCE) => {},
+            _ = self.projection.notified() => {},
+        }
+        while self.ordinary.try_recv().is_ok() {}
     }
 }
 
@@ -255,7 +285,11 @@ impl Reconciler {
 
         // The effective document: a live preview when one is being tried out
         // in the UI, otherwise the persisted state.
-        let desired = self.store.effective();
+        // Keep the document and working-copy identity from one StateStore
+        // read. The projection manager carries this identity through its
+        // child-local control sequence so the editor can tell an accepted
+        // preview from the geometry actually installed by the slicer.
+        let (desired, config_generation) = self.store.effective_with_generation();
         let capabilities = *self.capabilities.lock().await;
         let mut divergences: Vec<Divergence> = Vec::new();
 
@@ -398,7 +432,12 @@ impl Reconciler {
         // (freshly computed per call in `plan_outputs_with`, never carried
         // over), so this cannot restart the slicer on every ordinary pass.
         let (canvas_output, projection_divergences) = self
-            .sync_projection(&desired, canvas_plan, output_plan.topology_changed)
+            .sync_projection(
+                &desired,
+                config_generation,
+                canvas_plan,
+                output_plan.topology_changed,
+            )
             .await;
         divergences.extend(projection_divergences);
 
@@ -451,7 +490,8 @@ impl Reconciler {
         // measurements. A pass that cannot reach sway has verified nothing,
         // so it adopts nothing either — the outputs below are stale.
         if self.sway.is_connected() {
-            self.adopt_settled_outputs(&desired, &divergences).await;
+            self.adopt_settled_outputs(&desired, config_generation, &divergences)
+                .await;
         }
 
         // A pass that could not reach sway has not verified anything: the
@@ -525,6 +565,7 @@ impl Reconciler {
     async fn sync_projection(
         &self,
         desired: &crate::model::DesiredState,
+        config_generation: u64,
         plan: Option<crate::projection::CanvasPlan>,
         restart_slicer: bool,
     ) -> (Option<String>, Vec<Divergence>) {
@@ -720,7 +761,7 @@ impl Reconciler {
         if restart_slicer {
             manager.restart_slicer();
         }
-        divergences.extend(manager.sync_slicer(slicer.as_ref()));
+        divergences.extend(manager.sync_slicer(slicer.as_ref(), config_generation));
         if let Some(divergence) = warp_unavailable_divergence(&self.snapshot.projection_control()) {
             divergences.push(divergence);
         }
@@ -740,6 +781,7 @@ impl Reconciler {
     async fn sync_projection(
         &self,
         desired: &crate::model::DesiredState,
+        _config_generation: u64,
         _plan: Option<()>,
         _restart_slicer: bool,
     ) -> (Option<String>, Vec<Divergence>) {
@@ -1055,6 +1097,7 @@ impl Reconciler {
     async fn adopt_settled_outputs(
         &self,
         desired: &crate::model::DesiredState,
+        config_generation: u64,
         divergences: &[Divergence],
     ) {
         let observed = self.snapshot.outputs();
@@ -1113,16 +1156,25 @@ impl Reconciler {
             })
             .collect();
 
-        match self.store.update(|state| {
-            for output in &mut state.outputs {
-                if let Some((_, adopted)) = pins
-                    .iter()
-                    .find(|(rule, _)| rule.key() == output.r#match.key())
-                {
-                    output.adopted = Some(adopted.clone());
+        match self.store.replace_if(
+            StatePrecondition {
+                revision: Some(desired.revision),
+                generation: Some(config_generation),
+                epoch: None,
+            },
+            |current, _| {
+                let mut next = current.clone();
+                for output in &mut next.outputs {
+                    if let Some((_, adopted)) = pins
+                        .iter()
+                        .find(|(rule, _)| rule.key() == output.r#match.key())
+                    {
+                        output.adopted = Some(adopted.clone());
+                    }
                 }
-            }
-        }) {
+                Ok::<_, std::convert::Infallible>(next)
+            },
+        ) {
             Ok(_) => {
                 for (rule, adopted) in &pins {
                     let previous = previous_adopted.get(&rule.key()).cloned().flatten();
@@ -1143,9 +1195,19 @@ impl Reconciler {
                     );
                 }
             }
-            Err(error) => {
+            Err(ConditionalWriteError::Precondition { current }) => {
+                tracing::debug!(
+                    expected_revision = desired.revision,
+                    expected_generation = config_generation,
+                    actual_revision = current.revision,
+                    actual_generation = current.generation,
+                    "skipped stale settled-output adoption"
+                );
+            }
+            Err(ConditionalWriteError::State(error)) => {
                 tracing::warn!(%error, "failed to persist adopted output values");
             }
+            Err(ConditionalWriteError::Rejected(never)) => match never {},
         }
     }
 
@@ -1172,16 +1234,26 @@ impl Reconciler {
     }
 
     /// Create the trigger channel and the receiver the task services.
-    pub fn channel() -> (ReconcileTrigger, mpsc::Receiver<&'static str>) {
-        let (sender, receiver) = mpsc::channel(1);
-        (ReconcileTrigger { sender }, receiver)
+    pub fn channel() -> (ReconcileTrigger, ReconcileRequests) {
+        let (sender, ordinary) = mpsc::channel(1);
+        let projection = Arc::new(Notify::new());
+        (
+            ReconcileTrigger {
+                sender,
+                projection: projection.clone(),
+            },
+            ReconcileRequests {
+                ordinary,
+                projection,
+            },
+        )
     }
 
     /// The reconciliation task: react to triggers, poll as a backstop, and tick
     /// the supervisor.
     pub async fn run(
         self: Arc<Self>,
-        mut triggers: mpsc::Receiver<&'static str>,
+        mut triggers: ReconcileRequests,
         mut shutdown: watch::Receiver<bool>,
     ) {
         let mut projection_events = self.events.subscribe();
@@ -1226,10 +1298,14 @@ impl Reconciler {
                     tracing::info!("reconciler stopping");
                     return;
                 }
-                Some(reason) = triggers.recv() => {
-                    // Coalesce a burst of triggers into a single pass.
-                    tokio::time::sleep(DEBOUNCE).await;
-                    while triggers.try_recv().is_ok() {}
+                _ = triggers.projection.notified() => {
+                    while triggers.ordinary.try_recv().is_ok() {}
+                    self.reconcile().await;
+                }
+                Some(reason) = triggers.ordinary.recv() => {
+                    // Keep normal topology debounce, but an interactive edit
+                    // can interrupt it rather than waiting half a second.
+                    triggers.coalesce().await;
                     tracing::debug!(reason, "reconciling");
                     self.reconcile().await;
                 }
@@ -2289,6 +2365,38 @@ mod tests {
         );
         assert_eq!(after_third.outputs[0].adopted, Some(adopted));
         harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn projection_edit_interrupts_an_ordinary_debounce_and_coalesces() {
+        let (trigger, mut requests) = Reconciler::channel();
+        trigger.request("output event");
+        assert_eq!(requests.ordinary.recv().await, Some("output event"));
+        // A full ordinary queue must not swallow the interactive wakeup.
+        trigger.request("another output event");
+        let waiting = tokio::spawn(async move {
+            requests.coalesce().await;
+            requests
+        });
+        tokio::task::yield_now().await;
+        for _ in 0..100 {
+            trigger.request_projection();
+        }
+        let mut requests = tokio::time::timeout(DEBOUNCE / 2, waiting)
+            .await
+            .expect("projection edit waited for the normal 500 ms debounce")
+            .unwrap();
+        assert!(requests.ordinary.try_recv().is_err());
+        // The first wake can already belong to the active waiter when the
+        // remaining burst arrives. At most one additional pass is retained.
+        let _ =
+            tokio::time::timeout(Duration::from_millis(10), requests.projection.notified()).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), requests.projection.notified())
+                .await
+                .is_err(),
+            "a burst must retain at most one pending wakeup"
+        );
     }
 
     #[tokio::test]

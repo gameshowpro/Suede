@@ -180,6 +180,14 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
 #offline.failed .spinner { display: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { #offline .spinner { animation: none; } }
+#warp-editor { display: block; width: min(100%, 780px); height: auto; margin: 0 auto; background: var(--sunken); touch-action: none; }
+#warp-editor .warp-raster { fill: none; stroke: var(--muted); stroke-width: .003; stroke-dasharray: .01; }
+#warp-quad { fill: color-mix(in srgb, var(--accent) 12%, transparent); stroke: var(--accent); stroke-width: .004; }
+#warp-editor line { stroke: var(--accent); stroke-width: .003; }
+#warp-editor [data-handle] { fill: var(--panel); stroke: var(--accent); stroke-width: .004; cursor: grab; }
+#warp-editor [data-handle]:focus { fill: var(--accent); outline: none; }
+#warp-editor [data-handle].rejected { fill: var(--bad); stroke: var(--bad); }
+#warp-error { color: var(--bad); min-height: 1.5em; }
 </style>
 </head>
 <body>
@@ -238,6 +246,11 @@ window.addEventListener("error", (event) => {
     <button role="tab" aria-selected="false" data-tab="config">Raw config</button>
   </nav>
 
+  <div class="alert warn" id="config-conflict" hidden>
+    <strong>Configuration conflict</strong><p id="config-conflict-message"></p>
+    <button class="action ghost" id="config-export">Export local edits</button>
+    <button class="action" id="config-discard">Discard local edits and reload</button>
+  </div>
   <!-- Displays -->
   <section id="tab-displays">
     <div class="panel">
@@ -343,6 +356,54 @@ window.addEventListener("error", (event) => {
 
     <div class="panel" id="projection-panel">
       <h2>Projection</h2>
+      <fieldset>
+        <legend>Geometry</legend>
+        <div class="fields">
+          <div><label for="warp-mode">Requested mode</label><select id="warp-mode"><option value="simple">Simple rectangles</option><option value="warp">Warp</option></select></div>
+          <div><label for="warp-output">Output to edit</label><select id="warp-output"></select></div>
+        </div>
+        <p class="hint" id="warp-capability" role="status"></p>
+        <div class="row"><button class="action ghost" id="warp-convert">Replace warp settings from rectangles</button></div>
+        <p class="hint">Conversion replaces retained warp settings as an unsaved edit. Switching modes preserves both layouts.</p>
+        <div id="warp-controls" hidden>
+          <p class="hint">Destination pins move the picture within this output. Drag a handle or focus it and use arrow keys (0.001; Shift: 0.01). The two ends of each center line share one fraction. Pin edits keep source placement and browser dimensions fixed.</p>
+          <svg id="warp-editor" viewBox="-0.2 -0.2 1.4 1.4" preserveAspectRatio="none" role="group" aria-label="Destination geometry editor">
+            <rect x="0" y="0" width="1" height="1" class="warp-raster"/>
+            <polygon id="warp-quad"/>
+            <line id="warp-vertical"/><line id="warp-horizontal"/>
+            <ellipse data-handle="0" tabindex="0" role="button" aria-label="Top left corner"/>
+            <ellipse data-handle="1" tabindex="0" role="button" aria-label="Top right corner"/>
+            <ellipse data-handle="2" tabindex="0" role="button" aria-label="Bottom right corner"/>
+            <ellipse data-handle="3" tabindex="0" role="button" aria-label="Bottom left corner"/>
+            <ellipse data-handle="4" tabindex="0" role="button" aria-label="Vertical center top"/>
+            <ellipse data-handle="5" tabindex="0" role="button" aria-label="Vertical center bottom"/>
+            <ellipse data-handle="6" tabindex="0" role="button" aria-label="Horizontal center left"/>
+            <ellipse data-handle="7" tabindex="0" role="button" aria-label="Horizontal center right"/>
+          </svg>
+          <p id="warp-error" role="alert"></p>
+          <div class="fields" id="warp-numbers"></div>
+          <div class="row"><button class="action ghost" id="warp-reset-centers">Reset centers</button><button class="action ghost" id="warp-reset-pins">Reset pins</button></div>
+          <details><summary>Source placement and physical raster footprint</summary>
+            <p class="hint">Canvas units: width 1, height 1/aspect. Source placement selects browser content; the raster footprint describes physical light coverage. These are separate from destination pins.</p>
+            <div class="fields" id="warp-source"></div>
+          </details>
+        </div>
+        <p class="hint" id="warp-status" role="status"></p>
+        <div class="row"><button class="action" id="warp-save">Save</button><button class="action ghost" id="warp-cancel">Cancel</button></div>
+      </fieldset>
+      <fieldset id="warp-canvas">
+        <legend>Warp canvas</legend>
+        <p id="canvas-current" class="hint"></p>
+        <div class="fields">
+          <div><label for="canvas-aspect">Aspect (width / height)</label><input id="canvas-aspect" type="number" min="0.001" step="0.001"></div>
+          <div><label for="canvas-width">Chosen render width</label><input id="canvas-width" type="number" min="1" max="32768" step="1"></div>
+          <div><label for="canvas-scale">Recorded scale</label><input id="canvas-scale" type="number" min="0.001" step="0.05"></div>
+        </div>
+        <p class="hint">Adopting dimensions can resize and reflow the browser page. A scale below one loses one-to-one sampling. Recommendations use the current accepted canvas aspect. Pin dragging never adopts a recommendation.</p>
+        <div class="row"><button class="action ghost" id="canvas-adopt">Adopt chosen dimensions</button><button class="action ghost" id="canvas-recommend">Get recommendation</button></div>
+        <p class="hint" id="canvas-recommendation"></p><div class="row" id="canvas-presets"></div>
+      </fieldset>
+
       <p class="hint">The overlaps come from the layout above: drag the
         displays so they overlap exactly as the beams do on the surface — every
         seam its own amount. Suede renders the app once into that canvas and
@@ -721,16 +782,27 @@ const presetById = (id) => presets().find((p) => p.id === id);
 
 // --- helpers -------------------------------------------------------------
 
-async function api(path, options) {
+async function rawApi(path, options, metadata) {
   const response = await fetch(API + path, options);
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try { detail = (await response.json()).detail || detail; } catch {}
-    throw new Error(detail);
+    const error = new Error(detail); error.status = response.status; throw error;
+  }
+  if (metadata) {
+    metadata.generation = response.headers.get("x-config-generation");
+    metadata.epoch = response.headers.get("x-config-epoch");
+    metadata.revision = response.headers.get("etag");
   }
   if (response.status === 204) return null;
   const type = response.headers.get("content-type") || "";
   return type.includes("json") ? response.json() : response.blob();
+}
+function api(path, options) {
+  if (path.startsWith("/config") && options?.method && options.method !== "GET") {
+    return finishConfigWrite(path, options);
+  }
+  return rawApi(path, options);
 }
 const save = (path, body) => api(path, {
   method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -780,40 +852,116 @@ const bytes = (n) => n > 1048576 ? `${num(n / 1048576)} MB` : `${num(n / 1024, 0
 // until Save: the daemon holds them as a preview that any committed write or
 // restart discards. Cancel reverts to the snapshot taken at load/save.
 let configSnapshot = null;
-let previewTimer = null;
-let previewActive = false;
+let configGeneration = null, configEpoch = null, observedConfigEpoch = null, acceptedConfig = null;
+let previewTimer = null, previewActive = false, previewQueued = null;
+let previewFlight = null, writeTail = Promise.resolve(), lastPreviewAt = -Infinity;
+let editVersion = 0, configLoadSerial = 0, configConflict = false, configBusy = false;
+let recommendation = null;
 
-function pushPreview() {
-  clearTimeout(previewTimer);
-  previewTimer = setTimeout(async () => {
-    try {
-      // committed: false — the daemon applies it to the outputs and keeps
-      // disk untouched. Save later sends the same document with true.
-      await api("/config", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ...config, committed: false }),
-      });
-      previewActive = true;
-    } catch (error) {
-      toast(error.message, true);
-    }
-  }, 300);
+function configHeaders() {
+  if (configGeneration == null || configEpoch == null) throw new Error("Reload configuration to establish a working-copy version.");
+  return { "content-type": "application/json", "If-Match": String(config.revision),
+    "If-Config-Generation": String(configGeneration), "If-Config-Epoch": configEpoch };
 }
-
-async function cancelPreview() {
+function exclusiveWrite(operation) {
+  const result = writeTail.then(operation);
+  writeTail = result.catch(() => {});
+  return result;
+}
+function flagConflict(message) {
+  configConflict = true;
+  clearTimeout(previewTimer); previewQueued = null;
+  $("config-conflict").hidden = false;
+  $("config-conflict-message").textContent = message;
+  renderWarpStatus();
+}
+async function writeConfig(path, options) {
+  if (configConflict) throw new Error("Configuration changed elsewhere. Export your edits or reload before writing.");
+  const metadata = {};
+  try {
+    const result = await rawApi(path, { ...options, headers: { ...options.headers, ...configHeaders() } }, metadata);
+    if (metadata.generation == null || metadata.epoch !== configEpoch) throw new Error("The daemon did not return a working-copy version. Reload before editing.");
+    configGeneration = metadata.generation;
+    if (result?.revision != null) config.revision = result.revision;
+    return result;
+  } catch (error) {
+    if (error.status === 409 || error.status >= 500 || !error.status) flagConflict(error.message);
+    throw error;
+  }
+}
+function pushPreview() {
+  if (configBusy || configConflict) return;
+  editVersion++;
+  previewActive = true;
+  recommendation = null;
+  $("canvas-presets").replaceChildren();
+  $("canvas-recommendation").textContent = "Settings changed. Request a fresh recommendation.";
+  previewQueued = structuredClone(config);
+  schedulePreview();
+  renderWarpStatus();
+}
+function schedulePreview() {
   clearTimeout(previewTimer);
-  previewActive = false;
-  // Revert returns the saved document; adopt it as the new baseline.
+  if (!previewQueued || previewFlight || configBusy || configConflict) return;
+  previewTimer = setTimeout(sendPreview, Math.max(0, Math.ceil(50 - (performance.now() - lastPreviewAt))));
+}
+function sendPreview() {
+  if (!previewQueued || previewFlight || configBusy || configConflict) return;
+  if (performance.now() - lastPreviewAt < 50) { schedulePreview(); return; }
+  const next = previewQueued, version = editVersion;
+  previewQueued = null;
+  previewFlight = exclusiveWrite(async () => {
+    lastPreviewAt = performance.now();
+    const accepted = await writeConfig("/config", { method: "PUT", body: JSON.stringify({ ...next, committed: false }) });
+    acceptedConfig = structuredClone(accepted);
+    // Keep newer local pointer feedback while this response is in flight.
+    if (version === editVersion) config = structuredClone(accepted);
+  }).catch((error) => {
+    if (!configConflict) {
+      previewQueued = null;
+      if (acceptedConfig) config = structuredClone(acceptedConfig);
+      $("warp-error").textContent = error.message;
+      renderWarpEditor();
+    }
+    toast(error.message, true);
+  }).finally(() => { previewFlight = null; schedulePreview(); renderWarpStatus(); });
+}
+async function flushPreviews() {
+  while (previewFlight || previewQueued) {
+    if (previewFlight) await previewFlight;
+    else {
+      await new Promise(resolve => setTimeout(resolve, Math.max(0, Math.ceil(50 - (performance.now() - lastPreviewAt)))));
+      sendPreview();
+    }
+  }
+  if (configConflict) throw new Error("Reload after resolving the configuration conflict.");
+}
+async function finishConfigWrite(path, options) {
+  if (configBusy) throw new Error("A configuration operation is already in progress.");
+  configBusy = true;
+  document.querySelector("main").inert = true;
+  clearTimeout(previewTimer); previewQueued = null;
+  editVersion++;
+  try {
+    return await exclusiveWrite(async () => {
+      const result = await writeConfig(path, options);
+      previewActive = false;
+      acceptedConfig = null;
+      return result;
+    });
+  } finally { configBusy = false; document.querySelector("main").inert = false; }
+}
+async function cancelPreview() {
   config = await api("/config/revert", { method: "POST" });
   configSnapshot = structuredClone(config);
-  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection();
+  acceptedConfig = structuredClone(config);
+  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
   if (selected) selectOutput(selected);
 }
-
-// Persist exactly what is being looked at: the whole working document.
 function saveCommitted() {
-  return save("/config", { ...config, committed: true });
+  const next = structuredClone(config);
+  if (next.projection) next.projection.testPattern = null;
+  return save("/config", { ...next, committed: true });
 }
 
 async function run(operation, successMessage) {
@@ -822,7 +970,7 @@ async function run(operation, successMessage) {
     await loadConfig();
     if (successMessage) toast(successMessage);
     return result;
-  } catch (error) { toast(error.message, true); throw error; }
+  } catch (error) { toast(error.message, true); }
 }
 
 // --- alerts: warnings, what they mean, and what to do about them ---------
@@ -1473,7 +1621,8 @@ function outputEntryFromForm() {
   // specified one the moment the operator opens the editor and hits Save.
   const scale = $("o-scale").value.trim();
   return {
-    match: { name },
+    ...configEntry(name),
+    match: configEntry(name)?.match ?? { name },
     enable: $("o-enable").checked,
     mode: width ? { width, height, refreshHz } : null,
     position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
@@ -1884,14 +2033,14 @@ function paintCapabilities(r) {
 // output, needs neither overlaps nor a canvas, and is most wanted on the
 // plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
-  const idle = overlaps === 0;
-  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-renderer", "pj-save"]) {
+  const idle = overlaps === 0 && config?.projection?.mode !== "warp";
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free"]) {
     $(id).disabled = idle;
   }
   $("pj-idle").hidden = !idle;
 }
 
-function renderProjection() {
+function renderProjection(force = false) {
   // Never stomp an edit in progress. The pattern select lives in the Layout
   // panel, so it needs its own guard rather than the panel's.
   if ($("tp-pattern") !== document.activeElement) {
@@ -1901,8 +2050,9 @@ function renderProjection() {
   // left alone because an edit is in progress, so a config reload from
   // another client does not blank it.
   renderProjectionTiming();
+  renderWarpEditor();
   const panel = $("projection-panel");
-  if (panel.contains(document.activeElement)) return;
+  if (!force && panel.contains(document.activeElement)) return;
 
   const projection = config?.projection;
   $("pj-blend").checked = !!projection && projection.blend !== false;
@@ -1919,11 +2069,270 @@ function projectionFromForm() {
   const freeRun = $("pj-free").checked;
   const renderer = $("pj-renderer").value || "auto";
   const testPattern = $("tp-pattern").value || null;
-  // Off with default values: remove the section entirely. "auto" is the
-  // renderer's default, exactly like the other fields here.
-  return (!blend && gamma === 2.2 && blackLift === 0 && !testPattern && !freeRun && renderer === "auto")
-    ? null : { blend, gamma, blackLift, freeRun, renderer, testPattern };
+  return { ...config?.projection, mode: config?.projection?.mode ?? "simple",
+    blend, gamma, blackLift, freeRun, renderer, testPattern };
 }
+
+// --- destination geometry editor -----------------------------------------
+const outputKey = o => {
+  const m = o.match;
+  return m.name != null && m.make == null && m.model == null && m.serial == null ? m.name :
+    `edid:${m.name ?? ""}:${m.make ?? ""}:${m.model ?? ""}:${m.serial ?? ""}`;
+};
+const warpOutput = () => config?.outputs?.find(o => outputKey(o) === $("warp-output").value);
+const warpAvailable = () => projectionStats?.geometry?.warpAvailable === true && config?.projection?.renderer !== "cpu";
+const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy && !configConflict;
+let warpDrag = null, rejectedHandle = null;
+let projectionEventVersion = 0;
+
+// Solve the projective map from a unit square to the pins. Center endpoints
+// are recovered with its inverse, never a distance ratio on a perspective edge.
+function homography(from, to) {
+  const rows = [];
+  from.forEach(([x, y], i) => {
+    const [u, v] = to[i];
+    rows.push([x,y,1,0,0,0,-u*x,-u*y,u], [0,0,0,x,y,1,-v*x,-v*y,v]);
+  });
+  for (let i = 0; i < 8; i++) {
+    let pivot = i;
+    for (let j = i+1; j < 8; j++) if (Math.abs(rows[j][i]) > Math.abs(rows[pivot][i])) pivot = j;
+    [rows[i], rows[pivot]] = [rows[pivot], rows[i]];
+    if (Math.abs(rows[i][i]) < 1e-12) throw new Error("Pins form a singular perspective map.");
+    const divisor = rows[i][i]; rows[i] = rows[i].map(x => x / divisor);
+    for (let j = 0; j < 8; j++) if (j !== i) {
+      const factor = rows[j][i]; rows[j] = rows[j].map((x,k) => x-factor*rows[i][k]);
+    }
+  }
+  return rows.map(row => row[8]).concat(1);
+}
+const unitPins = [[0,0],[1,0],[1,1],[0,1]];
+function projectPoint(h, [x,y]) {
+  const d = h[6]*x + h[7]*y + h[8];
+  if (!Number.isFinite(d) || Math.abs(d) < 1e-10) throw new Error("Perspective map crosses a pole.");
+  return [(h[0]*x+h[1]*y+h[2])/d, (h[3]*x+h[4]*y+h[5])/d];
+}
+function validatePins(g) {
+  if (!g.corners.flat().every(Number.isFinite) || !g.center.every(v => Number.isFinite(v) && v >= .01 && v <= .99))
+    throw new Error("Use finite coordinates and center fractions from 0.01 to 0.99.");
+  if (g.corners.flat().some(v => Math.abs(v) > 16)) throw new Error("Pins exceed the supported coordinate range.");
+  for (let i=0; i<4; i++) {
+    const a=g.corners[i], b=g.corners[(i+1)%4], c=g.corners[(i+2)%4];
+    if ((b[0]-a[0])*(c[1]-b[1])-(b[1]-a[1])*(c[0]-b[0]) <= 1e-8)
+      throw new Error("Pins must remain convex in top-left, top-right, bottom-right, bottom-left order.");
+  }
+  for (const [h, domain] of [[homography(unitPins,g.corners),unitPins], [homography(g.corners,unitPins),unitPins]]) {
+    const denominators = domain.map(([x,y]) => h[6]*x+h[7]*y+h[8]);
+    if (!denominators.every(d => d > 1e-8) && !denominators.every(d => d < -1e-8))
+      throw new Error("Perspective map crosses a pole inside the source or output.");
+  }
+}
+function handlePoints(g) {
+  const h = homography(unitPins,g.corners), [cx,cy] = g.center;
+  return [...g.corners, ...[[cx,0],[cx,1],[0,cy],[1,cy]].map(p => projectPoint(h,p))];
+}
+function editGeometry(change, handle = null) {
+  if (!warpEditable() || !warpOutput()?.geometry) return;
+  const next = structuredClone(warpOutput().geometry);
+  try {
+    change(next); validatePins(next);
+    rejectedHandle = null; $("warp-error").textContent = "";
+    // Pointer-up often repeats the final move. Its state is already accepted,
+    // in flight, or in the newest queued slot; do not create a second preview.
+    if (JSON.stringify(next) === JSON.stringify(warpOutput().geometry)) { drawWarp(); return; }
+    warpOutput().geometry = next;
+    pushPreview(); drawWarp(); renderCanvas();
+    if (!warpDrag) renderWarpNumbers();
+  } catch (error) {
+    rejectedHandle = handle; $("warp-error").textContent = error.message; drawWarp();
+  }
+}
+function moveHandle(index, point) {
+  editGeometry(g => {
+    if (index < 4) g.corners[index] = point;
+    else {
+      const local = projectPoint(homography(g.corners,unitPins),point);
+      g.center[index < 6 ? 0 : 1] = local[index < 6 ? 0 : 1];
+    }
+  }, index);
+}
+function drawWarp() {
+  const g = warpOutput()?.geometry;
+  if (!g) return;
+  const points = handlePoints(g);
+  $("warp-quad").setAttribute("points",g.corners.map(p=>p.join(",")).join(" "));
+  [["warp-vertical",4,5],["warp-horizontal",6,7]].forEach(([id,a,b]) => {
+    for (const [attr,value] of Object.entries({x1:points[a][0],y1:points[a][1],x2:points[b][0],y2:points[b][1]})) $(id).setAttribute(attr,value);
+  });
+  document.querySelectorAll("[data-handle]").forEach(el => {
+    const i = Number(el.dataset.handle);
+    el.setAttribute("cx",points[i][0]); el.setAttribute("cy",points[i][1]); el.setAttribute("rx", 9 * 1.4 / Math.max(1,warpSvg.clientWidth));
+    el.setAttribute("ry", 9 * 1.4 / Math.max(1,warpSvg.clientHeight));
+    el.classList.toggle("rejected",i === rejectedHandle);
+    el.setAttribute("aria-disabled",String(!warpEditable()));
+  });
+}
+function renderWarpNumbers() {
+  const g = warpOutput()?.geometry;
+  if (!g) return;
+  const input = (id,label,value) => `<div><label for="${id}">${label}</label><input id="${id}" type="number" step="0.001" value="${value}" ${warpEditable()?"":"disabled"}></div>`;
+  $("warp-numbers").innerHTML = g.corners.map((p,i) => p.map((v,a) => input(`pin-${i}-${a}`,`${["Top left","Top right","Bottom right","Bottom left"][i]} ${a?"Y":"X"}`,v)).join("")).join("") +
+    g.center.map((v,a)=>input(`center-${a}`,`${a?"Horizontal":"Vertical"} center fraction`,v)).join("");
+  g.corners.forEach((p,i)=>p.forEach((v,a)=>$( `pin-${i}-${a}`).onchange = e => editGeometry(n=>n.corners[i][a]=Number(e.target.value),i)));
+  g.center.forEach((v,a)=>$(`center-${a}`).onchange = e => editGeometry(n=>n.center[a]=Number(e.target.value),a?6:4));
+  $("warp-source").innerHTML = ["source","rasterFootprint"].map(field => Object.entries(g[field]).map(([key,value]) => input(`${field}-${key}`,`${field === "source" ? "Source" : "Raster footprint"} ${key}`,value)).join("")).join("");
+  for (const field of ["source","rasterFootprint"]) for (const key of ["x","y","width","height"])
+    $(`${field}-${key}`).onchange = e => editGeometry(n => {
+      const value = Number(e.target.value);
+      if (!Number.isFinite(value) || (["width","height"].includes(key) && value <= 0)) throw new Error("Source and footprint dimensions must be finite and positive.");
+      n[field][key] = value;
+    });
+}
+function renderWarpEditor() {
+  if (!config || warpDrag) return;
+  $("warp-mode").value = config.projection?.mode ?? "simple";
+  const chosen = $("warp-output").value;
+  $("warp-output").innerHTML = (config.outputs ?? []).filter(o=>o.enable !== false).map(o=>`<option value="${escape(outputKey(o))}">${escape(outputKey(o))}</option>`).join("");
+  if ([...$("warp-output").options].some(o=>o.value===chosen)) $("warp-output").value = chosen;
+  $("warp-controls").hidden = !warpOutput()?.geometry;
+  const mode = warpOutput()?.mode;
+  $("warp-editor").style.aspectRatio = mode ? `${mode.width} / ${mode.height}` : "16 / 9";
+  drawWarp(); renderWarpNumbers(); renderWarpStatus(); renderCanvas();
+}
+function renderWarpStatus() {
+  const g = projectionStats?.geometry, c = projectionStats?.control;
+  $("warp-capability").textContent = `Effective mode: ${g?.effectiveMode ?? "unknown"}. ` +
+    (warpAvailable() ? "Warp capability verified. " : `Warp editing unavailable: ${g?.reason ?? "waiting for capability verification"}. `) +
+    (g?.retainedWarp || config?.projection?.canvas ? "Stored warp settings are retained." : "Convert rectangles to create warp settings.");
+  $("warp-mode").disabled = configConflict || configBusy;
+  $("warp-mode").querySelector('[value="warp"]').disabled = !warpAvailable();
+  for (const id of ["warp-convert","canvas-adopt","canvas-recommend"]) $(id).disabled = !warpAvailable() || configConflict || configBusy;
+  for (const id of ["warp-reset-pins","warp-reset-centers"]) $(id).disabled = !warpEditable();
+  $("warp-controls").inert = !warpEditable();
+  let message = previewActive || config?.committed === false ? "Unsaved edits. " : "";
+  if (configConflict) message += "Resolve the configuration conflict before editing.";
+  else if (previewQueued || previewFlight) message += "Preview awaiting server acceptance.";
+  else if (projectionStats?.running && c?.session && c?.appliedConfigGeneration != null && String(c.appliedConfigGeneration) === String(configGeneration))
+    message += "Effective projection installed for the latest accepted settings.";
+  else message += "Settings accepted; installation of this working copy is not yet confirmed.";
+  const output = c?.outputs?.find(o=>o.name===warpOutput()?.match?.name);
+  if (c?.session && output?.presentedGeneration != null) message +=
+    ` Selected output: presentation receipt for control generation ${output.presentedGeneration} (not optical visibility).`;
+  if (c?.lastFailure) message += ` ${c.lastFailure.reason ?? c.lastFailure.message ?? "Projection update failed."}`;
+  $("warp-status").textContent = message;
+}
+function oneToOneStatus() {
+  const g = warpOutput()?.geometry, mode = warpOutput()?.mode, c = config?.projection?.canvas;
+  if (!g || !mode || !c) return "One-to-one status unavailable.";
+  const h = Math.max(1, Math.round(c.renderWidth / c.aspect));
+  const source = [g.source.x*c.renderWidth, g.source.y*c.aspect*h,
+    g.source.width*c.renderWidth, g.source.height*c.aspect*h];
+  const exact = (c.scale ?? 1) >= 1 && g.center.every(v=>v===.5) &&
+    g.corners.every((p,i)=>p.every((v,a)=>v===unitPins[i][a])) &&
+    source.every(Number.isInteger) && source[2]===mode.width && source[3]===mode.height;
+  return exact ? "Selected output: one-to-one sampling." : "Selected output: resampled (not one-to-one).";
+}
+function renderCanvas() {
+  const c = config?.projection?.canvas;
+  $("canvas-current").textContent = c ? `Current: ${c.renderWidth} × ${Math.max(1,Math.round(c.renderWidth/c.aspect))}; aspect ${c.aspect}. ` +
+    oneToOneStatus() : "No retained warp canvas. Convert rectangles first.";
+  if (!$("warp-canvas").contains(document.activeElement)) {
+    $("canvas-aspect").value = c?.aspect ?? ""; $("canvas-width").value = c?.renderWidth ?? ""; $("canvas-scale").value = c?.scale ?? 1;
+  }
+  if (!recommendation) { $("canvas-presets").replaceChildren(); $("canvas-recommendation").textContent = "Recommendations are approximate and never applied automatically."; }
+}
+async function convertedRectangles() {
+  return api("/projection/convert", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({outputs:config.outputs})});
+}
+$("warp-convert").onclick = () => run(async () => {
+  const version = editVersion, result = await convertedRectangles();
+  if (version !== editVersion) throw new Error("Layout changed during conversion. Try again.");
+  if (!warpAvailable()) throw new Error("Warp capability is unavailable.");
+  const geometries = new Map(result.outputs.map(o=>[o.key,o.geometry]));
+  for (const o of config.outputs) if (geometries.has(outputKey(o))) o.geometry=geometries.get(outputKey(o));
+  config.projection = {...projectionFromForm(),canvas:result.canvas,mode:"warp"};
+  pushPreview(); renderWarpEditor();
+});
+$("warp-mode").onchange = e => {
+  if (!config) return;
+  if (e.target.value === "warp" && (!warpAvailable() || !config.projection?.canvas)) {
+    toast("Convert rectangles first, or wait for warp capability.",true); renderWarpEditor(); return;
+  }
+  config.projection = {...projectionFromForm(),mode:e.target.value}; pushPreview(); renderWarpEditor(); renderLayoutSize();
+};
+$("warp-output").onchange = renderWarpEditor;
+$("warp-save").onclick = () => $("pj-save").click();
+$("warp-cancel").onclick = () => $("pj-cancel").click();
+$("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
+$("warp-reset-pins").onclick = () => run(async () => {
+  const version=editVersion, key=$("warp-output").value, candidate=await convertedRectangles();
+  if (version!==editVersion || key!==$("warp-output").value) throw new Error("Selection changed during reset. Try again.");
+  const geometry = candidate.outputs.find(o=>o.key===key)?.geometry;
+  if (geometry) editGeometry(g=>g.corners=geometry.corners);
+});
+function adoptCanvas(aspect,width,scale) {
+  if (!warpAvailable() || !config?.projection?.canvas) throw new Error("Convert rectangles with warp capability verified first.");
+  const height=Math.max(1,Math.round(width/aspect));
+  if (![aspect,width,scale].every(v=>Number.isFinite(v)&&v>0) || !Number.isInteger(width) || width>32768 || height>32768 || width*height>64000000)
+    throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP, and a positive recorded scale.");
+  config.projection.canvas = {aspect,renderWidth:width,scale};
+  $("canvas-aspect").value=aspect; $("canvas-width").value=width; $("canvas-scale").value=scale;
+  pushPreview(); renderCanvas();
+}
+$("canvas-adopt").onclick = () => run(async () => adoptCanvas(Number($("canvas-aspect").value),Number($("canvas-width").value),Number($("canvas-scale").value)));
+$("canvas-recommend").onclick = () => run(async () => {
+  await flushPreviews();
+  const version=editVersion, result=await api("/projection/recommendation");
+  if (version!==editVersion || String(result.generation)!==String(configGeneration) || result.revision!==config.revision)
+    throw new Error("Recommendation is stale. Request another after the current edit settles.");
+  recommendation=result;
+  $("canvas-recommendation").textContent = `Approximate ideal: ${result.idealWidth} × ${result.idealHeight}; admissible: ${result.admissibleWidth} × ${result.admissibleHeight}. ` +
+    `Limits: ${result.knownLimits.maxDimension} per axis, ${result.knownLimits.maxCanvasPixels} canvas pixels, ${result.knownLimits.maxOutputPixels ?? 32000000} pixels per output. ` +
+    [...result.warnings,...result.unknownLimits.map(v=>`Unknown: ${v}`)].join(" ");
+  $("canvas-presets").replaceChildren();
+  for (const preset of result.presets) {
+    const button=document.createElement("button"); button.className="action ghost";
+    button.textContent=`Adopt ${preset.width} × ${preset.height} (${preset.scale}×)`;
+    button.onclick=()=>run(async()=>{
+      await flushPreviews();
+      const latest={}, current=await rawApi("/config",undefined,latest);
+      if (recommendation!==result || version!==editVersion || String(result.generation)!==String(latest.generation) || latest.epoch!==configEpoch || current.revision!==result.revision)
+        throw new Error("Recommendation is stale. Request another before adoption.");
+      adoptCanvas(result.requestedAspect,preset.width,preset.scale);
+    });
+    $("canvas-presets").append(button);
+  }
+});
+const warpSvg = $("warp-editor");
+function pointerPoint(event) {
+  const p = new DOMPoint(event.clientX,event.clientY).matrixTransform(warpSvg.getScreenCTM().inverse());
+  return [p.x,p.y];
+}
+warpSvg.addEventListener("pointerdown",event=>{
+  const handle=event.target.closest("[data-handle]");
+  if (!handle || !warpEditable()) return;
+  event.preventDefault(); handle.focus();
+  warpDrag={id:event.pointerId,index:Number(handle.dataset.handle)};
+  warpSvg.setPointerCapture(event.pointerId);
+});
+warpSvg.addEventListener("pointermove",event=>{
+  if (warpDrag?.id===event.pointerId) moveHandle(warpDrag.index,pointerPoint(event));
+});
+function endWarpDrag(event) {
+  if (warpDrag?.id!==event.pointerId) return;
+  if (event.type === "pointerup") moveHandle(warpDrag.index,pointerPoint(event));
+  warpDrag=null;
+  if (warpSvg.hasPointerCapture(event.pointerId)) warpSvg.releasePointerCapture(event.pointerId);
+  // pushPreview keeps the final valid state in the single newest-state slot.
+  renderWarpNumbers(); schedulePreview();
+}
+for (const type of ["pointerup","pointercancel","lostpointercapture"]) warpSvg.addEventListener(type,endWarpDrag);
+warpSvg.addEventListener("keydown",event=>{
+  const handle=event.target.closest("[data-handle]");
+  const delta={ArrowLeft:[-1,0],ArrowRight:[1,0],ArrowUp:[0,-1],ArrowDown:[0,1]}[event.key];
+  if (!handle || !delta || !warpEditable()) return;
+  event.preventDefault(); const i=Number(handle.dataset.handle), step=event.shiftKey?.01:.001;
+  moveHandle(i,handlePoints(warpOutput().geometry)[i].map((v,a)=>v+delta[a]*step));
+});
 
 // --- frame timing ----------------------------------------------------------
 //
@@ -2024,16 +2433,13 @@ for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-renderer", "
 $("pj-save").onclick = () => run(async () => {
   document.activeElement?.blur();
   if (!loaded()) return;
-  config.projection = projectionFromForm();
+  // Input handlers already updated the working copy. Do not reconstruct it
+  // from form values that may predate an accepted reload.
   // Blending settings are saved; the test pattern never is. An appliance
   // that boots into a test grid because someone left one up is a support
   // call, and the pattern is presented as a live diagnostic rather than a
   // setting — so committing here also takes it down.
-  if (config.projection?.testPattern) {
-    const { blend, gamma, blackLift, freeRun, renderer } = config.projection;
-    config.projection = (!blend && gamma === 2.2 && blackLift === 0 && !freeRun && renderer === "auto")
-      ? null : { blend, gamma, blackLift, freeRun, renderer, testPattern: null };
-  }
+  if (config.projection) config.projection.testPattern = null;
   clearTimeout(previewTimer);
   await saveCommitted();
 }, "saved projection");
@@ -2528,18 +2934,47 @@ document.querySelectorAll("nav button").forEach((button) => {
   };
 });
 
-async function loadConfig() {
-  config = await api("/config");
-  configSnapshot = structuredClone(config);
-  previewActive = false;
-  // Another client's change should not wipe out an edit in progress here.
-  if (document.activeElement !== $("config-json")) {
-    $("config-json").value = JSON.stringify(config, null, 2);
+async function loadConfig(force = false) {
+  const serial = ++configLoadSerial, version = editVersion, metadata = {};
+  const incoming = await rawApi("/config", undefined, metadata);
+  if (serial !== configLoadSerial || version !== editVersion || configBusy || previewFlight) return;
+  if (observedConfigEpoch != null && metadata.epoch !== observedConfigEpoch) {
+    // A restarted daemon can reuse numeric generations. Retire the old SSE
+    // source so already queued events cannot restore its stale applied status.
+    projectionEventVersion++;
+    if (projectionStats) projectionStats.control = null;
+    observedConfigEpoch = metadata.epoch;
+    if (stream) { stream.close(); stream = null; connect(); }
+  } else observedConfigEpoch = metadata.epoch;
+  if (!force && (previewActive || configConflict)) {
+    if (metadata.generation !== configGeneration || metadata.epoch !== configEpoch) flagConflict("Another client changed the working copy. Your local edits are preserved here.");
+    return;
   }
-  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection();
+  config = incoming;
+  if (configEpoch != null && configEpoch !== metadata.epoch && projectionStats) projectionStats.control = null;
+  configEpoch = metadata.epoch;
+  configGeneration = metadata.generation;
+  configSnapshot = structuredClone(config);
+  acceptedConfig = structuredClone(config);
+  previewActive = false; configConflict = false;
+  recommendation = null;
+  $("config-conflict").hidden = true;
+  if (document.activeElement !== $("config-json")) $("config-json").value = JSON.stringify(config, null, 2);
+  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
   if (selected) renderOutputBackgroundChoices(
     (config?.outputs ?? []).find((o) => o.match?.name === selected)?.background);
 }
+$("config-discard").onclick = () => run(async () => {
+  clearTimeout(previewTimer); previewQueued = null;
+  await writeTail;
+  editVersion++;
+  await loadConfig(true);
+}, "loaded current working copy");
+$("config-export").onclick = () => {
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(new Blob([JSON.stringify(config, null, 2)], { type: "application/json" }));
+  link.download = "suede-local-edits.json"; link.click(); URL.revokeObjectURL(link.href);
+};
 async function loadWallpapers() { wallpapers = await api("/wallpapers"); renderWallpapers(); }
 async function loadChecks() {
   checks = await api("/system/checks");
@@ -2560,7 +2995,9 @@ async function loadAll() {
   // itself always answers with an object now — {running, lastInterval} —
   // never a bare null, so a fetch failure here means the route is missing,
   // not that nothing is running.
-  projectionStats = await api("/projection/stats").catch(() => null);
+  const statsVersion = projectionEventVersion;
+  const latestStats = await api("/projection/stats").catch(() => null);
+  if (statsVersion === projectionEventVersion) projectionStats = latestStats;
   await loadConfig();
   renderAv(); renderOutputChoices();
   renderSystem(await api("/system"));
@@ -2570,7 +3007,7 @@ async function loadAll() {
 $("c-save").onclick = () => run(() =>
   save("/config", { ...JSON.parse($("config-json").value), committed: true }),
   "saved configuration");
-$("c-reload").onclick = () => run(async () => $("config-json").blur(), "reloaded from the daemon");
+$("c-reload").onclick = () => { $("config-json").blur(); $("config-discard").click(); };
 $("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
 
 // A laptop that slept has a stale page and an EventSource still working its
@@ -2669,6 +3106,8 @@ function connect() {
   const source = new EventSource(API + "/events");
   stream = source;
   source.onopen = () => {
+    if (stream !== source) return;
+    projectionEventVersion++;
     attempt = 0;
     hideOffline();
     $("live").textContent = "live"; $("live").className = "pill ok";
@@ -2704,15 +3143,17 @@ function connect() {
     renderApps();
   });
   source.addEventListener("status_changed", (e) => { status = JSON.parse(e.data); renderStatus(); });
-  source.addEventListener("config_changed", () => loadConfig());
+  source.addEventListener("config_changed", () => loadConfig().catch(error => toast(error.message, true)));
   source.addEventListener("checks_changed", (e) => { checks = JSON.parse(e.data); renderChecks(); renderAlerts(); });
   source.addEventListener("projection_stats_changed", (e) => {
+    if (stream !== source) return;
+    projectionEventVersion++;
     projectionStats = JSON.parse(e.data);
-    renderProjectionTiming();
+    renderProjectionTiming(); renderWarpStatus();
   });
 }
 
-window.addEventListener("resize", renderLayout);
+window.addEventListener("resize", () => { renderLayout(); drawWarp(); });
 loadAll().catch((error) => toast(error.message, true));
 // ?nosse: load once and stay static. For automated checks (a headless
 // browser's virtual clock never drains an endless event stream) — not for

@@ -6,7 +6,9 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::{DesiredState, SCHEMA_VERSION};
 
@@ -60,7 +62,39 @@ struct Documents {
 
 pub struct StateStore {
     dir: PathBuf,
+    /// Identifies this in-memory store instance. It is not a secret: it only
+    /// prevents a generation counter reset at daemon restart from looking like
+    /// the same working copy to an old client.
+    epoch: String,
     documents: RwLock<Documents>,
+}
+
+/// The two identities of a live configuration document.
+///
+/// `revision` identifies the persisted document. `generation` additionally
+/// identifies the in-memory working copy, so two previews of the same saved
+/// revision remain distinguishable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateVersion {
+    pub revision: u64,
+    pub generation: u64,
+    pub epoch: String,
+}
+
+/// Optional compare-and-swap conditions for a document transition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatePrecondition {
+    pub revision: Option<u64>,
+    pub generation: Option<u64>,
+    pub epoch: Option<String>,
+}
+
+/// A rejected conditional transition, or an error returned while preparing it.
+#[derive(Debug)]
+pub enum ConditionalWriteError<E> {
+    Precondition { current: StateVersion },
+    Rejected(E),
+    State(StateError),
 }
 
 impl StateStore {
@@ -112,6 +146,7 @@ impl StateStore {
 
         Ok(Self {
             dir,
+            epoch: fresh_epoch(),
             documents: RwLock::new(Documents {
                 current: {
                     let mut state = state;
@@ -130,6 +165,7 @@ impl StateStore {
     pub fn ephemeral(dir: PathBuf) -> Self {
         Self {
             dir,
+            epoch: fresh_epoch(),
             documents: RwLock::new(Documents {
                 current: {
                     let mut state = DesiredState::new();
@@ -199,6 +235,96 @@ impl StateStore {
         self.documents.read().unwrap().generation
     }
 
+    /// Read the effective document and both version identities in one lock
+    /// acquisition. HTTP responses use this to avoid advertising a revision
+    /// from one transition with a generation from another.
+    pub fn effective_with_version(&self) -> (DesiredState, StateVersion) {
+        let documents = self.documents.read().unwrap();
+        (
+            documents
+                .preview
+                .clone()
+                .unwrap_or_else(|| documents.current.clone()),
+            StateVersion {
+                revision: documents.current.revision,
+                generation: documents.generation,
+                epoch: self.epoch.clone(),
+            },
+        )
+    }
+
+    /// Atomically validate the expected version, build a saved document from
+    /// the current one, and persist it. `prepare` also receives the effective
+    /// document so retained projection settings keep the same semantics when a
+    /// working copy is live.
+    pub fn replace_if<E, F>(
+        &self,
+        expected: StatePrecondition,
+        prepare: F,
+    ) -> Result<(DesiredState, StateVersion), ConditionalWriteError<E>>
+    where
+        F: FnOnce(&DesiredState, &DesiredState) -> Result<DesiredState, E>,
+    {
+        let mut documents = self.documents.write().unwrap();
+        self.check_expected(&documents, expected)?;
+        let effective = documents
+            .preview
+            .as_ref()
+            .unwrap_or(&documents.current)
+            .clone();
+        let mut next =
+            prepare(&documents.current, &effective).map_err(ConditionalWriteError::Rejected)?;
+        next.schema_version = SCHEMA_VERSION;
+        next.revision = documents.current.revision.saturating_add(1);
+        next.committed = true;
+        self.persist(&next).map_err(ConditionalWriteError::State)?;
+        documents.current = next.clone();
+        documents.preview = None;
+        documents.generation = documents.generation.saturating_add(1);
+        let version = self.version(&documents);
+        Ok((next, version))
+    }
+
+    /// Atomically validate the expected version and replace the live working
+    /// copy. The supplied document is never persisted.
+    pub fn set_preview_if<E, F>(
+        &self,
+        expected: StatePrecondition,
+        prepare: F,
+    ) -> Result<(DesiredState, StateVersion), ConditionalWriteError<E>>
+    where
+        F: FnOnce(&DesiredState) -> Result<DesiredState, E>,
+    {
+        let mut documents = self.documents.write().unwrap();
+        self.check_expected(&documents, expected)?;
+        let effective = documents
+            .preview
+            .as_ref()
+            .unwrap_or(&documents.current)
+            .clone();
+        let mut preview = prepare(&effective).map_err(ConditionalWriteError::Rejected)?;
+        preview.committed = false;
+        preview.revision = documents.current.revision;
+        documents.preview = Some(preview.clone());
+        documents.generation = documents.generation.saturating_add(1);
+        let version = self.version(&documents);
+        Ok((preview, version))
+    }
+
+    /// Atomically discard a working copy when its version still matches.
+    pub fn clear_preview_if(
+        &self,
+        expected: StatePrecondition,
+    ) -> Result<(DesiredState, StateVersion), ConditionalWriteError<std::convert::Infallible>> {
+        let mut documents = self.documents.write().unwrap();
+        self.check_expected(&documents, expected)?;
+        documents.preview = None;
+        documents.generation = documents.generation.saturating_add(1);
+        let document = documents.current.clone();
+        let version = self.version(&documents);
+        Ok((document, version))
+    }
+
     /// Replace the document, bump its revision, and persist it.
     ///
     /// The caller is responsible for having validated `next`.
@@ -222,9 +348,19 @@ impl StateStore {
     where
         F: FnOnce(&mut DesiredState),
     {
-        let mut next = self.get();
-        edit(&mut next);
-        self.replace(next)
+        let result = self.replace_if(StatePrecondition::default(), |current, _| {
+            let mut next = current.clone();
+            edit(&mut next);
+            Ok::<_, std::convert::Infallible>(next)
+        });
+        match result {
+            Ok((state, _)) => Ok(state),
+            Err(ConditionalWriteError::State(error)) => Err(error),
+            Err(ConditionalWriteError::Precondition { .. }) => {
+                unreachable!("an empty precondition cannot be rejected")
+            }
+            Err(ConditionalWriteError::Rejected(never)) => match never {},
+        }
     }
 
     fn persist(&self, state: &DesiredState) -> Result<(), StateError> {
@@ -259,6 +395,47 @@ impl StateStore {
             source,
         })
     }
+
+    fn version(&self, documents: &Documents) -> StateVersion {
+        StateVersion {
+            revision: documents.current.revision,
+            generation: documents.generation,
+            epoch: self.epoch.clone(),
+        }
+    }
+
+    fn check_expected<E>(
+        &self,
+        documents: &Documents,
+        expected: StatePrecondition,
+    ) -> Result<(), ConditionalWriteError<E>> {
+        let current = self.version(documents);
+        if expected
+            .revision
+            .is_some_and(|revision| revision != current.revision)
+            || expected
+                .generation
+                .is_some_and(|generation| generation != current.generation)
+            || expected
+                .epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch != &current.epoch)
+        {
+            return Err(ConditionalWriteError::Precondition { current });
+        }
+        Ok(())
+    }
+}
+
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn fresh_epoch() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}-{:x}-{:x}", std::process::id(), nanos, sequence)
 }
 
 /// Read a current-schema document. `Ok(None)` means the file simply does not exist.
@@ -532,6 +709,65 @@ mod tests {
         assert!(reverted_generation > preview_generation);
         store.update(|_| {}).unwrap();
         assert!(store.generation() > reverted_generation);
+    }
+
+    #[test]
+    fn stale_epoch_rejects_a_restart_aba_with_the_same_revision_and_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = StateStore::load(dir.path().to_path_buf()).unwrap();
+        let (_, old) = first.effective_with_version();
+        drop(first);
+        let second = StateStore::load(dir.path().to_path_buf()).unwrap();
+        let (_, current) = second.effective_with_version();
+        assert_eq!(old.revision, current.revision);
+        assert_eq!(old.generation, current.generation);
+        assert_ne!(old.epoch, current.epoch);
+
+        let result = second.set_preview_if(
+            StatePrecondition {
+                revision: Some(old.revision),
+                generation: Some(old.generation),
+                epoch: Some(old.epoch),
+            },
+            |document| Ok::<_, std::convert::Infallible>(document.clone()),
+        );
+        assert!(matches!(
+            result,
+            Err(ConditionalWriteError::Precondition { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_conditional_commit_cannot_clear_a_newer_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = StateStore::ephemeral(dir.path().to_path_buf());
+        let (_, version) = store.effective_with_version();
+        let mut preview = store.get();
+        preview.settings.hide_cursor = false;
+        store
+            .set_preview_if(StatePrecondition::default(), |_| {
+                Ok::<_, std::convert::Infallible>(preview)
+            })
+            .unwrap();
+
+        // This models a reconciler adoption computed from `version` before
+        // the operator's preview was accepted. Its CAS must fail rather than
+        // persisting the old committed copy and clearing that preview.
+        let result = store.replace_if(
+            StatePrecondition {
+                revision: Some(version.revision),
+                generation: Some(version.generation),
+                epoch: Some(version.epoch),
+            },
+            |current, _| Ok::<_, std::convert::Infallible>(current.clone()),
+        );
+        assert!(matches!(
+            result,
+            Err(ConditionalWriteError::Precondition { .. })
+        ));
+        assert!(store.has_preview());
+        assert!(!store.effective().settings.hide_cursor);
+        assert!(store.get().settings.hide_cursor);
     }
 
     /// The project's alpha status means the only backwards-compatibility

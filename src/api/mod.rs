@@ -31,7 +31,7 @@ use crate::events::{EventHub, ServerEvent};
 use crate::model::{ConfigChange, DesiredState};
 use crate::reconciler::{ReconcileTrigger, Reconciler};
 use crate::snapshot::Snapshot;
-use crate::state::StateStore;
+use crate::state::{ConditionalWriteError, StatePrecondition, StateStore, StateVersion};
 use crate::supervisor::Supervisor;
 use crate::sway::SwayClient;
 
@@ -99,14 +99,103 @@ impl ApiState {
         Ok(saved)
     }
 
+    /// Commit a configuration transition only if both optional document
+    /// identities still match. Building, validation, persistence, and the
+    /// version comparison happen under the state-store write lock, so a
+    /// competing preview or section write cannot slip between them.
+    pub async fn commit_if<F>(
+        &self,
+        expected: StatePrecondition,
+        section: &str,
+        wait: Option<u64>,
+        prepare: F,
+    ) -> ApiResult<(DesiredState, StateVersion)>
+    where
+        F: FnOnce(&DesiredState) -> ApiResult<DesiredState>,
+    {
+        let (saved, version) = self
+            .store
+            .replace_if(expected, |current, effective| {
+                let mut next = prepare(current)?;
+                self.validate_configuration_against(&mut next, effective)?;
+                Ok(next)
+            })
+            .map_err(map_conditional_write_error)?;
+
+        self.events
+            .publish(ServerEvent::ConfigChanged(ConfigChange {
+                revision: saved.revision,
+                section: section.to_string(),
+            }));
+
+        match wait {
+            Some(seconds) => {
+                let timeout = std::time::Duration::from_secs(seconds.clamp(1, 120));
+                if tokio::time::timeout(timeout, self.reconciler.reconcile())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(section, "reconciliation did not settle within the wait");
+                }
+            }
+            None => self.trigger.request("config write"),
+        }
+
+        Ok((saved, version))
+    }
+
+    /// Apply an uncommitted working copy under the same atomic precondition
+    /// contract used by saves.
+    pub fn preview_if(
+        &self,
+        expected: StatePrecondition,
+        mut next: DesiredState,
+    ) -> ApiResult<(DesiredState, StateVersion)> {
+        let mut projection_only = false;
+        let result = self.store.set_preview_if(expected, |effective| {
+            self.validate_configuration_against(&mut next, effective)?;
+            projection_only = projection_only_change(effective, &next);
+            Ok(next)
+        });
+        let accepted = result.map_err(map_conditional_write_error)?;
+        if projection_only {
+            self.trigger.request_projection();
+        } else {
+            self.trigger.request("working copy");
+        }
+        Ok(accepted)
+    }
+
+    /// Discard an uncommitted working copy only when it is still the one the
+    /// caller read. This prevents a late Cancel from erasing a newer preview.
+    pub fn revert_if(
+        &self,
+        expected: StatePrecondition,
+    ) -> ApiResult<(DesiredState, StateVersion)> {
+        let accepted = self
+            .store
+            .clear_preview_if(expected)
+            .map_err(map_revert_error)?;
+        self.trigger.request("revert");
+        Ok(accepted)
+    }
+
     pub fn validate_configuration(&self, next: &mut DesiredState) -> ApiResult<()> {
         let previous = self.store.effective();
-        crate::projection_policy::preserve_retained(next, &previous);
+        self.validate_configuration_against(next, &previous)
+    }
+
+    fn validate_configuration_against(
+        &self,
+        next: &mut DesiredState,
+        previous: &DesiredState,
+    ) -> ApiResult<()> {
+        crate::projection_policy::preserve_retained(next, previous);
         next.validate(self.bootstrap.allow_overlaps)
             .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
         crate::projection_policy::validate_activation(
             next,
-            &previous,
+            previous,
             &self.snapshot.projection_control(),
             self.snapshot.slicer_running(),
             self.bootstrap.allow_overlaps,
@@ -131,6 +220,45 @@ impl ApiState {
             )));
         }
         Ok(())
+    }
+}
+
+/// Projection-only previews cannot change Sway output placement, apps, or
+/// other settings. Classify under the same state lock as the accepted edit;
+/// reading the old document outside that lock would race another operator.
+fn projection_only_change(previous: &DesiredState, next: &DesiredState) -> bool {
+    if previous.outputs.len() != next.outputs.len() {
+        return false;
+    }
+    let mut other_fields = next.clone();
+    other_fields.committed = previous.committed;
+    other_fields.revision = previous.revision;
+    other_fields.projection = previous.projection.clone();
+    for (output, previous_output) in other_fields.outputs.iter_mut().zip(&previous.outputs) {
+        output.geometry = previous_output.geometry.clone();
+    }
+    other_fields == *previous
+}
+
+fn map_conditional_write_error(error: ConditionalWriteError<ApiError>) -> ApiError {
+    match error {
+        ConditionalWriteError::Precondition { current } => ApiError::Conflict(format!(
+            "document is at revision {} and generation {}",
+            current.revision, current.generation
+        )),
+        ConditionalWriteError::Rejected(error) => error,
+        ConditionalWriteError::State(error) => ApiError::Internal(error.to_string()),
+    }
+}
+
+fn map_revert_error(error: ConditionalWriteError<std::convert::Infallible>) -> ApiError {
+    match error {
+        ConditionalWriteError::Precondition { current } => ApiError::Conflict(format!(
+            "document is at revision {} and generation {}",
+            current.revision, current.generation
+        )),
+        ConditionalWriteError::Rejected(never) => match never {},
+        ConditionalWriteError::State(error) => ApiError::Internal(error.to_string()),
     }
 }
 
@@ -461,6 +589,31 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[test]
+    fn only_projection_previews_bypass_topology_debounce() {
+        let previous = DesiredState::default();
+        let mut next = previous.clone();
+        next.projection = Some(crate::model::ProjectionConfig::default());
+        next.committed = !previous.committed;
+        assert!(projection_only_change(&previous, &next));
+        next.settings.hide_cursor = !previous.settings.hide_cursor;
+        assert!(!projection_only_change(&previous, &next));
+        next = previous.clone();
+        next.outputs.push(crate::model::OutputConfig::new(
+            crate::model::OutputMatch::default(),
+        ));
+        assert!(!projection_only_change(&previous, &next));
+
+        let previous: DesiredState =
+            serde_json::from_str(include_str!("../../docs/examples/four-output-warp.json"))
+                .unwrap();
+        let mut next = previous.clone();
+        next.outputs[0].geometry.as_mut().unwrap().corners[0][0] += 0.01;
+        assert!(projection_only_change(&previous, &next));
+        next.outputs[0].position.as_mut().unwrap().x += 1;
+        assert!(!projection_only_change(&previous, &next));
     }
 
     #[tokio::test]

@@ -6,7 +6,8 @@
 
 use crate::api::json::Json;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use utoipa::IntoParams;
 
@@ -16,6 +17,48 @@ use crate::model::{
     AppConfig, BackgroundPreset, DesiredState, OutputConfig, OutputMatch, ProjectionConfig,
     Settings,
 };
+use crate::state::{StatePrecondition, StateVersion};
+
+const CONFIG_GENERATION_HEADER: &str = "x-config-generation";
+const IF_CONFIG_GENERATION_HEADER: &str = "if-config-generation";
+const CONFIG_EPOCH_HEADER: &str = "x-config-epoch";
+const IF_CONFIG_EPOCH_HEADER: &str = "if-config-epoch";
+
+/// A full-document response paired with the exact state identity that
+/// produced it. `ETag` remains the persisted revision for established
+/// `If-Match` clients; `X-Config-Generation` adds working-copy identity.
+pub struct VersionedConfig {
+    document: DesiredState,
+    version: StateVersion,
+}
+
+impl VersionedConfig {
+    fn new(document: DesiredState, version: StateVersion) -> Self {
+        Self { document, version }
+    }
+}
+
+impl IntoResponse for VersionedConfig {
+    fn into_response(self) -> Response {
+        let mut response = Json(self.document).into_response();
+        response.headers_mut().insert(
+            header::ETAG,
+            HeaderValue::from_str(&format!("\"{}\"", self.version.revision))
+                .expect("u64 revision is a valid ETag"),
+        );
+        response.headers_mut().insert(
+            CONFIG_GENERATION_HEADER,
+            HeaderValue::from_str(&self.version.generation.to_string())
+                .expect("u64 generation is a valid header value"),
+        );
+        response.headers_mut().insert(
+            CONFIG_EPOCH_HEADER,
+            HeaderValue::from_str(&self.version.epoch)
+                .expect("state epoch is a valid header value"),
+        );
+        response
+    }
+}
 
 /// Optional blocking behavior for writes.
 #[derive(Debug, Default, Deserialize, IntoParams)]
@@ -25,10 +68,44 @@ pub struct WaitQuery {
     pub wait: Option<u64>,
 }
 
-fn if_match(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::IF_MATCH)
-        .and_then(|value| value.to_str().ok())
+fn precondition(headers: &HeaderMap) -> ApiResult<StatePrecondition> {
+    Ok(StatePrecondition {
+        revision: parse_condition(headers, header::IF_MATCH.as_str(), "If-Match")?,
+        generation: parse_condition(headers, IF_CONFIG_GENERATION_HEADER, "If-Config-Generation")?,
+        epoch: parse_opaque_condition(headers, IF_CONFIG_EPOCH_HEADER, "If-Config-Epoch")?,
+    })
+}
+
+fn parse_condition(headers: &HeaderMap, name: &str, label: &str) -> ApiResult<Option<u64>> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} must be a revision number")))?;
+    value
+        .trim()
+        .trim_matches('"')
+        .parse()
+        .map(Some)
+        .map_err(|_| ApiError::BadRequest(format!("{label} must be a revision number")))
+}
+
+fn parse_opaque_condition(
+    headers: &HeaderMap,
+    name: &str,
+    label: &str,
+) -> ApiResult<Option<String>> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| ApiError::BadRequest(format!("{label} must be a valid header value")))?;
+    if value.is_empty() {
+        return Err(ApiError::BadRequest(format!("{label} must not be empty")));
+    }
+    Ok(Some(value.to_owned()))
 }
 
 #[utoipa::path(
@@ -38,18 +115,35 @@ fn if_match(headers: &HeaderMap) -> Option<&str> {
         description = "The current document. `committed: false` means a \
                        working copy is live on the outputs but not saved.",
         body = DesiredState,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
     ))
 )]
-pub async fn get_config(State(state): State<ApiState>) -> Json<DesiredState> {
-    Json(state.store.effective())
+pub async fn get_config(State(state): State<ApiState>) -> VersionedConfig {
+    let (document, version) = state.store.effective_with_version();
+    VersionedConfig::new(document, version)
 }
 
 #[utoipa::path(
     put, path = "/api/v1/config", tag = "config",
-    params(WaitQuery), request_body = DesiredState,
+    params(
+        WaitQuery,
+        ("If-Match" = Option<String>, Header, description = "Optional persisted revision precondition from ETag"),
+        ("If-Config-Generation" = Option<u64>, Header, description = "Optional working-copy generation precondition"),
+        ("If-Config-Epoch" = Option<String>, Header, description = "Optional store-instance precondition from X-Config-Epoch"),
+    ), request_body = DesiredState,
     responses(
-        (status = 200, description = "The persisted document", body = DesiredState),
-        (status = 409, description = "If-Match revision is stale"),
+        (status = 200, description = "The accepted document", body = DesiredState,
+            headers(
+                ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+                ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+                ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+            )
+        ),
+        (status = 409, description = "If-Match, If-Config-Generation, or If-Config-Epoch is stale"),
         (status = 422, description = "Validation failed"),
     )
 )]
@@ -57,18 +151,20 @@ pub async fn put_config(
     State(state): State<ApiState>,
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
-    Json(mut body): Json<DesiredState>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
+    Json(body): Json<DesiredState>,
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
     if body.committed {
-        return state.commit(body, "all", query.wait).await.map(Json);
+        return state
+            .commit_if(expected, "all", query.wait, move |_| Ok(body))
+            .await
+            .map(|(document, version)| VersionedConfig::new(document, version));
     }
     // Not committed: everything except persistence. The document reaches the
     // outputs immediately; disk keeps the last saved state.
-    state.validate_configuration(&mut body)?;
-    state.store.set_preview(Some(body));
-    state.trigger.request("working copy");
-    Ok(Json(state.store.effective()))
+    state
+        .preview_if(expected, body)
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -89,11 +185,16 @@ pub async fn put_outputs(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(body): Json<Vec<OutputConfig>>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    next.outputs = body;
-    state.commit(next, "outputs", query.wait).await.map(Json)
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_if(expected, "outputs", query.wait, move |current| {
+            let mut next = current.clone();
+            next.outputs = body;
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -130,23 +231,28 @@ pub async fn put_output(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(mut body): Json<OutputConfig>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
     // The path is authoritative, so a body that disagrees cannot create a duplicate.
     if body.r#match.key() != key {
         body.r#match = OutputMatch::parse_key(&key);
     }
 
-    let mut next = state.store.get();
-    match next
-        .outputs
-        .iter_mut()
-        .find(|output| output.r#match.key() == key)
-    {
-        Some(existing) => *existing = body,
-        None => next.outputs.push(body),
-    }
-    state.commit(next, "outputs", query.wait).await.map(Json)
+    state
+        .commit_if(expected, "outputs", query.wait, move |current| {
+            let mut next = current.clone();
+            match next
+                .outputs
+                .iter_mut()
+                .find(|output| output.r#match.key() == key)
+            {
+                Some(existing) => *existing = body,
+                None => next.outputs.push(body),
+            }
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -162,17 +268,22 @@ pub async fn delete_output(
     Path(key): Path<String>,
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    let before = next.outputs.len();
-    next.outputs.retain(|output| output.r#match.key() != key);
-    if next.outputs.len() == before {
-        return Err(ApiError::NotFound(format!(
-            "no output configuration for {key}"
-        )));
-    }
-    state.commit(next, "outputs", query.wait).await.map(Json)
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_if(expected, "outputs", query.wait, move |current| {
+            let mut next = current.clone();
+            let before = next.outputs.len();
+            next.outputs.retain(|output| output.r#match.key() != key);
+            if next.outputs.len() == before {
+                return Err(ApiError::NotFound(format!(
+                    "no output configuration for {key}"
+                )));
+            }
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -196,16 +307,18 @@ pub async fn put_backgrounds(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(body): Json<Vec<BackgroundPreset>>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    next.backgrounds = body;
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
     // Validation rejects the write if this removed a preset an output still
     // refers to, so the two collections cannot drift out of agreement.
     state
-        .commit(next, "backgrounds", query.wait)
+        .commit_if(expected, "backgrounds", query.wait, move |current| {
+            let mut next = current.clone();
+            next.backgrounds = body;
+            Ok(next)
+        })
         .await
-        .map(Json)
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -220,19 +333,21 @@ pub async fn put_background(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(mut body): Json<BackgroundPreset>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
     // The path wins, so a mismatched body cannot silently create a second one.
     body.id = id;
-    let mut next = state.store.get();
-    match next.backgrounds.iter_mut().find(|p| p.id == body.id) {
-        Some(existing) => *existing = body,
-        None => next.backgrounds.push(body),
-    }
     state
-        .commit(next, "backgrounds", query.wait)
+        .commit_if(expected, "backgrounds", query.wait, move |current| {
+            let mut next = current.clone();
+            match next.backgrounds.iter_mut().find(|p| p.id == body.id) {
+                Some(existing) => *existing = body,
+                None => next.backgrounds.push(body),
+            }
+            Ok(next)
+        })
         .await
-        .map(Json)
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -249,40 +364,40 @@ pub async fn delete_background(
     Path(id): Path<String>,
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-
-    // Refused rather than cascaded: deleting a preset would otherwise blank
-    // every screen using it, which is a lot of damage for one click.
-    let users: Vec<String> = next
-        .outputs
-        .iter()
-        .filter(|output| {
-            output
-                .background
-                .as_ref()
-                .and_then(|background| background.preset_id())
-                == Some(id.as_str())
-        })
-        .map(|output| output.r#match.key())
-        .collect();
-    if !users.is_empty() {
-        return Err(ApiError::Conflict(format!(
-            "background preset {id:?} is still used by {}",
-            users.join(", ")
-        )));
-    }
-
-    let before = next.backgrounds.len();
-    next.backgrounds.retain(|preset| preset.id != id);
-    if next.backgrounds.len() == before {
-        return Err(ApiError::NotFound(format!("no background preset {id}")));
-    }
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
     state
-        .commit(next, "backgrounds", query.wait)
+        .commit_if(expected, "backgrounds", query.wait, move |current| {
+            let mut next = current.clone();
+            // Refused rather than cascaded: deleting a preset would otherwise blank
+            // every screen using it, which is a lot of damage for one click.
+            let users: Vec<String> = next
+                .outputs
+                .iter()
+                .filter(|output| {
+                    output
+                        .background
+                        .as_ref()
+                        .and_then(|background| background.preset_id())
+                        == Some(id.as_str())
+                })
+                .map(|output| output.r#match.key())
+                .collect();
+            if !users.is_empty() {
+                return Err(ApiError::Conflict(format!(
+                    "background preset {id:?} is still used by {}",
+                    users.join(", ")
+                )));
+            }
+            let before = next.backgrounds.len();
+            next.backgrounds.retain(|preset| preset.id != id);
+            if next.backgrounds.len() == before {
+                return Err(ApiError::NotFound(format!("no background preset {id}")));
+            }
+            Ok(next)
+        })
         .await
-        .map(Json)
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -303,11 +418,16 @@ pub async fn put_apps(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(body): Json<Vec<AppConfig>>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    next.apps = body;
-    state.commit(next, "apps", query.wait).await.map(Json)
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_if(expected, "apps", query.wait, move |current| {
+            let mut next = current.clone();
+            next.apps = body;
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -344,16 +464,20 @@ pub async fn put_app(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(mut body): Json<AppConfig>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
     body.id = id.clone();
-
-    let mut next = state.store.get();
-    match next.apps.iter_mut().find(|app| app.id == id) {
-        Some(existing) => *existing = body,
-        None => next.apps.push(body),
-    }
-    state.commit(next, "apps", query.wait).await.map(Json)
+    state
+        .commit_if(expected, "apps", query.wait, move |current| {
+            let mut next = current.clone();
+            match next.apps.iter_mut().find(|app| app.id == id) {
+                Some(existing) => *existing = body,
+                None => next.apps.push(body),
+            }
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -369,15 +493,20 @@ pub async fn delete_app(
     Path(id): Path<String>,
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    let before = next.apps.len();
-    next.apps.retain(|app| app.id != id);
-    if next.apps.len() == before {
-        return Err(ApiError::NotFound(format!("no app configuration for {id}")));
-    }
-    state.commit(next, "apps", query.wait).await.map(Json)
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_if(expected, "apps", query.wait, move |current| {
+            let mut next = current.clone();
+            let before = next.apps.len();
+            next.apps.retain(|app| app.id != id);
+            if next.apps.len() == before {
+                return Err(ApiError::NotFound(format!("no app configuration for {id}")));
+            }
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -398,11 +527,16 @@ pub async fn put_settings(
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
     Json(body): Json<Settings>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    next.settings = body;
-    state.commit(next, "settings", query.wait).await.map(Json)
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_if(expected, "settings", query.wait, move |current| {
+            let mut next = current.clone();
+            next.settings = body;
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
@@ -431,26 +565,44 @@ pub async fn put_projection(
     headers: HeaderMap,
     // `null` removes the section entirely — projection off, no trace left.
     Json(body): Json<Option<ProjectionConfig>>,
-) -> ApiResult<Json<DesiredState>> {
-    state.check_precondition(if_match(&headers))?;
-    let mut next = state.store.get();
-    next.projection = body;
-    state.commit(next, "projection", query.wait).await.map(Json)
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_if(expected, "projection", query.wait, move |current| {
+            let mut next = current.clone();
+            next.projection = body;
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 #[utoipa::path(
     post, path = "/api/v1/config/revert", tag = "config",
-    responses((
-        status = 200,
-        description = "Working copy discarded; the saved document is \
-                       re-applied and returned",
+    params(
+        ("If-Match" = Option<String>, Header, description = "Optional persisted revision precondition from ETag"),
+        ("If-Config-Generation" = Option<u64>, Header, description = "Optional working-copy generation precondition"),
+        ("If-Config-Epoch" = Option<String>, Header, description = "Optional store-instance precondition from X-Config-Epoch"),
+    ),
+    responses(
+        (status = 200,
+        description = "Working copy discarded; the saved document is re-applied and returned",
         body = DesiredState,
-    ))
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        )),
+        (status = 409, description = "If-Match, If-Config-Generation, or If-Config-Epoch is stale"),
+    )
 )]
-pub async fn revert_config(State(state): State<ApiState>) -> Json<DesiredState> {
-    state.store.set_preview(None);
-    state.trigger.request("revert");
-    Json(state.store.get())
+pub async fn revert_config(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> ApiResult<VersionedConfig> {
+    state
+        .revert_if(precondition(&headers)?)
+        .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
 /// Shared by handlers that need to report an unexpected state error.
@@ -464,9 +616,10 @@ pub const OK: StatusCode = StatusCode::OK;
 
 #[cfg(test)]
 mod tests {
+    use super::{CONFIG_EPOCH_HEADER, CONFIG_GENERATION_HEADER};
     use crate::api::test_support::{harness, Harness};
     use axum::body::Body;
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
     use tower::ServiceExt;
 
     async fn call(
@@ -495,6 +648,39 @@ mod tests {
         )
     }
 
+    async fn call_with_headers(
+        harness: &Harness,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder
+            .body(
+                body.map(|b| Body::from(b.to_string()))
+                    .unwrap_or(Body::empty()),
+            )
+            .unwrap();
+        let response = harness.router.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let response_headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            response_headers,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     const OUTPUT: &str = r#"{"match":{"name":"HDMI-A-1"},"enable":true,
         "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":0,"y":0}}"#;
 
@@ -509,6 +695,165 @@ mod tests {
         assert_eq!(body["revision"], 0);
         assert_eq!(body["outputs"].as_array().unwrap().len(), 0);
         assert_eq!(body["settings"]["hideCursor"], true);
+    }
+
+    #[tokio::test]
+    async fn full_config_responses_identify_the_exact_working_copy() {
+        let harness = harness(None);
+        let (status, headers, body) =
+            call_with_headers(&harness, "GET", "/api/v1/config", None, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("etag").unwrap(), "\"0\"");
+        assert_eq!(headers.get(CONFIG_GENERATION_HEADER).unwrap(), "0");
+        let epoch = headers
+            .get(CONFIG_EPOCH_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(!epoch.is_empty());
+        assert_eq!(body["revision"], 0);
+
+        let mut preview = harness.state.store.get();
+        preview.committed = false;
+        preview.settings.hide_cursor = false;
+        let (status, headers, _) = call_with_headers(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&preview).unwrap()),
+            &[
+                ("if-match", "0"),
+                ("if-config-generation", "0"),
+                ("if-config-epoch", &epoch),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("etag").unwrap(), "\"0\"");
+        assert_eq!(headers.get(CONFIG_GENERATION_HEADER).unwrap(), "1");
+        assert_eq!(headers.get(CONFIG_EPOCH_HEADER).unwrap(), epoch.as_str());
+
+        let (status, headers, body) = call_with_headers(
+            &harness,
+            "POST",
+            "/api/v1/config/revert",
+            None,
+            &[
+                ("if-match", "0"),
+                ("if-config-generation", "1"),
+                ("if-config-epoch", &epoch),
+            ],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get("etag").unwrap(), "\"0\"");
+        assert_eq!(headers.get(CONFIG_GENERATION_HEADER).unwrap(), "2");
+        assert_eq!(headers.get(CONFIG_EPOCH_HEADER).unwrap(), epoch.as_str());
+        assert_eq!(body["committed"], true);
+    }
+
+    #[tokio::test]
+    async fn competing_preview_save_and_revert_transitions_have_one_winner() {
+        let harness = harness(None);
+        let mut initial = harness.state.store.get();
+        initial.committed = false;
+        initial.settings.hide_cursor = false;
+        let (status, _, _) = call_with_headers(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&initial).unwrap()),
+            &[("if-match", "0"), ("if-config-generation", "0")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let mut replacement = harness.state.store.effective();
+        replacement.committed = false;
+        replacement.settings.hide_cursor = true;
+        let replacement_json = serde_json::to_string(&replacement).unwrap();
+        let preview = call_with_headers(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&replacement_json),
+            &[("if-match", "0"), ("if-config-generation", "1")],
+        );
+        let revert = call_with_headers(
+            &harness,
+            "POST",
+            "/api/v1/config/revert",
+            None,
+            &[("if-match", "0"), ("if-config-generation", "1")],
+        );
+        let (preview, revert) = tokio::join!(preview, revert);
+        assert_eq!(
+            [preview.0, revert.0]
+                .into_iter()
+                .filter(|status| *status == StatusCode::OK)
+                .count(),
+            1,
+            "only one same-generation preview/revert transition can apply"
+        );
+        assert_eq!(
+            [preview.0, revert.0]
+                .into_iter()
+                .filter(|status| *status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+
+        let (_, headers, document) =
+            call_with_headers(&harness, "GET", "/api/v1/config", None, &[]).await;
+        let revision = headers.get("etag").unwrap().to_str().unwrap().to_owned();
+        let generation = headers
+            .get(CONFIG_GENERATION_HEADER)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut saved = document.clone();
+        saved["committed"] = serde_json::Value::Bool(true);
+        let mut next_preview = document;
+        next_preview["committed"] = serde_json::Value::Bool(false);
+        next_preview["settings"]["hideCursor"] = serde_json::Value::Bool(false);
+        let saved_json = saved.to_string();
+        let next_preview_json = next_preview.to_string();
+        let write_headers = [
+            ("if-match", revision.as_str()),
+            ("if-config-generation", generation.as_str()),
+        ];
+        let save = call_with_headers(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&saved_json),
+            &write_headers,
+        );
+        let preview = call_with_headers(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&next_preview_json),
+            &write_headers,
+        );
+        let (save, preview) = tokio::join!(save, preview);
+        assert_eq!(
+            [save.0, preview.0]
+                .into_iter()
+                .filter(|status| *status == StatusCode::OK)
+                .count(),
+            1,
+            "only one same-generation preview/save transition can apply"
+        );
+        assert_eq!(
+            [save.0, preview.0]
+                .into_iter()
+                .filter(|status| *status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -426,6 +426,60 @@
           }
         ]
       },
+      "CanvasConfig": {
+        "additionalProperties": false,
+        "description": "Canvas aspect and the operator-selected render width.",
+        "properties": {
+          "aspect": {
+            "format": "double",
+            "type": "number"
+          },
+          "renderWidth": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scale": {
+            "description": "Descriptive operator-selected render scale. `renderWidth` remains the\nauthoritative raster width; this value is retained for UI and reports.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "aspect",
+          "renderWidth"
+        ],
+        "type": "object"
+      },
+      "CanvasRect": {
+        "additionalProperties": false,
+        "description": "A canvas rectangle in isotropic canvas units.",
+        "properties": {
+          "height": {
+            "format": "double",
+            "type": "number"
+          },
+          "width": {
+            "format": "double",
+            "type": "number"
+          },
+          "x": {
+            "format": "double",
+            "type": "number"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y",
+          "width",
+          "height"
+        ],
+        "type": "object"
+      },
       "CapabilityOutcome": {
         "description": "How a capability check ended.",
         "properties": {
@@ -687,6 +741,65 @@
         "required": [
           "revision",
           "section"
+        ],
+        "type": "object"
+      },
+      "ConvertLayoutRequest": {
+        "additionalProperties": false,
+        "description": "Request body for `POST /api/v1/projection/convert`.",
+        "properties": {
+          "outputs": {
+            "description": "The complete configured participant roster. Disabled entries are\nretained in the request but do not participate in the candidate.",
+            "items": {
+              "$ref": "#/components/schemas/OutputConfig"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "outputs"
+        ],
+        "type": "object"
+      },
+      "ConvertLayoutResponse": {
+        "description": "Candidate returned by the conversion endpoint.",
+        "properties": {
+          "canvas": {
+            "$ref": "#/components/schemas/CanvasConfig"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/ConvertedOutput"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "canvas",
+          "outputs",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "ConvertedOutput": {
+        "description": "One converted output, addressed by its stable configuration key.",
+        "properties": {
+          "geometry": {
+            "$ref": "#/components/schemas/OutputGeometry"
+          },
+          "key": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "geometry"
         ],
         "type": "object"
       },
@@ -1264,6 +1377,17 @@
             "description": "Whether the output should be enabled. `false` actively disables it.",
             "type": "boolean"
           },
+          "geometry": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputGeometry",
+                "description": "Persisted warp source, destination pins and physical footprint.\nKept independently from `position` and from the requested pipeline so\nswitching to simple mode does not discard calibrated warp settings."
+              }
+            ]
+          },
           "match": {
             "$ref": "#/components/schemas/OutputMatch",
             "description": "Which physical output this entry applies to."
@@ -1321,6 +1445,43 @@
         },
         "required": [
           "match"
+        ],
+        "type": "object"
+      },
+      "OutputGeometry": {
+        "additionalProperties": false,
+        "description": "Persisted per-output source placement and destination correction.",
+        "properties": {
+          "center": {
+            "items": {
+              "format": "double",
+              "type": "number"
+            },
+            "type": "array"
+          },
+          "corners": {
+            "description": "Output-local normalized destination pins in TL, TR, BR, BL order.",
+            "items": {
+              "items": {
+                "format": "double",
+                "type": "number"
+              },
+              "type": "array"
+            },
+            "type": "array"
+          },
+          "rasterFootprint": {
+            "$ref": "#/components/schemas/CanvasRect",
+            "description": "Physical light-field coverage, independent of source and destination\npins. Until a calibrated footprint is supplied, conversion copies the\nsource rectangle into this field."
+          },
+          "source": {
+            "$ref": "#/components/schemas/CanvasRect"
+          }
+        },
+        "required": [
+          "source",
+          "corners",
+          "rasterFootprint"
         ],
         "type": "object"
       },
@@ -1589,7 +1750,7 @@
       },
       "ProjectionConfig": {
         "additionalProperties": false,
-        "description": "Multi-projector configuration: edge blending today, warping later.\n\nThere is no overlap setting here, because the *layout is* the overlap\nconfiguration. Outputs are positioned in canvas space — the space the\ncontent is authored in — and wherever their rectangles intersect, that\nregion is projected by both machines. Different seams may overlap by\ndifferent amounts; rows and grids work the same way.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
+        "description": "Multi-projector configuration, including retained simple and warp layouts.\n\nThere is no overlap setting here, because the source layout determines\noverlap. In simple mode, outputs are positioned in canvas space — the\nspace the content is authored in — and wherever their rectangles intersect,\nthat region is projected by both machines. Warp mode stores those source\nrectangles separately from destination pins.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
         "properties": {
           "blackLift": {
             "default": 0.0,
@@ -1599,8 +1760,20 @@
           },
           "blend": {
             "default": true,
-            "description": "Master switch. `false` keeps the configuration but skips the entire\nblending chain: no overlays run, nothing is spawned, no divergences.",
+            "description": "Master switch for seam ramps. `false` retains required slicing and warp\nprocessing but disables the transfer fades.",
             "type": "boolean"
+          },
+          "canvas": {
+            "default": null,
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CanvasConfig",
+                "description": "Canvas geometry retained independently from simple output positions."
+              }
+            ]
           },
           "freeRun": {
             "default": false,
@@ -1612,6 +1785,15 @@
             "description": "The projectors' transfer gamma, shaping every ramp's fall-off.\n\nA ramp that is linear in signal is not linear in light: the display\nraises the signal to `gamma`. Each ramp is therefore pre-shaped as\n`ramp^(1/gamma)` so that the *luminance* of the two overlapping\nprojectors sums to a constant across the seam. One value for the whole\ninstallation — these are near-universally identical projectors; per-output\noverrides can be added later if mixed models ever matter.",
             "format": "double",
             "type": "number"
+          },
+          "mode": {
+            "default": "simple",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ProjectionMode",
+                "description": "Which geometry pipeline is requested. Warp settings remain retained\nwhile simple mode is active."
+              }
+            ]
           },
           "renderer": {
             "default": "auto",
@@ -1720,6 +1902,15 @@
               "null"
             ]
           },
+          "appliedConfigGeneration": {
+            "description": "Working-copy generation whose projection snapshot the slicer has\ninstalled. It advances only on an `applied` event from the current\nslicer session, or when an unchanged effective snapshot is already\nknown to have been installed. It must never be compared with the\nchild-local control generations.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "appliedGeneration": {
             "description": "Highest generation installed as a complete render revision.",
             "format": "int64",
@@ -1780,6 +1971,15 @@
           },
           "presentedGeneration": {
             "description": "Highest generation presented by any output. Independent heads need\nnot physically present a generation at the same instant.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "requestedConfigGeneration": {
+            "description": "Working-copy generation whose effective projection snapshot the\nmanager most recently asked this slicer session to realize. This is\ndeliberately separate from `requested_generation`: the latter is a\nchild-local control sequence, while this identifies the configuration\nresponse the editor received.",
             "format": "int64",
             "minimum": 0,
             "type": [
@@ -1853,12 +2053,59 @@
         },
         "type": "object"
       },
+      "ProjectionGeometryStatus": {
+        "properties": {
+          "effectiveMode": {
+            "$ref": "#/components/schemas/ProjectionMode"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requestedMode": {
+            "$ref": "#/components/schemas/ProjectionMode"
+          },
+          "requestedRenderer": {
+            "$ref": "#/components/schemas/Renderer"
+          },
+          "retainedWarp": {
+            "type": "boolean"
+          },
+          "warpAvailable": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "requestedRenderer",
+          "requestedMode",
+          "effectiveMode",
+          "retainedWarp"
+        ],
+        "type": "object"
+      },
+      "ProjectionMode": {
+        "description": "The selected projection pipeline.",
+        "enum": [
+          "simple",
+          "warp"
+        ],
+        "type": "string"
+      },
       "ProjectionReport": {
         "description": "What the projection pipeline is doing right now, as served by `GET\n/projection/stats` and `projection_stats_changed`.\n\nAdded 2026-09-15: a four-projector bench had a slicer that was\ndemonstrably alive (`pgrep -f \"suede slice\"` found it, and it had logged\nits startup line) but had produced no frames, because the frame loop is\ndamage-driven and the active page was a static image. The endpoint used\nto be `ProjectionStats | null`, and that `null` was reported for \"no\nslicer at all\" and \"slicer running but silent\" alike — which is exactly\nhow a running slicer got diagnosed as not running. `running` is tracked\nseparately from whatever the slicer has or has not reported, so the two\nsituations are no longer the same value.",
         "properties": {
           "control": {
             "$ref": "#/components/schemas/ProjectionControlStatus",
             "description": "Lifecycle of the most recent live slicer update.  This is independent\nof frame-interval statistics: a static canvas can apply a revision\nbefore it has any ten-second interval to report."
+          },
+          "geometry": {
+            "$ref": "#/components/schemas/ProjectionGeometryStatus",
+            "description": "Public mode selection, independent of sampler-level child diagnostics."
           },
           "lastInterval": {
             "oneOf": [
@@ -2027,6 +2274,84 @@
         ],
         "type": "object"
       },
+      "RecommendationResponse": {
+        "description": "Read-only resolution guidance. `approximate` is always true: the sampled\nJacobian maximum plus an engineering margin is guidance, not a proof of the\nexact maximum density.",
+        "properties": {
+          "admissibleHeight": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "admissibleWidth": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "approximate": {
+            "type": "boolean"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idealHeight": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "idealWidth": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "knownLimits": {
+            "$ref": "#/components/schemas/ResolutionLimits"
+          },
+          "presets": {
+            "items": {
+              "$ref": "#/components/schemas/ScalePreset"
+            },
+            "type": "array"
+          },
+          "requestedAspect": {
+            "format": "double",
+            "type": "number"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unknownLimits": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "revision",
+          "generation",
+          "requestedAspect",
+          "idealWidth",
+          "idealHeight",
+          "admissibleWidth",
+          "admissibleHeight",
+          "presets",
+          "knownLimits",
+          "unknownLimits",
+          "warnings",
+          "approximate"
+        ],
+        "type": "object"
+      },
       "Rect": {
         "properties": {
           "height": {
@@ -2062,6 +2387,32 @@
           "gpu"
         ],
         "type": "string"
+      },
+      "ResolutionLimits": {
+        "description": "Known allocation limits used by the recommendation calculation.",
+        "properties": {
+          "maxCanvasPixels": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxDimension": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxOutputPixels": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "maxDimension",
+          "maxCanvasPixels",
+          "maxOutputPixels"
+        ],
+        "type": "object"
       },
       "RestartPolicy": {
         "additionalProperties": false,
@@ -2108,6 +2459,36 @@
           "apiRequest"
         ],
         "type": "string"
+      },
+      "ScalePreset": {
+        "description": "A UI-adoptable resolution preset.",
+        "properties": {
+          "achievedScale": {
+            "format": "double",
+            "type": "number"
+          },
+          "height": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scale": {
+            "format": "double",
+            "type": "number"
+          },
+          "width": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "scale",
+          "width",
+          "height",
+          "achievedScale"
+        ],
+        "type": "object"
       },
       "Settings": {
         "additionalProperties": false,
@@ -2912,7 +3293,29 @@
                 }
               }
             },
-            "description": "The current document. `committed: false` means a working copy is live on the outputs but not saved."
+            "description": "The current document. `committed: false` means a working copy is live on the outputs but not saved.",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -2931,6 +3334,44 @@
               "format": "int64",
               "minimum": 0,
               "type": "integer"
+            }
+          },
+          {
+            "description": "Optional persisted revision precondition from ETag",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional working-copy generation precondition",
+            "in": "header",
+            "name": "If-Config-Generation",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional store-instance precondition from X-Config-Epoch",
+            "in": "header",
+            "name": "If-Config-Epoch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
@@ -2953,10 +3394,32 @@
                 }
               }
             },
-            "description": "The persisted document"
+            "description": "The accepted document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           },
           "409": {
-            "description": "If-Match revision is stale"
+            "description": "If-Match, If-Config-Generation, or If-Config-Epoch is stale"
           },
           "422": {
             "description": "Validation failed"
@@ -3603,6 +4066,46 @@
     "/api/v1/config/revert": {
       "post": {
         "operationId": "revert_config",
+        "parameters": [
+          {
+            "description": "Optional persisted revision precondition from ETag",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional working-copy generation precondition",
+            "in": "header",
+            "name": "If-Config-Generation",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional store-instance precondition from X-Config-Epoch",
+            "in": "header",
+            "name": "If-Config-Epoch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3612,7 +4115,32 @@
                 }
               }
             },
-            "description": "Working copy discarded; the saved document is re-applied and returned"
+            "description": "Working copy discarded; the saved document is re-applied and returned",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "If-Match, If-Config-Generation, or If-Config-Epoch is stale"
           }
         },
         "tags": [
@@ -3774,6 +4302,61 @@
         },
         "tags": [
           "observed"
+        ]
+      }
+    },
+    "/api/v1/projection/convert": {
+      "post": {
+        "operationId": "convert_layout",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConvertLayoutRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConvertLayoutResponse"
+                }
+              }
+            },
+            "description": "Converted candidate"
+          },
+          "422": {
+            "description": "The layout is incomplete or invalid"
+          }
+        },
+        "summary": "`POST /api/v1/projection/convert` — derive a warp candidate without saving.",
+        "tags": [
+          "projection"
+        ]
+      }
+    },
+    "/api/v1/projection/recommendation": {
+      "get": {
+        "operationId": "recommend_resolution",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecommendationResponse"
+                }
+              }
+            },
+            "description": "Approximate render-resolution guidance"
+          }
+        },
+        "summary": "`GET /api/v1/projection/recommendation` — estimate a useful canvas density.",
+        "tags": [
+          "projection"
         ]
       }
     },

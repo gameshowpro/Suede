@@ -7,7 +7,7 @@
 //! which is also what bounds the respawn rate.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -43,6 +43,23 @@ struct RunningSlicer {
     /// reports the CPU fallback; future edits then replace the child.
     live_control: bool,
     writer: Option<ControlWriter>,
+    /// Translation from this child session's control sequence to the
+    /// StateStore working-copy generation that produced its complete
+    /// snapshot. These are different namespaces: config previews can change
+    /// without a new child, and a child starts its sequence at zero.
+    config_generations: Arc<Mutex<BTreeMap<u64, u64>>>,
+    protocol_mismatch: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Session-scoped state owned by the stdout reader. Keeping it together makes
+/// the reader's epoch, session and config-generation gate one coherent
+/// boundary instead of a loose collection of arguments.
+#[derive(Clone)]
+struct SlicerReaderState {
+    current_epoch: Arc<Mutex<u64>>,
+    epoch: u64,
+    session: String,
+    config_generations: Arc<Mutex<BTreeMap<u64, u64>>>,
     protocol_mismatch: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -202,10 +219,24 @@ impl BlendManager {
             )));
     }
 
-    fn mark_control_requested(&self, session: &str, generation: u64, spec: &SlicerSpec) {
+    fn mark_control_requested(
+        &self,
+        session: &str,
+        generation: u64,
+        config_generation: u64,
+        spec: &SlicerSpec,
+    ) {
         if self.snapshot.update_projection_control(|status| {
             status.session = Some(session.to_string());
             highest_generation(&mut status.requested_generation, generation);
+            status.requested_config_generation = Some(config_generation);
+            // If the same complete control snapshot was already installed,
+            // a later StateStore generation that resolves to it is applied
+            // too. This is the only no-control-message fast path; an
+            // in-flight newer control generation cannot satisfy it.
+            if status.applied_generation == status.requested_generation {
+                status.applied_config_generation = Some(config_generation);
+            }
             status.requested_mode = Some(
                 if spec_requests_warp(spec) {
                     "warp"
@@ -228,12 +259,13 @@ impl BlendManager {
         Ok(generation)
     }
 
-    fn queue_update(&mut self, spec: SlicerSpec) -> Result<(), String> {
+    fn queue_update(&mut self, spec: SlicerSpec, config_generation: u64) -> Result<(), String> {
         let generation = self.next_control_generation()?;
         let Some(running) = self.slicer.as_ref() else {
             return Err("slicer is not running".to_string());
         };
         let session = running.session.clone();
+        record_config_generation(&running.config_generations, generation, config_generation);
         running
             .writer
             .as_ref()
@@ -244,7 +276,7 @@ impl BlendManager {
                 spec.clone(),
             ))
             .map_err(|error| error.to_string())?;
-        self.mark_control_requested(&session, generation, &spec);
+        self.mark_control_requested(&session, generation, config_generation, &spec);
         Ok(())
     }
 
@@ -389,7 +421,11 @@ impl BlendManager {
     }
 
     /// Make the running slicer match `spec`. `None` tears it down.
-    pub fn sync_slicer(&mut self, spec: Option<&SlicerSpec>) -> Vec<Divergence> {
+    pub fn sync_slicer(
+        &mut self,
+        spec: Option<&SlicerSpec>,
+        config_generation: u64,
+    ) -> Vec<Divergence> {
         if self.poll_slicer() {
             tracing::warn!("slicer control pipe closed; will respawn");
             self.stop_slicer("control pipe closed");
@@ -467,18 +503,45 @@ impl BlendManager {
                     .session
                     .clone();
                 let mut desired = spec.clone();
-                desired.control_session = session;
+                desired.control_session = session.clone();
                 let changed = self
                     .slicer
                     .as_ref()
                     .is_some_and(|current| current.desired != desired);
                 if changed {
-                    if let Err(error) = self.queue_update(desired.clone()) {
+                    if let Err(error) = self.queue_update(desired.clone(), config_generation) {
                         tracing::warn!(%error, "could not queue slicer control update; will respawn");
                         self.stop_slicer("control writer stopped");
                     } else if let Some(running) = &mut self.slicer {
                         running.desired = desired;
                     }
+                } else {
+                    // A state transition can leave the effective projection
+                    // snapshot byte-for-byte unchanged (for example, an
+                    // unrelated configuration edit). Correlate that accepted
+                    // working copy without inventing a control generation.
+                    let control_generation = self
+                        .snapshot
+                        .projection_control()
+                        .requested_generation
+                        .unwrap_or(0);
+                    if let Some(running) = self.slicer.as_ref() {
+                        // This generation may still be building. Associate
+                        // its eventual applied event with the newest
+                        // equivalent StateStore snapshot, rather than the
+                        // earlier preview that happened to start the build.
+                        record_config_generation(
+                            &running.config_generations,
+                            control_generation,
+                            config_generation,
+                        );
+                    }
+                    self.mark_control_requested(
+                        &session,
+                        control_generation,
+                        config_generation,
+                        spec,
+                    );
                 }
             }
             return Vec::new();
@@ -529,6 +592,8 @@ impl BlendManager {
                     None
                 };
                 let protocol_mismatch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let config_generations =
+                    Arc::new(Mutex::new(BTreeMap::from([(0, config_generation)])));
                 let (epoch, control_reset) = {
                     let mut current = self.slicer_epoch.lock().unwrap();
                     *current += 1;
@@ -546,10 +611,13 @@ impl BlendManager {
                         stdout,
                         self.snapshot.clone(),
                         self.events.clone(),
-                        self.slicer_epoch.clone(),
-                        epoch,
-                        session.clone(),
-                        protocol_mismatch.clone(),
+                        SlicerReaderState {
+                            current_epoch: self.slicer_epoch.clone(),
+                            epoch,
+                            session: session.clone(),
+                            config_generations: config_generations.clone(),
+                            protocol_mismatch: protocol_mismatch.clone(),
+                        },
                     );
                 }
                 self.slicer = Some(RunningSlicer {
@@ -559,6 +627,7 @@ impl BlendManager {
                     desired: desired.clone(),
                     live_control,
                     writer: stdin.map(ControlWriter::spawn),
+                    config_generations,
                     protocol_mismatch,
                 });
                 // --spec is generation zero in this new session. Do not
@@ -568,6 +637,7 @@ impl BlendManager {
                     self.mark_control_requested(
                         &self.slicer.as_ref().expect("child just started").session,
                         0,
+                        config_generation,
                         &desired,
                     );
                 }
@@ -605,7 +675,20 @@ impl BlendManager {
     }
 }
 
+#[cfg(test)]
 fn update_control_status(snapshot: &Snapshot, event: ControlEvent) -> bool {
+    update_control_status_for_config(snapshot, event, None)
+}
+
+/// Apply one child lifecycle event. `config_generation` is looked up while
+/// the reader is still tied to the child session, so an old child's local
+/// generation can never be mistaken for the StateStore generation of its
+/// replacement.
+fn update_control_status_for_config(
+    snapshot: &Snapshot,
+    event: ControlEvent,
+    config_generation: Option<u64>,
+) -> bool {
     snapshot.update_projection_control(|status| {
         status.session = Some(event.session);
         match event.kind {
@@ -644,7 +727,17 @@ fn update_control_status(snapshot: &Snapshot, event: ControlEvent) -> bool {
                 upload_ms,
                 sampling_modes,
             } => {
+                let advances_applied = status
+                    .applied_generation
+                    .is_none_or(|previous| event.generation >= previous);
                 highest_generation(&mut status.applied_generation, event.generation);
+                if advances_applied {
+                    // A pruned translation is intentionally reported as
+                    // unknown rather than leaving an older correlation in
+                    // place: the new render revision may differ from that
+                    // older snapshot.
+                    status.applied_config_generation = config_generation;
+                }
                 set_output_generation(
                     &mut status.outputs,
                     &outputs,
@@ -710,6 +803,34 @@ fn update_control_status(snapshot: &Snapshot, event: ControlEvent) -> bool {
             }
         }
     })
+}
+
+/// Keep only a bounded translation window. The slicer can still finish one
+/// older build after a burst of coalesced updates, so preserve a generous
+/// tail rather than retaining every drag sample forever. A missing entry
+/// simply withholds config correlation; it never guesses a wrong one.
+const MAX_CONFIG_GENERATION_MAPPINGS: usize = 256;
+
+fn record_config_generation(
+    mappings: &Arc<Mutex<BTreeMap<u64, u64>>>,
+    control_generation: u64,
+    config_generation: u64,
+) {
+    let mut mappings = mappings.lock().unwrap();
+    mappings.insert(control_generation, config_generation);
+    while mappings.len() > MAX_CONFIG_GENERATION_MAPPINGS {
+        let Some(oldest) = mappings.keys().copied().find(|generation| *generation != 0) else {
+            break;
+        };
+        mappings.remove(&oldest);
+    }
+}
+
+fn config_generation_for(
+    mappings: &Arc<Mutex<BTreeMap<u64, u64>>>,
+    control_generation: u64,
+) -> Option<u64> {
+    mappings.lock().unwrap().get(&control_generation).copied()
 }
 
 #[derive(Clone, Copy)]
@@ -835,10 +956,7 @@ fn spawn_slicer_stdout_reader(
     stdout: ChildStdout,
     snapshot: Arc<Snapshot>,
     events: EventHub,
-    current_epoch: Arc<Mutex<u64>>,
-    epoch: u64,
-    session: String,
-    protocol_mismatch: Arc<std::sync::atomic::AtomicBool>,
+    state: SlicerReaderState,
 ) {
     let build = std::thread::Builder::new()
         .name("slicer-stats".to_string())
@@ -854,19 +972,22 @@ fn spawn_slicer_stdout_reader(
                     }
                 };
                 if let Ok(event) = serde_json::from_slice::<ControlEvent>(&line) {
-                    if event_belongs_to_session(&event, &session) {
-                        let current = current_epoch.lock().unwrap();
-                        if *current != epoch {
+                    if event_belongs_to_session(&event, &state.session) {
+                        let current = state.current_epoch.lock().unwrap();
+                        if *current != state.epoch {
                             break;
                         }
                         if event.version == super::control::CONTROL_VERSION {
-                            if update_control_status(&snapshot, event) {
+                            let config_generation =
+                                config_generation_for(&state.config_generations, event.generation);
+                            if update_control_status_for_config(&snapshot, event, config_generation)
+                            {
                                 events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
                                     snapshot.projection_report(),
                                 )));
                             }
                         } else {
-                            protocol_mismatch.store(true, Ordering::SeqCst);
+                            state.protocol_mismatch.store(true, Ordering::SeqCst);
                         }
                     } else {
                         tracing::debug!("ignored a control event from another slicer session");
@@ -885,8 +1006,8 @@ fn spawn_slicer_stdout_reader(
                         // critical section.  An old reader may publish just
                         // before a stop clears status, never after a new
                         // child has replaced it.
-                        let current = current_epoch.lock().unwrap();
-                        if *current != epoch {
+                        let current = state.current_epoch.lock().unwrap();
+                        if *current != state.epoch {
                             break;
                         }
                         snapshot.set_projection_stats(Some(stats));
@@ -1103,10 +1224,10 @@ mod tests {
         let mut manager = manager_for_test();
         let spec = minimal_slicer_spec();
 
-        manager.sync_slicer(Some(&spec));
+        manager.sync_slicer(Some(&spec), 0);
         let pid = manager.slicer_pid().expect("must have spawned a slicer");
 
-        manager.sync_slicer(Some(&spec));
+        manager.sync_slicer(Some(&spec), 0);
         assert_eq!(
             manager.slicer_pid(),
             Some(pid),
@@ -1124,11 +1245,11 @@ mod tests {
         let mut manager = manager_for_test();
         let spec = minimal_slicer_spec();
 
-        manager.sync_slicer(Some(&spec));
+        manager.sync_slicer(Some(&spec), 0);
         let pid = manager.slicer_pid().expect("must have spawned a slicer");
 
         manager.restart_slicer();
-        manager.sync_slicer(Some(&spec));
+        manager.sync_slicer(Some(&spec), 0);
         assert_ne!(
             manager.slicer_pid(),
             Some(pid),
@@ -1307,6 +1428,126 @@ mod tests {
     }
 
     #[test]
+    fn config_generation_stays_pending_until_the_current_session_applies_it() {
+        let manager = manager_for_test();
+        let spec = minimal_slicer_spec();
+
+        manager.mark_control_requested("current", 7, 41, &spec);
+        update_control_status_for_config(
+            &manager.snapshot,
+            ControlEvent::new("current".into(), 7, ControlEventKind::Accepted),
+            Some(41),
+        );
+        let pending = manager.snapshot.projection_control();
+        assert_eq!(pending.requested_config_generation, Some(41));
+        assert_eq!(pending.applied_config_generation, None);
+
+        update_control_status_for_config(
+            &manager.snapshot,
+            ControlEvent::new(
+                "current".into(),
+                7,
+                ControlEventKind::Applied {
+                    outputs: vec!["DP-1".into()],
+                    build_ms: None,
+                    upload_ms: None,
+                    sampling_modes: std::collections::BTreeMap::new(),
+                },
+            ),
+            Some(41),
+        );
+        assert_eq!(
+            manager
+                .snapshot
+                .projection_control()
+                .applied_config_generation,
+            Some(41)
+        );
+
+        // A new StateStore generation with the same installed control
+        // snapshot is applied immediately, without pretending that its
+        // working-copy number is a slicer control number.
+        manager.mark_control_requested("current", 7, 42, &spec);
+        let unchanged = manager.snapshot.projection_control();
+        assert_eq!(unchanged.requested_config_generation, Some(42));
+        assert_eq!(unchanged.applied_config_generation, Some(42));
+    }
+
+    #[test]
+    fn stale_session_cannot_advance_config_correlation() {
+        let manager = manager_for_test();
+        manager.snapshot.update_projection_control(|status| {
+            status.session = Some("current".into());
+            status.requested_config_generation = Some(12);
+        });
+        let old = ControlEvent::new(
+            "old".into(),
+            7,
+            ControlEventKind::Applied {
+                outputs: vec!["DP-1".into()],
+                build_ms: None,
+                upload_ms: None,
+                sampling_modes: std::collections::BTreeMap::new(),
+            },
+        );
+        if event_belongs_to_session(&old, "current") {
+            update_control_status_for_config(&manager.snapshot, old, Some(99));
+        }
+        let status = manager.snapshot.projection_control();
+        assert_eq!(status.requested_config_generation, Some(12));
+        assert_eq!(status.applied_config_generation, None);
+    }
+
+    #[test]
+    fn old_control_generation_cannot_regress_config_correlation() {
+        let manager = manager_for_test();
+        manager.mark_control_requested("current", 8, 80, &minimal_slicer_spec());
+        update_control_status_for_config(
+            &manager.snapshot,
+            ControlEvent::new(
+                "current".into(),
+                8,
+                ControlEventKind::Applied {
+                    outputs: vec!["DP-1".into()],
+                    build_ms: None,
+                    upload_ms: None,
+                    sampling_modes: std::collections::BTreeMap::new(),
+                },
+            ),
+            Some(80),
+        );
+        manager.mark_control_requested("current", 9, 90, &minimal_slicer_spec());
+
+        update_control_status_for_config(
+            &manager.snapshot,
+            ControlEvent::new(
+                "current".into(),
+                7,
+                ControlEventKind::Applied {
+                    outputs: vec!["DP-1".into()],
+                    build_ms: None,
+                    upload_ms: None,
+                    sampling_modes: std::collections::BTreeMap::new(),
+                },
+            ),
+            Some(70),
+        );
+        let status = manager.snapshot.projection_control();
+        assert_eq!(status.requested_config_generation, Some(90));
+        assert_eq!(status.applied_config_generation, Some(80));
+    }
+
+    #[test]
+    fn equivalent_pending_snapshot_uses_its_newest_config_generation() {
+        let mappings = Arc::new(Mutex::new(BTreeMap::from([(0, 0)])));
+        record_config_generation(&mappings, 7, 41);
+        // A no-op reconcile can observe a newer working-copy generation
+        // before control generation 7 has reached `applied`.
+        record_config_generation(&mappings, 7, 42);
+        assert_eq!(config_generation_for(&mappings, 7), Some(42));
+    }
+
+    #[test]
     fn capability_status_records_the_negotiated_cpu_fallback() {
         let manager = manager_for_test();
         update_control_status(
@@ -1436,7 +1677,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        manager.mark_control_requested("public-layout", 0, &spec);
+        manager.mark_control_requested("public-layout", 0, 0, &spec);
         assert_eq!(
             manager
                 .snapshot
@@ -1506,6 +1747,7 @@ mod tests {
             desired: spec.clone(),
             live_control: true,
             writer: Some(writer),
+            config_generations: Arc::new(Mutex::new(BTreeMap::from([(0, 0)]))),
             protocol_mismatch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         manager.snapshot.update_projection_control(|status| {
@@ -1513,7 +1755,7 @@ mod tests {
             status.requested_generation = Some(0);
         });
         spec.gamma = 2.4;
-        assert!(manager.sync_slicer(Some(&spec)).is_empty());
+        assert!(manager.sync_slicer(Some(&spec), 1).is_empty());
         assert_eq!(manager.slicer_pid(), Some(pid));
         assert_eq!(
             manager.snapshot.projection_control().requested_generation,
@@ -1522,7 +1764,7 @@ mod tests {
         manager.snapshot.update_projection_control(|status| {
             status.effective_renderer = Some(crate::model::Renderer::Cpu);
         });
-        assert!(manager.sync_slicer(Some(&spec)).is_empty());
+        assert!(manager.sync_slicer(Some(&spec), 1).is_empty());
         let replacement = manager.slicer.as_ref().unwrap();
         assert_ne!(replacement.child.id(), pid);
         assert_eq!(replacement.desired.gamma, 2.4);
