@@ -652,10 +652,12 @@ fn update_control_status(snapshot: &Snapshot, event: ControlEvent) -> bool {
                     OutputStage::Applied,
                 );
                 set_output_sampling(&mut status.outputs, sampling_modes);
-                if status
-                    .outputs
-                    .iter()
-                    .any(|output| output.sampling_mode.as_deref() == Some("bilinear"))
+                if (status.requested_mode.as_deref() == Some("warp")
+                    && status.warp_available == Some(true))
+                    || status
+                        .outputs
+                        .iter()
+                        .any(|output| output.sampling_mode.as_deref() == Some("bilinear"))
                 {
                     status.effective_mode = Some("warp".to_string());
                 } else if status
@@ -921,13 +923,17 @@ fn slicer_requests_live_candidate(spec: &SlicerSpec) -> bool {
 /// reject it, never advertise the resulting rectangle fallback as requested
 /// simple mode. The source rectangle is the current Phase 1 output-size seam.
 fn spec_requests_warp(spec: &SlicerSpec) -> bool {
-    spec.slices.iter().any(|slice| {
-        slice.geometry.as_ref().is_some_and(|geometry| {
-            geometry
-                .warp(slice.source.width as u32, slice.source.height as u32)
-                .map_or(true, |warp| warp.is_some())
+    spec.layout.is_some()
+        || spec.slices.iter().any(|slice| {
+            if slice.source_rect.is_some() {
+                return true;
+            }
+            slice.geometry.as_ref().is_some_and(|geometry| {
+                geometry
+                    .warp(slice.source.width as u32, slice.source.height as u32)
+                    .map_or(true, |warp| warp.is_some())
+            })
         })
-    })
 }
 
 fn slicer_fingerprint(spec: &SlicerSpec, live_control: bool) -> u64 {
@@ -967,9 +973,22 @@ fn slicer_topology_fingerprint(spec: &SlicerSpec) -> u64 {
         .hash(&mut hasher);
     for slice in &spec.slices {
         slice.output.hash(&mut hasher);
-        serde_json::to_string(&slice.source)
-            .unwrap_or_default()
-            .hash(&mut hasher);
+        if spec.layout.is_some() && spec.pattern.is_none() {
+            slice.source.width.hash(&mut hasher);
+            slice.source.height.hash(&mut hasher);
+        } else {
+            serde_json::to_string(&slice.source)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            serde_json::to_string(&slice.source_rect)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+        }
+    }
+    if let Some(layout) = &spec.layout {
+        for participant in &layout.participants {
+            participant.output.hash(&mut hasher);
+        }
     }
     hasher.finish()
 }
@@ -1060,6 +1079,8 @@ mod tests {
 
     fn minimal_slicer_spec() -> SlicerSpec {
         SlicerSpec {
+            layout: None,
+            coverage_rects: Vec::new(),
             control_session: String::new(),
             source: "HEADLESS-1".to_string(),
             canvas_width: 100,
@@ -1130,6 +1151,7 @@ mod tests {
         let mut gpu = minimal_slicer_spec();
         gpu.renderer = crate::model::Renderer::Gpu;
         gpu.slices.push(SliceSpec {
+            source_rect: None,
             output: "DP-1".to_string(),
             source: Rect {
                 x: 0,
@@ -1372,6 +1394,93 @@ mod tests {
         let status = manager.snapshot.projection_control();
         assert_eq!(status.effective_mode.as_deref(), Some("warp"));
         assert_eq!(status.warp_reason.as_deref(), Some("filtering verified"));
+    }
+
+    #[test]
+    fn public_warp_layout_remains_warp_when_every_applied_sampler_is_exact() {
+        use crate::model::Rect;
+        use crate::projection::blend::SliceSpec;
+
+        let manager = manager_for_test();
+        let mut spec = minimal_slicer_spec();
+        spec.renderer = crate::model::Renderer::Gpu;
+        spec.slices.push(SliceSpec {
+            output: "DP-1".into(),
+            source: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            source_rect: Some([0.0, 0.0, 100.0, 100.0]),
+            geometry: None,
+            ramps: Vec::new(),
+        });
+        let source = crate::model::CanvasRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        spec.layout = Some(crate::projection::layout::LayoutSpec {
+            aspect: 1.0,
+            blend: true,
+            participants: vec![crate::projection::layout::LayoutParticipant {
+                output: "DP-1".into(),
+                source,
+                raster_footprint: source,
+            }],
+        });
+        assert!(
+            super::super::warp_update::sampling_warp(&spec, &spec.slices[0], (100, 100))
+                .unwrap()
+                .is_none()
+        );
+        manager.mark_control_requested("public-layout", 0, &spec);
+        assert_eq!(
+            manager
+                .snapshot
+                .projection_control()
+                .requested_mode
+                .as_deref(),
+            Some("warp")
+        );
+        update_control_status(
+            &manager.snapshot,
+            ControlEvent::new(
+                "public-layout".into(),
+                0,
+                ControlEventKind::Capability {
+                    requested_renderer: crate::model::Renderer::Gpu,
+                    effective_renderer: crate::model::Renderer::Gpu,
+                    warp_available: true,
+                    reason: None,
+                    requested_mode: "warp".into(),
+                    effective_mode: "warp".into(),
+                },
+            ),
+        );
+        update_control_status(
+            &manager.snapshot,
+            ControlEvent::new(
+                "public-layout".into(),
+                0,
+                ControlEventKind::Applied {
+                    outputs: vec!["DP-1".into()],
+                    build_ms: None,
+                    upload_ms: None,
+                    sampling_modes: std::collections::BTreeMap::from([(
+                        "DP-1".into(),
+                        "exact".into(),
+                    )]),
+                },
+            ),
+        );
+        let status = manager.snapshot.projection_control();
+        assert_eq!(status.effective_mode.as_deref(), Some("warp"));
+        assert_eq!(status.requested_mode.as_deref(), Some("warp"));
+        assert_eq!(status.warp_available, Some(true));
+        assert_eq!(status.outputs[0].sampling_mode.as_deref(), Some("exact"));
     }
 
     #[cfg(unix)]

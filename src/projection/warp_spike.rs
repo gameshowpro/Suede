@@ -382,6 +382,8 @@ mod tests {
     };
     fn spec() -> SlicerSpec {
         SlicerSpec {
+            layout: None,
+            coverage_rects: Vec::new(),
             control_session: String::new(),
             source: "canvas".into(),
             canvas_width: 8,
@@ -392,6 +394,7 @@ mod tests {
             free_run: false,
             renderer: Default::default(),
             slices: vec![SliceSpec {
+                source_rect: None,
                 geometry: None,
                 output: "A".into(),
                 source: Rect {

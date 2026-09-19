@@ -28,8 +28,10 @@ pub enum StateError {
         #[source]
         source: std::io::Error,
     },
-    #[error("state document is from a newer schema version ({found}, supported {supported})")]
+    #[error("state document has unsupported schema version ({found}, supported {supported})")]
     UnsupportedSchema { found: u32, supported: u32 },
+    #[error("state document at {path} is invalid: {detail}")]
+    InvalidDocument { path: PathBuf, detail: String },
 }
 
 /// The saved document and the unsaved one, under a single lock.
@@ -50,6 +52,10 @@ struct Documents {
     /// restart or any committed write discards it, so disk state stays the
     /// only durable truth.
     preview: Option<DesiredState>,
+    /// In-memory basis for read-only previews/recommendations. This changes
+    /// for every working-copy transition, including revert, while persisted
+    /// document revisions retain their existing meaning.
+    generation: u64,
 }
 
 pub struct StateStore {
@@ -84,6 +90,7 @@ impl StateStore {
                 tracing::info!(path = %primary.display(), "no persisted state; starting empty");
                 DesiredState::new()
             }
+            Err(error @ StateError::UnsupportedSchema { .. }) => return Err(error),
             Err(error) => {
                 tracing::error!(%error, path = %primary.display(), "state file unreadable; trying backup");
                 match read_document(&backup) {
@@ -94,6 +101,7 @@ impl StateStore {
                         );
                         state
                     }
+                    Err(error @ StateError::UnsupportedSchema { .. }) => return Err(error),
                     _ => {
                         tracing::error!("backup unusable; starting from empty desired state");
                         DesiredState::new()
@@ -113,6 +121,7 @@ impl StateStore {
                     state
                 },
                 preview: None,
+                generation: 0,
             }),
         })
     }
@@ -128,6 +137,7 @@ impl StateStore {
                     state
                 },
                 preview: None,
+                generation: 0,
             }),
         }
     }
@@ -158,7 +168,9 @@ impl StateStore {
             document.revision = self.revision();
             document
         });
-        self.documents.write().unwrap().preview = preview;
+        let mut documents = self.documents.write().unwrap();
+        documents.preview = preview;
+        documents.generation = documents.generation.saturating_add(1);
     }
 
     pub fn has_preview(&self) -> bool {
@@ -167,6 +179,24 @@ impl StateStore {
 
     pub fn revision(&self) -> u64 {
         self.documents.read().unwrap().current.revision
+    }
+
+    /// Return the effective document and the in-memory working-copy basis that
+    /// produced it. Two previews can share a persisted revision while still
+    /// needing distinct recommendation/cache identities.
+    pub fn effective_with_generation(&self) -> (DesiredState, u64) {
+        let documents = self.documents.read().unwrap();
+        (
+            documents
+                .preview
+                .clone()
+                .unwrap_or_else(|| documents.current.clone()),
+            documents.generation,
+        )
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.documents.read().unwrap().generation
     }
 
     /// Replace the document, bump its revision, and persist it.
@@ -183,6 +213,7 @@ impl StateStore {
         // A committed write supersedes whatever was being previewed. Same
         // guard, so this can no longer race the readers.
         documents.preview = None;
+        documents.generation = documents.generation.saturating_add(1);
         Ok(next)
     }
 
@@ -230,7 +261,7 @@ impl StateStore {
     }
 }
 
-/// Read and migrate a document. `Ok(None)` means the file simply does not exist.
+/// Read a current-schema document. `Ok(None)` means the file simply does not exist.
 fn read_document(path: &Path) -> Result<Option<DesiredState>, StateError> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
@@ -243,11 +274,10 @@ fn read_document(path: &Path) -> Result<Option<DesiredState>, StateError> {
         }
     };
 
-    let mut state: DesiredState =
-        serde_json::from_str(&text).map_err(|error| StateError::Write {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
-        })?;
+    let state: DesiredState = serde_json::from_str(&text).map_err(|error| StateError::Write {
+        path: path.to_path_buf(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidData, error),
+    })?;
 
     if state.schema_version > SCHEMA_VERSION {
         return Err(StateError::UnsupportedSchema {
@@ -255,9 +285,20 @@ fn read_document(path: &Path) -> Result<Option<DesiredState>, StateError> {
             supported: SCHEMA_VERSION,
         });
     }
-    // A document written before versioning is treated as version 1.
-    if state.schema_version == 0 {
-        state.schema_version = SCHEMA_VERSION;
+    // Alpha state files must carry this exact schema; older documents are not
+    // migrated.
+    if state.schema_version != SCHEMA_VERSION {
+        return Err(StateError::UnsupportedSchema {
+            found: state.schema_version,
+            supported: SCHEMA_VERSION,
+        });
+    }
+
+    if let Err(errors) = state.validate(true) {
+        return Err(StateError::InvalidDocument {
+            path: path.to_path_buf(),
+            detail: errors.join("; "),
+        });
     }
 
     Ok(Some(state))
@@ -266,7 +307,10 @@ fn read_document(path: &Path) -> Result<Option<DesiredState>, StateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{AppConfig, Launcher, OutputConfig, OutputMatch, RestartPolicy};
+    use crate::model::{
+        AppConfig, CanvasConfig, CanvasRect, Launcher, Mode, OutputConfig, OutputGeometry,
+        OutputMatch, Position, ProjectionConfig, ProjectionMode, RestartPolicy,
+    };
 
     fn sample_app(id: &str) -> AppConfig {
         AppConfig {
@@ -295,8 +339,39 @@ mod tests {
         assert_eq!(store.revision(), 0);
 
         let mut next = store.get();
-        next.outputs
-            .push(OutputConfig::new(OutputMatch::by_name("HDMI-A-1")));
+        let mut output = OutputConfig::new(OutputMatch::by_name("HDMI-A-1"));
+        output.mode = Some(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        });
+        output.position = Some(Position { x: 0, y: 0 });
+        output.geometry = Some(OutputGeometry {
+            source: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        });
+        next.outputs.push(output);
+        next.projection = Some(ProjectionConfig {
+            mode: ProjectionMode::Warp,
+            canvas: Some(CanvasConfig {
+                aspect: 1.0,
+                render_width: 1920,
+                scale: 1.0,
+            }),
+            ..ProjectionConfig::default()
+        });
         next.apps.push(sample_app("renderer-1"));
         let saved = store.replace(next).unwrap();
         assert_eq!(saved.revision, 1);
@@ -306,6 +381,14 @@ mod tests {
         assert_eq!(state.revision, 1);
         assert_eq!(state.outputs.len(), 1);
         assert_eq!(state.apps[0].id, "renderer-1");
+        assert_eq!(
+            state.outputs[0].geometry.as_ref().unwrap().center,
+            [0.5, 0.5]
+        );
+        assert_eq!(
+            state.projection.as_ref().unwrap().mode,
+            ProjectionMode::Warp
+        );
     }
 
     #[test]
@@ -352,6 +435,37 @@ mod tests {
     }
 
     #[test]
+    fn invalid_current_schema_primary_falls_back_to_valid_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE_NAME),
+            br#"{
+                "schemaVersion": 2,
+                "outputs": [{
+                    "match": {"name": "HDMI-A-1"},
+                    "enable": true,
+                    "mode": {"width": 100, "height": 100, "refreshHz": 60},
+                    "position": {"x": 0, "y": 0},
+                    "geometry": {
+                        "source": {"x": 0, "y": 0, "width": 1, "height": 1},
+                        "corners": [[0,0],[0,0],[1,1],[0,1]],
+                        "rasterFootprint": {"x": 0, "y": 0, "width": 1, "height": 1}
+                    }
+                }],
+                "projection": {
+                    "mode": "warp",
+                    "canvas": {"aspect": 1, "renderWidth": 100}
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(BACKUP_NAME), br#"{"schemaVersion": 2}"#).unwrap();
+
+        let recovered = StateStore::load(dir.path().to_path_buf()).unwrap();
+        assert!(recovered.get().outputs.is_empty());
+    }
+
+    #[test]
     fn missing_directory_is_created() {
         let dir = tempfile::tempdir().unwrap();
         let nested = dir.path().join("a/b/c");
@@ -368,19 +482,56 @@ mod tests {
             br#"{"schemaVersion": 999, "revision": 4}"#,
         )
         .unwrap();
-        // Refused, so the daemon starts empty rather than silently downgrading.
-        let store = StateStore::load(dir.path().to_path_buf()).unwrap();
-        assert_eq!(store.get().revision, 0);
+        let result = StateStore::load(dir.path().to_path_buf());
+        assert!(matches!(
+            result,
+            Err(StateError::UnsupportedSchema { found: 999, .. })
+        ));
     }
 
     #[test]
-    fn unversioned_document_is_treated_as_version_one() {
+    fn newer_backup_schema_is_refused_instead_of_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), b"not json").unwrap();
+        std::fs::write(
+            dir.path().join(BACKUP_NAME),
+            br#"{"schemaVersion": 999, "revision": 4}"#,
+        )
+        .unwrap();
+        let result = StateStore::load(dir.path().to_path_buf());
+        assert!(matches!(
+            result,
+            Err(StateError::UnsupportedSchema { found: 999, .. })
+        ));
+    }
+
+    #[test]
+    fn unversioned_document_is_not_migrated() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(FILE_NAME), br#"{"revision": 7}"#).unwrap();
+        let result = StateStore::load(dir.path().to_path_buf());
+        assert!(matches!(
+            result,
+            Err(StateError::UnsupportedSchema { found: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn preview_generation_changes_without_changing_revision() {
+        let dir = tempfile::tempdir().unwrap();
         let store = StateStore::load(dir.path().to_path_buf()).unwrap();
-        let state = store.get();
-        assert_eq!(state.schema_version, SCHEMA_VERSION);
-        assert_eq!(state.revision, 7);
+        let initial = store.generation();
+        let mut preview = store.get();
+        preview.revision = 999;
+        store.set_preview(Some(preview));
+        let (_, preview_generation) = store.effective_with_generation();
+        assert!(preview_generation > initial);
+        assert_eq!(store.revision(), 0);
+        store.set_preview(None);
+        let reverted_generation = store.generation();
+        assert!(reverted_generation > preview_generation);
+        store.update(|_| {}).unwrap();
+        assert!(store.generation() > reverted_generation);
     }
 
     /// The project's alpha status means the only backwards-compatibility
@@ -400,7 +551,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join(FILE_NAME),
-            br#"{"settings": {"hideCursor": true, "outputPollIntervalSeconds": 5,
+            br#"{"schemaVersion": 2, "settings": {"hideCursor": true, "outputPollIntervalSeconds": 5,
                  "allowRawSwayCommands": false}}"#,
         )
         .unwrap();

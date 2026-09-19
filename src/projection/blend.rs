@@ -95,6 +95,10 @@ fn area(rect: &Rect) -> i64 {
 pub struct SliceSpec {
     pub output: String,
     pub source: Rect,
+    /// Absolute canvas pixel boundaries for generalized source placement.
+    /// `source` retains the exact crop origin and configured raster dimensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rect: Option<[f64; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<super::warp::Geometry>,
     pub ramps: Vec<RampSpec>,
@@ -123,6 +127,12 @@ pub struct SlicerSpec {
     /// Which pipeline to blend with; see [`crate::model::Renderer`].
     #[serde(default)]
     pub renderer: Renderer,
+    /// Full configured roster, independently of which outputs can present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<super::layout::LayoutSpec>,
+    /// Configured simple-mode coverage, including unattached outputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_rects: Vec<Rect>,
     pub slices: Vec<SliceSpec>,
 }
 
@@ -131,6 +141,8 @@ pub struct SlicerSpec {
 pub struct CanvasPlan {
     pub canvas_width: i32,
     pub canvas_height: i32,
+    pub layout: Option<super::layout::LayoutSpec>,
+    pub coverage_rects: Vec<Rect>,
     /// Where each output goes in *sway's* layout: a plain edge-to-edge
     /// tiling, row-major by the configured layout. Sway never sees overlaps.
     pub sway_positions: Vec<(String, i32, i32)>,
@@ -305,6 +317,7 @@ pub fn canvas_plan_with_warp_activation(
         .zip(participants)
         .filter(|((_, _), participant)| participant.connected)
         .map(|(((name, rect), ramps), _)| SliceSpec {
+            source_rect: None,
             geometry: None,
             output: name.clone(),
             source: *rect,
@@ -326,6 +339,8 @@ pub fn canvas_plan_with_warp_activation(
     }
 
     Some(CanvasPlan {
+        layout: None,
+        coverage_rects: rects.iter().map(|(_, rect)| *rect).collect(),
         canvas_width,
         canvas_height,
         sway_positions,
@@ -1254,6 +1269,8 @@ mod tests {
     fn the_slicer_spec_serialises_stably() {
         // The spec crosses a process boundary as JSON; field names are ABI.
         let spec = SlicerSpec {
+            layout: None,
+            coverage_rects: Vec::new(),
             control_session: String::new(),
             source: "HEADLESS-1".into(),
             canvas_width: 3680,
@@ -1264,6 +1281,7 @@ mod tests {
             free_run: false,
             renderer: Renderer::Auto,
             slices: vec![SliceSpec {
+                source_rect: None,
                 geometry: None,
                 output: "DP-3".into(),
                 source: Rect {

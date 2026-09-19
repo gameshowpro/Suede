@@ -57,7 +57,7 @@ pub async fn put_config(
     State(state): State<ApiState>,
     Query(query): Query<WaitQuery>,
     headers: HeaderMap,
-    Json(body): Json<DesiredState>,
+    Json(mut body): Json<DesiredState>,
 ) -> ApiResult<Json<DesiredState>> {
     state.check_precondition(if_match(&headers))?;
     if body.committed {
@@ -65,8 +65,7 @@ pub async fn put_config(
     }
     // Not committed: everything except persistence. The document reaches the
     // outputs immediately; disk keeps the last saved state.
-    body.validate(state.bootstrap.allow_overlaps)
-        .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
+    state.validate_configuration(&mut body)?;
     state.store.set_preview(Some(body));
     state.trigger.request("working copy");
     Ok(Json(state.store.effective()))

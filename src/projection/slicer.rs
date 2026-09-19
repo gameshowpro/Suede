@@ -1922,7 +1922,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // every slice, because how much a projector must lift depends on how many
     // *others* light the same pixel — a four-way grid centre needs none while
     // its two-way seams still do.
-    let coverage = Coverage::new(spec.slices.iter().map(|slice| slice.source));
+    let coverage = Coverage::new(super::warp_update::coverage_rects(spec));
     for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
         let (width, height) = presenter.configured.unwrap();
         // Built at the *presented* size: ramps are defined against the
@@ -2230,18 +2230,20 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
 }
 
 fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
-    let mut requested = false;
+    let mut requested =
+        spec.layout.is_some() || spec.slices.iter().any(|s| s.source_rect.is_some());
     for slice in &spec.slices {
         anyhow::ensure!(
             slice.source.width > 0 && slice.source.height > 0,
             "source dimensions must be positive"
         );
-        if let Some(geometry) = &slice.geometry {
-            requested |= geometry
-                .warp(slice.source.width as u32, slice.source.height as u32)
-                .map_err(anyhow::Error::msg)?
-                .is_some();
-        }
+        requested |= super::warp_update::sampling_warp(
+            spec,
+            slice,
+            (slice.source.width as u32, slice.source.height as u32),
+        )
+        .map_err(anyhow::Error::msg)?
+        .is_some();
     }
     Ok(requested)
 }
@@ -2395,13 +2397,27 @@ fn static_pattern_rgba(
     );
     let rect = slice.source;
     anyhow::ensure!(
-        rect.x >= 0 && rect.y >= 0 && rect.width > 0 && rect.height > 0,
+        rect.width > 0 && rect.height > 0,
         "invalid static pattern source rectangle"
     );
     let (width, height) = (rect.width as u32, rect.height as u32);
     anyhow::ensure!(
         u64::from(width) * u64::from(height) <= 32_000_000,
         "static pattern output exceeds the 32 megapixel limit"
+    );
+    let source = slice.source_rect.unwrap_or([
+        f64::from(rect.x),
+        f64::from(rect.y),
+        f64::from(rect.width),
+        f64::from(rect.height),
+    ]);
+    anyhow::ensure!(
+        source.iter().all(|v| v.is_finite())
+            && source[2] > 0.0
+            && source[3] > 0.0
+            && (source[0] + source[2]).is_finite()
+            && (source[1] + source[3]).is_finite(),
+        "invalid static pattern source rectangle"
     );
     let fake = OverlaySpec {
         output: slice.output.clone(),
@@ -2416,14 +2432,82 @@ fn static_pattern_rgba(
     for pixel in rgba.chunks_exact_mut(4) {
         pixel[3] = 255;
     }
-    for y in 0..height.min((spec.canvas_height as u32).saturating_sub(rect.y as u32)) {
-        for x in 0..width.min((spec.canvas_width as u32).saturating_sub(rect.x as u32)) {
-            let src = (y as usize * width as usize + x as usize) * 3;
-            let dst = ((y as usize + rect.y as usize) * spec.canvas_width as usize
-                + x as usize
-                + rect.x as usize)
-                * 4;
-            rgba[dst..dst + 3].copy_from_slice(&rgb[src..src + 3]);
+    if rect.x >= 0
+        && rect.y >= 0
+        && source
+            == [
+                f64::from(rect.x),
+                f64::from(rect.y),
+                f64::from(rect.width),
+                f64::from(rect.height),
+            ]
+    {
+        // Preserve every existing integer-source diagnostic byte, including
+        // its per-output labels and the unpainted surrounding canvas.
+        for y in 0..height.min((spec.canvas_height as u32).saturating_sub(rect.y as u32)) {
+            for x in 0..width.min((spec.canvas_width as u32).saturating_sub(rect.x as u32)) {
+                let src = (y as usize * width as usize + x as usize) * 3;
+                let dst = ((y as usize + rect.y as usize) * spec.canvas_width as usize
+                    + x as usize
+                    + rect.x as usize)
+                    * 4;
+                rgba[dst..dst + 3].copy_from_slice(&rgb[src..src + 3]);
+            }
+        }
+        return Ok(rgba);
+    }
+
+    // Paint the fixed diagnostic picture into continuous canvas space. The
+    // shader clamps to source-border texel centers, so include the neighboring
+    // canvas texels used by bilinear filtering and extend picture-edge colors
+    // into that support. This avoids black fringes at fractional source edges
+    // and also gives a subpixel source rectangle a defined midpoint sample.
+    let canvas_size = [spec.canvas_width, spec.canvas_height];
+    let bounds: [(i32, i32); 2] = std::array::from_fn(|axis| {
+        let inset = (source[axis + 2] * 0.5).min(0.5);
+        let first_center = source[axis] + inset;
+        let last_center = source[axis] + (source[axis + 2] - inset).max(inset);
+        (
+            (first_center - 0.5)
+                .floor()
+                .max(0.0)
+                .min(f64::from(canvas_size[axis])) as i32,
+            ((last_center - 0.5).ceil() + 1.0)
+                .max(0.0)
+                .min(f64::from(canvas_size[axis])) as i32,
+        )
+    });
+    for y in bounds[1].0..bounds[1].1 {
+        for x in bounds[0].0..bounds[0].1 {
+            // Both spaces use pixel boundaries; subtract 0.5 only when
+            // converting the local diagnostic position to sample indices.
+            let px = if source[2] < 1.0 {
+                f64::from(width - 1) * 0.5
+            } else {
+                (((f64::from(x) + 0.5 - source[0]) / source[2]) * f64::from(width) - 0.5)
+                    .clamp(0.0, f64::from(width - 1))
+            };
+            let py = if source[3] < 1.0 {
+                f64::from(height - 1) * 0.5
+            } else {
+                (((f64::from(y) + 0.5 - source[1]) / source[3]) * f64::from(height) - 0.5)
+                    .clamp(0.0, f64::from(height - 1))
+            };
+            let x0 = px.floor() as u32;
+            let y0 = py.floor() as u32;
+            let x1 = (x0 + 1).min(width - 1);
+            let y1 = (y0 + 1).min(height - 1);
+            let tx = px - f64::from(x0);
+            let ty = py - f64::from(y0);
+            let dst = (y as usize * spec.canvas_width as usize + x as usize) * 4;
+            for channel in 0..3 {
+                let at = |sx: u32, sy: u32| {
+                    f64::from(rgb[(sy as usize * width as usize + sx as usize) * 3 + channel])
+                };
+                rgba[dst + channel] = ((1.0 - ty) * ((1.0 - tx) * at(x0, y0) + tx * at(x1, y0))
+                    + ty * ((1.0 - tx) * at(x0, y1) + tx * at(x1, y1)))
+                .round() as u8;
+            }
         }
     }
     Ok(rgba)
@@ -2504,6 +2588,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
         let presenter = &mut state.presenters[output.index];
         presenter.transfer = std::mem::take(&mut output.table);
         presenter.warp = output.warp.take();
+        presenter.source = output.source;
         presenter.warp_revision = prepared.generation;
         presenter.stale = true;
     }
@@ -5904,6 +5989,119 @@ mod tests {
                 static_pattern_rgba(&spec, &warped, pattern).unwrap(),
                 "pins must not move diagnostic source pixels"
             );
+        }
+    }
+
+    #[test]
+    fn static_white_covers_larger_fractional_sources_and_clips_negative_origins() {
+        let spec = pattern_spec();
+        let mut slice = spec.slices[0].clone();
+        slice.source.x = 20;
+        slice.source.y = 10;
+        slice.source_rect = Some([20.25, 10.75, 290.5, 220.5]);
+        let canvas = static_pattern_rgba(&spec, &slice, TestPattern::White).unwrap();
+        let pixel = |bytes: &[u8], x: usize, y: usize| {
+            let offset = (y * spec.canvas_width as usize + x) * 4;
+            <[u8; 4]>::try_from(&bytes[offset..offset + 4]).unwrap()
+        };
+        // This lies beyond the old output-sized paint rectangle but inside
+        // the configured source, and must not turn black when sampled.
+        assert_eq!(pixel(&canvas, 300, 220), [255, 255, 255, 255]);
+        assert_eq!(pixel(&canvas, 0, 0), [0, 0, 0, 255]);
+        slice.source.x = -31;
+        slice.source.y = -21;
+        slice.source_rect = Some([-30.25, -20.75, 300.5, 220.5]);
+        let clipped = static_pattern_rgba(&spec, &slice, TestPattern::White).unwrap();
+        assert_eq!(pixel(&clipped, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(pixel(&clipped, 268, 198), [255, 255, 255, 255]);
+        assert_eq!(pixel(&clipped, 319, 239), [0, 0, 0, 255]);
+        let black = static_pattern_rgba(&spec, &slice, TestPattern::Black).unwrap();
+        assert!(black.chunks_exact(4).all(|p| p == [0, 0, 0, 255]));
+    }
+
+    #[test]
+    fn static_diagnostics_scale_into_fractional_sources_without_following_pins() {
+        let mut spec = pattern_spec();
+        spec.canvas_width = 640;
+        spec.canvas_height = 480;
+        let mut slice = spec.slices[0].clone();
+        slice.source.x = 0;
+        slice.source.y = 0;
+        slice.source_rect = Some([0.5, 0.5, 480.0, 360.0]);
+        for pattern in [TestPattern::Grid, TestPattern::Gamma, TestPattern::Identify] {
+            let canvas = static_pattern_rgba(&spec, &slice, pattern).unwrap();
+            let picture = super::super::pattern::render(
+                240,
+                180,
+                &OverlaySpec {
+                    output: slice.output.clone(),
+                    gamma: spec.gamma,
+                    black_lift: 0.0,
+                    rect: slice.source,
+                    pattern: Some(pattern),
+                    ramps: Vec::new(),
+                },
+            );
+            // At 2x density with a half-pixel source origin, these canvas
+            // centers coincide exactly with diagnostic picture centers.
+            for y in (0..180usize).step_by(13) {
+                for x in (0..239usize).step_by(17) {
+                    let src = (y * 240 + x) * 3;
+                    let dst = ((2 * y + 1) * 640 + 2 * x + 1) * 4;
+                    assert_eq!(
+                        &canvas[dst..dst + 3],
+                        &picture[src..src + 3],
+                        "{pattern:?} {x},{y}"
+                    );
+                    for c in 0..3 {
+                        let midpoint = (u16::from(picture[src + c])
+                            + u16::from(picture[src + 3 + c]))
+                        .div_ceil(2) as u8;
+                        assert_eq!(
+                            canvas[dst + 4 + c],
+                            midpoint,
+                            "{pattern:?} midpoint {x},{y}"
+                        );
+                    }
+                }
+            }
+            let mut pinned = slice.clone();
+            pinned.geometry = Some(super::super::warp::Geometry {
+                corners: [[12.0, 8.0], [240.0, 0.0], [230.0, 170.0], [0.0, 180.0]],
+                center: [0.3, 0.7],
+            });
+            assert_eq!(
+                canvas,
+                static_pattern_rgba(&spec, &pinned, pattern).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn static_source_support_prevents_fractional_white_fringes_and_preserves_exact_bytes() {
+        let spec = pattern_spec();
+        let mut slice = spec.slices[0].clone();
+        for pattern in [
+            TestPattern::White,
+            TestPattern::Grid,
+            TestPattern::Gamma,
+            TestPattern::Identify,
+        ] {
+            let legacy = static_pattern_rgba(&spec, &slice, pattern).unwrap();
+            slice.source_rect = Some([30.0, 20.0, 240.0, 180.0]);
+            assert_eq!(legacy, static_pattern_rgba(&spec, &slice, pattern).unwrap());
+            slice.source_rect = None;
+        }
+        slice.source.x = 30;
+        slice.source.y = 20;
+        slice.source_rect = Some([30.9, 20.9, 0.25, 0.25]);
+        let canvas = static_pattern_rgba(&spec, &slice, TestPattern::White).unwrap();
+        // The midpoint (31.025,21.025) uses all four of these support texels.
+        for y in 20..=21usize {
+            for x in 30..=31usize {
+                let offset = (y * 320 + x) * 4;
+                assert_eq!(&canvas[offset..offset + 4], &[255, 255, 255, 255]);
+            }
         }
     }
 

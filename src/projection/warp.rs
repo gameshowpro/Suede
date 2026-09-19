@@ -4,8 +4,8 @@
 //! boundaries.  `corners` are output pixel boundaries in TL, TR, BR, BL
 //! order; the source is the unit square and is remapped around `center`
 //! before the homography is applied.
-//! Source placement, canvas density, and capture y inversion belong to the
-//! caller. Pin edits do not change that source rectangle or the canvas size.
+//! An optional source rectangle supplies canvas placement and density without
+//! changing local pin geometry. Capture y inversion belongs to the caller.
 
 // Frozen bounds for the Phase 1 pixel-coordinate mapping: positive area and
 // convex turns exceed EPS * max(width, height)^2; elimination pivots exceed
@@ -49,6 +49,7 @@ pub struct Warp {
     edges: [[f64; 3]; 4],
     bounds: [f64; 4], // min x, min y, max x, max y
     identity: bool,
+    source_rect: Option<[f64; 4]>,
 }
 
 impl Warp {
@@ -151,7 +152,89 @@ impl Warp {
             edges,
             bounds,
             identity,
+            source_rect: None,
         })
+    }
+
+    /// Set absolute canvas pixel-boundary x, y, width, and height. This does
+    /// not change output-local geometry or the exact local identity flag.
+    pub fn with_source_rect(mut self, rect: [f64; 4]) -> Result<Self, String> {
+        let limit = MAX_CORNER_SCALE * MAX_DIMENSION as f64;
+        if !rect.iter().all(|v| v.is_finite() && v.abs() <= limit)
+            || rect[2] <= 0.0
+            || rect[3] <= 0.0
+            || rect[2] as f32 <= 0.0
+            || rect[3] as f32 <= 0.0
+            || (rect[0] + rect[2]).abs() > limit
+            || (rect[1] + rect[3]).abs() > limit
+        {
+            return Err("warp source rectangle must have finite positive extents within bounded canvas coordinates".into());
+        }
+        // Check the actual f32 mapping, including the new scale and offset.
+        // A valid local map can lose precision when sampling a larger source.
+        let rows = self.inverse.map(|r| r.map(|v| v as f32));
+        let expected = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        for (p, expected) in self.corners.iter().zip(expected) {
+            let q = rows.map(|r| r[0] * p[0] as f32 + r[1] * p[1] as f32 + r[2]);
+            for axis in 0..2 {
+                let s = q[axis] / q[2];
+                let c = self.center[axis] as f32;
+                let unit = if s <= c {
+                    s / (2.0 * c)
+                } else {
+                    0.5 + (s - c) / (2.0 * (1.0 - c))
+                };
+                let mapped = rect[axis] as f32 + unit * rect[axis + 2] as f32;
+                let exact = rect[axis] + expected[axis] * rect[axis + 2];
+                if !mapped.is_finite() || (mapped as f64 - exact).abs() > MAX_F32_CORNER_ERROR {
+                    return Err("warp f32 mapping loses canvas source corner precision".into());
+                }
+            }
+        }
+        self.source_rect = Some(rect);
+        Ok(self)
+    }
+
+    pub fn source_rect(&self) -> Option<[f64; 4]> {
+        self.source_rect
+    }
+
+    /// Unclamped absolute canvas coordinates, before capture y inversion.
+    /// Existing callers without a source rectangle retain unit pixel density.
+    pub fn canvas_at(&self, x: f64, y: f64, fallback_origin: [f64; 2]) -> Option<[f64; 2]> {
+        let local = self.source_at(x, y)?;
+        let rect = self.source_rect.unwrap_or([
+            fallback_origin[0],
+            fallback_origin[1],
+            self.output_width as f64,
+            self.output_height as f64,
+        ]);
+        let point = [
+            rect[0] + local[0] / self.output_width as f64 * rect[2],
+            rect[1] + local[1] / self.output_height as f64 * rect[3],
+        ];
+        point.iter().all(|v| v.is_finite()).then_some(point)
+    }
+
+    /// Canvas sampling position with source-border texel-center clamping.
+    /// Subpixel source extents sample their midpoint. Canvas clipping and
+    /// capture y inversion still belong to the caller.
+    pub fn clamped_canvas_at(&self, x: f64, y: f64, fallback_origin: [f64; 2]) -> Option<[f64; 2]> {
+        let mut point = self.canvas_at(x, y, fallback_origin)?;
+        let rect = self.source_rect.unwrap_or([
+            fallback_origin[0],
+            fallback_origin[1],
+            self.output_width as f64,
+            self.output_height as f64,
+        ]);
+        for axis in 0..2 {
+            let inset = (rect[axis + 2] * 0.5).min(0.5);
+            point[axis] = point[axis].clamp(
+                rect[axis] + inset,
+                rect[axis] + (rect[axis + 2] - inset).max(inset),
+            );
+        }
+        Some(point)
     }
 
     /// Construct the exact neutral mapping for an output of `width`×`height`.
@@ -678,6 +761,73 @@ mod tests {
     }
 
     #[test]
+    fn source_rectangle_changes_canvas_mapping_without_changing_local_geometry() {
+        let original = Warp::identity(17, 9);
+        assert_eq!(original.source_rect(), None);
+        assert_point(original.canvas_at(0.5, 8.5, [3.0, 2.0]), [3.5, 10.5]);
+        let rect = [3.25, -2.125, 25.5, 13.5];
+        let mapped = original.with_source_rect(rect).unwrap();
+        assert_eq!(mapped.source_rect(), Some(rect));
+        assert!(mapped.is_identity());
+        assert_point(mapped.source_at(0.5, 8.5), [0.5, 8.5]);
+        assert_point(mapped.canvas_at(0.5, 8.5, [99.0, 99.0]), [4.0, 10.625]);
+        assert_point(mapped.destination_at(0.5, 0.5), [8.5, 4.5]);
+        assert_eq!(mapped.coverage(0, 0), 1.0);
+        // The caller keeps this exact rect and selects general sampling.
+        let near = Warp::identity(17, 9)
+            .with_source_rect([1e-10, 0.0, 17.0, 9.0])
+            .unwrap();
+        assert_eq!(near.source_rect().unwrap()[0], 1e-10);
+    }
+
+    #[test]
+    fn source_border_clamp_uses_canvas_pixels_and_subpixel_midpoints() {
+        let warp = Warp::identity(8, 4)
+            .with_source_rect([2.25, 3.125, 16.0, 2.0])
+            .unwrap();
+        assert_point(warp.clamped_canvas_at(-1.0, -1.0, [0.0; 2]), [2.75, 3.625]);
+        assert_point(warp.clamped_canvas_at(9.0, 5.0, [0.0; 2]), [17.75, 4.625]);
+        let tiny = Warp::identity(8, 4)
+            .with_source_rect([0.1, 3.125, 0.3, 0.25])
+            .unwrap();
+        for point in [[0.0, 0.0], [4.0, 2.0], [8.0, 4.0]] {
+            assert_point(
+                tiny.clamped_canvas_at(point[0], point[1], [0.0; 2]),
+                [0.25, 3.25],
+            );
+        }
+    }
+
+    #[test]
+    fn source_rectangle_rejects_unbounded_and_unrepresentable_inputs() {
+        for rect in [
+            [f64::NAN, 0.0, 8.0, 4.0],
+            [0.0, 0.0, f64::INFINITY, 4.0],
+            [0.0, 0.0, 0.0, 4.0],
+            [0.0, 0.0, 8.0, -1.0],
+            [0.0, 0.0, 1e-300, 4.0],
+            [524288.0, 0.0, 8.0, 4.0],
+            [-524289.0, 0.0, 8.0, 4.0],
+        ] {
+            assert!(
+                Warp::identity(8, 4).with_source_rect(rect).is_err(),
+                "{rect:?}"
+            );
+        }
+        // This narrow translated destination retains local pixel precision,
+        // but magnifying the source makes f32 cancellation unacceptable.
+        let warp = Warp::new(
+            [[10.0, 0.0], [10.003, 0.0], [10.003, 4.0], [10.0, 4.0]],
+            [0.5, 0.5],
+            8,
+            4,
+        )
+        .unwrap();
+        assert!(warp.with_source_rect([0.0, 0.0, 32768.0, 4.0]).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "projection")]
     fn d1_moves_the_picture_and_overlap_without_changing_source_selection() {
         use crate::model::Rect;
         use crate::projection::blend::{transfer_at, FadeTo, RampSpec};

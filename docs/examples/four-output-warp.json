@@ -1,4 +1,6 @@
 {
+  "schemaVersion": 2,
+  "revision": 0,
   "outputs": [
     {
       "match": {
@@ -13,6 +15,42 @@
       "position": {
         "x": 0,
         "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.0,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.0,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
       },
       "adaptiveSync": false,
       "maxRenderTimeMs": null,
@@ -40,6 +78,42 @@
       "position": {
         "x": 1920,
         "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.25,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.25,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
       }
     },
     {
@@ -55,6 +129,42 @@
       "position": {
         "x": 3840,
         "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.5,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.5,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
       }
     },
     {
@@ -70,6 +180,42 @@
       "position": {
         "x": 5760,
         "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.75,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.75,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
       }
     }
   ],
@@ -140,11 +286,24 @@
       }
     }
   ],
+  "projection": {
+    "mode": "warp",
+    "canvas": {
+      "aspect": 7.111111111111111,
+      "renderWidth": 7680,
+      "scale": 1.0
+    },
+    "blend": true,
+    "gamma": 2.2,
+    "blackLift": 0.0,
+    "freeRun": false,
+    "renderer": "auto"
+  },
+  "backgrounds": [],
   "settings": {
     "hideCursor": true,
     "outputPollIntervalSeconds": 5
   },
   "activeApp": "renderer-1",
-  "committed": true,
-  "schemaVersion": 2
+  "committed": true
 }

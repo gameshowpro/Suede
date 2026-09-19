@@ -158,6 +158,7 @@ mod tests {
         // as "still running, just quiet" — the ambiguity this type exists
         // to remove.
         let event = ServerEvent::ProjectionStatsChanged(Box::new(crate::model::ProjectionReport {
+            geometry: Default::default(),
             running: false,
             last_interval: None,
             control: Default::default(),

@@ -23,6 +23,8 @@ struct Key {
     slice: SliceSpec,
     gamma: f64,
     lift: f64,
+    layout: Option<super::layout::LocalKey>,
+    coverage: Vec<crate::model::Rect>,
 }
 
 pub struct Output {
@@ -31,6 +33,7 @@ pub struct Output {
     pub size: (u32, u32),
     pub warp: Option<Warp>,
     pub table: Vec<(u16, u8)>,
+    pub source: crate::model::Rect,
     key: Key,
 }
 
@@ -351,10 +354,20 @@ pub fn same_topology(a: &SlicerSpec, b: &SlicerSpec) -> bool {
         && a.free_run == b.free_run
         && a.renderer == b.renderer
         && a.slices.len() == b.slices.len()
-        && a.slices
-            .iter()
-            .zip(&b.slices)
-            .all(|(a, b)| a.output == b.output && a.source == b.source)
+        && a.slices.iter().zip(&b.slices).all(|(sa, sb)| {
+            sa.output == sb.output
+                && (if a.layout.is_some() && b.layout.is_some() && a.pattern.is_none() {
+                    sa.source.width == sb.source.width && sa.source.height == sb.source.height
+                } else {
+                    sa.source == sb.source && sa.source_rect == sb.source_rect
+                })
+        })
+        && a.layout
+            .as_ref()
+            .map(|l| l.participants.iter().map(|p| &p.output).collect::<Vec<_>>())
+            == b.layout
+                .as_ref()
+                .map(|l| l.participants.iter().map(|p| &p.output).collect::<Vec<_>>())
 }
 
 /// Validate startup resources before allocating presenter images or tables.
@@ -380,6 +393,20 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
         return Err("invalid canvas, gamma or fixed lift".into());
     }
     let mut names = std::collections::HashSet::new();
+    let layout = spec
+        .layout
+        .as_ref()
+        .map(|l| super::layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height))
+        .transpose()?;
+    let coverage = coverage_rects(spec);
+    if coverage.iter().any(|r| {
+        r.width <= 0
+            || r.height <= 0
+            || r.x.checked_add(r.width).is_none()
+            || r.y.checked_add(r.height).is_none()
+    }) {
+        return Err("invalid configured coverage rectangle".into());
+    }
     spec.slices
         .iter()
         .zip(sizes)
@@ -399,13 +426,21 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
             }
             let mut slice = slice.clone();
             if let Some(geometry) = &slice.geometry {
-                if w != slice.source.width as u32 || h != slice.source.height as u32 {
+                if slice.source_rect.is_none()
+                    && (w != slice.source.width as u32 || h != slice.source.height as u32)
+                {
                     return Err("warp requires unit source density".into());
                 }
                 if geometry.warp(w, h)?.is_none() {
                     slice.geometry = None;
                 }
             }
+            if slice.source_rect.is_some()
+                && (w != slice.source.width as u32 || h != slice.source.height as u32)
+            {
+                return Err("configured output raster differs from presenter dimensions".into());
+            }
+            sampling_warp(spec, &slice, (w, h))?;
             if slice.ramps.len() > 64 {
                 return Err("at most 64 ramps per output are supported".into());
             }
@@ -418,6 +453,15 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
                 return Err("invalid ramp rectangle".into());
             }
             Ok(Key {
+                layout: layout
+                    .as_ref()
+                    .map(|l| l.index(&slice.output).map(|i| l.key(i, spec.black_lift)))
+                    .transpose()?,
+                coverage: if spec.layout.is_none() && spec.black_lift > 0.0 {
+                    coverage.clone()
+                } else {
+                    Vec::new()
+                },
                 slice,
                 gamma: spec.gamma,
                 lift: spec.black_lift,
@@ -426,17 +470,54 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
         .collect()
 }
 
+pub(crate) fn coverage_rects(spec: &SlicerSpec) -> Vec<crate::model::Rect> {
+    if spec.coverage_rects.is_empty() {
+        spec.slices.iter().map(|s| s.source).collect()
+    } else {
+        spec.coverage_rects.clone()
+    }
+}
+
+pub(crate) fn sampling_warp(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    size: (u32, u32),
+) -> Result<Option<Warp>, String> {
+    let warp = slice
+        .geometry
+        .as_ref()
+        .map(|g| g.warp(size.0, size.1))
+        .transpose()?
+        .flatten();
+    let Some(source) = slice.source_rect else {
+        return Ok(warp);
+    };
+    if warp.is_none()
+        && source[0] == f64::from(slice.source.x)
+        && source[1] == f64::from(slice.source.y)
+        && super::layout::exact_source(source, size, (spec.canvas_width, spec.canvas_height))
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        warp.unwrap_or_else(|| Warp::identity(size.0, size.1))
+            .with_source_rect(source)?,
+    ))
+}
+
 /// Shared row evaluator for scoped builds and the measured pool candidate.
+#[allow(clippy::too_many_arguments)]
 fn fill_rows(
     spec: &SlicerSpec,
     slice: &SliceSpec,
     warp: Option<&Warp>,
     coverage: &Coverage,
+    layout: Option<(&super::layout::Evaluator, usize)>,
     size: (u32, u32),
     first_row: usize,
     dest: &mut [(u16, u8)],
 ) {
-    let (width, height) = size;
+    let width = size.0;
     for (offset, value) in dest.iter_mut().enumerate() {
         let x = (offset % width as usize) as u32;
         let y = (first_row + offset / width as usize) as u32;
@@ -445,17 +526,34 @@ fn fill_rows(
         if edge == 0.0 {
             continue;
         }
-        let Some([sx, sy]) = warp.map_or(Some([x as f64 + 0.5, y as f64 + 0.5]), |w| {
-            w.source_at(x as f64 + 0.5, y as f64 + 0.5)
-        }) else {
+        let Some([cx, cy]) = warp.map_or(
+            Some([
+                slice.source.x as f64 + x as f64 + 0.5,
+                slice.source.y as f64 + y as f64 + 0.5,
+            ]),
+            |w| {
+                w.clamped_canvas_at(
+                    x as f64 + 0.5,
+                    y as f64 + 0.5,
+                    [slice.source.x as f64, slice.source.y as f64],
+                )
+            },
+        ) else {
             continue;
         };
-        let sx = sx.clamp(0.5, width as f64 - 0.5);
-        let sy = sy.clamp(0.5, height as f64 - 0.5);
-        let cx = slice.source.x as f64 + sx;
-        let cy = slice.source.y as f64 + sy;
-        if cx < 0.0 || cy < 0.0 || cx >= spec.canvas_width as f64 || cy >= spec.canvas_height as f64
+        let sx = cx - slice.source.x as f64;
+        let sy = cy - slice.source.y as f64;
+        // Match the shader's canvas texel-center bounds, including fractional
+        // source rectangles. Sync colors use this same transfer table.
+        if cx < 0.5
+            || cy < 0.5
+            || cx > spec.canvas_width as f64 - 0.5
+            || cy > spec.canvas_height as f64 - 0.5
         {
+            continue;
+        }
+        if let Some((layout, index)) = layout {
+            *value = layout.transfer(index, cx, cy, spec.gamma, spec.black_lift, edge);
             continue;
         }
         *value = transfer_at(
@@ -477,17 +575,21 @@ fn build(
 ) -> Result<Prepared, String> {
     let started = Instant::now();
     let spec = &request.spec;
-    let coverage = Coverage::new(spec.slices.iter().map(|s| s.source));
+    let coverage = Coverage::new(coverage_rects(spec));
+    let layout = spec
+        .layout
+        .as_ref()
+        .map(|l| super::layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height))
+        .transpose()?;
     let mut outputs = Vec::with_capacity(indices.len());
     for &index in indices {
         let slice = &request.keys[index].slice;
         let (width, height) = sizes[index];
-        let warp = slice
-            .geometry
+        let warp = sampling_warp(spec, slice, (width, height))?;
+        let layout = layout
             .as_ref()
-            .map(|g| g.warp(width, height))
-            .transpose()?
-            .flatten();
+            .map(|l| l.index(&slice.output).map(|i| (l, i)))
+            .transpose()?;
         let mut table = Vec::new();
         table
             .try_reserve_exact(width as usize * height as usize)
@@ -504,6 +606,7 @@ fn build(
                         slice,
                         warp.as_ref(),
                         coverage,
+                        layout,
                         (width, height),
                         chunk * rows,
                         dest,
@@ -512,6 +615,7 @@ fn build(
             }
         });
         outputs.push(Output {
+            source: slice.source,
             index,
             name: slice.output.clone(),
             size: (width, height),
@@ -541,6 +645,8 @@ mod tests {
 
     fn fixture() -> SlicerSpec {
         SlicerSpec {
+            layout: None,
+            coverage_rects: Vec::new(),
             control_session: "test-session".into(),
             source: "canvas".into(),
             canvas_width: 12,
@@ -554,6 +660,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(i, name)| SliceSpec {
+                    source_rect: None,
                     output: name.into(),
                     source: Rect {
                         x: i as i32 * 4,
@@ -592,6 +699,180 @@ mod tests {
     }
     fn send(c: &mut Controller, generation: u64, spec: SlicerSpec) {
         c.request(ControlUpdate::new(c.session().into(), generation, spec));
+    }
+
+    fn public_layout_fixture() -> SlicerSpec {
+        let mut spec = fixture();
+        spec.canvas_width = 14;
+        spec.canvas_height = 8;
+        spec.slices = (0..3)
+            .map(|i| SliceSpec {
+                output: format!("P{i}"),
+                source: Rect {
+                    x: i * 4,
+                    y: 0,
+                    width: 6,
+                    height: 8,
+                },
+                source_rect: Some([i as f64 * 4.0, 0.0, 6.0, 8.0]),
+                geometry: None,
+                ramps: Vec::new(),
+            })
+            .collect();
+        spec.layout = Some(super::super::layout::LayoutSpec {
+            aspect: 14.0 / 8.0,
+            blend: true,
+            participants: spec
+                .slices
+                .iter()
+                .map(|s| {
+                    let r = crate::model::CanvasRect {
+                        x: s.source.x as f64 / 14.0,
+                        y: 0.0,
+                        width: 6.0 / 14.0,
+                        height: 8.0 / 14.0,
+                    };
+                    super::super::layout::LayoutParticipant {
+                        output: s.output.clone(),
+                        source: r,
+                        raster_footprint: r,
+                    }
+                })
+                .collect(),
+        });
+        spec
+    }
+
+    #[test]
+    fn explicit_source_origin_is_authoritative_even_with_stale_integer_metadata() {
+        let mut spec = fixture();
+        spec.slices[0].source_rect = Some([4.0, 0.0, 8.0, 8.0]);
+        let mapping = sampling_warp(&spec, &spec.slices[0], (8, 8))
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.canvas_at(0.5, 0.5, [0.0, 0.0]), Some([4.5, 0.5]));
+        spec.slices[0].source.x = 4;
+        assert!(sampling_warp(&spec, &spec.slices[0], (8, 8))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn fractional_canvas_edge_has_zero_transfer_for_content_and_sync() {
+        let mut spec = fixture();
+        spec.black_lift = 0.0;
+        spec.slices[0].source_rect = Some([-0.25, 0.0, 8.0, 8.0]);
+        let prepared = build(
+            Request {
+                generation: 1,
+                keys: validate(&spec, &[(8, 8); 2]).unwrap(),
+                spec,
+            },
+            &[(8, 8); 2],
+            &[0],
+            1,
+        )
+        .unwrap();
+        assert_eq!(prepared.outputs[0].table[0], (0, 0));
+        assert_ne!(prepared.outputs[0].table[1], (0, 0));
+    }
+
+    #[test]
+    fn public_pin_edits_remain_sparse_and_fractional_sources_match_full_build() {
+        let spec = public_layout_fixture();
+        let sizes = vec![(6, 8); 3];
+        let mut c = Controller::new(&spec, sizes.clone(), 2).unwrap();
+        let initial = complete(&mut c);
+        assert!(initial.outputs.iter().all(|o| o.warp.is_none()));
+        c.installed(&initial);
+        let mut pin = spec.clone();
+        pin.slices[1].geometry = Some(Geometry {
+            corners: [[0.5, 0.5], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]],
+            center: [0.5, 0.5],
+        });
+        assert!(same_topology(&spec, &pin));
+        send(&mut c, 1, pin.clone());
+        let built = complete(&mut c);
+        assert_eq!(
+            built.outputs.iter().map(|o| o.index).collect::<Vec<_>>(),
+            vec![1]
+        );
+        c.installed(&built);
+        let mut source = pin.clone();
+        source.slices[0].source_rect.as_mut().unwrap()[2] = 6.25;
+        source.layout.as_mut().unwrap().participants[0].source.width = 6.25 / 14.0;
+        assert!(same_topology(&pin, &source));
+        send(&mut c, 2, source.clone());
+        let changed = complete(&mut c);
+        assert_eq!(
+            changed.outputs.iter().map(|o| o.index).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(changed.outputs[0].warp.is_some());
+        let full = build(
+            Request {
+                generation: 2,
+                keys: validate(&source, &sizes).unwrap(),
+                spec: source.clone(),
+            },
+            &sizes,
+            &[0, 1, 2],
+            1,
+        )
+        .unwrap();
+        for o in &changed.outputs {
+            assert_eq!(o.table, full.outputs[o.index].table);
+        }
+        assert_eq!(initial.outputs[2].table, full.outputs[2].table);
+        c.installed(&changed);
+        // A footprint edit that raises N invalidates every lift consumer,
+        // including P2, whose source does not overlap P0.
+        source.layout.as_mut().unwrap().participants[0]
+            .raster_footprint
+            .width = 1.0;
+        send(&mut c, 3, source);
+        let shared = complete(&mut c);
+        assert_eq!(
+            shared.outputs.iter().map(|o| o.index).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+    }
+
+    #[test]
+    fn absent_presenters_still_shape_weights_and_black_lift() {
+        let all = public_layout_fixture();
+        let sizes = vec![(6, 8); 3];
+        let full = build(
+            Request {
+                generation: 0,
+                keys: validate(&all, &sizes).unwrap(),
+                spec: all.clone(),
+            },
+            &sizes,
+            &[0, 1, 2],
+            1,
+        )
+        .unwrap();
+        let mut sparse = all.clone();
+        sparse.slices.remove(1);
+        let subset = build(
+            Request {
+                generation: 0,
+                keys: validate(&sparse, &[(6, 8); 2]).unwrap(),
+                spec: sparse,
+            },
+            &[(6, 8); 2],
+            &[0, 1],
+            1,
+        )
+        .unwrap();
+        assert_eq!(full.outputs[0].table, subset.outputs[0].table);
+        assert_eq!(full.outputs[2].table, subset.outputs[1].table);
+        // A disconnected physical participant keeps N even in simple mode.
+        let mut simple = fixture();
+        simple.coverage_rects = vec![simple.slices[0].source, simple.slices[1].source];
+        simple.slices.pop();
+        assert_eq!(Coverage::new(coverage_rects(&simple)).max(), 2);
     }
 
     #[test]
@@ -828,6 +1109,7 @@ mod tests {
                         &task.spec.slices[0],
                         task.warp.as_ref(),
                         &task.coverage,
+                        None,
                         (1920, 1080),
                         task.first,
                         &mut task.table,
@@ -975,6 +1257,8 @@ mod tests {
         assert!(!same_topology(
             &b,
             &SlicerSpec {
+                layout: None,
+                coverage_rects: Vec::new(),
                 gamma: 2.2,
                 ..b.clone()
             }

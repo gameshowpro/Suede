@@ -63,12 +63,13 @@ fn embedded_fragment_offsets_match_every_rust_push_constant_member() {
         std::mem::offset_of!(PushConstants, center),
         std::mem::offset_of!(PushConstants, warp_enabled),
         std::mem::offset_of!(PushConstants, padding),
+        std::mem::offset_of!(PushConstants, source_rect),
     ];
     assert_eq!(structs[&ty].len(), expected.len());
     let actual: Vec<_> = offsets[&ty].values().map(|v| *v as usize).collect();
     assert_eq!(actual, expected);
     assert_eq!(
-        actual.last().unwrap() + 4,
+        actual.last().unwrap() + 16,
         std::mem::size_of::<PushConstants>()
     );
 }
@@ -544,14 +545,28 @@ fn reference(
         .flat_map(|y| {
             (0..size[0]).map(move |x| {
                 let index = (y * size[0] + x) as usize;
-                let local = warp.map_or([x as f64 + 0.5, y as f64 + 0.5], |w| {
-                    let p = w.source_at(x as f64 + 0.5, y as f64 + 0.5).unwrap();
+                let mut source = warp.map_or(
                     [
-                        p[0].clamp(0.5, size[0] as f64 - 0.5),
-                        p[1].clamp(0.5, size[1] as f64 - 0.5),
-                    ]
-                });
-                let mut source = [local[0] + origin[0] as f64, local[1] + origin[1] as f64];
+                        x as f64 + 0.5 + origin[0] as f64,
+                        y as f64 + 0.5 + origin[1] as f64,
+                    ],
+                    |w| {
+                        let p = w.source_at(x as f64 + 0.5, y as f64 + 0.5).unwrap();
+                        let rect = w.source_rect().unwrap_or([
+                            origin[0] as f64,
+                            origin[1] as f64,
+                            size[0] as f64,
+                            size[1] as f64,
+                        ]);
+                        std::array::from_fn(|axis| {
+                            let inset = (rect[axis + 2] * 0.5).min(0.5);
+                            (rect[axis] + p[axis] / size[axis] as f64 * rect[axis + 2]).clamp(
+                                rect[axis] + inset,
+                                rect[axis] + (rect[axis + 2] - inset).max(inset),
+                            )
+                        })
+                    },
+                );
                 if invert {
                     source[1] = canvas_size[1] as f64 - source[1];
                 }
@@ -600,7 +615,7 @@ fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
         println!("GPU readback: {}", gpu.describe());
         for source_format in formats {
             for invert in [false, true] {
-                for case in 0..11 {
+                for case in 0..18 {
                     let spectrum = case < 2;
                     let size = if spectrum { [256, 7] } else { [17, 9] };
                     let canvas_size = if spectrum { [256, 9] } else { [23, 15] };
@@ -615,18 +630,32 @@ fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
                         ),
                         4 => (identity, [0.3, 0.7]),
                         5 => ([[0.5, 0.5], [w, 0.5], [w, h], [0.5, h]], [0.5, 0.5]),
-                        6 => (
+                        6 | 16 => (
                             [[-2.0, -1.0], [w + 2.0, 0.0], [w + 1.0, h + 1.0], [-1.0, h]],
                             [0.5, 0.5],
                         ),
                         _ => (identity, [0.5, 0.5]),
                     };
-                    if case >= 7 {
+                    if (7..11).contains(&case) {
                         origin = [canvas_size[0] - 3, canvas_size[1] - 2];
                     }
-                    let warp = Warp::new(pins, center, size[0], size[1]).unwrap();
-                    if case >= 9 {
+                    let mut warp = Warp::new(pins, center, size[0], size[1]).unwrap();
+                    if (9..11).contains(&case) {
                         origin = [u32::MAX, u32::MAX];
+                    }
+                    let rect = match case {
+                        11 => Some([3.25, 2.375, w, h]),           // fractional placement
+                        12 => Some([2.0, 1.0, w * 0.75, h * 1.4]), // unequal density
+                        // Actual rounded canvas height determines vertical density.
+                        13 => Some([3.0, 2.0, w, h * 15.0 / 14.75]),
+                        14 => Some([-3.25, -2.125, w * 1.5, h * 1.75]), // clipping
+                        15 => Some([5.25, 3.125, 0.25, 0.375]),         // subpixel extent
+                        16 => Some([1.125, 0.875, w * 1.125, h * 1.375]), // overscan
+                        17 => Some([0.0, 0.0, 23.0, 15.0]),             // first/last rows, scale
+                        _ => None,
+                    };
+                    if let Some(rect) = rect {
+                        warp = warp.with_source_rect(rect).unwrap();
                     }
                     let enabled = !matches!(case, 0 | 7 | 9);
                     let mapping = enabled.then_some(&warp);
@@ -664,7 +693,11 @@ fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
                         &table,
                         target_format,
                     )?;
-                    let tolerance = if matches!(case, 3..=6) { 1 } else { 0 };
+                    let tolerance = if matches!(case, 3..=6 | 11..=17) {
+                        1
+                    } else {
+                        0
+                    };
                     for (i, (got, want)) in got.chunks_exact(4).zip(expected).enumerate() {
                         let want = encode(want, target_format);
                         assert_eq!(got[3], 255, "alpha case {case} pixel {i}");
@@ -687,6 +720,71 @@ fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
     println!(
         "GPU readback passed: {cases} cases, worst channel error {worst_error} byte(s); identity/exact tolerance 0, warped tolerance 1"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+fn sync_shapes_keep_output_local_coordinates_with_scaled_source_rectangles() -> anyhow::Result<()> {
+    let mut gpu = Gpu::new(None)?;
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let size = [17, 9];
+    let canvas = Image::new(&gpu, [1, 1], format)?;
+    let target = Image::new(&gpu, size, format)?;
+    let shape_rects = [[2, 1, 7, 4], [9, 5, 15, 8]];
+    for center in [[0.5, 0.5], [0.3, 0.7]] {
+        let local = Warp::new(
+            [[0.0, 0.0], [17.0, 0.0], [17.0, 9.0], [0.0, 9.0]],
+            center,
+            size[0],
+            size[1],
+        )
+        .map_err(anyhow::Error::msg)?;
+        let table = vec![(256, 0); (size[0] * size[1]) as usize];
+        gpu.set_transfer(2, size[0], size[1], &table)?;
+        gpu.set_sync_shapes(
+            2,
+            1,
+            &[[2, 1, 15, 8], [2, 4, 0, 0], shape_rects[0], shape_rects[1]],
+        )?;
+        let expected: Vec<_> = (0..size[1])
+            .flat_map(|y| (0..size[0]).map(move |x| (x, y)))
+            .flat_map(|(x, y)| {
+                let p = local.source_at(x as f64 + 0.5, y as f64 + 0.5).unwrap();
+                let q = [p[0].clamp(0.5, 16.5), p[1].clamp(0.5, 8.5)];
+                let lit = shape_rects.iter().any(|r| {
+                    q[0] >= r[0] as f64
+                        && q[0] < r[2] as f64
+                        && q[1] >= r[1] as f64
+                        && q[1] < r[3] as f64
+                });
+                let byte = if lit { 255 } else { 0 };
+                [byte, byte, byte, 255]
+            })
+            .collect();
+        for rect in [[3.25, 2.375, 25.5, 4.5], [-30.25, 100.875, 0.25, 25.5]] {
+            let mapping = local
+                .clone()
+                .with_source_rect(rect)
+                .map_err(anyhow::Error::msg)?;
+            for invert in [false, true] {
+                let mut constants = PushConstants::canvas([0, 0], size, 1, invert, Some(&mapping));
+                constants.mode = 1;
+                constants.groups = 1;
+                let got = draw_installed(
+                    &mut gpu,
+                    TestCanvas::Pixels(&canvas, &[0, 0, 0, 255]),
+                    &target,
+                    constants,
+                    format,
+                )?;
+                assert_eq!(
+                    got, expected,
+                    "center={center:?}, rect={rect:?}, invert={invert}"
+                );
+            }
+        }
+    }
     Ok(())
 }
 

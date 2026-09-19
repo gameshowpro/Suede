@@ -7,6 +7,7 @@ pub mod docs;
 pub mod events;
 pub mod json;
 pub mod observed;
+pub mod projection;
 pub mod ui;
 pub mod wallpapers;
 
@@ -65,12 +66,11 @@ impl ApiState {
     /// until reconciliation settles.
     pub async fn commit(
         &self,
-        next: DesiredState,
+        mut next: DesiredState,
         section: &str,
         wait: Option<u64>,
     ) -> ApiResult<DesiredState> {
-        next.validate(self.bootstrap.allow_overlaps)
-            .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
+        self.validate_configuration(&mut next)?;
 
         let saved = self
             .store
@@ -97,6 +97,21 @@ impl ApiState {
         }
 
         Ok(saved)
+    }
+
+    pub fn validate_configuration(&self, next: &mut DesiredState) -> ApiResult<()> {
+        let previous = self.store.effective();
+        crate::projection_policy::preserve_retained(next, &previous);
+        next.validate(self.bootstrap.allow_overlaps)
+            .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
+        crate::projection_policy::validate_activation(
+            next,
+            &previous,
+            &self.snapshot.projection_control(),
+            self.snapshot.slicer_running(),
+            self.bootstrap.allow_overlaps,
+        )
+        .map_err(ApiError::Validation)
     }
 
     /// Reject a write whose `If-Match` revision is stale.
@@ -130,6 +145,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/av", get(observed::list_av_devices))
         .route("/status", get(observed::get_status))
         .route("/projection/stats", get(observed::get_projection_stats))
+        .route("/projection/convert", post(projection::convert_layout))
+        .route(
+            "/projection/recommendation",
+            get(projection::recommend_resolution),
+        )
         .route("/system", get(observed::get_system))
         .route("/system/checks", get(observed::list_checks))
         .route("/system/checks/{id}/fix", post(observed::fix_check))

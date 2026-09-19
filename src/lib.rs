@@ -16,6 +16,7 @@ pub mod ports;
 pub mod probe;
 #[cfg(feature = "projection")]
 pub mod projection;
+pub mod projection_policy;
 pub mod reconciler;
 pub mod snapshot;
 pub mod state;
@@ -24,6 +25,9 @@ pub mod sway;
 pub mod util;
 pub mod wallpapers;
 pub mod watchdog;
+// Pure mapping validation is also required by builds without a renderer.
+#[path = "projection/warp.rs"]
+pub mod warp_math;
 
 /// Version of the running daemon, from `Cargo.toml`.
 ///

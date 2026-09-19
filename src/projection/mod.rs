@@ -23,7 +23,12 @@ pub mod overlay;
 pub mod pattern;
 #[cfg(unix)]
 pub mod slicer;
-pub mod warp;
+pub use crate::warp_math as warp;
+pub mod layout;
+
+// Packet 4 reference only: no runtime or public configuration dependency.
+#[cfg(test)]
+mod seam_oracle;
 
 pub use blend::{
     canvas_plan, canvas_plan_with_warp_activation, overlay_specs, CanvasPlan, OverlaySpec,

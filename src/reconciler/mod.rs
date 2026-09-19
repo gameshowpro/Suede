@@ -285,6 +285,40 @@ impl Reconciler {
         // The configured layout lives in canvas space and may overlap; sway
         // must only ever see a plain tiling. Decide the mapping first, so the
         // output planner below works on what sway is actually given.
+        let previous_geometry = self.snapshot.projection_report().geometry;
+        let geometry_status = crate::projection_policy::status(
+            &desired,
+            &self.snapshot.projection_control(),
+            self.snapshot.slicer_running(),
+            self.allow_overlaps,
+            Some(&previous_geometry),
+        );
+        if self
+            .snapshot
+            .set_projection_geometry(geometry_status.clone())
+        {
+            self.events
+                .publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                    self.snapshot.projection_report(),
+                )));
+        }
+        if geometry_status.requested_mode == crate::model::ProjectionMode::Warp
+            && geometry_status.effective_mode == crate::model::ProjectionMode::Simple
+        {
+            divergences.push(Divergence::new("warp_unavailable", "projection", format!("{}; using retained simple rectangles. Saved warp settings remain available for restoration", geometry_status.reason.clone().unwrap_or_else(|| "warp support is unavailable".into()))));
+        }
+        #[cfg(feature = "projection")]
+        if geometry_status.effective_mode == crate::model::ProjectionMode::Warp {
+            if let Err(error) =
+                crate::projection::layout::canvas_plan(&desired, &self.snapshot.outputs())
+            {
+                divergences.push(Divergence::new(
+                    "warp_geometry_invalid",
+                    "projection",
+                    error,
+                ));
+            }
+        }
         let canvas_plan = self.plan_canvas(&desired);
         let sway_outputs = self.outputs_for_sway(&desired, canvas_plan.as_ref());
 
@@ -625,6 +659,8 @@ impl Reconciler {
                     // they left.
                     if anything_to_show && !plan.slices.is_empty() {
                         slicer = Some(SlicerSpec {
+                            layout: plan.layout,
+                            coverage_rects: plan.coverage_rects,
                             control_session: String::new(),
                             source: name.clone(),
                             canvas_width: width,
@@ -752,12 +788,29 @@ impl Reconciler {
         &self,
         desired: &crate::model::DesiredState,
     ) -> Option<crate::projection::CanvasPlan> {
-        self.plan_canvas_with_warp(desired, false)
+        let previous = self.snapshot.projection_report().geometry;
+        let policy = crate::projection_policy::status(
+            desired,
+            &self.snapshot.projection_control(),
+            self.snapshot.slicer_running(),
+            self.allow_overlaps,
+            Some(&previous),
+        );
+        if policy.effective_mode == crate::model::ProjectionMode::Warp {
+            return crate::projection::layout::canvas_plan(desired, &self.snapshot.outputs()).ok();
+        }
+        // A retained warp configuration can probe the actual pipeline while
+        // displaying its separate simple layout, including a single output.
+        let probe = self.allow_overlaps
+            && desired.projection.as_ref().is_some_and(|p| {
+                p.renderer != crate::model::Renderer::Cpu
+                    && (p.mode == crate::model::ProjectionMode::Warp || p.canvas.is_some())
+            });
+        self.plan_canvas_with_warp(desired, probe)
     }
 
-    /// Phase 1's internal activation seam for direct slicer fixtures. Normal
-    /// reconciliation passes false because the persisted schema has no
-    /// geometry yet; Phase 2 will provide the actual nonidentity decision.
+    /// Plan simple rectangles, optionally keeping a slicer active to probe
+    /// capability before restoring a retained warp configuration.
     #[cfg(feature = "projection")]
     fn plan_canvas_with_warp(
         &self,
@@ -1131,6 +1184,12 @@ impl Reconciler {
         mut triggers: mpsc::Receiver<&'static str>,
         mut shutdown: watch::Receiver<bool>,
     ) {
+        let mut projection_events = self.events.subscribe();
+        let initial_control = self.snapshot.projection_control();
+        let mut capability_signature = (
+            initial_control.warp_available,
+            initial_control.requested_renderer,
+        );
         self.detect_capabilities().await;
         self.reconcile().await;
 
@@ -1153,6 +1212,16 @@ impl Reconciler {
 
         loop {
             tokio::select! {
+                Ok(ServerEvent::ProjectionStatsChanged(_)) = projection_events.recv() => {
+                    let control = self.snapshot.projection_control();
+                    let signature = (control.warp_available, control.requested_renderer);
+                    // Only capability transitions cause a pass; frame/control
+                    // acknowledgments must not turn every frame into planning.
+                    if signature != capability_signature {
+                        capability_signature = signature;
+                        self.reconcile().await;
+                    }
+                }
                 _ = shutdown.changed() => {
                     tracing::info!("reconciler stopping");
                     return;
@@ -1264,6 +1333,7 @@ impl Reconciler {
 /// Surface a rejected direct warp as reconciliation divergence while keeping
 /// legacy CPU/simple installations quiet. The capability record remains the
 /// richer health/status explanation and survives until the child changes.
+#[cfg(any(feature = "projection", test))]
 fn warp_unavailable_divergence(
     control: &crate::model::ProjectionControlStatus,
 ) -> Option<Divergence> {
@@ -1284,9 +1354,10 @@ fn warp_unavailable_divergence(
 mod tests {
     use super::*;
     use crate::audio::mock::MockAudio;
+    #[cfg(feature = "projection")]
+    use crate::model::Output;
     use crate::model::{
-        AppConfig, AudioConfig, Launcher, Mode, Output, OutputConfig, OutputMatch, Position,
-        RestartPolicy,
+        AppConfig, AudioConfig, Launcher, Mode, OutputConfig, OutputMatch, Position, RestartPolicy,
     };
     use crate::supervisor::LaunchContext;
     use crate::sway::mock::MockSway;
@@ -1303,6 +1374,10 @@ mod tests {
     }
 
     fn harness() -> Harness {
+        harness_with_allow_overlaps(false)
+    }
+
+    fn harness_with_allow_overlaps(allow_overlaps: bool) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let sway = Arc::new(MockSway::with_fixtures());
         let audio = Arc::new(MockAudio::with_devices());
@@ -1331,7 +1406,7 @@ mod tests {
             events: events.clone(),
             wallpapers: Arc::new(WallpaperStore::new(dir.path().join("wallpapers"))),
             docs_base_url: "https://suede.gameshow.pro/".to_string(),
-            allow_overlaps: false,
+            allow_overlaps,
         }));
         Harness {
             reconciler,
@@ -1354,6 +1429,62 @@ mod tests {
         });
         config.position = Some(Position { x, y: 0 });
         config
+    }
+
+    #[cfg(feature = "projection")]
+    fn warp_output(name: &str, x: i32, corners: [[f64; 2]; 4]) -> OutputConfig {
+        let mut config = configured_output(name, x);
+        let source = crate::model::CanvasRect {
+            x: f64::from(x) / 3680.0,
+            y: 0.0,
+            width: 1920.0 / 3680.0,
+            height: 1080.0 / 3680.0,
+        };
+        config.geometry = Some(crate::model::OutputGeometry {
+            source,
+            corners,
+            center: [0.5, 0.5],
+            raster_footprint: source,
+        });
+        config
+    }
+
+    #[cfg(feature = "projection")]
+    fn warp_layout(mode: crate::model::ProjectionMode) -> crate::model::DesiredState {
+        let mut desired = crate::model::DesiredState::new();
+        desired.projection = Some(crate::model::ProjectionConfig {
+            mode,
+            canvas: Some(crate::model::CanvasConfig {
+                aspect: 3680.0 / 1080.0,
+                render_width: 3680,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        });
+        desired.outputs.push(warp_output(
+            "HDMI-A-1",
+            0,
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        ));
+        desired.outputs.push(warp_output(
+            "HDMI-A-2",
+            1760,
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        ));
+        desired
+    }
+
+    #[cfg(feature = "projection")]
+    fn mark_gpu_warp_available(harness: &Harness) {
+        harness.snapshot.set_slicer_running(true);
+        harness
+            .snapshot
+            .set_projection_control(crate::model::ProjectionControlStatus {
+                requested_renderer: Some(crate::model::Renderer::Auto),
+                effective_renderer: Some(crate::model::Renderer::Gpu),
+                warp_available: Some(true),
+                ..Default::default()
+            });
     }
 
     #[test]
@@ -1398,6 +1529,189 @@ mod tests {
         assert_eq!((plan.canvas_width, plan.canvas_height), (1920, 1080));
         assert_eq!(plan.slices.len(), 1);
         assert!(plan.slices[0].ramps.is_empty());
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn public_warp_pins_leave_canvas_sway_positions_and_source_selection_unchanged() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        mark_gpu_warp_available(&harness);
+        let mut desired = warp_layout(crate::model::ProjectionMode::Warp);
+
+        let first = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("available warp must produce a public plan");
+        let first_sway = harness.reconciler.outputs_for_sway(&desired, Some(&first));
+
+        desired.outputs[0].geometry.as_mut().unwrap().corners[0] = [0.12, 0.1];
+        let second = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("a pin edit must preserve the public plan");
+        let second_sway = harness.reconciler.outputs_for_sway(&desired, Some(&second));
+
+        assert_eq!((first.canvas_width, first.canvas_height), (3680, 1080));
+        assert_eq!(
+            (second.canvas_width, second.canvas_height),
+            (first.canvas_width, first.canvas_height)
+        );
+        assert_eq!(first.sway_positions, second.sway_positions);
+        assert_eq!(
+            first_sway
+                .iter()
+                .map(|output| output.position)
+                .collect::<Vec<_>>(),
+            second_sway
+                .iter()
+                .map(|output| output.position)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(first.layout, second.layout);
+        assert_eq!(first.slices[0].source, second.slices[0].source);
+        assert_eq!(first.slices[0].source_rect, second.slices[0].source_rect);
+        assert_ne!(first.slices[0].geometry, second.slices[0].geometry);
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn public_warp_plan_retains_an_unattached_configured_participant() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        mark_gpu_warp_available(&harness);
+        let mut desired = warp_layout(crate::model::ProjectionMode::Warp);
+        desired.outputs[1].r#match = crate::model::OutputMatch::by_name("HDMI-A-9");
+
+        let plan = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("the attached participant must still produce a plan");
+        assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
+        assert_eq!(plan.layout.as_ref().unwrap().participants.len(), 2);
+        assert!(plan
+            .layout
+            .as_ref()
+            .unwrap()
+            .participants
+            .iter()
+            .any(|participant| participant.output == "HDMI-A-9"));
+        assert_eq!(plan.slices.len(), 1);
+        assert_eq!(plan.slices[0].output, "HDMI-A-1");
+        let sway = harness.reconciler.outputs_for_sway(&desired, Some(&plan));
+        assert_eq!(sway[1].position, desired.outputs[1].position);
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn cpu_capability_forces_simple_then_gpu_recovery_selects_saved_warp() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        harness.snapshot.set_slicer_running(true);
+        harness
+            .snapshot
+            .set_projection_control(crate::model::ProjectionControlStatus {
+                requested_renderer: Some(crate::model::Renderer::Auto),
+                effective_renderer: Some(crate::model::Renderer::Cpu),
+                warp_available: Some(false),
+                warp_reason: Some("CPU renderer has no warp path".into()),
+                ..Default::default()
+            });
+        let desired = warp_layout(crate::model::ProjectionMode::Warp);
+        let policy = crate::projection_policy::status(
+            &desired,
+            &harness.snapshot.projection_control(),
+            true,
+            true,
+            None,
+        );
+        assert_eq!(policy.effective_mode, crate::model::ProjectionMode::Simple);
+        let simple = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("overlapping simple fallback still needs a canvas");
+        assert!(simple.slices.iter().all(|slice| slice.geometry.is_none()));
+        assert!(simple
+            .slices
+            .iter()
+            .all(|slice| slice.source_rect.is_none()));
+
+        mark_gpu_warp_available(&harness);
+        let recovered_policy = crate::projection_policy::status(
+            &desired,
+            &harness.snapshot.projection_control(),
+            true,
+            true,
+            None,
+        );
+        assert_eq!(
+            recovered_policy.effective_mode,
+            crate::model::ProjectionMode::Warp
+        );
+        let recovered = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("GPU capability recovery must select saved warp settings");
+        assert!(recovered
+            .slices
+            .iter()
+            .all(|slice| slice.geometry.is_some()));
+        assert!(recovered
+            .slices
+            .iter()
+            .all(|slice| slice.source_rect.is_some()));
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn single_output_probe_uses_the_retained_canvas_and_activates_warp_path() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        mark_gpu_warp_available(&harness);
+        let mut desired = crate::model::DesiredState::new();
+        desired.projection = Some(crate::model::ProjectionConfig {
+            mode: crate::model::ProjectionMode::Simple,
+            canvas: Some(crate::model::CanvasConfig {
+                aspect: 1.0,
+                render_width: 100,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        });
+        let mut output = configured_output("HDMI-A-1", 0);
+        output.mode = Some(crate::model::Mode {
+            width: 100,
+            height: 100,
+            refresh_hz: 60.0,
+        });
+        let source = crate::model::CanvasRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+        };
+        output.geometry = Some(crate::model::OutputGeometry {
+            source,
+            raster_footprint: source,
+            corners: [[0.12, 0.1], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+        });
+        desired.outputs.push(output);
+
+        let plan = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("a retained nonidentity mapping must probe the single output");
+        assert_eq!((plan.canvas_width, plan.canvas_height), (100, 100));
+        assert_eq!(plan.slices.len(), 1);
     }
 
     fn app(id: &str, output: Option<&str>, audio: Option<AudioConfig>) -> AppConfig {

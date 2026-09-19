@@ -387,7 +387,7 @@ const REQUIRED_DEVICE_EXTENSIONS: [&CStr; 5] = [
 
 /// A device's push constants, `#[repr(C)]` to match `blend.frag`'s
 /// `PushConstants` block byte for byte. The legacy eight-u32 prefix is
-/// followed by three vec4 rows and a fully initialized 16-byte control block.
+/// followed by three vec4 rows, a 16-byte control block, and the source rect.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
@@ -407,6 +407,7 @@ struct PushConstants {
     center: [f32; 2],
     warp_enabled: u32,
     padding: u32,
+    source_rect: [f32; 4],
 }
 
 impl PushConstants {
@@ -430,6 +431,15 @@ impl PushConstants {
             center: warp.map_or([0.5; 2], |w| w.center()),
             warp_enabled: u32::from(warp.is_some()),
             padding: 0,
+            source_rect: warp
+                .and_then(|w| w.source_rect())
+                .unwrap_or([
+                    source[0] as f64,
+                    source[1] as f64,
+                    size[0] as f64,
+                    size[1] as f64,
+                ])
+                .map(|v| v as f32),
         }
     }
 
@@ -2062,6 +2072,12 @@ impl Gpu {
         jobs: &[BlendJob<'_>],
     ) -> anyhow::Result<Duration> {
         for job in jobs {
+            // Explicit source rectangles are validated by Warp and may
+            // scale or extend beyond the canvas. The general shader checks
+            // each sample and writes opaque black outside the canvas.
+            if job.warp.is_some_and(|warp| warp.source_rect().is_some()) {
+                continue;
+            }
             let right = job
                 .source_x
                 .checked_add(job.target.width)
@@ -3008,11 +3024,12 @@ mod tests {
 
     #[test]
     fn push_constants_match_warp_shader_layout() {
-        assert_eq!(std::mem::size_of::<PushConstants>(), 96);
+        assert_eq!(std::mem::size_of::<PushConstants>(), 112);
         assert_eq!(std::mem::offset_of!(PushConstants, inverse_rows), 32);
         assert_eq!(std::mem::offset_of!(PushConstants, center), 80);
         assert_eq!(std::mem::offset_of!(PushConstants, warp_enabled), 88);
         assert_eq!(std::mem::offset_of!(PushConstants, padding), 92);
+        assert_eq!(std::mem::offset_of!(PushConstants, source_rect), 96);
         assert_eq!(std::mem::align_of::<PushConstants>(), 4);
         // Vulkan guarantees only 128 bytes of push constants, and a device
         // that offers exactly that must still take this block.

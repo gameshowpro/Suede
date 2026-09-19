@@ -351,6 +351,8 @@ impl Divergence {
         "background_preset_not_found",
         "tearing_unsupported",
         "projection_unavailable",
+        "warp_unavailable",
+        "warp_geometry_invalid",
         "blend_overlay_failed",
         "headless_unavailable",
     ];
@@ -377,6 +379,7 @@ impl Divergence {
             "projection_unavailable" | "blend_overlay_failed" | "headless_unavailable" => {
                 "configuration/#projection-edge-blending"
             }
+            "warp_unavailable" | "warp_geometry_invalid" => "configuration/#projection-geometry",
             _ => return None,
         })
     }
@@ -685,6 +688,9 @@ pub struct ConfigChange {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionReport {
+    /// Public mode selection, independent of sampler-level child diagnostics.
+    #[serde(default, skip_serializing_if = "ProjectionGeometryStatus::is_empty")]
+    pub geometry: ProjectionGeometryStatus,
     /// Whether a slicer process is alive. A slicer can be running and yet
     /// have reported nothing: the frame loop is damage-driven, so a static
     /// page produces no frames and therefore no interval. Distinguishing
@@ -701,6 +707,23 @@ pub struct ProjectionReport {
     /// before it has any ten-second interval to report.
     #[serde(default, skip_serializing_if = "ProjectionControlStatus::is_empty")]
     pub control: ProjectionControlStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGeometryStatus {
+    pub requested_renderer: crate::model::Renderer,
+    pub requested_mode: crate::model::ProjectionMode,
+    pub effective_mode: crate::model::ProjectionMode,
+    pub warp_available: Option<bool>,
+    pub reason: Option<String>,
+    pub retained_warp: bool,
+}
+
+impl ProjectionGeometryStatus {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Observed progress of the complete snapshots sent to the slicer.

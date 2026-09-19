@@ -26,6 +26,7 @@ pub struct Snapshot {
     /// Live-control progress is distinct from ten-second frame statistics so
     /// a static source can still show whether a requested edit was installed.
     projection_control: RwLock<ProjectionControlStatus>,
+    projection_geometry: RwLock<crate::model::observed::ProjectionGeometryStatus>,
 }
 
 impl Snapshot {
@@ -145,10 +146,23 @@ impl Snapshot {
     /// liveness alongside whatever the slicer has most recently reported.
     pub fn projection_report(&self) -> ProjectionReport {
         ProjectionReport {
+            geometry: self.projection_geometry.read().unwrap().clone(),
             running: self.slicer_running(),
             last_interval: self.projection_stats(),
             control: self.projection_control(),
         }
+    }
+
+    pub fn set_projection_geometry(
+        &self,
+        value: crate::model::observed::ProjectionGeometryStatus,
+    ) -> bool {
+        let mut guard = self.projection_geometry.write().unwrap();
+        if *guard == value {
+            return false;
+        }
+        *guard = value;
+        true
     }
 
     /// Total height of the layout, used to park the cursor below every output.

@@ -514,13 +514,35 @@ somewhere. Check the `direct-scanout` health check first — it compares the
 running compositor against these keys and says which way they disagree.
 
 
-## Warping (pipeline integration in progress)
+## Warping {: #warping }
 
-The internal GPU slicer can pin the four corners of an output's picture and
-move its horizontal and vertical center fractions. Destination pins move the
-picture within that output; they do not change the source rectangle, Chromium
-viewport, or neighboring outputs' crops. This is currently an internal fixture
-and pipeline capability. Public configuration and editing are later work.
+Warp mode lets an operator fit each projector's picture to a physical surface
+with four destination pins and two center fractions. The public model keeps
+three pieces of geometry separate: a source rectangle selects browser content,
+destination pins move that rectangle in the output raster, and
+`rasterFootprint` records where the projector's entire light field lands. A
+pin drag therefore leaves the browser canvas, source coverage, and physical
+footprint unchanged. Source and footprint rectangles are stored in isotropic
+canvas units; pins are output-local normalized coordinates in TL, TR, BR, BL
+order.
+
+The canvas occupies `[0,1] × [0,1/aspect]`. With `renderWidth = W`, Suede
+uses `H = max(1, round(W/aspect))` and converts a source rectangle to pixel
+boundaries with x density `W` and y density `aspect * H`; rounding `H` is
+preserved rather than silently resizing the chosen width. `scale` is retained
+as descriptive canvas metadata. Warp currently requires output scale `1.0`
+and transform `normal`; output mode dimensions must stay within 32,768 pixels
+per axis and 32 megapixels.
+
+The configured source roster contains one to eight enabled participants,
+including outputs without a connected display. Each source is finite, positive,
+visible after clipping to the canvas, and bounded by ±16 times the larger
+canvas span. The clipped graph connects only through positive-area overlap or
+a shared edge segment, so point contacts and gaps are rejected. Original
+source rectangles that overlap by at least 80% of the smaller area form a
+pure stack only when every pair meets that threshold; mixed stack/seam layouts
+are invalid. These source rules drive normalized minimum-distance seam weights;
+destination pin edits do not change them.
 
 For each output pixel, the pipeline inverse-maps the destination into content
 coordinates, samples the source, and applies its precomputed canvas-space
@@ -543,9 +565,38 @@ canvases through the same shader, preserving connector labels and calibration
 pixels. A single nonidentity output can use the internal planning/slicing path;
 identity keeps the existing direct path.
 
-The agreed public behavior is forced simple rectangle mode when startup finds
-no warp capability, with separately retained warp settings and a health warning
-for recovery. Persistence and UI integration belong to the later geometry/UI
-phases; this checkpoint supplies the capability evidence and enforcement.
-Public configuration still supplies identity geometry. See the
-[packet 3 record](../research/warp/PACKET3.md) for validation and rollout limits.
+The daemon keeps simple rectangle settings and warp settings separately. If
+startup finds no warp capability, effective mode is forced to simple while the
+saved warp settings remain available for restoration; the health report names
+the limitation. Geometry-only edits do not resize the headless canvas. An
+explicit canvas or resolution edit does, because `renderWidth` is an operator
+choice rather than a value inferred during a corner drag.
+
+The two read-only planning endpoints keep these choices reviewable. The
+simple-to-warp conversion requires complete explicit modes and positions for
+all enabled configured participants, including disconnected outputs, and
+returns identity pins and neutral centers without saving anything. The
+resolution recommendation uses the effective working copy and includes its
+revision and generation. It samples a dense grid of the largest-singular
+Jacobian density, including both sides of center-remap breaks, then adds a
+conservative margin. The response says `approximate: true`: sampled density is
+useful planning guidance, not an exact maximum proof. Invalid or ill-conditioned
+geometry is rejected. Known planning limits are 32,768 pixels per dimension,
+64 megapixels for the canvas, and 32 megapixels per output; device and
+compositor limits remain unknown, so the endpoint does not probe by resizing a
+headless output.
+
+The public routes are `POST /api/v1/projection/convert` for the unsaved
+simple-to-warp candidate, `GET /api/v1/projection/recommendation` for the
+approximate resolution guidance, and `GET /api/v1/projection/stats` for live
+pipeline status. The stats response includes `geometry` with requested and
+effective mode, requested renderer, warp availability, any limitation reason,
+and whether warp settings remain retained. Recommendations never resize or
+silently adopt a canvas; an operator must write the returned candidate or
+resolution explicitly.
+
+The current alpha schema is written directly. Old configuration files are not
+migrated and no legacy seam-weight mode is retained. See the
+[packet 3 record](../research/warp/PACKET3.md) for the capability evidence and
+the [configuration reference](configuration.md#projection-geometry) for the
+JSON fields.

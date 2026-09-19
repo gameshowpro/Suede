@@ -3,10 +3,12 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::geometry::{validate_sources, CanvasConfig, OutputGeometry, ProjectionMode};
 use super::observed::{Mode, Output, Position};
 
-/// Schema version of the persisted document. Bump when a migration is needed.
-pub const SCHEMA_VERSION: u32 = 1;
+/// Current persisted-document schema. Alpha upgrades require this exact
+/// version; older files are not migrated.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// The complete desired-state document.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
@@ -50,13 +52,13 @@ pub struct DesiredState {
     pub settings: Settings,
 }
 
-/// Multi-projector configuration: edge blending today, warping later.
+/// Multi-projector configuration, including retained simple and warp layouts.
 ///
-/// There is no overlap setting here, because the *layout is* the overlap
-/// configuration. Outputs are positioned in canvas space — the space the
-/// content is authored in — and wherever their rectangles intersect, that
-/// region is projected by both machines. Different seams may overlap by
-/// different amounts; rows and grids work the same way.
+/// There is no overlap setting here, because the source layout determines
+/// overlap. In simple mode, outputs are positioned in canvas space — the
+/// space the content is authored in — and wherever their rectangles intersect,
+/// that region is projected by both machines. Warp mode stores those source
+/// rectangles separately from destination pins.
 ///
 /// Sway never sees any of this. It is always handed a plain edge-to-edge
 /// tiling; the active app renders into a headless canvas the size of the
@@ -66,8 +68,14 @@ pub struct DesiredState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct ProjectionConfig {
-    /// Master switch. `false` keeps the configuration but skips the entire
-    /// blending chain: no overlays run, nothing is spawned, no divergences.
+    /// Which geometry pipeline is requested. Warp settings remain retained
+    /// while simple mode is active.
+    pub mode: ProjectionMode,
+    /// Canvas geometry retained independently from simple output positions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<CanvasConfig>,
+    /// Master switch for seam ramps. `false` retains required slicing and warp
+    /// processing but disables the transfer fades.
     pub blend: bool,
     /// The projectors' transfer gamma, shaping every ramp's fall-off.
     ///
@@ -111,6 +119,8 @@ pub struct ProjectionConfig {
 impl Default for ProjectionConfig {
     fn default() -> Self {
         Self {
+            mode: ProjectionMode::Simple,
+            canvas: None,
             blend: true,
             gamma: 2.2,
             black_lift: 0.0,
@@ -359,7 +369,25 @@ impl DesiredState {
             errors.extend(preset.background.problems(&prefix));
         }
 
+        if self.projection.is_none() {
+            // Retained warp entries remain part of the document even when no
+            // projection pipeline is requested, so malformed numbers cannot
+            // hide behind the absent pipeline.
+            for (index, output) in self.outputs.iter().enumerate() {
+                if let Some(geometry) = &output.geometry {
+                    if let Err(error) = geometry.validate_numbers(None) {
+                        errors.push(format!("outputs[{index}].geometry {error}"));
+                    }
+                }
+            }
+        }
+
         if let Some(projection) = &self.projection {
+            if let Some(canvas) = projection.canvas.as_ref() {
+                if let Err(error) = canvas.dimensions() {
+                    errors.push(format!("projection.canvas {error}"));
+                }
+            }
             // 1.0 disables the correction; beyond 4.0 is no known display and
             // almost certainly a typo'd measurement (22 for 2.2).
             if !(projection.gamma.is_finite() && (1.0..=4.0).contains(&projection.gamma)) {
@@ -376,6 +404,100 @@ impl DesiredState {
                     "projection.blackLift must be between 0.0 and 0.5, not {}",
                     projection.black_lift
                 ));
+            }
+
+            // Geometry is retained across pipeline edits, so validate every
+            // retained entry even while simple mode is requested. Warp has a
+            // complete configured roster contract: unattached outputs count,
+            // and each enabled participant needs an explicit/effective mode
+            // and complete geometry.
+            let mut warp_sources = Vec::new();
+            let enabled_count = self.outputs.iter().filter(|output| output.enable).count();
+            for (index, output) in self.outputs.iter().enumerate() {
+                let prefix = format!("outputs[{index}]");
+                if let Some(geometry) = &output.geometry {
+                    if let Err(error) = geometry.validate_numbers(projection.canvas.as_ref()) {
+                        errors.push(format!("{prefix}.geometry {error}"));
+                    } else if let (Some(canvas), Some(mode)) =
+                        (projection.canvas.as_ref(), output.effective_mode())
+                    {
+                        if mode.width > 0 && mode.height > 0 {
+                            if let Err(error) = geometry.validate_for_output(
+                                canvas,
+                                mode.width as u32,
+                                mode.height as u32,
+                            ) {
+                                errors.push(format!("{prefix}.geometry {error}"));
+                            }
+                        }
+                    }
+                }
+                if projection.mode == ProjectionMode::Warp && output.enable {
+                    let Some(canvas) = projection.canvas.as_ref() else {
+                        errors.push("projection.canvas is required in warp mode".into());
+                        continue;
+                    };
+                    let Some(mode) = output.effective_mode() else {
+                        errors.push(format!("{prefix}.mode is required in warp mode"));
+                        continue;
+                    };
+                    if output.position.is_none() {
+                        errors.push(format!(
+                            "{prefix}.position is required as the simple-mode fallback in warp mode"
+                        ));
+                    }
+                    if output.effective_scale().is_some_and(|scale| scale != 1.0) {
+                        errors.push(format!(
+                            "{prefix}.scale must be 1.0 in warp mode until raster scaling is supported"
+                        ));
+                    }
+                    if output
+                        .effective_transform()
+                        .is_some_and(|transform| transform != Transform::Normal)
+                    {
+                        errors.push(format!(
+                            "{prefix}.transform must be normal in warp mode until transformed rasters are supported"
+                        ));
+                    }
+                    if mode.width <= 0 || mode.height <= 0 {
+                        errors.push(format!("{prefix}.mode dimensions must be positive"));
+                        continue;
+                    }
+                    if mode.width > 32_768 || mode.height > 32_768 {
+                        errors.push(format!(
+                            "{prefix}.mode dimensions must be at most 32768 pixels per axis"
+                        ));
+                    }
+                    if (mode.width as u64) * (mode.height as u64) > 32_000_000 {
+                        errors.push(format!("{prefix}.mode allocation exceeds the 32MP limit"));
+                    }
+                    let (width, height) = (mode.width as u32, mode.height as u32);
+                    match &output.geometry {
+                        Some(geometry) => {
+                            if let Err(error) = geometry.validate_for_output(canvas, width, height)
+                            {
+                                errors.push(format!("{prefix}.geometry {error}"));
+                            }
+                            warp_sources.push(geometry.source);
+                        }
+                        None => errors.push(format!("{prefix}.geometry is required in warp mode")),
+                    }
+                }
+            }
+            if projection.mode == ProjectionMode::Warp {
+                if !allow_overlaps {
+                    errors.push("warp mode requires allow_overlaps = true".into());
+                }
+                if enabled_count == 0 {
+                    errors.push("warp mode requires at least one enabled output".into());
+                }
+                if let Some(canvas) = projection.canvas.as_ref() {
+                    if warp_sources.len() == enabled_count && !warp_sources.is_empty() {
+                        if let Err(error) = validate_sources(canvas, &warp_sources) {
+                            errors.push(format!("projection sources {error}"));
+                        }
+                    }
+                }
             }
         }
 
@@ -708,6 +830,11 @@ pub struct OutputConfig {
     /// Never adopted — see [`AdoptedOutput`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
+    /// Persisted warp source, destination pins and physical footprint.
+    /// Kept independently from `position` and from the requested pipeline so
+    /// switching to simple mode does not discard calibrated warp settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<OutputGeometry>,
     /// When absent, left as Sway's own and, once settled, pinned into
     /// `adopted.scale`. Prefer [`OutputConfig::effective_scale`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -939,6 +1066,7 @@ impl OutputConfig {
             enable: true,
             mode: None,
             position: None,
+            geometry: None,
             scale: None,
             transform: None,
             adaptive_sync: false,
@@ -1258,6 +1386,18 @@ fn default_heartbeat_grace() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_simple_and_warp_examples_validate_against_the_current_schema() {
+        for json in [
+            include_str!("../../docs/examples/four-output-appliance.json"),
+            include_str!("../../docs/examples/four-output-warp.json"),
+        ] {
+            let state: DesiredState = serde_json::from_str(json).unwrap();
+            assert_eq!(state.schema_version, SCHEMA_VERSION);
+            state.validate(true).unwrap();
+        }
+    }
     use crate::model::observed::Rect;
 
     fn output(name: &str, make: Option<&str>) -> Output {
@@ -1374,6 +1514,7 @@ mod tests {
                 refresh_hz: 60.0,
             }),
             position: Some(Position { x, y }),
+            geometry: None,
             scale: None,
             transform: None,
             adaptive_sync: false,

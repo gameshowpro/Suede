@@ -58,6 +58,8 @@ layout(push_constant) uniform PushConstants {
     vec2 center;
     uint warp_enabled;
     uint padding;
+    // Absolute canvas pixel-boundary x, y, width, height, at byte 96.
+    vec4 source_rect;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -79,6 +81,7 @@ void main() {
     }
 
     vec2 local = vec2(p);
+    vec2 unit = vec2(0.0);
     bool local_valid = true;
     if (pc.warp_enabled != 0u) {
         vec3 h = vec3(dot(pc.inverse_row0.xyz, vec3(gl_FragCoord.xy, 1.0)),
@@ -90,13 +93,14 @@ void main() {
             local_valid = false;
         } else {
             vec2 s = h.xy / h.z;
-            local = vec2(s.x <= pc.center.x
+            unit = vec2(s.x <= pc.center.x
                              ? s.x / (2.0 * pc.center.x)
                              : 0.5 + (s.x - pc.center.x) / (2.0 * (1.0 - pc.center.x)),
                          s.y <= pc.center.y
                              ? s.y / (2.0 * pc.center.y)
                              : 0.5 + (s.y - pc.center.y) / (2.0 * (1.0 - pc.center.y)));
-            local *= vec2(pc.width, pc.height);
+            // Sync shapes stay in output-local source-pattern coordinates.
+            local = unit * vec2(pc.width, pc.height);
             // A nonzero transfer entry means this destination pixel is
             // covered.  Clamp its source to a texel center, including when a
             // partially covered edge maps just outside the source rectangle.
@@ -160,12 +164,19 @@ void main() {
         // the black lift shape the counter exactly as they shape content.
         c = uvec3(lit * 255u);
     } else if (pc.warp_enabled != 0u) {
-        vec2 source = local + vec2(pc.source_x, pc.source_y);
+        vec2 source = pc.source_rect.xy + unit * pc.source_rect.zw;
+        // The transfer table is authoritative for destination border AA.
+        // Clamp covered samples to source texel centers; a source narrower
+        // than one canvas pixel has a single sampling position at its middle.
+        vec2 inset = min(vec2(0.5), pc.source_rect.zw * 0.5);
+        source = clamp(source, pc.source_rect.xy + inset,
+                       pc.source_rect.xy + max(inset, pc.source_rect.zw - inset));
         if (pc.y_invert != 0u) {
             source.y = float(pc.canvas_height) - source.y;
         }
         vec2 canvas_size = vec2(textureSize(canvas, 0));
-        if (source.x < 0.5 || source.x > canvas_size.x - 0.5 ||
+        if (any(isnan(source)) || any(isinf(source)) ||
+            source.x < 0.5 || source.x > canvas_size.x - 0.5 ||
             source.y < 0.5 || source.y > canvas_size.y - 0.5) {
             outColor = vec4(0.0, 0.0, 0.0, 1.0);
             return;

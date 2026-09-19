@@ -944,11 +944,27 @@ which it will, unless [`direct_scanout = false`](#direct-scanout) asks sway
 to composite the slices instead.
 
 ```json
-"projection": { "blend": true, "gamma": 2.2, "blackLift": 0.04 }
+"projection": {
+  "mode": "simple",
+  "blend": true, "gamma": 2.2, "blackLift": 0.04
+}
+```
+
+Warp mode stores a separate canvas and geometry alongside those retained
+rectangle settings:
+
+```json
+"projection": {
+  "mode": "warp",
+  "canvas": { "aspect": 7.111111111111111, "renderWidth": 7680, "scale": 1.0 },
+  "blend": true, "gamma": 2.2, "blackLift": 0.04
+}
 ```
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
+| `mode` | string | `simple` | `simple` uses the rectangle layout; `warp` activates the retained canvas and per-output geometry |
+| `canvas` | object or null | `null` | Required in warp mode. Contains `aspect`, authoritative `renderWidth`, and descriptive `scale` |
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
@@ -956,10 +972,100 @@ to composite the slices instead.
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
 
+#### Canvas and warp geometry {: #projection-geometry }
+
+`mode` is `simple` (the default) or `warp`. Both modes retain the ordinary
+output `position` and `mode` fields, so a simple layout remains useful when
+warp support is unavailable. The daemon retains saved warp settings while
+temporarily forcing effective simple mode on a machine without the required
+warp capability; it reports that limitation as a health warning and restores
+warp when capability returns. Switching modes does not silently overwrite the
+other mode's settings.
+
+Warp mode has an explicit canvas and per-output geometry:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `canvas.aspect` | positive number | Canvas width divided by height in isotropic canvas units |
+| `canvas.renderWidth` | integer | Chosen canvas width. It is authoritative; height is `round(renderWidth / aspect)`, at least one pixel |
+| `canvas.scale` | number | Descriptive operator scale, default `1.0`; it does not replace `renderWidth` |
+| `geometry.source` | rectangle | The content rectangle in canvas units (`x`, `y`, `width`, `height`) |
+| `geometry.corners` | four pairs | Destination pins in output-local normalized coordinates, ordered TL, TR, BR, BL. Identity is `[[0,0],[1,0],[1,1],[0,1]]` |
+| `geometry.center` | pair | Horizontal and vertical center fractions, normally `[0.5,0.5]` |
+| `geometry.rasterFootprint` | rectangle | The calibrated light footprint in canvas units, independent of source placement and pin edits |
+
+Source rectangles and destination pins answer different questions. The source
+selects which browser content an output shows; the pins move that picture in
+the output raster. The footprint describes where the projector's full raster
+lands, including black pixels outside a pinned picture. Pin edits never resize
+the browser or change a neighbor's source coverage.
+
+Canvas coordinates use `[0,1] × [0,1/aspect]`. If `renderWidth` is `W`, the
+canvas height is `H = max(1, round(W/aspect))`, with positive half-way values
+rounded up; `renderWidth` remains the
+chosen allocation and `scale` is descriptive metadata. A source rectangle's
+continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`.
+Corners are normalized to the output raster and are ordered top-left,
+top-right, bottom-right, bottom-left. Warp mode currently requires each
+enabled configured output, including an unattached output, to have geometry,
+an explicit or adopted mode, a simple fallback `position`, scale `1.0`, and
+transform `normal`. The roster has one to eight enabled participants, the
+canvas must be complete, and the appliance must set `allow_overlaps = true`.
+
+Every retained geometry is numerically validated even in simple mode. In warp
+mode, each source must have finite positive dimensions, visible canvas area,
+and coordinates bounded by ±16 times `max(1, 1/aspect)`. The clipped source
+graph must be connected through positive-area overlap or a shared edge
+segment; point contacts and gaps do not connect it. A pair whose original
+rectangles overlap by at least 80% of the smaller rectangle is a near-total
+stack. Stacks are accepted only when every pair is a stack; mixed stack/seam
+layouts are rejected. `rasterFootprint` is separate physical calibration and
+is initially copied from `source` by conversion.
+
+`POST /api/v1/projection/convert` is a read-only simple-to-warp conversion.
+Send the complete enabled participant roster in `{ "outputs": [...] }`, with
+an explicit `mode` and `position` for every enabled output, including outputs
+that are currently disconnected. Negative positions are valid. The response
+returns the bounding canvas, normalized source rectangles, identity pins,
+neutral centers, and an explicit initial footprint. Disabled outputs are
+retained in configuration but do not make a conversion incomplete. A missing
+mode or position is rejected; the candidate is never saved or applied.
+
+`GET /api/v1/projection/recommendation` is also read-only. It uses the
+effective working copy and reports its persisted `revision` and working-copy
+`generation`, a requested aspect, ideal and admissible dimensions, and
+`1.0`, `0.75`, and `0.5` scale presets. The ideal width samples the largest
+singular value of the canvas-to-output Jacobian on a dense grid for every
+output, evaluating both sides of center-remap breaks and applying a
+5% engineering margin. It is explicitly `approximate: true`; it is guidance,
+not a proof of the exact maximum. Ill-conditioned or non-finite geometry is
+rejected. Suggested widths are rounded up to eight pixels for UI convenience,
+while the persisted `renderWidth` remains authoritative and is never changed
+by a recommendation or a corner edit.
+
+The known planning limits are a 32,768-pixel maximum dimension, 64 megapixels
+for the canvas, and 32 megapixels per output. Driver and compositor allocation
+limits are unknown and are listed in the response. The endpoint does not
+resize a headless output or probe those limits.
+
+`GET /api/v1/projection/stats` reports the live `geometry` status alongside
+frame and lifecycle statistics. It includes requested and effective mode,
+requested renderer, warp availability, a limitation reason when present, and
+whether warp settings are retained. An effective simple mode therefore does
+not imply that saved warp geometry was discarded.
+
+Complete schema examples are available for a [simple appliance](examples/four-output-appliance.json)
+and a [warp appliance](examples/four-output-warp.json). The warp example
+requires `allow_overlaps = true` and a verified GPU pipeline for activation.
+
+The alpha schema is version 2. Existing files are not migrated; create or
+write the current schema directly. There is no legacy seam-weight mode.
+
 Slicing engages whenever the configured layout overlaps, with or without
 this section — and on an `allow_overlaps` appliance whenever two or more
 outputs take part at all; the section adds the blending. A single-output
-layout is never sliced either way. A full overlap (a stacked projector, a
+warp layout is also sliced; a simple layout can keep a slicer active to probe
+capability when warp settings are retained. A full overlap (a stacked projector, a
 mirror) is duplicated at full strength and never ramped.
 
 `renderer` chooses which pipeline the slicer blends with. `auto`, the

@@ -4,7 +4,9 @@
 //! client asked for. The two are never conflated.
 
 pub mod desired;
+pub mod geometry;
 pub mod observed;
 
 pub use desired::*;
+pub use geometry::*;
 pub use observed::*;
