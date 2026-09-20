@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, research/warp, 'research/**', 'preview/**']
   pull_request:
-    branches: [main]
+    branches: [main, research/warp]
   workflow_dispatch:
     inputs:
       docs_only:
@@ -124,7 +124,8 @@ jobs:
   build:
     needs: [changes, test]
     if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/research/warp' || startsWith(github.ref, 'refs/heads/research/') || startsWith(github.ref, 'refs/heads/preview/')) &&
       needs.changes.outputs.app == 'true'
     # Pinned, unlike the jobs above, because this one produces artifacts.
     # cargo-deb derives `Depends: libc6 (>= X)` from whatever glibc the build
