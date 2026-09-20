@@ -1011,29 +1011,29 @@ fn warp_alignment(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
 
     // Precompute 2px ranges for vertical (X) lines at 0%, 10%, ..., 100%
     let mut x_ranges = [(0i32, 0i32); 11];
-    for i in 0..=10 {
+    for (i, range) in x_ranges.iter_mut().enumerate() {
         let x_pos = (i as f64 * 0.1 * cw).round() as i32;
         if i == 0 {
-            x_ranges[i] = (0, 1);
+            *range = (0, 1);
         } else if i == 10 {
             let end = cw.round() as i32;
-            x_ranges[i] = (end - 2, end - 1);
+            *range = (end - 2, end - 1);
         } else {
-            x_ranges[i] = (x_pos - 1, x_pos);
+            *range = (x_pos - 1, x_pos);
         }
     }
 
     // Precompute 2px ranges for horizontal (Y) lines at 0%, 10%, ..., 100%
     let mut y_ranges = [(0i32, 0i32); 11];
-    for j in 0..=10 {
+    for (j, range) in y_ranges.iter_mut().enumerate() {
         let y_pos = (j as f64 * 0.1 * ch).round() as i32;
         if j == 0 {
-            y_ranges[j] = (0, 1);
+            *range = (0, 1);
         } else if j == 10 {
             let end = ch.round() as i32;
-            y_ranges[j] = (end - 2, end - 1);
+            *range = (end - 2, end - 1);
         } else {
-            y_ranges[j] = (y_pos - 1, y_pos);
+            *range = (y_pos - 1, y_pos);
         }
     }
 
@@ -1101,7 +1101,15 @@ mod tests {
 
     #[test]
     fn warp_alignment_renders_grid_and_circle() {
-        let mut sp = spec(TestPattern::WarpAlignment, Rect { x: 0, y: 0, width: 1000, height: 1000 });
+        let mut sp = spec(
+            TestPattern::WarpAlignment,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1000,
+                height: 1000,
+            },
+        );
         sp.canvas_size = Some([1000, 1000]);
         let rgb = render(1000, 1000, &sp);
 
