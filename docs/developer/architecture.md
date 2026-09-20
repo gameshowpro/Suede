@@ -118,3 +118,10 @@ Two dependencies named in the original specification were replaced during implem
 **The `pipewire` crate → `pw-dump` and `pw-cli`.** The crate links against `libpipewire-0.3`, which would add a build-time native dependency, break the "only libc" property, and require a PipeWire-equipped arm64 sysroot for cross-compilation. Driving PipeWire's own command-line tools gives the same capabilities — enumeration, change notification, null sink creation — with no build dependency at all. `pw-dump --monitor` is used purely as a change *trigger*, mirroring how Sway's detail-free `output` event is handled, with a one-shot `pw-dump` providing the authoritative list.
 
 **The web UI is build-step free.** The specification called for TypeScript compiled to static assets. It is instead one self-contained HTML file embedded with `include_str!`. A reference client's job is to be readable and to exercise every endpoint; requiring an npm toolchain in CI to ship it would be a poor trade.
+
+## Future architecture plans
+
+For in-depth design RFCs and upcoming architectural evolutions, see the [Engineering Plans](../plans/index.md) section:
+
+- [Black Offset Architecture Plan](../plans/black-offset.md): Multi-projector optical black floor compensation, non-linear dynamic roll-off, and scene-adaptive temporal contrast masking.
+- [Direct-to-Display Presentation via VK_KHR_display](../plans/VK_KHR_display.md): Bypassing the Wayland compositor to present directly to display hardware via Vulkan display extensions.

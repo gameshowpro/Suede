@@ -184,6 +184,8 @@ the API would only be claiming an environment that is already fixed.
     that is measurable on the machine in front of you rather than argued
     about.
 
+    For future architectural plans to bypass the compositor presentation pass entirely via direct Vulkan display acquisition, see the [Direct-to-Display Plan](plans/VK_KHR_display.md).
+
 A single-output layout is never sliced in any of the three.
 
 No fix ever restarts sway: that would tear down every window on every display.
@@ -1006,6 +1008,7 @@ Rise and fall time constants are 1-3,600,000 milliseconds. Slew must be
 positive and at most 10 lift units per second. All values must be finite.
 These defaults are provisional and need tuning for the installation.
 See the [complete adaptive example](examples/four-output-adaptive.json).
+For detailed mathematical derivations, forced "off" topology rules, and multi-dimensional roll-off curves, see the [Black Offset Plan](plans/black-offset.md).
 
 The statistic is mean linear luminance after sRGB decoding with Rec.709 RGB
 weights (0.2126, 0.7152, 0.0722). A regular grid of at most 256 by 256 source

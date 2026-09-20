@@ -512,6 +512,7 @@ compositor refused to flip: the buffer is the wrong size or format for the
 display controller, the output is scaled, or the variable is still set
 somewhere. Check the `direct-scanout` health check first — it compares the
 running compositor against these keys and says which way they disagree.
+To bypass the compositor presentation pass entirely and eliminate driver spin loops, see the proposed [Direct-to-Display Presentation Plan (VK_KHR_display)](plans/VK_KHR_display.md).
 
 
 ## Warping and Display Modes {: #warping }
@@ -526,7 +527,7 @@ Suede provides two distinct projection display modes: **Simple mode** and **Warp
 | **Mapping Geometry** | Pure rectangular crop and scale | Non-linear 4-corner destination pinning and 2-fraction optical center remap |
 | **Edge Blending & Seams** | Simple rectangular overlaps without ramps | Normalized minimum-distance smooth blending ramps with gamma-shaped falloff |
 | **Border Anti-Aliasing** | Not applicable (aligned to raster) | Continuous sub-pixel border coverage attenuating gain and black lift |
-| **Black Level Compensation** | Optional constant black lift | Constant, dynamic, or adaptive black level compensation across overlap zones |
+| **Black Level Compensation** | Optional constant black lift | Constant, dynamic, or adaptive compensation across overlap zones (see [Black Offset Plan](plans/black-offset.md)) |
 | **Pipeline Overhead** | Minimal (direct hardware scanning or rectangular blit) | Low GPU fragment shader pass with inverse homography and precomputed transfer tables |
 | **Renderer Compatibility** | GPU and CPU fallback pipelines | Requires GPU pipeline (Vulkan or EGL/GLES) |
 | **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity; bilinear interpolation on non-identity pins |
