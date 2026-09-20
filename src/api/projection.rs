@@ -13,7 +13,10 @@ use utoipa::ToSchema;
 
 use crate::api::json::Json;
 use crate::error::{ApiError, ApiResult};
-use crate::model::{validate_sources, CanvasConfig, CanvasRect, OutputConfig, OutputGeometry};
+use crate::model::{
+    validate_sources, CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, ProjectionMode,
+    Transform,
+};
 use crate::state::StateStore;
 
 /// Request body for `POST /api/v1/projection/convert`.
@@ -56,9 +59,13 @@ pub struct ResolutionLimits {
 #[serde(rename_all = "camelCase")]
 pub struct ScalePreset {
     pub scale: f64,
-    pub width: u32,
-    pub height: u32,
+    pub width: u64,
+    pub height: u64,
     pub achieved_scale: f64,
+    /// Whether this target can be allocated within the known canvas limits.
+    /// Unavailable targets remain in the response so the UI can explain and
+    /// disable them instead of relabeling a clamped width as 100%.
+    pub available: bool,
 }
 
 /// Read-only resolution guidance. `approximate` is always true: the sampled
@@ -297,7 +304,33 @@ pub fn recommend_for_state(
         return Err("at least one enabled output is required".into());
     }
 
-    let converted = convert_layout_candidate(&document.outputs).ok();
+    // The requested mode is the recommendation basis. A capability fallback
+    // is deliberately not represented in DesiredState, so retaining Warp here
+    // keeps the answer useful while the effective renderer is temporarily
+    // Simple. A missing projection section means the shared rectangular path.
+    let requested_mode = document
+        .projection
+        .as_ref()
+        .map(|projection| projection.mode)
+        .unwrap_or(ProjectionMode::Simple);
+
+    let converted = convert_layout_candidate(&document.outputs)
+        .ok()
+        .or_else(|| {
+            // Conversion intentionally rejects transformed/scaled outputs for
+            // the Warp candidate. Simple can still estimate its shared source
+            // rectangles, so retry the rectangular conversion with those
+            // output-only compositor properties normalized away.
+            if requested_mode != ProjectionMode::Simple {
+                return None;
+            }
+            let mut simple_outputs = document.outputs.clone();
+            for output in &mut simple_outputs {
+                output.scale = Some(1.0);
+                output.transform = Some(Transform::Normal);
+            }
+            convert_layout_candidate(&simple_outputs).ok()
+        });
     let requested_aspect = document
         .projection
         .as_ref()
@@ -312,7 +345,7 @@ pub fn recommend_for_state(
     let geometries: Vec<(&OutputConfig, OutputGeometry)> = outputs
         .iter()
         .map(|output| {
-            let geometry = output
+            let mut geometry = output
                 .geometry
                 .clone()
                 .or_else(|| {
@@ -327,6 +360,13 @@ pub fn recommend_for_state(
                 .ok_or_else(|| {
                     format!("output {} has no complete geometry", output.r#match.key())
                 })?;
+            if requested_mode == ProjectionMode::Simple {
+                // Source placement/content selection is shared between the
+                // two modes. Simple contributes no retained corner or center
+                // correction to the sampling estimate.
+                geometry.corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                geometry.center = [0.5, 0.5];
+            }
             Ok((*output, geometry))
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -352,6 +392,33 @@ pub fn recommend_for_state(
             u32::try_from(mode.width).map_err(|_| "output width exceeds u32".to_string())?;
         let height =
             u32::try_from(mode.height).map_err(|_| "output height exceeds u32".to_string())?;
+        let rotated = matches!(
+            output.effective_transform(),
+            Some(
+                Transform::Rotate90
+                    | Transform::Rotate270
+                    | Transform::Flipped90
+                    | Transform::Flipped270
+            )
+        );
+        let (width, height) = if requested_mode == ProjectionMode::Simple && rotated {
+            (height, width)
+        } else {
+            (width, height)
+        };
+        if requested_mode == ProjectionMode::Warp
+            && (output
+                .effective_scale()
+                .is_some_and(|scale| (scale - 1.0).abs() > f64::EPSILON)
+                || output
+                    .effective_transform()
+                    .is_some_and(|transform| transform != Transform::Normal))
+        {
+            return Err(format!(
+                "output {} uses a scale or transform unsupported by Warp recommendation",
+                output.r#match.key()
+            ));
+        }
         if u64::from(width) * u64::from(height) > LIMITS.max_output_pixels {
             return Err(format!(
                 "output {} exceeds the known 32 megapixel output limit",
@@ -405,28 +472,32 @@ pub fn recommend_for_state(
     // Five percent is an engineering margin for finite-difference truncation
     // and variation between the 33×33 grid points. It is not a mathematical
     // bound on the unsampled maximum.
-    let ideal_width_f = round_up_eight((density * 1.05).ceil().max(1.0));
+    // The density estimator uses canonical isotropic canvas units. Account
+    // for the actual rounded integer height when choosing the width: for an
+    // odd aspect/height pair, `round(width / aspect)` can otherwise leave the
+    // y density just below the sampled target.
+    let target_density = (density * 1.05).ceil().max(1.0);
+    let ideal_width_f = width_for_density(target_density, requested_aspect)?;
     if !ideal_width_f.is_finite() || ideal_width_f >= u64::MAX as f64 {
         return Err("geometry density is too ill-conditioned to represent safely".into());
     }
     let ideal_width = ideal_width_f as u64;
-    let ideal_height_f = (ideal_width_f / requested_aspect).round().max(1.0);
+    let ideal_height_f = round_positive(ideal_width_f / requested_aspect).max(1.0);
     if !ideal_height_f.is_finite() || ideal_height_f >= u64::MAX as f64 {
         return Err("geometry density is too ill-conditioned to represent safely".into());
     }
     let ideal_height = ideal_height_f as u64;
-    let admissible_seed = ideal_width.min(u64::from(LIMITS.max_dimension)) as u32;
-    let admissible_width = admissible_width(admissible_seed, requested_aspect)?;
+    let admissible_width = admissible_width(requested_aspect)?;
     let admissible_height = canvas_height(admissible_width, requested_aspect)?;
     if ideal_width > u64::from(LIMITS.max_dimension) {
         warnings.push(format!(
-            "ideal width was clamped to {} by the known dimension limit",
+            "ideal width exceeds the known dimension limit of {}",
             LIMITS.max_dimension
         ));
     }
     if u64::from(admissible_width) < ideal_width {
         warnings.push(format!(
-            "ideal width was clamped to {} by known canvas limits",
+            "ideal width exceeds the known admissible canvas width of {}",
             admissible_width
         ));
     }
@@ -434,17 +505,20 @@ pub fn recommend_for_state(
         "device and compositor maximum dimensions are unknown; no live probe was performed".into(),
     );
 
-    let presets = [1.0, 0.75, 0.5]
+    let presets = [0.25, 0.5, 0.75, 1.0]
         .into_iter()
         .map(|scale| {
-            let width = round_up_eight((admissible_width as f64 * scale).ceil())
-                .min(admissible_width as f64) as u32;
-            let height = canvas_height(width, requested_aspect).unwrap_or(1);
+            let width = round_positive(ideal_width as f64 * scale).max(1.0) as u64;
+            let height = round_positive(width as f64 / requested_aspect).max(1.0) as u64;
+            let available = width <= u64::from(LIMITS.max_dimension)
+                && height <= u64::from(LIMITS.max_dimension)
+                && width.saturating_mul(height) <= LIMITS.max_canvas_pixels;
             ScalePreset {
                 scale,
                 width,
                 height,
                 achieved_scale: width as f64 / ideal_width.max(1) as f64,
+                available,
             }
         })
         .collect();
@@ -466,37 +540,87 @@ pub fn recommend_for_state(
 }
 
 fn canvas_height(width: u32, aspect: f64) -> Result<u32, String> {
+    let height = canvas_height_unbounded(u64::from(width), aspect)?;
+    if height > u64::from(LIMITS.max_dimension) {
+        return Err("canvas height exceeds the known dimension limit".into());
+    }
+    if u64::from(width).saturating_mul(height) > LIMITS.max_canvas_pixels {
+        return Err("canvas exceeds the known pixel limit".into());
+    }
+    u32::try_from(height).map_err(|_| "canvas height exceeds u32".into())
+}
+
+fn canvas_height_unbounded(width: u64, aspect: f64) -> Result<u64, String> {
     if !(aspect.is_finite() && aspect > 0.0) {
         return Err("canvas aspect must be finite and positive".into());
     }
-    let height = (f64::from(width) / aspect).round().max(1.0);
-    if height > f64::from(LIMITS.max_dimension) {
-        return Err("canvas height exceeds the known dimension limit".into());
+    let height = round_positive(width as f64 / aspect).max(1.0);
+    if !height.is_finite() || height >= u64::MAX as f64 {
+        return Err("canvas height is too large to represent safely".into());
     }
-    let height = height as u32;
-    if u64::from(width) * u64::from(height) > LIMITS.max_canvas_pixels {
-        return Err("canvas exceeds the known pixel limit".into());
-    }
-    Ok(height)
+    Ok(height as u64)
 }
 
-fn admissible_width(ideal: u32, aspect: f64) -> Result<u32, String> {
-    let mut width = (ideal.min(LIMITS.max_dimension) / 8) * 8;
-    while width >= 8 {
-        let height = canvas_height(width, aspect).unwrap_or_default();
-        if height > 0 && u64::from(width) * u64::from(height) <= LIMITS.max_canvas_pixels {
-            return Ok(width);
+fn admissible_width(aspect: f64) -> Result<u32, String> {
+    // The known limit is small enough that a descending search is clearer and
+    // less error-prone than trying to combine dimension and pixel constraints
+    // algebraically around positive half-up height rounding.
+    for width in (1..=LIMITS.max_dimension).rev() {
+        if let Ok(height) = canvas_height(width, aspect) {
+            if height > 0 {
+                return Ok(width);
+            }
         }
-        width -= 8;
     }
-    Err("canvas aspect cannot fit within the known limits at an 8-pixel width".into())
+    Err("canvas aspect cannot fit within the known limits".into())
 }
 
-fn round_up_eight(value: f64) -> f64 {
-    if !value.is_finite() || value <= 0.0 {
-        return 8.0;
+fn width_for_density(target_density: f64, aspect: f64) -> Result<f64, String> {
+    if !(target_density.is_finite() && target_density > 0.0) {
+        return Err("geometry density is not finite and positive".into());
     }
-    (value.ceil() / 8.0).ceil() * 8.0
+    if !(aspect.is_finite() && aspect > 0.0) {
+        return Err("canvas aspect must be finite and positive".into());
+    }
+    // For positive half-up rounding, round(width / aspect) >= h exactly when
+    // width >= aspect * (h - 0.5). Calculate the minimum required integer
+    // height directly instead of incrementing width: at very large values an
+    // f64 cannot represent width + 1, and an incremental loop could stall.
+    let required_height = (target_density / aspect).ceil().max(1.0);
+    // Canvas height is at least one even below the first rounding boundary.
+    let y_width = if required_height == 1.0 {
+        1.0
+    } else {
+        (aspect * (required_height - 0.5)).ceil().max(1.0)
+    };
+    let width = target_density.ceil().max(y_width).max(1.0);
+    if !width.is_finite() || width >= u64::MAX as f64 {
+        return Err("geometry density is too ill-conditioned to represent safely".into());
+    }
+    let height = round_positive(width / aspect).max(1.0);
+    if height < required_height {
+        // This guard handles a boundary lost to floating-point rounding. It
+        // is a fixed correction, with a representability check, rather than a
+        // potentially unbounded search.
+        let corrected = (aspect * (required_height + 0.5)).ceil().max(width);
+        if !corrected.is_finite()
+            || corrected >= u64::MAX as f64
+            || round_positive(corrected / aspect) < required_height
+        {
+            return Err("geometry density is too ill-conditioned to represent safely".into());
+        }
+        return Ok(corrected);
+    }
+    Ok(width)
+}
+
+/// Round a positive value to the nearest integer, with exact half values
+/// rounded upward. The recommendation uses this for preset dimensions and
+/// derived canvas heights; it never imposes an 8-pixel allocation alignment.
+fn round_positive(value: f64) -> f64 {
+    // Preserve overflow so callers reject it; infinity is not a one-pixel
+    // canvas. Rust's positive round implements ties upward without addition.
+    value.round().max(1.0)
 }
 
 fn sample_density(
@@ -651,7 +775,12 @@ mod tests {
     fn canvas_height_uses_positive_rounding_for_fractional_aspect() {
         assert_eq!(canvas_height(100, 1.6).unwrap(), 63);
         assert_eq!(canvas_height(100, 3.0).unwrap(), 33);
-        assert_eq!(round_up_eight(100.1), 104.0);
+        assert_eq!(round_positive(100.4), 100.0);
+        assert_eq!(round_positive(100.5), 101.0);
+        assert_eq!(width_for_density(105.84, 1.6).unwrap(), 107.0);
+        assert!(width_for_density(1.0e20, 1.6).is_err());
+        assert_eq!(width_for_density(100.0, 1.0e9).unwrap(), 100.0);
+        assert!(canvas_height_unbounded(100, 1.0e-320).is_err());
     }
 
     #[test]
@@ -731,6 +860,148 @@ mod tests {
     }
 
     #[test]
+    fn simple_recommendation_uses_identity_correction_with_shared_source() {
+        let mut configured = output("simple", 0, 0, 160, 90, true);
+        configured.geometry = Some(OutputGeometry {
+            source: CanvasRect {
+                x: 0.125,
+                y: 0.0,
+                width: 0.5,
+                height: 0.5,
+            },
+            // Retained Warp calibration must not affect a requested Simple
+            // recommendation. The source rectangle remains shared.
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.4, 1.0], [0.0, 1.0]],
+            center: [0.25, 0.75],
+            raster_footprint: CanvasRect {
+                x: 0.125,
+                y: 0.0,
+                width: 0.5,
+                height: 0.5,
+            },
+        });
+        let mut state = crate::model::DesiredState::new();
+        state.outputs = vec![configured.clone()];
+        state.projection = Some(crate::model::ProjectionConfig {
+            mode: ProjectionMode::Simple,
+            canvas: Some(CanvasConfig {
+                aspect: 16.0 / 9.0,
+                render_width: 101,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        });
+        let simple =
+            recommend_for_state(&StateStore::ephemeral(std::env::temp_dir()), &state, 0).unwrap();
+
+        configured.geometry.as_mut().unwrap().corners =
+            [[0.0, 0.0], [1.0, 0.0], [1.4, 1.0], [0.0, 1.0]];
+        state.outputs[0] = configured;
+        state.projection.as_mut().unwrap().mode = ProjectionMode::Warp;
+        let warp =
+            recommend_for_state(&StateStore::ephemeral(std::env::temp_dir()), &state, 0).unwrap();
+        assert!(warp.ideal_width > simple.ideal_width);
+    }
+
+    #[test]
+    fn recommendation_is_invariant_to_render_width_with_rounded_height() {
+        let mut configured = output("odd", 0, 0, 160, 63, true);
+        configured.geometry = Some(OutputGeometry {
+            source: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0 / 1.6,
+            },
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0 / 1.6,
+            },
+        });
+        let mut state = crate::model::DesiredState::new();
+        state.outputs = vec![configured];
+        state.projection = Some(crate::model::ProjectionConfig {
+            mode: ProjectionMode::Simple,
+            canvas: Some(CanvasConfig {
+                aspect: 1.6,
+                render_width: 100,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        });
+        let store = StateStore::ephemeral(std::env::temp_dir());
+        let first = recommend_for_state(&store, &state, 1).unwrap();
+        state
+            .projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 101;
+        let second = recommend_for_state(&store, &state, 2).unwrap();
+        assert_eq!(first.ideal_width, second.ideal_width);
+        assert_eq!(first.ideal_height, second.ideal_height);
+    }
+
+    #[test]
+    fn simple_recommendation_uses_rotated_physical_raster_dimensions() {
+        let mut normal = output("normal", 0, 0, 160, 80, true);
+        normal.geometry = Some(OutputGeometry {
+            source: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 0.5,
+            },
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 0.5,
+            },
+        });
+        let mut rotated = normal.clone();
+        rotated.r#match = OutputMatch::by_name("rotated");
+        rotated.scale = Some(2.0);
+        rotated.transform = Some(Transform::Rotate90);
+        let mut normal_state = crate::model::DesiredState::new();
+        normal_state.outputs = vec![normal];
+        normal_state.projection = Some(crate::model::ProjectionConfig {
+            mode: ProjectionMode::Simple,
+            canvas: Some(CanvasConfig {
+                aspect: 2.0,
+                render_width: 100,
+                scale: 1.0,
+            }),
+            ..Default::default()
+        });
+        let mut rotated_state = crate::model::DesiredState {
+            outputs: vec![rotated],
+            ..normal_state.clone()
+        };
+        let store = StateStore::ephemeral(std::env::temp_dir());
+        let normal_rec = recommend_for_state(&store, &normal_state, 0).unwrap();
+        let rotated_rec = recommend_for_state(&store, &rotated_state, 0).unwrap();
+        assert!(rotated_rec.ideal_width > normal_rec.ideal_width);
+
+        rotated_state.outputs[0].scale = Some(1.0);
+        let rotated_without_scale = recommend_for_state(&store, &rotated_state, 0).unwrap();
+        assert_eq!(rotated_rec.ideal_width, rotated_without_scale.ideal_width);
+
+        let mut converted_rotated = rotated_state.clone();
+        converted_rotated.outputs[0].geometry = None;
+        let converted = recommend_for_state(&store, &converted_rotated, 0).unwrap();
+        assert_eq!(rotated_without_scale.ideal_width, converted.ideal_width);
+    }
+
+    #[test]
     fn recommendation_clamps_dimensions_and_reports_achieved_presets() {
         let mut wide = output("wide", 0, 0, 32768, 900, true);
         wide.geometry = Some(OutputGeometry {
@@ -769,11 +1040,19 @@ mod tests {
             u64::from(response.admissible_width) * u64::from(response.admissible_height)
                 <= LIMITS.max_canvas_pixels
         );
-        assert!(response.presets.iter().all(|preset| {
-            preset.width <= response.admissible_width
-                && preset.achieved_scale.is_finite()
-                && preset.achieved_scale > 0.0
-        }));
+        assert!(response
+            .presets
+            .iter()
+            .all(|preset| { preset.achieved_scale.is_finite() && preset.achieved_scale > 0.0 }));
+        assert_eq!(
+            response
+                .presets
+                .iter()
+                .map(|preset| preset.scale)
+                .collect::<Vec<_>>(),
+            vec![0.25, 0.5, 0.75, 1.0]
+        );
+        assert!(response.presets.iter().any(|preset| !preset.available));
         assert_eq!(response.generation, 9);
     }
 

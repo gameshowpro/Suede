@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en-US">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Suede warp source fixture</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: #050505; }
+    #source-stage { position: relative; width: 100%; height: 100%; min-width: 1px; min-height: 1px; }
+    #source-canvas { display: block; width: 100%; height: 100%; }
+    #probe-panel {
+      position: absolute; z-index: 2; top: 12px; left: 12px; max-width: min(560px, calc(100vw - 24px));
+      padding: 9px 11px; border: 1px solid rgba(255,255,255,.25); border-radius: 4px;
+      background: rgba(0,0,0,.72); color: #e8e8e8; font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      white-space: pre-wrap; pointer-events: none; user-select: none;
+    }
+    #probe-panel[hidden] { display: none; }
+    #probe-panel strong { color: #7dd3fc; font-weight: 600; }
+    body[data-layout="narrow"] #probe-panel { top: 6px; left: 6px; max-width: calc(100vw - 12px); padding: 6px 8px; font-size: 10px; }
+    body[data-layout="wide"] #probe-panel { max-width: 640px; }
+  </style>
+</head>
+<body>
+  <main id="source-stage" aria-label="Warp source fixture">
+    <canvas id="source-canvas" aria-label="Warp source content"></canvas>
+    <output id="probe-panel" aria-live="polite"></output>
+  </main>
+  <script>
+  (() => {
+    'use strict';
+
+    const canvas = document.getElementById('source-canvas');
+    const stage = document.getElementById('source-stage');
+    const panel = document.getElementById('probe-panel');
+    const allowedModes = new Set(['dark', 'bright', 'grid', 'moving']);
+    const params = new URLSearchParams(window.location.search);
+    const samples = [];
+    let mode = normalizeMode(params.get('mode'));
+    let layout = 'wide';
+    let context = null;
+    let fallback2d = null;
+    let contextKind = 'unavailable';
+    let animationFrame = 0;
+    let lastProbe = null;
+    let resizeObserver = null;
+
+    function normalizeMode(value) {
+      return allowedModes.has(value) ? value : 'grid';
+    }
+
+    function number(value) {
+      return Number.isFinite(value) ? Number(value.toFixed(3)) : null;
+    }
+
+    function updateLayout() {
+      const width = window.innerWidth;
+      layout = width < 720 ? 'narrow' : width < 1200 ? 'medium' : 'wide';
+      document.body.dataset.layout = layout;
+    }
+
+    function canvasRect() {
+      const rect = canvas.getBoundingClientRect();
+      const style = getComputedStyle(canvas);
+      return {
+        cssWidth: number(rect.width),
+        cssHeight: number(rect.height),
+        cssLeft: number(rect.left),
+        cssTop: number(rect.top),
+        computedWidth: style.width,
+        computedHeight: style.height,
+        backingWidth: canvas.width,
+        backingHeight: canvas.height
+      };
+    }
+
+    function webglInfo() {
+      if (!context || contextKind !== 'webgl') {
+        return { available: false, drawingBufferWidth: null, drawingBufferHeight: null, reason: contextKind };
+      }
+      const gl = context.gl;
+      return {
+        available: true,
+        drawingBufferWidth: gl.drawingBufferWidth,
+        drawingBufferHeight: gl.drawingBufferHeight,
+        renderer: (() => {
+          try {
+            const debug = gl.getExtension('WEBGL_debug_renderer_info');
+            return debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : null;
+          } catch (_) { return null; }
+        })()
+      };
+    }
+
+    function buildProbe(reason, eventType) {
+      const viewport = window.visualViewport;
+      const probe = {
+        timestamp: new Date().toISOString(),
+        monotonicMs: number(performance.now()),
+        reason: reason || 'manual',
+        eventType: eventType || null,
+        mode,
+        responsiveLayout: layout,
+        window: {
+          innerWidth: window.innerWidth,
+          innerHeight: window.innerHeight,
+          outerWidth: window.outerWidth,
+          outerHeight: window.outerHeight,
+          devicePixelRatio: number(window.devicePixelRatio),
+          visualViewport: viewport ? {
+            width: number(viewport.width), height: number(viewport.height),
+            scale: number(viewport.scale), offsetLeft: number(viewport.offsetLeft), offsetTop: number(viewport.offsetTop)
+          } : null
+        },
+        canvas: canvasRect(),
+        webgl: webglInfo(),
+        sampleCount: samples.length + 1
+      };
+      return probe;
+    }
+
+    function renderPanel(probe) {
+      if (panel.hidden) return;
+      const c = probe.canvas;
+      const g = probe.webgl;
+      panel.innerHTML = '<strong>Suede warp source</strong>  mode=' + probe.mode + '  layout=' + probe.responsiveLayout +
+        '\nwindow ' + probe.window.innerWidth + '×' + probe.window.innerHeight + '  DPR ' + probe.window.devicePixelRatio +
+        '\ncanvas CSS ' + c.cssWidth + '×' + c.cssHeight + '  backing ' + c.backingWidth + '×' + c.backingHeight +
+        '\nWebGL drawing buffer ' + (g.available ? g.drawingBufferWidth + '×' + g.drawingBufferHeight : 'unavailable (' + g.reason + ')') +
+        '\n' + probe.reason + ' @ ' + probe.timestamp;
+    }
+
+    function record(reason, eventType) {
+      updateLayout();
+      lastProbe = buildProbe(reason, eventType);
+      samples.push(lastProbe);
+      // Keep the fixture bounded during long moving-content runs while retaining
+      // enough history to correlate every ordinary resize/event sequence.
+      if (samples.length > 2000) samples.splice(0, samples.length - 2000);
+      lastProbe.sampleCount = samples.length;
+      renderPanel(lastProbe);
+      window.dispatchEvent(new CustomEvent('warp-source-sample', { detail: lastProbe }));
+      return lastProbe;
+    }
+
+    function compileShader(gl, type, source) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        const error = gl.getShaderInfoLog(shader) || 'unknown shader error';
+        gl.deleteShader(shader);
+        throw new Error(error);
+      }
+      return shader;
+    }
+
+    function createWebGL() {
+      try {
+        const gl = canvas.getContext('webgl', { antialias: false, preserveDrawingBuffer: true });
+        if (!gl) throw new Error('WebGL context unavailable');
+        const vertex = compileShader(gl, gl.VERTEX_SHADER, 'attribute vec2 position; varying vec2 uv; void main() { uv = position * 0.5 + 0.5; gl_Position = vec4(position, 0.0, 1.0); }');
+        const fragment = compileShader(gl, gl.FRAGMENT_SHADER, 'precision mediump float; varying vec2 uv; uniform float time; uniform vec2 resolution; uniform int mode; void main() { vec2 p = uv; vec3 color; if (mode == 0) { color = vec3(0.008); } else if (mode == 1) { color = vec3(0.96); } else if (mode == 2) { vec2 cell = p * 24.0; float line = step(0.91, fract(cell.x)) + step(0.91, fract(cell.y)); float center = step(0.985, abs(fract(p.x) - 0.5)) + step(0.985, abs(fract(p.y) - 0.5)); color = mix(vec3(0.015), vec3(0.72, 0.84, 0.95), min(1.0, line + center)); } else { float stripe = step(0.0, sin((p.x + time * 0.12) * 36.0)); float bar = step(0.93, fract(p.y * 5.0 + time * 0.18)); color = mix(vec3(0.025, 0.06, 0.11), vec3(0.1, 0.75, 0.95), stripe); color = mix(color, vec3(1.0, 0.3, 0.08), bar); } gl_FragColor = vec4(color, 1.0); }');
+        const program = gl.createProgram();
+        gl.attachShader(program, vertex); gl.attachShader(program, fragment); gl.linkProgram(program);
+        if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program) || 'program link error');
+        const buffer = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+        gl.useProgram(program);
+        const position = gl.getAttribLocation(program, 'position');
+        gl.enableVertexAttribArray(position); gl.vertexAttribPointer(position, 2, gl.FLOAT, false, 0, 0);
+        context = { gl, program, mode: gl.getUniformLocation(program, 'mode'), time: gl.getUniformLocation(program, 'time'), resolution: gl.getUniformLocation(program, 'resolution') };
+        contextKind = 'webgl';
+      } catch (error) {
+        context = null;
+        fallback2d = canvas.getContext('2d');
+        contextKind = fallback2d ? '2d-fallback' : 'unavailable';
+        window.__warpSourceWebGLError = String(error && error.message || error);
+      }
+    }
+
+    function resizeCanvas(reason, eventType) {
+      updateLayout();
+      const rect = canvas.getBoundingClientRect();
+      const dpr = Math.max(1, Number(window.devicePixelRatio) || 1);
+      const width = Math.max(1, Math.round(rect.width * dpr));
+      const height = Math.max(1, Math.round(rect.height * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width; canvas.height = height;
+      }
+      if (contextKind === 'webgl') context.gl.viewport(0, 0, canvas.width, canvas.height);
+      draw(performance.now());
+      return record(reason || 'resize', eventType || null);
+    }
+
+    function draw(now) {
+      if (contextKind === 'webgl') {
+        const gl = context.gl;
+        gl.viewport(0, 0, canvas.width, canvas.height);
+        gl.clearColor(0.008, 0.008, 0.008, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.useProgram(context.program);
+        gl.uniform1i(context.mode, ['dark', 'bright', 'grid', 'moving'].indexOf(mode));
+        gl.uniform1f(context.time, now / 1000); gl.uniform2f(context.resolution, canvas.width, canvas.height);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      } else if (contextKind === '2d-fallback') {
+        const width = canvas.width, height = canvas.height;
+        fallback2d.clearRect(0, 0, width, height);
+        fallback2d.fillStyle = mode === 'bright' ? '#f5f5f5' : '#020202';
+        fallback2d.fillRect(0, 0, width, height);
+        if (mode === 'grid') {
+          fallback2d.strokeStyle = '#b8d7ef'; fallback2d.lineWidth = Math.max(1, Math.round(width / 900));
+          for (let i = 1; i < 24; i++) { const x = width * i / 24, y = height * i / 24; fallback2d.beginPath(); fallback2d.moveTo(x, 0); fallback2d.lineTo(x, height); fallback2d.moveTo(0, y); fallback2d.lineTo(width, y); fallback2d.stroke(); }
+        } else if (mode === 'moving') {
+          const x = ((now / 1000 * width * .12) % (width * 1.4)) - width * .2;
+          fallback2d.fillStyle = '#18bde8'; fallback2d.fillRect(x, 0, width * .18, height);
+          fallback2d.fillStyle = '#ff4d19'; fallback2d.fillRect(0, height * .78, width, height * .08);
+        }
+      }
+    }
+
+    function animationTick(now) {
+      draw(now);
+      if (mode === 'moving') animationFrame = window.requestAnimationFrame(animationTick);
+    }
+
+    function scheduleAnimation() {
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = mode === 'moving' ? window.requestAnimationFrame(animationTick) : 0;
+    }
+
+    function setMode(nextMode, reason) {
+      const value = normalizeMode(nextMode);
+      mode = value;
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      animationFrame = 0;
+      draw(performance.now());
+      scheduleAnimation();
+      record(reason || 'mode-change', 'mode');
+      return mode;
+    }
+
+    function snapshot() {
+      return lastProbe ? JSON.parse(JSON.stringify(lastProbe)) : record('manual', null);
+    }
+
+    window.warpSource = {
+      getProbe: snapshot,
+      getSamples: () => JSON.parse(JSON.stringify(samples)),
+      clearSamples: () => { samples.length = 0; return record('sample-reset', null); },
+      sample: reason => record(reason || 'manual', 'api'),
+      setMode,
+      getMode: () => mode,
+      setHud: visible => { panel.hidden = !visible; renderPanel(lastProbe || record('hud-change', 'api')); return !panel.hidden; }
+    };
+    window.__warpSourceProbe = window.warpSource;
+
+    window.addEventListener('resize', () => resizeCanvas('window-resize', 'resize'));
+    window.addEventListener('orientationchange', () => resizeCanvas('orientation-change', 'orientationchange'));
+    if (window.visualViewport) window.visualViewport.addEventListener('resize', () => resizeCanvas('visual-viewport-resize', 'visualViewport.resize'));
+    resizeObserver = new ResizeObserver(() => resizeCanvas('stage-resize', 'ResizeObserver'));
+    resizeObserver.observe(stage);
+
+    panel.hidden = params.get('hud') === '0' || params.get('hud') === 'false';
+    createWebGL();
+    resizeCanvas('initial', 'load');
+    setMode(mode, 'initial-mode');
+  })();
+  </script>
+</body>
+</html>

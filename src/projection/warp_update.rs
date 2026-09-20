@@ -4,7 +4,7 @@
 //! splitting. The control reader and build completion wake the Wayland poll;
 //! neither reads files nor waits on stdin in the render thread.
 use super::{
-    blend::{transfer_at, Coverage, SliceSpec, SlicerSpec},
+    blend::{dynamic_transfer_at, transfer_at, Coverage, SliceSpec, SlicerSpec},
     control::{ControlEvent, ControlEventKind, ControlUpdate, CONTROL_VERSION},
     warp::Warp,
 };
@@ -25,6 +25,7 @@ struct Key {
     lift: f64,
     layout: Option<super::layout::LocalKey>,
     coverage: Vec<crate::model::Rect>,
+    dynamic: bool,
 }
 
 pub struct Output {
@@ -33,12 +34,30 @@ pub struct Output {
     pub size: (u32, u32),
     pub warp: Option<Warp>,
     pub table: Vec<(u16, u8)>,
+    /// Tagged dynamic shape entries. This is populated only for adaptive
+    /// transfer; fixed mode retains the exact `(a, b)` table above.
+    pub dynamic_table: Option<Vec<u32>>,
     pub source: crate::model::Rect,
     key: Key,
 }
 
+impl Output {
+    /// Identity crop/scale uses a [`Warp`] as its sampler too, but only an
+    /// explicit nonidentity destination geometry needs GPU Warp capability.
+    pub(crate) fn has_geometric_correction(&self) -> bool {
+        self.key.slice.geometry.as_ref().is_some_and(|geometry| {
+            geometry
+                .warp(self.size.0, self.size.1)
+                .map_or(true, |warp| warp.is_some())
+        })
+    }
+}
+
 pub struct Prepared {
     pub generation: u64,
+    /// Accepted settings for this generation, including adaptive controller
+    /// configuration even when no geometry table had to be rebuilt.
+    pub spec: SlicerSpec,
     pub outputs: Vec<Output>,
     pub build_ms: f64,
 }
@@ -370,6 +389,10 @@ pub fn same_topology(a: &SlicerSpec, b: &SlicerSpec) -> bool {
                 .map(|l| l.participants.iter().map(|p| &p.output).collect::<Vec<_>>())
 }
 
+fn dynamic_mode(spec: &SlicerSpec) -> bool {
+    spec.adaptive_lift.is_some() && spec.pattern.is_none()
+}
+
 /// Validate startup resources before allocating presenter images or tables.
 pub(crate) fn validate_initial(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<(), String> {
     validate(spec, sizes).map(|_| ())
@@ -392,12 +415,27 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
     {
         return Err("invalid canvas, gamma or fixed lift".into());
     }
+    if let Some(adaptive) = spec.adaptive_lift {
+        adaptive.validate()?;
+        if adaptive.level.to_bits() != spec.black_lift.to_bits() {
+            return Err("adaptive level must match the fixed black-lift fallback".into());
+        }
+    }
     let mut names = std::collections::HashSet::new();
     let layout = spec
         .layout
         .as_ref()
         .map(|l| super::layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height))
         .transpose()?;
+    if dynamic_mode(spec) {
+        let maximum = layout.as_ref().map_or_else(
+            || Coverage::new(coverage_rects(spec)).max(),
+            super::layout::Evaluator::maximum,
+        );
+        if maximum > 8 {
+            return Err("dynamic transfer supports at most eight overlapping footprints".into());
+        }
+    }
     let coverage = coverage_rects(spec);
     if coverage.iter().any(|r| {
         r.width <= 0
@@ -455,16 +493,25 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
             Ok(Key {
                 layout: layout
                     .as_ref()
-                    .map(|l| l.index(&slice.output).map(|i| l.key(i, spec.black_lift)))
+                    .map(|l| {
+                        l.index(&slice.output)
+                            .map(|i| l.key(i, spec.black_lift, dynamic_mode(spec)))
+                    })
                     .transpose()?,
-                coverage: if spec.layout.is_none() && spec.black_lift > 0.0 {
+                coverage: if spec.layout.is_none() && (spec.black_lift > 0.0 || dynamic_mode(spec))
+                {
                     coverage.clone()
                 } else {
                     Vec::new()
                 },
                 slice,
                 gamma: spec.gamma,
-                lift: spec.black_lift,
+                lift: if dynamic_mode(spec) {
+                    0.0
+                } else {
+                    spec.black_lift
+                },
+                dynamic: dynamic_mode(spec),
             })
         })
         .collect()
@@ -476,6 +523,19 @@ pub(crate) fn coverage_rects(spec: &SlicerSpec) -> Vec<crate::model::Rect> {
     } else {
         spec.coverage_rects.clone()
     }
+}
+
+/// Shared physical maximum for the dynamic shader uniform. The value is
+/// derived from configured footprints, including disconnected outputs.
+pub(crate) fn maximum_coverage(spec: &SlicerSpec) -> u32 {
+    spec.layout.as_ref().map_or_else(
+        || Coverage::new(coverage_rects(spec)).max(),
+        |layout| {
+            super::layout::Evaluator::new(layout, spec.canvas_width, spec.canvas_height)
+                .map(|e| e.maximum())
+                .unwrap_or(0)
+        },
+    )
 }
 
 pub(crate) fn sampling_warp(
@@ -567,6 +627,58 @@ fn fill_rows(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn fill_dynamic_rows(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    warp: Option<&Warp>,
+    coverage: &Coverage,
+    layout: Option<(&super::layout::Evaluator, usize)>,
+    size: (u32, u32),
+    first_row: usize,
+    dest: &mut [u32],
+) {
+    let width = size.0;
+    for (offset, value) in dest.iter_mut().enumerate() {
+        let x = (offset % width as usize) as u32;
+        let y = (first_row + offset / width as usize) as u32;
+        *value = 0;
+        let edge = warp.map_or(1.0, |w| w.coverage(x, y));
+        if edge == 0.0 {
+            continue;
+        }
+        let Some([cx, cy]) = warp.map_or(
+            Some([
+                slice.source.x as f64 + x as f64 + 0.5,
+                slice.source.y as f64 + y as f64 + 0.5,
+            ]),
+            |w| {
+                w.clamped_canvas_at(
+                    x as f64 + 0.5,
+                    y as f64 + 0.5,
+                    [slice.source.x as f64, slice.source.y as f64],
+                )
+            },
+        ) else {
+            continue;
+        };
+        let sx = cx - slice.source.x as f64;
+        let sy = cy - slice.source.y as f64;
+        if cx < 0.5
+            || cy < 0.5
+            || cx > spec.canvas_width as f64 - 0.5
+            || cy > spec.canvas_height as f64 - 0.5
+        {
+            continue;
+        }
+        *value = if let Some((layout, index)) = layout {
+            layout.dynamic_shape(index, cx, cy, spec.gamma, edge)
+        } else {
+            dynamic_transfer_at(&slice.ramps, spec.gamma, sx, sy, edge, coverage.at(cx, cy))
+        };
+    }
+}
+
 fn build(
     request: Request,
     sizes: &[(u32, u32)],
@@ -590,30 +702,62 @@ fn build(
             .as_ref()
             .map(|l| l.index(&slice.output).map(|i| (l, i)))
             .transpose()?;
+        let dynamic = request.keys[index].dynamic;
         let mut table = Vec::new();
-        table
-            .try_reserve_exact(width as usize * height as usize)
-            .map_err(|e| e.to_string())?;
-        table.resize(width as usize * height as usize, (0, 0));
-        let rows = (height as usize).div_ceil(workers);
-        std::thread::scope(|scope| {
-            for (chunk, dest) in table.chunks_mut(rows * width as usize).enumerate() {
-                let warp = &warp;
-                let coverage = &coverage;
-                scope.spawn(move || {
-                    fill_rows(
-                        spec,
-                        slice,
-                        warp.as_ref(),
-                        coverage,
-                        layout,
-                        (width, height),
-                        chunk * rows,
-                        dest,
-                    );
-                });
-            }
-        });
+        let mut dynamic_table = None;
+        if dynamic {
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(width as usize * height as usize)
+                .map_err(|e| e.to_string())?;
+            values.resize(width as usize * height as usize, 0);
+            let rows = (height as usize).div_ceil(workers);
+            std::thread::scope(|scope| {
+                for (chunk, dest) in values.chunks_mut(rows * width as usize).enumerate() {
+                    let warp = &warp;
+                    let coverage = &coverage;
+                    scope.spawn(move || {
+                        fill_dynamic_rows(
+                            spec,
+                            slice,
+                            warp.as_ref(),
+                            coverage,
+                            layout,
+                            (width, height),
+                            chunk * rows,
+                            dest,
+                        );
+                    });
+                }
+            });
+            dynamic_table = Some(values);
+        } else {
+            table
+                .try_reserve_exact(width as usize * height as usize)
+                .map_err(|e| e.to_string())?;
+            table.resize(width as usize * height as usize, (0, 0));
+        }
+        if !dynamic {
+            let rows = (height as usize).div_ceil(workers);
+            std::thread::scope(|scope| {
+                for (chunk, dest) in table.chunks_mut(rows * width as usize).enumerate() {
+                    let warp = &warp;
+                    let coverage = &coverage;
+                    scope.spawn(move || {
+                        fill_rows(
+                            spec,
+                            slice,
+                            warp.as_ref(),
+                            coverage,
+                            layout,
+                            (width, height),
+                            chunk * rows,
+                            dest,
+                        );
+                    });
+                }
+            });
+        }
         outputs.push(Output {
             source: slice.source,
             index,
@@ -621,11 +765,13 @@ fn build(
             size: (width, height),
             warp,
             table,
+            dynamic_table,
             key: request.keys[index].clone(),
         });
     }
     Ok(Prepared {
         generation: request.generation,
+        spec: request.spec.clone(),
         outputs,
         build_ms: started.elapsed().as_secs_f64() * 1000.0,
     })
@@ -635,7 +781,7 @@ fn build(
 mod tests {
     use super::*;
     use crate::{
-        model::{Rect, Renderer},
+        model::{AdaptiveBlackLift, Rect, Renderer},
         projection::{
             blend::{FadeTo, RampSpec},
             warp::Geometry,
@@ -653,6 +799,7 @@ mod tests {
             canvas_height: 8,
             gamma: 2.2,
             black_lift: 0.1,
+            adaptive_lift: None,
             pattern: None,
             free_run: false,
             renderer: Renderer::Gpu,
@@ -969,6 +1116,48 @@ mod tests {
         let local = complete(&mut c);
         assert_eq!(local.outputs.len(), 1);
         assert_eq!(local.outputs[0].index, 0);
+    }
+
+    #[test]
+    fn controller_switches_transfer_modes_and_keeps_parameter_only_updates_sparse() {
+        let mut c = initialized();
+        let mut adaptive = fixture();
+        adaptive.black_lift = 0.2;
+        adaptive.adaptive_lift = Some(AdaptiveBlackLift {
+            level: 0.2,
+            dark_threshold: 0.02,
+            bright_threshold: 0.2,
+            rise_ms: 1_000.0,
+            fall_ms: 250.0,
+            slew_per_second: 0.1,
+        });
+        send(&mut c, 1, adaptive.clone());
+        let enabled = complete(&mut c);
+        assert_eq!(enabled.spec.adaptive_lift, adaptive.adaptive_lift);
+        assert!(enabled
+            .outputs
+            .iter()
+            .all(|output| output.dynamic_table.is_some() && output.table.is_empty()));
+        c.installed(&enabled);
+
+        let mut parameters = adaptive.clone();
+        parameters.adaptive_lift.as_mut().unwrap().bright_threshold = 0.3;
+        send(&mut c, 2, parameters.clone());
+        let changed = complete(&mut c);
+        assert_eq!(changed.spec.adaptive_lift, parameters.adaptive_lift);
+        assert!(changed.outputs.is_empty());
+        c.installed(&changed);
+
+        let mut fixed = parameters;
+        fixed.adaptive_lift = None;
+        fixed.black_lift = 0.1;
+        send(&mut c, 3, fixed);
+        let disabled = complete(&mut c);
+        assert!(disabled.spec.adaptive_lift.is_none());
+        assert!(disabled
+            .outputs
+            .iter()
+            .all(|output| output.dynamic_table.is_none() && !output.table.is_empty()));
     }
 
     #[test]

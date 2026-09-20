@@ -63,8 +63,8 @@ pub fn status(
     }
 }
 
-/// Simple-mode writes preserve retained warp data even when a full-document
-/// client omits it. Explicit output deletion is still an output deletion.
+/// Preserve omitted calibration for Simple clients, without overwriting explicit
+/// shared canvas or source edits. Explicit output deletion remains deletion.
 pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
     let simple = next
         .projection
@@ -75,7 +75,10 @@ pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
     }
     if let Some(old) = &previous.projection {
         if old.canvas.is_some() {
-            next.projection.get_or_insert_with(Default::default).canvas = old.canvas;
+            let projection = next.projection.get_or_insert_with(Default::default);
+            if projection.canvas.is_none() {
+                projection.canvas = old.canvas;
+            }
         }
     }
     for output in &mut next.outputs {
@@ -84,7 +87,7 @@ pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
             .iter()
             .find(|o| o.r#match == output.r#match)
         {
-            if old.geometry.is_some() {
+            if output.geometry.is_none() {
                 output.geometry = old.geometry.clone();
             }
         }
@@ -107,19 +110,27 @@ pub fn validate_activation(
         .as_ref()
         .map(|p| p.mode)
         .unwrap_or_default();
-    let geometry_changed = next.projection.as_ref().and_then(|p| p.canvas.as_ref())
-        != previous.projection.as_ref().and_then(|p| p.canvas.as_ref())
-        || next.outputs.iter().any(|o| {
-            previous
-                .outputs
-                .iter()
-                .find(|p| p.r#match == o.r#match)
-                .and_then(|p| p.geometry.as_ref())
-                != o.geometry.as_ref()
-        });
+    // Shared source selection and resolution remain editable during fallback.
+    // Only activation or changes to retained correction require verified Warp.
+    let correction_changed = next.outputs.iter().any(|o| {
+        let old = previous
+            .outputs
+            .iter()
+            .find(|p| p.r#match == o.r#match)
+            .and_then(|p| p.geometry.as_ref());
+        match (old, o.geometry.as_ref()) {
+            (Some(old), Some(new)) => {
+                old.corners != new.corners
+                    || old.center != new.center
+                    || old.raster_footprint != new.raster_footprint
+            }
+            (None, None) => false,
+            _ => true,
+        }
+    });
     let capability = status(next, control, running, allow_overlaps, None);
     if capability.warp_available != Some(true)
-        && (before_mode != ProjectionMode::Warp || geometry_changed)
+        && (before_mode != ProjectionMode::Warp || correction_changed)
     {
         return Err(format!("warp_unavailable: {}; retained warp settings remain saved; use simple mode until capability is verified", capability.reason.unwrap_or_else(|| "the selected pipeline cannot warp".into())));
     }
@@ -185,6 +196,116 @@ mod tests {
     }
 
     #[test]
+    fn simple_shared_edits_survive_retention_and_do_not_need_integer_positions() {
+        let before = saved();
+        let mut next = before.clone();
+        next.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
+        next.projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 75;
+        next.outputs[0].position = None;
+        next.outputs[0].geometry.as_mut().unwrap().source.x = -0.125;
+        preserve_retained(&mut next, &before);
+        assert_eq!(
+            next.projection
+                .as_ref()
+                .unwrap()
+                .canvas
+                .unwrap()
+                .render_width,
+            75
+        );
+        let geometry = next.outputs[0].geometry.as_ref().unwrap();
+        let old = before.outputs[0].geometry.as_ref().unwrap();
+        assert_eq!(geometry.source.x, -0.125);
+        assert_eq!(geometry.corners, old.corners);
+        assert_eq!(geometry.center, old.center);
+        assert_eq!(geometry.raster_footprint, old.raster_footprint);
+        assert!(next.validate(true).is_ok());
+    }
+
+    #[test]
+    fn fallback_allows_shared_edits_but_still_guards_correction() {
+        let before = saved();
+        let mut next = before.clone();
+        next.projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 50;
+        next.outputs[0].geometry.as_mut().unwrap().source.x = 0.125;
+        let cpu = ProjectionControlStatus {
+            requested_renderer: Some(Renderer::Auto),
+            effective_renderer: Some(Renderer::Cpu),
+            warp_available: Some(false),
+            ..Default::default()
+        };
+        assert!(validate_activation(&next, &before, &cpu, true, true).is_ok());
+        assert_eq!(next.projection.as_ref().unwrap().mode, ProjectionMode::Warp);
+        next.outputs[0].geometry.as_mut().unwrap().center[0] = 0.625;
+        assert!(validate_activation(&next, &before, &cpu, true, true).is_err());
+    }
+
+    #[test]
+    fn shared_simple_validates_sources_instead_of_stale_integer_positions() {
+        let mut next = saved();
+        next.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
+        let mut second = next.outputs[0].clone();
+        second.r#match = OutputMatch::by_name("B");
+        second.position = Some(crate::model::Position { x: 10000, y: 10000 });
+        second.geometry.as_mut().unwrap().source.x = 0.5;
+        next.outputs[0].geometry.as_mut().unwrap().source.width = 0.5;
+        second.geometry.as_mut().unwrap().source.width = 0.5;
+        next.outputs.push(second);
+        assert!(next.validate(true).is_ok());
+        next.outputs[1].geometry.as_mut().unwrap().source.x = 0.6;
+        assert!(next
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("disconnected")));
+        next.outputs[1].geometry = None;
+        assert!(next
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("geometry is required")));
+    }
+
+    #[test]
+    fn shared_simple_rejects_unallocatable_compositor_scale() {
+        let mut next = saved();
+        next.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
+        next.outputs[0].scale = Some(0.01);
+        assert!(next
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("presentation allocation")));
+        next.outputs[0].scale = Some(1e-10);
+        assert!(next
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("presentation dimensions")));
+        next.outputs[0].scale = Some(2.0);
+        next.outputs[0].transform = Some(crate::model::Transform::Rotate90);
+        assert!(next.validate(true).is_ok());
+        next.projection.as_mut().unwrap().mode = ProjectionMode::Warp;
+        assert!(next
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("transform must be normal")));
+    }
+
+    #[test]
     fn unsupported_or_unresolved_activation_rejects_without_replacing_saved_state() {
         let requested = saved();
         let mut simple = requested.clone();
@@ -242,7 +363,7 @@ mod tests {
 
     #[cfg(feature = "projection")]
     #[tokio::test]
-    async fn api_preview_save_revert_and_recovery_preserve_separate_settings() {
+    async fn api_preview_save_revert_and_recovery_preserve_shared_settings() {
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
         let mut h = crate::api::test_support::harness(None);
@@ -343,10 +464,54 @@ mod tests {
         restore.committed = false;
         restore.projection.as_mut().unwrap().renderer = Renderer::Auto;
         restore.projection.as_mut().unwrap().mode = ProjectionMode::Warp;
-        assert_eq!(app.oneshot(put(&restore)).await.unwrap().status(), 200);
+        assert_eq!(
+            app.clone().oneshot(put(&restore)).await.unwrap().status(),
+            200
+        );
         assert_eq!(
             h.state.store.effective().outputs[0].geometry,
             baseline.outputs[0].geometry
         );
+
+        // A real capability loss keeps Warp intent, but does not make shared
+        // framing read-only. Commit and disk reload must retain both edits and
+        // correction; invalid crops must leave the accepted generation intact.
+        h.state
+            .snapshot
+            .set_projection_control(ProjectionControlStatus {
+                requested_renderer: Some(Renderer::Auto),
+                effective_renderer: Some(Renderer::Cpu),
+                warp_available: Some(false),
+                ..Default::default()
+            });
+        let mut fallback = h.state.store.effective();
+        fallback.committed = true;
+        fallback
+            .projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 75;
+        fallback.outputs[0].geometry.as_mut().unwrap().source.x = -0.125;
+        assert_eq!(
+            app.clone().oneshot(put(&fallback)).await.unwrap().status(),
+            200
+        );
+        let accepted = h.state.store.effective_with_generation();
+        let reloaded = crate::state::StateStore::load(h._dir.path().to_path_buf()).unwrap();
+        assert_eq!(reloaded.get(), accepted.0);
+        assert_eq!(
+            reloaded.get().projection.unwrap().mode,
+            ProjectionMode::Warp
+        );
+        assert_eq!(
+            accepted.0.outputs[0].geometry.as_ref().unwrap().corners,
+            baseline.outputs[0].geometry.as_ref().unwrap().corners
+        );
+        fallback.outputs[0].geometry.as_mut().unwrap().source.x = 2.0;
+        assert_eq!(app.oneshot(put(&fallback)).await.unwrap().status(), 422);
+        assert_eq!(h.state.store.effective_with_generation(), accepted);
     }
 }

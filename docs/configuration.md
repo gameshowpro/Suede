@@ -960,8 +960,8 @@ to composite the slices instead.
 }
 ```
 
-Warp mode stores a separate canvas and geometry alongside those retained
-rectangle settings:
+Simple and Warp share one canvas and each output's `geometry.source` crop.
+Warp adds retained corner and center correction to the same content selection:
 
 ```json
 "projection": {
@@ -973,32 +973,88 @@ rectangle settings:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | string | `simple` | `simple` uses the rectangle layout; `warp` activates the retained canvas and per-output geometry |
-| `canvas` | object or null | `null` | Required in warp mode. Contains `aspect`, authoritative `renderWidth`, and descriptive `scale` |
+| `mode` | string | `simple` | `simple` crops and scales the shared source; `warp` adds retained geometric correction |
+| `canvas` | object or null | `null` | Shared `aspect` and authoritative `renderWidth`. Required for Warp; when absent, Simple uses integer output positions. `scale` is deprecated metadata and has no rendering effect |
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
-| `blackLift` | number | `0.0` | Black-level compensation outside the seams, 0-0.5 |
+| `blackLift` | number or object | `0.0` | Fixed compensation or optional adaptive compensation, with level 0-0.5; see below |
 | `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
 
+#### Adaptive black lift
+
+A numeric `blackLift` keeps the exact fixed transfer arithmetic. An explicit
+`{"mode":"fixed","level":0.04}` has the same meaning. To vary compensation
+with source content, use:
+
+```json
+"blackLift": {
+  "mode": "adaptive",
+  "level": 0.2,
+  "darkThreshold": 0.02,
+  "brightThreshold": 0.2,
+  "riseMs": 1000,
+  "fallMs": 250,
+  "slewPerSecond": 0.1
+}
+```
+
+`level` is required and remains in 0-0.5. The other fields default to the
+values shown. Thresholds must satisfy `0 <= darkThreshold < brightThreshold <= 1`.
+Rise and fall time constants are 1-3,600,000 milliseconds. Slew must be
+positive and at most 10 lift units per second. All values must be finite.
+These defaults are provisional and need tuning for the installation.
+See the [complete adaptive example](examples/four-output-adaptive.json).
+
+The statistic is mean linear luminance after sRGB decoding with Rec.709 RGB
+weights (0.2126, 0.7152, 0.0722). A regular grid of at most 256 by 256 source
+texels selects the center of each grid cell before ramps, picture borders,
+or lift. Black content and unused canvas count; allocation padding does not.
+Each completed source capture is measured once, regardless of overlapping
+outputs or their presentation rates. This sampled estimate can alias periodic
+thin lines and checkerboards; it is not the mean of every source pixel.
+
+The target is `level * clamp((brightThreshold - luminance) /
+(brightThreshold - darkThreshold), 0, 1)`. The shared controller uses monotonic
+elapsed time, exponential smoothing with the appropriate rise/fall constant,
+then slew limiting and clamping. It starts at configured level. Zero samples
+retain the last valid target and report stale measurement. A bounded 20 ms
+timer repaints retained static content until the controller settles; lift
+ticks do not rebuild geometry tables or create new captures.
+
+Adaptive transfer uses a separately tagged, quantized shape table. Numeric
+and tagged fixed settings retain their existing byte-exact path. Calibration
+patterns suspend adaptation and use the exact configured fixed transfer.
+CPU rendering or unavailable GPU measurement uses configured fixed level and
+reports the reason; ordinary rendering continues. Sampling and readback add
+work and should be benchmarked on the target hardware before rollout.
+
+`GET /api/v1/projection/stats` and projection events expose `control.blackLift`:
+metric definition, availability/reason, stale measurement, calibration pause, capture ID, sample
+count, luminance, measurement timestamp/age, target and applied levels,
+measurement duration, and logical presentation generation. A logical
+generation shares one level across outputs; independent physical scanout is
+still governed by the existing presentation policy. Capture, logical,
+configuration, and control generations are different identities. Sample age
+continues increasing when the source is static, even after adaptation settles.
+
 #### Canvas and warp geometry {: #projection-geometry }
 
-`mode` is `simple` (the default) or `warp`. Both modes retain the ordinary
-output `position` and `mode` fields, so a simple layout remains useful when
-warp support is unavailable. The daemon retains saved warp settings while
+`mode` is `simple` (the default) or `warp`. Both use the shared canvas and crop
+when configured. The daemon retains saved correction and requested intent while
 temporarily forcing effective simple mode on a machine without the required
 warp capability; it reports that limitation as a health warning and restores
 warp when capability returns. Switching modes does not silently overwrite the
-other mode's settings.
+shared content settings or correction.
 
-Warp mode has an explicit canvas and per-output geometry:
+Shared canvas rendering has explicit canvas and per-output geometry:
 
 | Field | Type | Meaning |
 |---|---|---|
 | `canvas.aspect` | positive number | Canvas width divided by height in isotropic canvas units |
 | `canvas.renderWidth` | integer | Chosen canvas width. It is authoritative; height is `round(renderWidth / aspect)`, at least one pixel |
-| `canvas.scale` | number | Descriptive operator scale, default `1.0`; it does not replace `renderWidth` |
+| `canvas.scale` | number | Deprecated metadata, default `1.0`; it does not control rendering or the displayed rendering percentage |
 | `geometry.source` | rectangle | The content rectangle in canvas units (`x`, `y`, `width`, `height`) |
 | `geometry.corners` | four pairs | Destination pins in output-local normalized coordinates, ordered TL, TR, BR, BL. Identity is `[[0,0],[1,0],[1,1],[0,1]]` |
 | `geometry.center` | pair | Horizontal and vertical center fractions, normally `[0.5,0.5]` |
@@ -1013,17 +1069,19 @@ the browser or change a neighbor's source coverage.
 Canvas coordinates use `[0,1] × [0,1/aspect]`. If `renderWidth` is `W`, the
 canvas height is `H = max(1, round(W/aspect))`, with positive half-way values
 rounded up; `renderWidth` remains the
-chosen allocation and `scale` is descriptive metadata. A source rectangle's
+chosen allocation and `scale` is deprecated descriptive metadata. A source rectangle's
 continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`.
 Corners are normalized to the output raster and are ordered top-left,
-top-right, bottom-right, bottom-left. Warp mode currently requires each
-enabled configured output, including an unattached output, to have geometry,
-an explicit or adopted mode, a simple fallback `position`, scale `1.0`, and
-transform `normal`. The roster has one to eight enabled participants, the
+top-right, bottom-right, bottom-left. A shared canvas requires each enabled
+configured output, including an unattached output, to have geometry and an
+explicit or adopted mode. Warp additionally requires output scale `1.0` and
+transform `normal`; selecting it never clears retained hardware settings.
+Legacy `position` is not a second crop and is not required for fallback.
+The roster has one to eight enabled participants, the
 canvas must be complete, and the appliance must set `allow_overlaps = true`.
 
-Every retained geometry is numerically validated even in simple mode. In warp
-mode, each source must have finite positive dimensions, visible canvas area,
+Every retained geometry is numerically validated even in Simple. With a shared
+canvas in either mode, each source must have finite positive dimensions, visible canvas area,
 and coordinates bounded by ±16 times `max(1, 1/aspect)`. The clipped source
 graph must be connected through positive-area overlap or a shared edge
 segment; point contacts and gaps do not connect it. A pair whose original
@@ -1044,19 +1102,31 @@ mode or position is rejected; the candidate is never saved or applied.
 `GET /api/v1/projection/recommendation` is also read-only. It uses the
 effective working copy and reports its persisted `revision` and working-copy
 `generation`, a requested aspect, ideal and admissible dimensions, and
-`1.0`, `0.75`, and `0.5` scale presets. The ideal width samples the largest
+`0.25`, `0.5`, `0.75`, and `1.0` scale presets. The ideal width samples the largest
 singular value of the canvas-to-output Jacobian on a dense grid for every
 output, evaluating both sides of center-remap breaks and applying a
 5% engineering margin. It is explicitly `approximate: true`; it is guidance,
 not a proof of the exact maximum. Ill-conditioned or non-finite geometry is
-rejected. Suggested widths are rounded up to eight pixels for UI convenience,
-while the persisted `renderWidth` remains authoritative and is never changed
-by a recommendation or a corner edit.
+rejected. Preset widths round to the nearest positive integer (ties up), with
+no multiple-of-eight restriction. Percentages use the ideal width, while the
+admissible allocation limit is reported separately; an impossible preset is
+disabled. Simple uses rectangular mapping and Warp uses retained intended
+correction even during temporary capability fallback. The normalized density
+baseline stays stable across width-only edits. Recommendations never change
+`renderWidth`, source dimensions, or configuration.
 
 The known planning limits are a 32,768-pixel maximum dimension, 64 megapixels
 for the canvas, and 32 megapixels per output. Driver and compositor allocation
 limits are unknown and are listed in the response. The endpoint does not
 resize a headless output or probe those limits.
+
+CPU Simple supports fractional crops and content scaling in projection-enabled
+builds. Simple presentation buffers follow the compositor's rotated/scaled
+logical output dimensions, while content scale and density guidance refer to
+the physical raster. Those buffers also obey the output allocation limit.
+Builds without projection machinery cannot render arbitrary shared crops;
+they report `projection_unavailable`. Direct tiling configurations must not
+configure a shared canvas: it requires `allow_overlaps = true` and a slicer.
 
 `GET /api/v1/projection/stats` reports the live `geometry` status alongside
 frame and lifecycle statistics. It includes requested and effective mode,
@@ -1067,6 +1137,10 @@ not imply that saved warp geometry was discarded.
 Complete schema examples are available for a [simple appliance](examples/four-output-appliance.json)
 and a [warp appliance](examples/four-output-warp.json). The warp example
 requires `allow_overlaps = true` and a verified GPU pipeline for activation.
+The [shared canvas example](examples/four-output-shared-canvas.json) uses CPU
+Simple with a 1824×1026 canvas, four 1920×1080 outputs, 200% content scale,
+and a 2×2 arrangement with 10% overlap. Switching its mode to Warp uses the
+same source crops once a capable Auto/GPU renderer is selected.
 
 The alpha schema is version 2. Existing files are not migrated; create or
 write the current schema directly. There is no legacy seam-weight mode.
@@ -1177,10 +1251,27 @@ before a daemon restart.
 
 #### Editing geometry in the web UI {: #geometry-editor }
 
-In **Displays → Projection**, choose an output and select **Warp**. To create
-or deliberately replace its calibration, use **Replace warp settings from
-rectangles**. This uses the server's canonical conversion and leaves the result
-unsaved. Switching simple/warp mode preserves the separate settings.
+In **Displays → Layout**, edit canvas aspect and render width, choose Simple
+or Warp, then select an output in the table or diagram. Hardware settings,
+shared content crop, and Warp correction use that one selection. Missing
+calibration is initialized with identity pins and neutral centers; switching
+modes preserves the shared composition and retained calibration.
+
+Crop X/Y are source pixels. Content scale is enlargement from source pixels
+to output pixels: 200% maps a 960×540 crop to a 1920×1080 output. This differs
+from compositor **Output scale** and the read-only global **Rendering scale**.
+The canonical stored values are normalized rectangles; displayed crop pixels
+and percentages are derived, never separately stored. Width-only changes
+preserve those rectangles, pins, and physical footprints, avoiding drift on
+repeated resolution changes. Aspect edits keep crop pixel origins and content
+scale anchored, exposing unused or out-of-bounds areas for adjustment.
+
+**Arrange automatically** accepts positive integer rows/columns and overlap
+as a percentage of adjacent tile extents. It places enabled configured outputs
+in table order, including disconnected outputs with known modes, and uniformly
+fits their composition inside the chosen canvas. Disabled outputs and existing
+calibration stay unchanged. Unused canvas is visible; mixed-size grids that
+fail source topology validation are rejected. Arrangement is one unsaved edit.
 
 Drag the four corner handles to place the picture inside the output raster.
 The four center-line handles control two shared fractions: moving either end
@@ -1191,20 +1282,31 @@ centers** and **Reset pins** are also unsaved edits. Source placement and the
 physical raster footprint have separate controls; destination pin movement
 does not change the selected browser content or its dimensions.
 
-**Save** persists the working document; **Cancel** restores the committed
-version. Previews are serialized with both operations. If another client or a
+One **Save** persists the entire Displays page; **Cancel** restores its committed
+state, including canvas dimensions. Previews are serialized with both operations.
+Switching output rows retains drafts, and invalid fields block Save. If another client or a
 daemon restart changes the working copy, the editor keeps your local edits
 and offers **Export local edits** or **Discard local edits and reload**.
-Warp controls require verified capability. CPU fallback shows its reason and
-keeps stored calibration while you edit the simple rectangles; returning to
-verified GPU capability permits restoration.
+Warp correction controls require verified capability. During CPU fallback,
+Simple is visibly selected and Warp is disabled; normal health warnings explain
+the reason. Shared crops and canvas remain editable. Saving those edits keeps
+the requested Warp intent and calibration for capability recovery. Deliberately
+selecting Simple changes that intent and survives reload.
 
-The canvas panel shows current dimensions and selected-output sampling status.
-Enter aspect, render width, and recorded scale, then choose **Adopt chosen
-dimensions**, or request a recommendation for the current accepted aspect and
-explicitly adopt one of its presets. Adoption can resize and reflow the page.
-Recommendations are approximate, report known and unknown limits, expire when
-their working-copy basis changes, and never apply during a drag.
+Recommendations refresh automatically after material edits settle. They show
+calculating, stale, invalid, and unavailable states; stale presets cannot apply.
+Focus render width to expose 25%, 50%, 75%, and 100% buttons; keyboard or touch
+activation fills that field. Width/aspect edits preview directly and can resize
+and reflow the source browser. Rendering scale is chosen width / ideal width,
+so 50% width corresponds to approximately 25% of the pixels at fixed aspect.
+It can exceed 100% within allocation limits. Cancel restores the previous size.
+
+Pin toggles promote the exact resolved mode, output scale, or transform to an
+explicit setting; unpinning returns to automatic adoption. Provenance labels
+distinguish waiting, adopted, and pinned values. Position is never adopted,
+and max render time Off is not automatic. Compact numeric labels retain full
+canonical precision: focus/blur, selection, unrelated edits, and Save do not
+round calibration. Raw config retains exact stored numbers.
 
 The editor distinguishes server acceptance from slicer installation using
 `control.appliedConfigGeneration` and the current child session. Numeric

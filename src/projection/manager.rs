@@ -324,7 +324,12 @@ impl BlendManager {
     fn clear_projection_stats(&self) {
         let stats_changed = self.snapshot.set_projection_stats(None);
         let running_changed = self.snapshot.set_slicer_running(false);
-        if stats_changed || running_changed {
+        // Retain diagnostic control failures, but never advertise an old
+        // child's measurement or applied lift after it stops rendering.
+        let lift_changed = self.snapshot.update_projection_control(|control| {
+            control.black_lift = None;
+        });
+        if stats_changed || running_changed || lift_changed {
             self.publish_projection_report();
         }
     }
@@ -692,6 +697,14 @@ fn update_control_status_for_config(
     snapshot.update_projection_control(|status| {
         status.session = Some(event.session);
         match event.kind {
+            ControlEventKind::BlackLift { status: lift } => {
+                if status
+                    .applied_generation
+                    .is_none_or(|g| event.generation >= g)
+                {
+                    status.black_lift = lift;
+                }
+            }
             ControlEventKind::Capability {
                 requested_renderer,
                 effective_renderer,
@@ -745,19 +758,16 @@ fn update_control_status_for_config(
                     OutputStage::Applied,
                 );
                 set_output_sampling(&mut status.outputs, sampling_modes);
-                if (status.requested_mode.as_deref() == Some("warp")
-                    && status.warp_available == Some(true))
-                    || status
-                        .outputs
-                        .iter()
-                        .any(|output| output.sampling_mode.as_deref() == Some("bilinear"))
+                if status.requested_mode.as_deref() == Some("warp")
+                    && status.warp_available == Some(true)
                 {
                     status.effective_mode = Some("warp".to_string());
-                } else if status
-                    .outputs
-                    .iter()
-                    .all(|output| output.sampling_mode.as_deref() == Some("exact"))
-                {
+                } else if status.outputs.iter().all(|output| {
+                    matches!(
+                        output.sampling_mode.as_deref(),
+                        Some("exact") | Some("bilinear")
+                    )
+                }) {
                     status.effective_mode = Some("simple".to_string());
                 }
                 status.build_ms = build_ms.or(status.build_ms);
@@ -1040,21 +1050,18 @@ fn slicer_requests_live_candidate(spec: &SlicerSpec) -> bool {
     spec.renderer != crate::model::Renderer::Cpu
 }
 
-/// A malformed internal geometry is still a warp request: the slicer must
+/// A malformed internal geometry is still a Warp request: the slicer must
 /// reject it, never advertise the resulting rectangle fallback as requested
-/// simple mode. The source rectangle is the current Phase 1 output-size seam.
+/// Simple mode. Source rectangles are shared crop/scale mappings and work in
+/// Simple, including the CPU renderer.
 fn spec_requests_warp(spec: &SlicerSpec) -> bool {
-    spec.layout.is_some()
-        || spec.slices.iter().any(|slice| {
-            if slice.source_rect.is_some() {
-                return true;
-            }
-            slice.geometry.as_ref().is_some_and(|geometry| {
-                geometry
-                    .warp(slice.source.width as u32, slice.source.height as u32)
-                    .map_or(true, |warp| warp.is_some())
-            })
+    spec.slices.iter().any(|slice| {
+        slice.geometry.as_ref().is_some_and(|geometry| {
+            geometry
+                .warp(slice.source.width as u32, slice.source.height as u32)
+                .map_or(true, |warp| warp.is_some())
         })
+    })
 }
 
 fn slicer_fingerprint(spec: &SlicerSpec, live_control: bool) -> u64 {
@@ -1168,6 +1175,7 @@ mod tests {
             black_lift: 0.0,
             rect: Rect::default(),
             pattern: None,
+            canvas_size: None,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,
@@ -1200,6 +1208,7 @@ mod tests {
 
     fn minimal_slicer_spec() -> SlicerSpec {
         SlicerSpec {
+            adaptive_lift: None,
             layout: None,
             coverage_rects: Vec::new(),
             control_session: String::new(),
@@ -1599,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn applied_sampling_updates_effective_mode_without_erasing_capability_reason() {
+    fn bilinear_simple_crop_does_not_change_effective_mode() {
         let manager = manager_for_test();
         update_control_status(
             &manager.snapshot,
@@ -1633,12 +1642,12 @@ mod tests {
             ),
         );
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.effective_mode.as_deref(), Some("warp"));
+        assert_eq!(status.effective_mode.as_deref(), Some("simple"));
         assert_eq!(status.warp_reason.as_deref(), Some("filtering verified"));
     }
 
     #[test]
-    fn public_warp_layout_remains_warp_when_every_applied_sampler_is_exact() {
+    fn shared_simple_layout_remains_simple_when_every_applied_sampler_is_exact() {
         use crate::model::Rect;
         use crate::projection::blend::SliceSpec;
 
@@ -1684,7 +1693,7 @@ mod tests {
                 .projection_control()
                 .requested_mode
                 .as_deref(),
-            Some("warp")
+            Some("simple")
         );
         update_control_status(
             &manager.snapshot,
@@ -1696,8 +1705,8 @@ mod tests {
                     effective_renderer: crate::model::Renderer::Gpu,
                     warp_available: true,
                     reason: None,
-                    requested_mode: "warp".into(),
-                    effective_mode: "warp".into(),
+                    requested_mode: "simple".into(),
+                    effective_mode: "simple".into(),
                 },
             ),
         );
@@ -1718,8 +1727,8 @@ mod tests {
             ),
         );
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.effective_mode.as_deref(), Some("warp"));
-        assert_eq!(status.requested_mode.as_deref(), Some("warp"));
+        assert_eq!(status.effective_mode.as_deref(), Some("simple"));
+        assert_eq!(status.requested_mode.as_deref(), Some("simple"));
         assert_eq!(status.warp_available, Some(true));
         assert_eq!(status.outputs[0].sampling_mode.as_deref(), Some("exact"));
     }

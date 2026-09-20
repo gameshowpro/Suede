@@ -114,7 +114,15 @@ impl Snapshot {
     }
 
     pub fn projection_control(&self) -> ProjectionControlStatus {
-        self.projection_control.read().unwrap().clone()
+        let mut control = self.projection_control.read().unwrap().clone();
+        if let Some(lift) = &mut control.black_lift {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            lift.sample_age_ms = lift.measured_at_unix_ms.map(|at| now.saturating_sub(at));
+        }
+        control
     }
 
     /// Replace control lifecycle state, reporting whether a client needs an

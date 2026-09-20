@@ -339,7 +339,25 @@ impl Reconciler {
         if geometry_status.requested_mode == crate::model::ProjectionMode::Warp
             && geometry_status.effective_mode == crate::model::ProjectionMode::Simple
         {
-            divergences.push(Divergence::new("warp_unavailable", "projection", format!("{}; using retained simple rectangles. Saved warp settings remain available for restoration", geometry_status.reason.clone().unwrap_or_else(|| "warp support is unavailable".into()))));
+            #[cfg(feature = "projection")]
+            let fallback_detail = if self.allow_overlaps {
+                "using the shared canvas and content crop without geometric correction"
+            } else {
+                "shared canvas rendering is unavailable while allowOverlaps is disabled"
+            };
+            #[cfg(not(feature = "projection"))]
+            let fallback_detail = "shared canvas rendering is unavailable in this build";
+            divergences.push(Divergence::new(
+                "warp_unavailable",
+                "projection",
+                format!(
+                    "{}; {fallback_detail}. Saved Warp calibration remains available for restoration",
+                    geometry_status
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "warp support is unavailable".into())
+                ),
+            ));
         }
         #[cfg(feature = "projection")]
         if geometry_status.effective_mode == crate::model::ProjectionMode::Warp {
@@ -707,7 +725,8 @@ impl Reconciler {
                             canvas_width: width,
                             canvas_height: height,
                             gamma: projection.gamma,
-                            black_lift: projection.black_lift,
+                            black_lift: projection.black_lift.level(),
+                            adaptive_lift: projection.black_lift.adaptive(),
                             pattern: projection.test_pattern,
                             free_run: projection.free_run,
                             renderer: projection.renderer,
@@ -838,8 +857,25 @@ impl Reconciler {
             self.allow_overlaps,
             Some(&previous),
         );
-        if policy.effective_mode == crate::model::ProjectionMode::Warp {
-            return crate::projection::layout::canvas_plan(desired, &self.snapshot.outputs()).ok();
+        // Canvas/source geometry is shared by Simple and Warp.  The latter
+        // merely adds the retained destination correction; an unavailable
+        // Warp renderer must keep the same crop and canvas allocation.
+        if desired
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.canvas.is_some())
+            && desired
+                .outputs
+                .iter()
+                .filter(|output| output.enable)
+                .all(|output| output.geometry.is_some())
+        {
+            return crate::projection::layout::canvas_plan_with_correction(
+                desired,
+                &self.snapshot.outputs(),
+                policy.effective_mode == crate::model::ProjectionMode::Warp,
+            )
+            .ok();
         }
         // A retained warp configuration can probe the actual pipeline while
         // displaying its separate simple layout, including a single output.
@@ -1712,11 +1748,32 @@ mod tests {
             .reconciler
             .plan_canvas(&desired)
             .expect("overlapping simple fallback still needs a canvas");
+        let canvas = desired
+            .projection
+            .as_ref()
+            .unwrap()
+            .canvas
+            .as_ref()
+            .unwrap();
+        let expected_sources: Vec<_> = desired
+            .outputs
+            .iter()
+            .map(|output| Some(output.geometry.as_ref().unwrap().source.pixel_rect(canvas)))
+            .collect();
         assert!(simple.slices.iter().all(|slice| slice.geometry.is_none()));
         assert!(simple
             .slices
             .iter()
-            .all(|slice| slice.source_rect.is_none()));
+            .all(|slice| slice.source_rect.is_some()));
+        assert_eq!(
+            simple
+                .slices
+                .iter()
+                .map(|slice| slice.source_rect)
+                .collect::<Vec<_>>(),
+            expected_sources,
+            "forced Simple must retain the shared source crop"
+        );
 
         mark_gpu_warp_available(&harness);
         let recovered_policy = crate::projection_policy::status(
@@ -1742,6 +1799,36 @@ mod tests {
             .slices
             .iter()
             .all(|slice| slice.source_rect.is_some()));
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn shared_simple_plan_uses_logical_rotated_and_scaled_destinations() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        let mut desired = warp_layout(crate::model::ProjectionMode::Simple);
+        desired.outputs[0].scale = Some(2.0);
+        desired.outputs[0].transform = Some(crate::model::Transform::Rotate90);
+
+        let plan = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("shared Simple canvas must be planned");
+        assert_eq!(
+            (plan.slices[0].source.width, plan.slices[0].source.height),
+            (540, 960),
+            "1920×1080 at scale 2 and 90° rotation is a 540×960 layer surface"
+        );
+        assert_eq!(plan.sway_positions[0], ("HDMI-A-1".into(), 0, 0));
+        assert_eq!(plan.sway_positions[1], ("HDMI-A-2".into(), 540, 0));
+        assert!(plan.slices.iter().all(|slice| slice.geometry.is_none()));
+        assert_eq!(
+            plan.slices[0].source_rect,
+            Some([0.0, 0.0, 1920.0, 1080.0]),
+            "source selection remains in the shared physical canvas"
+        );
     }
 
     #[cfg(feature = "projection")]

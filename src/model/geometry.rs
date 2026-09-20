@@ -20,7 +20,7 @@ const SHARED_EDGE_EPS: f64 = 1.0e-10;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectionMode {
-    /// Existing rectangular output positions and edge blending.
+    /// Shared rectangular content selection and scaling, without correction.
     #[default]
     Simple,
     /// Configured canvas source rectangles and destination corner pins.
@@ -93,8 +93,9 @@ impl CanvasRect {
 pub struct CanvasConfig {
     pub aspect: f64,
     pub render_width: u32,
-    /// Descriptive operator-selected render scale. `renderWidth` remains the
-    /// authoritative raster width; this value is retained for UI and reports.
+    /// Deprecated descriptive metadata, retained for document compatibility.
+    /// Does not control rendering or express the current recommendation ratio;
+    /// `renderWidth` is the authoritative raster width.
     #[serde(default = "default_scale")]
     pub scale: f64,
 }
@@ -153,10 +154,13 @@ impl CanvasConfig {
     }
 }
 
-/// Persisted per-output source placement and destination correction.
+/// Persisted shared content selection and independent destination correction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputGeometry {
+    /// Canonical normalized crop, used by both Simple and Warp. Pixel crop
+    /// origins and content enlargement are derived from this rectangle, never
+    /// stored as a second editable representation.
     pub source: CanvasRect,
     /// Output-local normalized destination pins in TL, TR, BR, BL order.
     pub corners: [[f64; 2]; 4],

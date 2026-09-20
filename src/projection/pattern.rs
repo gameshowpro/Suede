@@ -33,6 +33,7 @@ pub fn render(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
         // Reaching here means the tiled path asked for it — see
         // `sync_unavailable`.
         Some(TestPattern::Sync) => sync_unavailable(&mut rgb, width, height),
+        Some(TestPattern::WarpAlignment) => warp_alignment(&mut rgb, width, height, spec),
         None => {}
     }
     rgb
@@ -986,6 +987,96 @@ fn sync_unavailable(rgb: &mut [u8], width: u32, height: u32) {
     text(rgb, width, height, text_x, text_y, scale, message);
 }
 
+// --- warp alignment -------------------------------------------------------
+
+/// A dark gray background with white lines marking out every 10% of canvas
+/// width and height (2 pixels thick) and concentric alignment circles in the
+/// center of the canvas.
+fn warp_alignment(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
+    let (cw, ch) = match spec.canvas_size {
+        Some([w, h]) if w > 0 && h > 0 => (w as f64, h as f64),
+        _ => {
+            let w = (spec.rect.x + spec.rect.width).max(width as i32).max(1) as f64;
+            let h = (spec.rect.y + spec.rect.height).max(height as i32).max(1) as f64;
+            (w, h)
+        }
+    };
+
+    let cx = cw * 0.5;
+    let cy = ch * 0.5;
+    let min_dim = cw.min(ch);
+    let r_inscribed = min_dim * 0.5;
+    let r_stated = min_dim;
+    let r_center = min_dim * 0.05;
+
+    // Precompute 2px ranges for vertical (X) lines at 0%, 10%, ..., 100%
+    let mut x_ranges = [(0i32, 0i32); 11];
+    for i in 0..=10 {
+        let x_pos = (i as f64 * 0.1 * cw).round() as i32;
+        if i == 0 {
+            x_ranges[i] = (0, 1);
+        } else if i == 10 {
+            let end = cw.round() as i32;
+            x_ranges[i] = (end - 2, end - 1);
+        } else {
+            x_ranges[i] = (x_pos - 1, x_pos);
+        }
+    }
+
+    // Precompute 2px ranges for horizontal (Y) lines at 0%, 10%, ..., 100%
+    let mut y_ranges = [(0i32, 0i32); 11];
+    for j in 0..=10 {
+        let y_pos = (j as f64 * 0.1 * ch).round() as i32;
+        if j == 0 {
+            y_ranges[j] = (0, 1);
+        } else if j == 10 {
+            let end = ch.round() as i32;
+            y_ranges[j] = (end - 2, end - 1);
+        } else {
+            y_ranges[j] = (y_pos - 1, y_pos);
+        }
+    }
+
+    let dark_gray = [40u8, 40u8, 40u8];
+    let white = [255u8, 255u8, 255u8];
+
+    // Background fill
+    for chunk in rgb.chunks_exact_mut(3) {
+        chunk.copy_from_slice(&dark_gray);
+    }
+
+    for y in 0..height as i32 {
+        let gy = y + spec.rect.y;
+        let on_horiz_line = y_ranges.iter().any(|&(y0, y1)| gy >= y0 && gy <= y1);
+        let dy = (gy as f64 + 0.5) - cy;
+
+        for x in 0..width as i32 {
+            let gx = x + spec.rect.x;
+            if on_horiz_line {
+                put(rgb, width, x, y, white);
+                continue;
+            }
+
+            let on_vert_line = x_ranges.iter().any(|&(x0, x1)| gx >= x0 && gx <= x1);
+            if on_vert_line {
+                put(rgb, width, x, y, white);
+                continue;
+            }
+
+            let dx = (gx as f64 + 0.5) - cx;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            // 2-pixel stroke thickness: distance within 1.0 of circle radius
+            if (dist - r_inscribed).abs() <= 1.0
+                || (dist - r_stated).abs() <= 1.0
+                || (dist - r_center).abs() <= 1.0
+            {
+                put(rgb, width, x, y, white);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -998,6 +1089,7 @@ mod tests {
             black_lift: 0.0,
             rect,
             pattern: Some(pattern),
+            canvas_size: None,
             ramps: Vec::new(),
         }
     }
@@ -1005,6 +1097,31 @@ mod tests {
     fn pixel(rgb: &[u8], width: u32, x: i32, y: i32) -> [u8; 3] {
         let offset = (y as usize * width as usize + x as usize) * 3;
         [rgb[offset], rgb[offset + 1], rgb[offset + 2]]
+    }
+
+    #[test]
+    fn warp_alignment_renders_grid_and_circle() {
+        let mut sp = spec(TestPattern::WarpAlignment, Rect { x: 0, y: 0, width: 1000, height: 1000 });
+        sp.canvas_size = Some([1000, 1000]);
+        let rgb = render(1000, 1000, &sp);
+
+        // A pixel far from lines and circles, e.g. (250, 250), should be dark gray [40, 40, 40]
+        assert_eq!(pixel(&rgb, 1000, 250, 250), [40, 40, 40]);
+
+        // (0, 0) should be on the 0% grid lines -> white [255, 255, 255]
+        assert_eq!(pixel(&rgb, 1000, 0, 0), [255, 255, 255]);
+
+        // Top tangent of inscribed circle (500, 0) -> white [255, 255, 255]
+        assert_eq!(pixel(&rgb, 1000, 500, 0), [255, 255, 255]);
+
+        // 10% vertical line at x = 100 -> white
+        assert_eq!(pixel(&rgb, 1000, 100, 250), [255, 255, 255]);
+
+        // Small center circle of diameter 0.1 * min (radius 50) at (500, 450) -> white
+        assert_eq!(pixel(&rgb, 1000, 500, 450), [255, 255, 255]);
+        // Center itself (500, 500) is interior -> dark gray (except grid lines)
+        // Check pixel at (505, 505) inside the small circle but off lines -> dark gray
+        assert_eq!(pixel(&rgb, 1000, 505, 505), [40, 40, 40]);
     }
 
     #[test]
@@ -1181,6 +1298,7 @@ mod tests {
                         height: height as i32,
                     },
                     pattern: Some(TestPattern::Identify),
+                    canvas_size: None,
                     ramps: Vec::new(),
                 },
             );
@@ -1277,6 +1395,7 @@ mod tests {
                         height: h as i32,
                     },
                     pattern: Some(pattern),
+                    canvas_size: None,
                     ramps: Vec::new(),
                 },
             );

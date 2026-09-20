@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::black_lift::BlackLift;
 use super::geometry::{validate_sources, CanvasConfig, OutputGeometry, ProjectionMode};
 use super::observed::{Mode, Output, Position};
 
@@ -52,13 +53,12 @@ pub struct DesiredState {
     pub settings: Settings,
 }
 
-/// Multi-projector configuration, including retained simple and warp layouts.
+/// Shared multi-projector content layout and retained Warp correction.
 ///
 /// There is no overlap setting here, because the source layout determines
-/// overlap. In simple mode, outputs are positioned in canvas space — the
-/// space the content is authored in — and wherever their rectangles intersect,
-/// that region is projected by both machines. Warp mode stores those source
-/// rectangles separately from destination pins.
+/// overlap. Simple and Warp share the configured canvas and normalized source
+/// rectangles. Warp adds destination correction to that content selection.
+/// Without an explicit canvas, integer output positions define the layout.
 ///
 /// Sway never sees any of this. It is always handed a plain edge-to-edge
 /// tiling; the active app renders into a headless canvas the size of the
@@ -71,7 +71,7 @@ pub struct ProjectionConfig {
     /// Which geometry pipeline is requested. Warp settings remain retained
     /// while simple mode is active.
     pub mode: ProjectionMode,
-    /// Canvas geometry retained independently from simple output positions.
+    /// Shared canvas dimensions for Simple, Warp, and capability fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasConfig>,
     /// Master switch for seam ramps. `false` retains required slicing and warp
@@ -93,7 +93,7 @@ pub struct ProjectionConfig {
     /// the seam, so it lifts the signal everywhere *else* to match —
     /// `out = lift + (1 − lift)·in`. On a black scene, raise this until the
     /// un-doubled regions match the seams.
-    pub black_lift: f64,
+    pub black_lift: BlackLift,
     /// Show a built-in test pattern instead of the content. `null` is off.
     ///
     /// Patterns draw in *global* coordinates, so features continue exactly
@@ -123,7 +123,7 @@ impl Default for ProjectionConfig {
             canvas: None,
             blend: true,
             gamma: 2.2,
-            black_lift: 0.0,
+            black_lift: BlackLift::default(),
             test_pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
@@ -196,6 +196,9 @@ pub enum TestPattern {
     /// clip a script measures frame by frame, and for tying that clip back to
     /// the stats log and the journal.
     Sync,
+    /// 10% grid lines and center alignment circle on dark gray for warp geometry.
+    #[serde(rename = "warp-alignment")]
+    WarpAlignment,
 }
 
 impl DesiredState {
@@ -279,6 +282,9 @@ impl DesiredState {
             .outputs
             .iter()
             .filter(|output| output.enable)
+            // Shared crops supersede legacy integer positions. Validating both
+            // would reject good crops because of stale compositor coordinates.
+            .filter(|_| self.projection.as_ref().is_none_or(|p| p.canvas.is_none()))
             .filter_map(|output| {
                 // The adopted mode counts too: once a value has been pinned,
                 // it is as settled a fact as one the operator typed in, and
@@ -398,19 +404,13 @@ impl DesiredState {
             }
             // Above 0.5 the "compensation" is brighter than mid-grey, which
             // is no black level anyone measured.
-            if !(projection.black_lift.is_finite() && (0.0..=0.5).contains(&projection.black_lift))
-            {
-                errors.push(format!(
-                    "projection.blackLift must be between 0.0 and 0.5, not {}",
-                    projection.black_lift
-                ));
+            if let Err(error) = projection.black_lift.validate() {
+                errors.push(format!("projection.{error}"));
             }
 
-            // Geometry is retained across pipeline edits, so validate every
-            // retained entry even while simple mode is requested. Warp has a
-            // complete configured roster contract: unattached outputs count,
-            // and each enabled participant needs an explicit/effective mode
-            // and complete geometry.
+            // A shared canvas has one complete configured roster in either
+            // pipeline, including disconnected enabled outputs.
+            let shared = projection.canvas.is_some() || projection.mode == ProjectionMode::Warp;
             let mut warp_sources = Vec::new();
             let enabled_count = self.outputs.iter().filter(|output| output.enable).count();
             for (index, output) in self.outputs.iter().enumerate() {
@@ -432,28 +432,26 @@ impl DesiredState {
                         }
                     }
                 }
-                if projection.mode == ProjectionMode::Warp && output.enable {
+                if shared && output.enable {
                     let Some(canvas) = projection.canvas.as_ref() else {
                         errors.push("projection.canvas is required in warp mode".into());
                         continue;
                     };
                     let Some(mode) = output.effective_mode() else {
-                        errors.push(format!("{prefix}.mode is required in warp mode"));
+                        errors.push(format!("{prefix}.mode is required for a shared canvas"));
                         continue;
                     };
-                    if output.position.is_none() {
-                        errors.push(format!(
-                            "{prefix}.position is required as the simple-mode fallback in warp mode"
-                        ));
-                    }
-                    if output.effective_scale().is_some_and(|scale| scale != 1.0) {
+                    if projection.mode == ProjectionMode::Warp
+                        && output.effective_scale().is_some_and(|scale| scale != 1.0)
+                    {
                         errors.push(format!(
                             "{prefix}.scale must be 1.0 in warp mode until raster scaling is supported"
                         ));
                     }
-                    if output
-                        .effective_transform()
-                        .is_some_and(|transform| transform != Transform::Normal)
+                    if projection.mode == ProjectionMode::Warp
+                        && output
+                            .effective_transform()
+                            .is_some_and(|transform| transform != Transform::Normal)
                     {
                         errors.push(format!(
                             "{prefix}.transform must be normal in warp mode until transformed rasters are supported"
@@ -472,6 +470,11 @@ impl DesiredState {
                         errors.push(format!("{prefix}.mode allocation exceeds the 32MP limit"));
                     }
                     let (width, height) = (mode.width as u32, mode.height as u32);
+                    if let Err(error) = output
+                        .presentation_dimensions(mode, projection.mode == ProjectionMode::Warp)
+                    {
+                        errors.push(format!("{prefix} {error}"));
+                    }
                     match &output.geometry {
                         Some(geometry) => {
                             if let Err(error) = geometry.validate_for_output(canvas, width, height)
@@ -480,16 +483,19 @@ impl DesiredState {
                             }
                             warp_sources.push(geometry.source);
                         }
-                        None => errors.push(format!("{prefix}.geometry is required in warp mode")),
+                        None => errors
+                            .push(format!("{prefix}.geometry is required for a shared canvas")),
                     }
                 }
             }
-            if projection.mode == ProjectionMode::Warp {
+            if shared {
                 if !allow_overlaps {
-                    errors.push("warp mode requires allow_overlaps = true".into());
+                    errors.push("shared canvas rendering requires allow_overlaps = true".into());
                 }
                 if enabled_count == 0 {
-                    errors.push("warp mode requires at least one enabled output".into());
+                    errors.push(
+                        "shared canvas rendering requires at least one enabled output".into(),
+                    );
                 }
                 if let Some(canvas) = projection.canvas.as_ref() {
                     if warp_sources.len() == enabled_count && !warp_sources.is_empty() {
@@ -830,7 +836,8 @@ pub struct OutputConfig {
     /// Never adopted — see [`AdoptedOutput`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
-    /// Persisted warp source, destination pins and physical footprint.
+    /// Shared normalized content source plus retained Warp correction and
+    /// independent physical light footprint. Simple uses the same source.
     /// Kept independently from `position` and from the requested pipeline so
     /// switching to simple mode does not discard calibrated warp settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1096,6 +1103,48 @@ impl OutputConfig {
     pub fn effective_transform(&self) -> Option<Transform> {
         self.transform
             .or_else(|| self.adopted.as_ref().and_then(|adopted| adopted.transform))
+    }
+
+    /// Destination buffer dimensions. Simple presents in compositor logical
+    /// coordinates; Warp requires a normal, unit-scale physical raster.
+    /// Validate before casting or allocating, including very small scales.
+    pub fn presentation_dimensions(
+        &self,
+        mode: Mode,
+        apply_correction: bool,
+    ) -> Result<(i32, i32), String> {
+        let scale = if apply_correction {
+            1.0
+        } else {
+            self.effective_scale().unwrap_or(1.0)
+        };
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err("output scale must be finite and positive".into());
+        }
+        let rotated = !apply_correction
+            && matches!(
+                self.effective_transform(),
+                Some(
+                    Transform::Rotate90
+                        | Transform::Rotate270
+                        | Transform::Flipped90
+                        | Transform::Flipped270
+                )
+            );
+        let (width, height) = if rotated {
+            (mode.height, mode.width)
+        } else {
+            (mode.width, mode.height)
+        };
+        let width = (f64::from(width) / scale).round();
+        let height = (f64::from(height) / scale).round();
+        if !(1.0..=32768.0).contains(&width) || !(1.0..=32768.0).contains(&height) {
+            return Err("presentation dimensions must be in 1..=32768 pixels per axis".into());
+        }
+        if width * height > 32_000_000.0 {
+            return Err("presentation allocation exceeds the 32MP limit".into());
+        }
+        Ok((width as i32, height as i32))
     }
 }
 
@@ -1392,6 +1441,8 @@ mod tests {
         for json in [
             include_str!("../../docs/examples/four-output-appliance.json"),
             include_str!("../../docs/examples/four-output-warp.json"),
+            include_str!("../../docs/examples/four-output-shared-canvas.json"),
+            include_str!("../../docs/examples/four-output-adaptive.json"),
         ] {
             let state: DesiredState = serde_json::from_str(json).unwrap();
             assert_eq!(state.schema_version, SCHEMA_VERSION);

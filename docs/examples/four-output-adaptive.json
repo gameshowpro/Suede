@@ -1,0 +1,317 @@
+{
+  "schemaVersion": 2,
+  "revision": 0,
+  "outputs": [
+    {
+      "match": {
+        "name": "HDMI-A-1"
+      },
+      "enable": true,
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 0,
+        "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.0,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.0,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
+      },
+      "adaptiveSync": false,
+      "maxRenderTimeMs": null,
+      "adopted": {
+        "scale": 1.0,
+        "transform": "normal",
+        "display": {
+          "make": "Acme Displays",
+          "model": "AD-2400",
+          "serial": "0x00012345"
+        },
+        "capturedAt": 1757894400
+      }
+    },
+    {
+      "match": {
+        "name": "HDMI-A-2"
+      },
+      "enable": true,
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 1920,
+        "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.25,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.25,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
+      }
+    },
+    {
+      "match": {
+        "name": "HDMI-A-3"
+      },
+      "enable": true,
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 3840,
+        "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.5,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.5,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
+      }
+    },
+    {
+      "match": {
+        "name": "HDMI-A-4"
+      },
+      "enable": true,
+      "mode": {
+        "width": 1920,
+        "height": 1080,
+        "refreshHz": 60
+      },
+      "position": {
+        "x": 5760,
+        "y": 0
+      },
+      "geometry": {
+        "source": {
+          "x": 0.75,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        },
+        "corners": [
+          [
+            0.0,
+            0.0
+          ],
+          [
+            1.0,
+            0.0
+          ],
+          [
+            1.0,
+            1.0
+          ],
+          [
+            0.0,
+            1.0
+          ]
+        ],
+        "center": [
+          0.5,
+          0.5
+        ],
+        "rasterFootprint": {
+          "x": 0.75,
+          "y": 0.0,
+          "width": 0.25,
+          "height": 0.140625
+        }
+      }
+    }
+  ],
+  "apps": [
+    {
+      "id": "renderer-1",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "http://control.local/render/1?hb={heartbeatUrl}"
+      },
+      "audio": {
+        "output": "alsa_output.pci-0000_01_00.1.hdmi-stereo"
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      }
+    },
+    {
+      "id": "renderer-2",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "http://control.local/render/2?hb={heartbeatUrl}"
+      },
+      "audio": {
+        "output": null
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      }
+    },
+    {
+      "id": "renderer-3",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "http://control.local/render/3?hb={heartbeatUrl}"
+      },
+      "audio": {
+        "output": null
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      }
+    },
+    {
+      "id": "renderer-4",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "http://control.local/render/4?hb={heartbeatUrl}"
+      },
+      "audio": {
+        "output": null
+      },
+      "heartbeat": {
+        "enabled": true,
+        "timeoutSeconds": 25,
+        "startupGraceSeconds": 60
+      }
+    }
+  ],
+  "projection": {
+    "mode": "warp",
+    "canvas": {
+      "aspect": 7.111111111111111,
+      "renderWidth": 7680,
+      "scale": 1.0
+    },
+    "blend": true,
+    "gamma": 2.2,
+    "blackLift": {
+      "mode": "adaptive",
+      "level": 0.2,
+      "darkThreshold": 0.02,
+      "brightThreshold": 0.2,
+      "riseMs": 1000,
+      "fallMs": 250,
+      "slewPerSecond": 0.1
+    },
+    "freeRun": false,
+    "renderer": "auto"
+  },
+  "backgrounds": [],
+  "settings": {
+    "hideCursor": true,
+    "outputPollIntervalSeconds": 5
+  },
+  "activeApp": "renderer-1",
+  "committed": true
+}

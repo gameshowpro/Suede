@@ -426,6 +426,85 @@
           }
         ]
       },
+      "BlackLift": {
+        "description": "Black lift's backwards-compatible number or its explicitly tagged form.",
+        "oneOf": [
+          {
+            "description": "A bare number has always meant fixed lift.",
+            "format": "double",
+            "type": "number"
+          },
+          {
+            "$ref": "#/components/schemas/BlackLiftMode",
+            "description": "A tagged fixed or adaptive configuration."
+          }
+        ]
+      },
+      "BlackLiftMode": {
+        "description": "Explicit black-lift modes. The tag is the JSON `mode` field.",
+        "oneOf": [
+          {
+            "description": "Fixed lift using the same arithmetic as the legacy numeric form.",
+            "properties": {
+              "level": {
+                "format": "double",
+                "type": "number"
+              },
+              "mode": {
+                "enum": [
+                  "fixed"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "level",
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Lift controlled by source-canvas luminance.",
+            "properties": {
+              "brightThreshold": {
+                "format": "double",
+                "type": "number"
+              },
+              "darkThreshold": {
+                "format": "double",
+                "type": "number"
+              },
+              "fallMs": {
+                "format": "double",
+                "type": "number"
+              },
+              "level": {
+                "format": "double",
+                "type": "number"
+              },
+              "mode": {
+                "enum": [
+                  "adaptive"
+                ],
+                "type": "string"
+              },
+              "riseMs": {
+                "format": "double",
+                "type": "number"
+              },
+              "slewPerSecond": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "level",
+              "mode"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CanvasConfig": {
         "additionalProperties": false,
         "description": "Canvas aspect and the operator-selected render width.",
@@ -440,7 +519,7 @@
             "type": "integer"
           },
           "scale": {
-            "description": "Descriptive operator-selected render scale. `renderWidth` remains the\nauthoritative raster width; this value is retained for UI and reports.",
+            "description": "Deprecated descriptive metadata, retained for document compatibility.\nDoes not control rendering or express the current recommendation ratio;\n`renderWidth` is the authoritative raster width.",
             "format": "double",
             "type": "number"
           }
@@ -1384,7 +1463,7 @@
               },
               {
                 "$ref": "#/components/schemas/OutputGeometry",
-                "description": "Persisted warp source, destination pins and physical footprint.\nKept independently from `position` and from the requested pipeline so\nswitching to simple mode does not discard calibrated warp settings."
+                "description": "Shared normalized content source plus retained Warp correction and\nindependent physical light footprint. Simple uses the same source.\nKept independently from `position` and from the requested pipeline so\nswitching to simple mode does not discard calibrated warp settings."
               }
             ]
           },
@@ -1450,7 +1529,7 @@
       },
       "OutputGeometry": {
         "additionalProperties": false,
-        "description": "Persisted per-output source placement and destination correction.",
+        "description": "Persisted shared content selection and independent destination correction.",
         "properties": {
           "center": {
             "items": {
@@ -1475,7 +1554,8 @@
             "description": "Physical light-field coverage, independent of source and destination\npins. Until a calibrated footprint is supplied, conversion copies the\nsource rectangle into this field."
           },
           "source": {
-            "$ref": "#/components/schemas/CanvasRect"
+            "$ref": "#/components/schemas/CanvasRect",
+            "description": "Canonical normalized crop, used by both Simple and Warp. Pixel crop\norigins and content enlargement are derived from this rectangle, never\nstored as a second editable representation."
           }
         },
         "required": [
@@ -1748,15 +1828,112 @@
         ],
         "type": "object"
       },
+      "ProjectionBlackLiftStatus": {
+        "description": "Adaptive lift telemetry. Capture IDs count measurements, while logical\ngenerations also advance for retained-capture repaints. Neither is a\npersisted configuration revision or a promise of simultaneous scanout.",
+        "properties": {
+          "applied": {
+            "format": "double",
+            "type": "number"
+          },
+          "available": {
+            "type": "boolean"
+          },
+          "captureId": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "logicalGeneration": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "luminance": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "measuredAtUnixMs": {
+            "description": "Unix timestamp of the most recent valid source measurement.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "measurementMs": {
+            "description": "Duration of the most recent sampling pass and host readback.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "metric": {
+            "type": "string"
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sampleAgeMs": {
+            "description": "Age at response serialization, including while static content settles.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "sampleCount": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "stale": {
+            "description": "The latest capture had no samples; the last valid target is retained.",
+            "type": "boolean"
+          },
+          "target": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "metric",
+          "available",
+          "paused",
+          "stale",
+          "sampleCount",
+          "target",
+          "applied",
+          "logicalGeneration"
+        ],
+        "type": "object"
+      },
       "ProjectionConfig": {
         "additionalProperties": false,
-        "description": "Multi-projector configuration, including retained simple and warp layouts.\n\nThere is no overlap setting here, because the source layout determines\noverlap. In simple mode, outputs are positioned in canvas space — the\nspace the content is authored in — and wherever their rectangles intersect,\nthat region is projected by both machines. Warp mode stores those source\nrectangles separately from destination pins.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
+        "description": "Shared multi-projector content layout and retained Warp correction.\n\nThere is no overlap setting here, because the source layout determines\noverlap. Simple and Warp share the configured canvas and normalized source\nrectangles. Warp adds destination correction to that content selection.\nWithout an explicit canvas, integer output positions define the layout.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
         "properties": {
           "blackLift": {
             "default": 0.0,
-            "description": "Black-level compensation, `0.0` (off) to `0.5`.\n\nProjector black is not zero light, so seams glow in dark scenes: they\nreceive two projectors' worth of leaked black. The fix cannot darken\nthe seam, so it lifts the signal everywhere *else* to match —\n`out = lift + (1 − lift)·in`. On a black scene, raise this until the\nun-doubled regions match the seams.",
-            "format": "double",
-            "type": "number"
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BlackLift",
+                "description": "Black-level compensation, `0.0` (off) to `0.5`.\n\nProjector black is not zero light, so seams glow in dark scenes: they\nreceive two projectors' worth of leaked black. The fix cannot darken\nthe seam, so it lifts the signal everywhere *else* to match —\n`out = lift + (1 − lift)·in`. On a black scene, raise this until the\nun-doubled regions match the seams."
+              }
+            ]
           },
           "blend": {
             "default": true,
@@ -1771,7 +1948,7 @@
               },
               {
                 "$ref": "#/components/schemas/CanvasConfig",
-                "description": "Canvas geometry retained independently from simple output positions."
+                "description": "Shared canvas dimensions for Simple, Warp, and capability fallback."
               }
             ]
           },
@@ -1918,6 +2095,17 @@
             "type": [
               "integer",
               "null"
+            ]
+          },
+          "blackLift": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectionBlackLiftStatus",
+                "description": "Shared source measurement and lift for the active slicer session."
+              }
             ]
           },
           "buildMs": {
@@ -2467,8 +2655,12 @@
             "format": "double",
             "type": "number"
           },
+          "available": {
+            "description": "Whether this target can be allocated within the known canvas limits.\nUnavailable targets remain in the response so the UI can explain and\ndisable them instead of relabeling a clamped width as 100%.",
+            "type": "boolean"
+          },
           "height": {
-            "format": "int32",
+            "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
@@ -2477,7 +2669,7 @@
             "type": "number"
           },
           "width": {
-            "format": "int32",
+            "format": "int64",
             "minimum": 0,
             "type": "integer"
           }
@@ -2486,7 +2678,8 @@
           "scale",
           "width",
           "height",
-          "achievedScale"
+          "achievedScale",
+          "available"
         ],
         "type": "object"
       },
@@ -2674,7 +2867,8 @@
           "black",
           "gamma",
           "identify",
-          "sync"
+          "sync",
+          "warp-alignment"
         ],
         "type": "string"
       },

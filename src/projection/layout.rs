@@ -30,6 +30,7 @@ pub(crate) struct LocalKey {
     sources: Vec<CanvasRect>,
     footprints: Vec<CanvasRect>,
     maximum: u32,
+    dynamic: bool,
 }
 
 pub(crate) struct Evaluator {
@@ -146,7 +147,7 @@ impl Evaluator {
             .ok_or_else(|| format!("presenter {output} is absent from configured layout"))
     }
 
-    pub fn key(&self, index: usize, lift: f64) -> LocalKey {
+    pub fn key(&self, index: usize, lift: f64, dynamic: bool) -> LocalKey {
         let source = &self.spec.participants[index].source;
         LocalKey {
             own_source: *source,
@@ -163,7 +164,7 @@ impl Evaluator {
             } else {
                 Vec::new()
             },
-            footprints: if lift > 0.0 {
+            footprints: if dynamic || lift > 0.0 {
                 self.spec
                     .participants
                     .iter()
@@ -173,8 +174,19 @@ impl Evaluator {
             } else {
                 Vec::new()
             },
-            maximum: if lift > 0.0 { self.maximum } else { 0 },
+            maximum: if dynamic || lift > 0.0 {
+                self.maximum
+            } else {
+                0
+            },
+            dynamic,
         }
+    }
+
+    /// Maximum physical raster coverage for the complete configured layout.
+    /// This is a shared uniform for every dynamic output in one generation.
+    pub fn maximum(&self) -> u32 {
+        self.maximum
     }
 
     pub fn transfer(
@@ -227,6 +239,43 @@ impl Evaluator {
             (edge * lift * 255.0).round() as u8,
         )
     }
+
+    /// Dynamic shape entry containing ramp, border coverage and physical
+    /// coverage count. The adaptive level is intentionally absent: it is a
+    /// shared runtime uniform and changing it must not rebuild this table.
+    pub fn dynamic_shape(&self, index: usize, cx: f64, cy: f64, gamma: f64, edge: f64) -> u32 {
+        let (x, y) = (cx / self.width, cy / self.vertical_density);
+        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0 / self.spec.aspect).contains(&y) {
+            return crate::projection::blend::pack_dynamic_shape(0.0, 0.0, 0);
+        }
+        let Some(own) = distance(&self.spec.participants[index].source, x, y) else {
+            return crate::projection::blend::pack_dynamic_shape(0.0, 0.0, 0);
+        };
+        let weight = if !self.spec.blend || self.stacked {
+            1.0
+        } else {
+            let mut count = 0;
+            let mut total = 0.0;
+            for p in &self.spec.participants {
+                if let Some(d) = distance(&p.source, x, y) {
+                    count += 1;
+                    total += d;
+                }
+            }
+            if total > 0.0 {
+                own / total
+            } else {
+                1.0 / f64::from(count)
+            }
+        };
+        let n = self
+            .spec
+            .participants
+            .iter()
+            .filter(|p| contains(&p.raster_footprint, x, y))
+            .count() as u32;
+        crate::projection::blend::pack_dynamic_shape(weight.powf(1.0 / gamma), edge, n)
+    }
 }
 
 /// Whether the complete canvas mapping has the integer translation fast path.
@@ -248,6 +297,19 @@ pub fn canvas_plan(
     desired: &crate::model::DesiredState,
     observed: &[crate::model::Output],
 ) -> Result<super::blend::CanvasPlan, String> {
+    canvas_plan_with_correction(desired, observed, true)
+}
+
+/// Plan the common canvas/source mapping for either presentation mode.
+///
+/// Source rectangles and physical footprints belong to the installation, not
+/// to corner correction.  Simple therefore uses this same plan with no
+/// destination geometry, while Warp adds the retained correction below.
+pub fn canvas_plan_with_correction(
+    desired: &crate::model::DesiredState,
+    observed: &[crate::model::Output],
+    apply_correction: bool,
+) -> Result<super::blend::CanvasPlan, String> {
     let projection = desired
         .projection
         .as_ref()
@@ -263,6 +325,8 @@ pub fn canvas_plan(
     let mut positions = Vec::new();
     for config in desired.outputs.iter().filter(|o| o.enable) {
         let mode = config.effective_mode().ok_or("warp output mode missing")?;
+        let (destination_width, destination_height) =
+            config.presentation_dimensions(mode, apply_correction)?;
         let geometry = config
             .geometry
             .as_ref()
@@ -287,11 +351,11 @@ pub fn canvas_plan(
             source: crate::model::Rect {
                 x: source[0].floor() as i32,
                 y: source[1].floor() as i32,
-                width: mode.width,
-                height: mode.height,
+                width: destination_width,
+                height: destination_height,
             },
             source_rect: Some(source),
-            geometry: Some(super::warp::Geometry {
+            geometry: apply_correction.then_some(super::warp::Geometry {
                 corners: geometry
                     .corners
                     .map(|p| [p[0] * f64::from(mode.width), p[1] * f64::from(mode.height)]),
@@ -299,7 +363,7 @@ pub fn canvas_plan(
             }),
             ramps: Vec::new(),
         });
-        positions.push((config.r#match.key(), output, mode.width));
+        positions.push((config.r#match.key(), output, destination_width));
     }
     Evaluator::new(&layout, width as i32, height as i32)?;
     // Stable output identity and raster sizes, never destination/source pins.
@@ -314,6 +378,7 @@ pub fn canvas_plan(
         canvas_width: width as i32,
         canvas_height: height as i32,
         layout: Some(layout),
+        adaptive_lift: projection.black_lift.adaptive_settings(),
         coverage_rects: Vec::new(),
         slices,
         sway_positions,
@@ -448,8 +513,8 @@ mod tests {
         let b = Evaluator::new(&input, 100, 100).unwrap();
         assert_eq!(b.maximum, 1);
         assert_eq!(b.transfer(0, 10.0, 50.0, 1.0, 0.2, 1.0), (256, 0));
-        assert_ne!(a.key(0, 0.2), b.key(0, 0.2));
-        assert_eq!(a.key(0, 0.0), b.key(0, 0.0));
+        assert_ne!(a.key(0, 0.2, false), b.key(0, 0.2, false));
+        assert_eq!(a.key(0, 0.0, false), b.key(0, 0.0, false));
     }
 
     #[test]
@@ -462,9 +527,9 @@ mod tests {
         let before = Evaluator::new(&input, 100, 100).unwrap();
         input.participants[0].source.width = 0.42;
         let after = Evaluator::new(&input, 100, 100).unwrap();
-        assert_ne!(before.key(0, 0.1), after.key(0, 0.1));
-        assert_ne!(before.key(1, 0.1), after.key(1, 0.1));
-        assert_eq!(before.key(2, 0.1), after.key(2, 0.1));
+        assert_ne!(before.key(0, 0.1, false), after.key(0, 0.1, false));
+        assert_ne!(before.key(1, 0.1, false), after.key(1, 0.1, false));
+        assert_eq!(before.key(2, 0.1, false), after.key(2, 0.1, false));
         for y in 0..100 {
             for x in 0..100 {
                 assert_eq!(
@@ -507,8 +572,16 @@ mod tests {
         input.participants[0].source.x = 0.1;
         input.participants[0].source.width = 0.9;
         let after = Evaluator::new(&input, 100, 100).unwrap();
-        assert_ne!(before.key(0, 0.0), after.key(0, 0.0));
+        assert_ne!(before.key(0, 0.0, false), after.key(0, 0.0, false));
         assert_eq!(before.transfer(0, 5.0, 50.0, 1.0, 0.0, 1.0), (256, 0));
         assert_eq!(after.transfer(0, 5.0, 50.0, 1.0, 0.0, 1.0), (0, 0));
+    }
+
+    #[test]
+    fn dynamic_keys_ignore_level_but_include_mode() {
+        let input = spec(&[rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)]);
+        let evaluator = Evaluator::new(&input, 100, 100).unwrap();
+        assert_eq!(evaluator.key(0, 0.0, true), evaluator.key(0, 0.5, true));
+        assert_ne!(evaluator.key(0, 0.0, true), evaluator.key(0, 0.0, false));
     }
 }

@@ -1486,4 +1486,32 @@ mod tests {
             "{body}"
         );
     }
+
+    #[tokio::test]
+    async fn projection_black_lift_tagged_modes_roundtrip_and_validate() {
+        let harness = harness(None);
+        for value in [
+            serde_json::json!(0.04),
+            serde_json::json!({"mode":"fixed","level":0.04}),
+            serde_json::json!({"mode":"adaptive","level":0.2,"darkThreshold":0.03,
+                "brightThreshold":0.3,"riseMs":800.0,"fallMs":400.0,"slewPerSecond":0.2}),
+        ] {
+            let input = serde_json::json!({"blackLift":value}).to_string();
+            let (status, body) =
+                call(&harness, "PUT", "/api/v1/config/projection", Some(&input)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["projection"]["blackLift"], value);
+        }
+        for value in [
+            serde_json::json!({"mode":"adaptive","level":0.6}),
+            serde_json::json!({"mode":"adaptive","level":0.2,"darkThreshold":0.3,"brightThreshold":0.2}),
+            serde_json::json!({"mode":"adaptive","level":0.2,"riseMs":0}),
+            serde_json::json!({"mode":"adaptive","level":0.2,"slewPerSecond":0}),
+        ] {
+            let input = serde_json::json!({"blackLift":value}).to_string();
+            let (status, _) =
+                call(&harness, "PUT", "/api/v1/config/projection", Some(&input)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
+        }
+    }
 }

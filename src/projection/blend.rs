@@ -67,6 +67,9 @@ pub struct OverlaySpec {
     /// Test pattern to draw instead of showing the content through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<TestPattern>,
+    /// Global canvas dimensions (width, height), for canvas-relative patterns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas_size: Option<[u32; 2]>,
     pub ramps: Vec<RampSpec>,
 }
 
@@ -118,6 +121,10 @@ pub struct SlicerSpec {
     pub canvas_height: i32,
     pub gamma: f64,
     pub black_lift: f64,
+    /// Optional dynamic shape transfer. The numeric `black_lift` remains the
+    /// fixed fallback and startup level for adaptive mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_lift: Option<crate::model::AdaptiveBlackLift>,
     /// Render this instead of capturing, for alignment and calibration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<TestPattern>,
@@ -142,6 +149,9 @@ pub struct CanvasPlan {
     pub canvas_width: i32,
     pub canvas_height: i32,
     pub layout: Option<super::layout::LayoutSpec>,
+    /// Adaptive control is carried with the derived plan so the slicer can
+    /// select the tagged shape transfer without changing geometry.
+    pub adaptive_lift: Option<crate::model::AdaptiveBlackLift>,
     pub coverage_rects: Vec<Rect>,
     /// Where each output goes in *sway's* layout: a plain edge-to-edge
     /// tiling, row-major by the configured layout. Sway never sees overlaps.
@@ -340,6 +350,7 @@ pub fn canvas_plan_with_warp_activation(
 
     Some(CanvasPlan {
         layout: None,
+        adaptive_lift: config.and_then(|p| p.black_lift.adaptive_settings()),
         coverage_rects: rects.iter().map(|(_, rect)| *rect).collect(),
         canvas_width,
         canvas_height,
@@ -364,6 +375,65 @@ pub fn canvas_plan_with_warp_activation(
 pub struct Coverage {
     rects: Vec<Rect>,
     max: u32,
+}
+
+/// Shape-transfer format used by adaptive black lift. Bit 31 tags this as a
+/// dynamic entry. Bits 0..15 store the gamma-shaped ramp, bits 16..23 store
+/// output-pixel picture coverage, bits 24..27 store physical coverage count,
+/// and bits 28..30 are reserved and zero. All floating values are clamped
+/// before positive-ties-up rounding; coverage counts above eight are rejected
+/// by the update validator and saturate here for defensive callers.
+pub const DYNAMIC_TRANSFER_TAG: u32 = 1 << 31;
+
+pub fn pack_dynamic_shape(ramp: f64, edge: f64, coverage: u32) -> u32 {
+    let r = (ramp.clamp(0.0, 1.0) * 65_535.0).round() as u32;
+    let e = (edge.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let n = coverage.min(8);
+    DYNAMIC_TRANSFER_TAG | r | (e << 16) | (n << 24)
+}
+
+pub fn unpack_dynamic_shape(value: u32) -> Option<(u16, u8, u8)> {
+    (value & DYNAMIC_TRANSFER_TAG != 0 && value & 0x7000_0000 == 0).then_some((
+        (value & 0xffff) as u16,
+        ((value >> 16) & 0xff) as u8,
+        ((value >> 24) & 0xf) as u8,
+    ))
+}
+
+/// Reference arithmetic for the tagged dynamic transfer. The ramp and edge
+/// inputs are the unpacked quantized values, matching the shader's input.
+pub fn dynamic_shade(value: u32, input: u8, level: f64, maximum: u32) -> u8 {
+    let Some((r16, e8, n8)) = unpack_dynamic_shape(value) else {
+        return 0;
+    };
+    let n = u32::from(n8);
+    if n == 0 || e8 == 0 || maximum == 0 {
+        return 0;
+    }
+    let r = f64::from(r16) / 65_535.0;
+    let e = f64::from(e8) / 255.0;
+    let l = (level.clamp(0.0, 1.0) * f64::from(maximum.saturating_sub(n)) / f64::from(n))
+        .clamp(0.0, 1.0);
+    (255.0 * e * ((1.0 - l) * r * (f64::from(input) / 255.0) + l))
+        .round()
+        .clamp(0.0, 255.0) as u8
+}
+
+/// Build one dynamic shape entry from ramps and output-pixel coverage.
+pub fn dynamic_transfer_at(
+    ramps: &[RampSpec],
+    gamma: f64,
+    x: f64,
+    y: f64,
+    edge: f64,
+    coverage: u32,
+) -> u32 {
+    if coverage == 0 || edge <= 0.0 {
+        return pack_dynamic_shape(0.0, 0.0, 0);
+    }
+    let transmitted =
+        ramps_attenuation(ramps, x, y).map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
+    pack_dynamic_shape(transmitted, edge, coverage)
 }
 
 fn covering(rects: &[Rect], x: f64, y: f64) -> u32 {
@@ -496,9 +566,10 @@ pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) ->
         .map(|participant| OverlaySpec {
             output: participant.name.clone(),
             gamma: config.gamma,
-            black_lift: config.black_lift,
+            black_lift: config.black_lift.level(),
             rect: participant.rect,
             pattern: config.test_pattern,
+            canvas_size: None,
             ramps: Vec::new(),
         })
         .collect();
@@ -1225,6 +1296,7 @@ mod tests {
             black_lift: 0.0,
             rect: Rect::default(),
             pattern: None,
+            canvas_size: None,
             ramps: vec![RampSpec {
                 rect: Rect {
                     x: 0,
@@ -1259,6 +1331,7 @@ mod tests {
                 height: 1,
             },
             pattern: Some(TestPattern::White),
+            canvas_size: None,
             ramps: Vec::new(),
         };
         let pixels = pixel_map(100, 1, &spec);
@@ -1277,6 +1350,7 @@ mod tests {
             canvas_height: 1080,
             gamma: 2.2,
             black_lift: 0.04,
+            adaptive_lift: None,
             pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
@@ -1445,5 +1519,33 @@ mod tests {
         let saturated = coverage.lift(0.5, 1.5, 1.5);
         assert_eq!(saturated, 1.0); // k=3, L*k=1.5
         assert_eq!(transfer_at(&[], 2.2, saturated, 1.5, 1.5, 0.5), (0, 128));
+    }
+
+    #[test]
+    fn dynamic_shape_packing_rounds_saturates_and_reserves_bits() {
+        let value = pack_dynamic_shape(0.5, 0.5, 9);
+        assert_eq!(value & DYNAMIC_TRANSFER_TAG, DYNAMIC_TRANSFER_TAG);
+        assert_eq!(value & 0x0000_ffff, 32_768);
+        assert_eq!((value >> 16) & 0xff, 128);
+        assert_eq!((value >> 24) & 0xf, 8);
+        assert_eq!(value & 0x7000_0000, 0);
+        assert_eq!(unpack_dynamic_shape(value), Some((32_768, 128, 8)));
+    }
+
+    #[test]
+    fn dynamic_shade_handles_k_greater_than_one_and_saturation() {
+        let shape = pack_dynamic_shape(1.0, 1.0, 1);
+        assert_eq!(dynamic_shade(shape, 255, 0.4, 4), 255); // l saturates
+        assert_eq!(dynamic_shade(shape, 0, 0.4, 4), 255);
+        let half = pack_dynamic_shape(1.0, 0.5, 1);
+        assert_eq!(dynamic_shade(half, 255, 0.0, 4), 128);
+        assert_eq!(
+            dynamic_shade(pack_dynamic_shape(1.0, 1.0, 0), 255, 0.2, 4),
+            0
+        );
+        assert_eq!(
+            dynamic_shade(pack_dynamic_shape(1.0, 0.0, 1), 255, 0.2, 4),
+            0
+        );
     }
 }

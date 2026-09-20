@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::projection::warp::Warp;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
@@ -64,12 +65,16 @@ fn embedded_fragment_offsets_match_every_rust_push_constant_member() {
         std::mem::offset_of!(PushConstants, warp_enabled),
         std::mem::offset_of!(PushConstants, padding),
         std::mem::offset_of!(PushConstants, source_rect),
+        std::mem::offset_of!(PushConstants, dynamic_lift),
+        std::mem::offset_of!(PushConstants, dynamic_maximum),
+        std::mem::offset_of!(PushConstants, dynamic_padding),
+        std::mem::offset_of!(PushConstants, dynamic_padding) + 4,
     ];
     assert_eq!(structs[&ty].len(), expected.len());
     let actual: Vec<_> = offsets[&ty].values().map(|v| *v as usize).collect();
     assert_eq!(actual, expected);
     assert_eq!(
-        actual.last().unwrap() + 16,
+        actual.last().unwrap() + std::mem::size_of::<u32>(),
         std::mem::size_of::<PushConstants>()
     );
 }
@@ -90,6 +95,7 @@ struct Image {
     memory: vk::DeviceMemory,
     view: vk::ImageView,
     size: [u32; 2],
+    initialized: Cell<bool>,
     device: Arc<DeviceState>,
 }
 
@@ -169,6 +175,7 @@ impl Image {
             memory,
             view,
             size,
+            initialized: Cell::new(false),
             device: Arc::clone(&gpu.device),
         })
     }
@@ -384,15 +391,27 @@ fn draw_installed(
         }
         device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
+            if target.initialized.get() {
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            } else {
+                vk::PipelineStageFlags::TOP_OF_PIPE
+            },
             vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             vk::DependencyFlags::empty(),
             &[],
             &[],
             &[image_barrier(
                 target.image,
-                vk::ImageLayout::UNDEFINED,
-                vk::AccessFlags::empty(),
+                if target.initialized.get() {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                },
+                if target.initialized.get() {
+                    vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+                } else {
+                    vk::AccessFlags::empty()
+                },
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
             )],
         );
@@ -497,6 +516,7 @@ fn draw_installed(
             gpu.fence,
         )?;
         device.wait_for_fences(&[gpu.fence], true, 10_000_000_000)?;
+        target.initialized.set(true);
         Ok(std::slice::from_raw_parts(readback.get().mapped, readback_bytes).to_vec())
     }
 }
@@ -720,6 +740,176 @@ fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
     println!(
         "GPU readback passed: {cases} cases, worst channel error {worst_error} byte(s); identity/exact tolerance 0, warped tolerance 1"
     );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+fn tagged_dynamic_transfer_matches_the_documented_rounding_and_outside_black() -> anyhow::Result<()>
+{
+    use crate::projection::blend::{dynamic_shade, pack_dynamic_shape};
+    let mut gpu = Gpu::new(None)?;
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let size = [256, 9 * 5 * 5];
+    let canvas = Image::new(&gpu, size, format)?;
+    let target = Image::new(&gpu, size, format)?;
+    let mut pixels = Vec::new();
+    let mut table = Vec::new();
+    for n in 0..=8 {
+        for ramp in [0.0, 0.13, 0.5, 0.87, 1.0] {
+            for edge in [0.0, 1.0 / 255.0, 0.5, 254.0 / 255.0, 1.0] {
+                for value in 0..=255u8 {
+                    pixels.extend_from_slice(&[value, 255 - value, value.wrapping_mul(37), 11]);
+                    table.push(pack_dynamic_shape(ramp, edge, n));
+                }
+            }
+        }
+    }
+    gpu.set_packed_transfer(2, size[0], size[1], &table)?;
+    let mut worst = 0;
+    for maximum in [1, 4, 8] {
+        for level in [0.0, 0.01, 0.12, 0.3333333, 0.5] {
+            gpu.set_dynamic_lift(level, maximum)?;
+            let mut constants = PushConstants::canvas([0, 0], size, size[1], false, None);
+            constants.dynamic_lift = level as f32;
+            constants.dynamic_maximum = maximum;
+            let got = draw_installed(
+                &mut gpu,
+                TestCanvas::Pixels(&canvas, &pixels),
+                &target,
+                constants,
+                format,
+            )?;
+            for (index, pixel) in got.chunks_exact(4).enumerate() {
+                assert_eq!(pixel[3], 255);
+                for channel in 0..3 {
+                    let expected =
+                        dynamic_shade(table[index], pixels[index * 4 + channel], level, maximum);
+                    let error = pixel[channel].abs_diff(expected);
+                    worst = worst.max(error);
+                    assert!(error <= 1, "dynamic parity pixel {index} channel {channel}, L={level} N={maximum}: {} vs {expected}", pixel[channel]);
+                    if (table[index] >> 24) & 15 == 0
+                        || (table[index] >> 16) & 255 == 0
+                        || (table[index] & 0xffff == 65535 && pixels[index * 4 + channel] == 255)
+                    {
+                        assert_eq!(
+                            pixel[channel], expected,
+                            "outside black and covered white must be exact"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "Dynamic GPU parity: 864000 pixels, worst channel error {worst}; fixed tables untouched"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+fn source_measurement_reuses_its_target_without_stale_samples_or_padding() -> anyhow::Result<()> {
+    let mut gpu = Gpu::new(None)?;
+    let white = [255u8, 255, 255, 255].repeat(4);
+    let black = [0u8, 0, 0, 255].repeat(4);
+    let first = gpu.upload_static_canvas_rgba(2, 2, &white)?;
+    let (luminance, count) = gpu.measure_static_luminance(&first, 2, 2)?;
+    assert_eq!(count, 4);
+    assert!((luminance - 1.0).abs() < 1e-12);
+    let dark = gpu.upload_static_canvas_rgba(2, 2, &black)?;
+    let (luminance, count) = gpu.measure_static_luminance(&dark, 2, 2)?;
+    assert_eq!(count, 4);
+    assert_eq!(
+        luminance, 0.0,
+        "previous white measurement leaked into reset readback"
+    );
+    let third = gpu.upload_static_canvas_rgba(2, 2, &white)?;
+    let (luminance, count) = gpu.measure_static_luminance(&third, 2, 2)?;
+    assert_eq!(count, 4);
+    assert!((luminance - 1.0).abs() < 1e-12);
+
+    // The logical domain can be smaller than the backing canvas: exclude a
+    // bright second column as allocation padding would be excluded in capture.
+    let padded = gpu.upload_static_canvas_rgba(
+        2,
+        2,
+        &[
+            0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 255, 255, 255, 255,
+        ],
+    )?;
+    let (luminance, count) =
+        gpu.measure_luminance_inner(padded.image, padded.view, false, false, 1, 2)?;
+    assert_eq!(count, 2);
+    assert_eq!(luminance, 0.0);
+    Ok(())
+}
+
+#[test]
+#[ignore = "benchmark only; run explicitly on the target GPU"]
+fn benchmark_source_measurement_grid_readback_25_frames() -> anyhow::Result<()> {
+    // This is an offscreen draw+measurement microbenchmark, not a playback
+    // claim. It retains source, target, transfer, and measurement resources.
+    for size in [[1920, 1080], [3680, 2000]] {
+        let mut gpu = Gpu::new(None)?;
+        let pixels = vec![32u8, 32, 32, 255]
+            .into_iter()
+            .cycle()
+            .take((size[0] * size[1] * 4) as usize)
+            .collect::<Vec<_>>();
+        let canvas = gpu.upload_static_canvas_rgba(size[0], size[1], &pixels)?;
+        let target = Image::new(&gpu, [16, 16], vk::Format::R8G8B8A8_UNORM)?;
+        let table = vec![(256, 0); 16 * 16];
+        gpu.set_transfer(2, 16, 16, &table)?;
+        let constants = PushConstants::canvas([0, 0], [16, 16], size[1], false, None);
+        // Build retained resources outside timed samples.
+        let _ = draw_installed(
+            &mut gpu,
+            TestCanvas::Static(&canvas),
+            &target,
+            constants,
+            vk::Format::R8G8B8A8_UNORM,
+        )?;
+        let _ = gpu.measure_static_luminance(&canvas, size[0], size[1])?;
+        let mut off_samples = Vec::with_capacity(25);
+        for _ in 0..25 {
+            let started = std::time::Instant::now();
+            let _ = draw_installed(
+                &mut gpu,
+                TestCanvas::Static(&canvas),
+                &target,
+                constants,
+                vk::Format::R8G8B8A8_UNORM,
+            )?;
+            off_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let mut on_samples = Vec::with_capacity(25);
+        for _ in 0..25 {
+            let started = std::time::Instant::now();
+            let _ = draw_installed(
+                &mut gpu,
+                TestCanvas::Static(&canvas),
+                &target,
+                constants,
+                vk::Format::R8G8B8A8_UNORM,
+            )?;
+            let _ = gpu.measure_static_luminance(&canvas, size[0], size[1])?;
+            on_samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+        let off_mean = off_samples.iter().sum::<f64>() / off_samples.len() as f64;
+        let on_mean = on_samples.iter().sum::<f64>() / on_samples.len() as f64;
+        println!(
+            "source measurement {}x{} (one 16x16 offscreen target; not compositor playback): off mean {:.3} ms/frame samples {:?}; on mean {:.3} ms/frame samples {:?}; delta {:.3} ms/frame ({})",
+            size[0],
+            size[1],
+            off_mean,
+            off_samples,
+            on_mean,
+            on_samples,
+            on_mean - off_mean,
+            gpu.describe()
+        );
+    }
     Ok(())
 }
 

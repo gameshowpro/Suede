@@ -730,6 +730,9 @@ impl ProjectionGeometryStatus {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectionControlStatus {
+    /// Shared source measurement and lift for the active slicer session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub black_lift: Option<ProjectionBlackLiftStatus>,
     /// Session of the currently running child, when it has accepted a live
     /// control message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -795,6 +798,32 @@ pub struct ProjectionControlStatus {
     /// implying an atomic wall-wide flip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<ProjectionControlOutputStatus>,
+}
+
+/// Adaptive lift telemetry. Capture IDs count measurements, while logical
+/// generations also advance for retained-capture repaints. Neither is a
+/// persisted configuration revision or a promise of simultaneous scanout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionBlackLiftStatus {
+    pub metric: String,
+    pub available: bool,
+    pub paused: bool,
+    /// The latest capture had no samples; the last valid target is retained.
+    pub stale: bool,
+    pub reason: Option<String>,
+    pub capture_id: Option<u64>,
+    pub sample_count: u32,
+    pub luminance: Option<f64>,
+    /// Unix timestamp of the most recent valid source measurement.
+    pub measured_at_unix_ms: Option<u64>,
+    /// Age at response serialization, including while static content settles.
+    pub sample_age_ms: Option<u64>,
+    pub target: f64,
+    pub applied: f64,
+    pub logical_generation: u64,
+    /// Duration of the most recent sampling pass and host readback.
+    pub measurement_ms: Option<f64>,
 }
 
 /// The latest lifecycle generation reported for one named output.

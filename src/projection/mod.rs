@@ -11,6 +11,7 @@
 //! The whole module is compiled out without the `projection` cargo feature;
 //! the configuration schema is not, so every build speaks the same API.
 
+pub mod adaptive;
 pub mod blend;
 pub mod control;
 #[cfg(unix)]

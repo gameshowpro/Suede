@@ -58,6 +58,10 @@ pub struct ControlEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlEventKind {
+    /// Independent of config progress: animation never sends preview writes.
+    BlackLift {
+        status: Option<crate::model::observed::ProjectionBlackLiftStatus>,
+    },
     /// The renderer selected after the slicer has probed its actual capture
     /// and presentation path.  This is deliberately a child report: a
     /// configured GPU label alone does not prove that a capture image can be

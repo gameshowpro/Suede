@@ -443,6 +443,8 @@ struct Presenter {
     /// row-major at the configured size. Two-dimensional because seams can
     /// run on any edge — a grid corner is the product of two ramps.
     transfer: Vec<(u16, u8)>,
+    /// Tagged shape table for adaptive mode; fixed tables remain byte exact.
+    dynamic_table: Option<Vec<u32>>,
     warp: Option<super::warp::Warp>,
     /// Research revision carried by this output, independent of source frames.
     warp_revision: u64,
@@ -1424,10 +1426,259 @@ struct State {
     gate_blocked_since: Option<Instant>,
     warp_updates: Option<super::warp_update::Controller>,
     warp_available: bool,
+    /// Exact unit-density copies can use an unfilterable capture image. A
+    /// fractional shared crop needs linear filtering and falls back to CPU
+    /// under `renderer: auto` when the selected modifier cannot provide it.
+    requires_linear_sampling: bool,
     /// Immutable diagnostic sources; each output retains its connector labels.
     static_canvases: Vec<gpu::StaticCanvas>,
     /// A failed draw keeps the retained source dirty and retries on a bounded timer.
     gpu_retry_after: Option<Instant>,
+    adaptive: Option<LiftRuntime>,
+    /// Advances only on completed source captures, never on repaint ticks.
+    capture_id: u64,
+    capture_measurement: Option<CapturedLuminance>,
+}
+
+/// Kept across transfer-mode/settings changes so a static capture can be
+/// reused without a second GPU measurement or a new screencopy request.
+#[derive(Clone)]
+struct CapturedLuminance {
+    capture_id: u64,
+    result: Result<(f64, u32), String>,
+    measured_at_unix_ms: u64,
+    cost_ms: f64,
+}
+
+/// One controller and one uniform value for the entire wall. The measurement
+/// identity is independent of presentation feedback and configuration IDs.
+struct LiftRuntime {
+    controller: super::adaptive::AdaptiveController,
+    maximum: u32,
+    canvas_size: (u32, u32),
+    session: String,
+    generation: u64,
+    next_tick: Option<Instant>,
+    next_report: Instant,
+    status: crate::model::observed::ProjectionBlackLiftStatus,
+}
+
+impl LiftRuntime {
+    /// Publish the current adaptive status when its 100 ms reporting window
+    /// permits it. Returns whether an event was emitted, which keeps callers
+    /// and tests from confusing an updated local status with a reported one.
+    fn report(&mut self, now: Instant, force: bool) -> bool {
+        if !force && now < self.next_report {
+            return false;
+        }
+        self.next_report = now + Duration::from_millis(100);
+        self.status.target = self.controller.target();
+        self.status.applied = self.controller.level();
+        self.status.sample_age_ms = self.status.measured_at_unix_ms.map(|at| {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64)
+                .saturating_sub(at)
+        });
+        let event = super::control::ControlEvent::new(
+            self.session.clone(),
+            self.generation,
+            super::control::ControlEventKind::BlackLift {
+                status: Some(self.status.clone()),
+            },
+        );
+        if let Ok(line) = serde_json::to_string(&event) {
+            println!("{line}");
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn configure_adaptive(state: &mut State, spec: &SlicerSpec, generation: u64) {
+    let now = Instant::now();
+    let Some(config) = spec.adaptive_lift else {
+        if state.adaptive.take().is_some() {
+            let event = super::control::ControlEvent::new(
+                spec.control_session.clone(),
+                generation,
+                super::control::ControlEventKind::BlackLift { status: None },
+            );
+            if let Ok(line) = serde_json::to_string(&event) {
+                println!("{line}");
+            }
+        }
+        return;
+    };
+    let maximum = super::warp_update::maximum_coverage(spec);
+    if let Some(runtime) = &mut state.adaptive {
+        if runtime.controller.config() == config {
+            runtime.generation = generation;
+            runtime.maximum = maximum;
+            runtime.report(now, true);
+            return;
+        }
+    }
+    let mut controller = super::adaptive::AdaptiveController::new(config, now);
+    let paused = spec.pattern.is_some();
+    let reason = if paused {
+        controller.set_paused(true, now);
+        Some("Calibration pattern suspends source measurement and adaptation".into())
+    } else if state.capture.backend != Some(Backend::Gpu) {
+        controller.unavailable();
+        Some(
+            "Source measurement requires the GPU capture path; using configured fixed level".into(),
+        )
+    } else {
+        Some("Waiting for the first source measurement".into())
+    };
+    state.adaptive = Some(LiftRuntime {
+        controller, maximum,
+        canvas_size: (spec.canvas_width as u32, spec.canvas_height as u32),
+        session: spec.control_session.clone(), generation, next_tick: None,
+        next_report: now,
+        status: crate::model::observed::ProjectionBlackLiftStatus {
+            metric: "Mean linear Rec.709 luminance after sRGB decoding; nearest cell centers on a source-canvas grid up to 256x256, including unused canvas, excluding allocation padding".into(),
+            available: false, paused, stale: false, reason,
+            capture_id: None, sample_count: 0, luminance: None,
+            measured_at_unix_ms: None, sample_age_ms: None,
+            target: config.level, applied: config.level,
+            logical_generation: state.timing.snapshot_id, measurement_ms: None,
+        },
+    });
+    state.adaptive.as_mut().unwrap().report(now, true);
+    if let Some(slot) = state
+        .capture
+        .pending_slot
+        .or(state.capture.last_blended_slot)
+    {
+        measure_adaptive(state, slot);
+    }
+}
+
+/// Called once for each completed capture, while its slot is still owned by
+/// the slicer. No presenter or retained-capture repaint calls measurement.
+fn measure_adaptive(state: &mut State, slot: usize) -> bool {
+    let Some(runtime) = &mut state.adaptive else {
+        return false;
+    };
+    if runtime.controller.paused() || state.capture.backend != Some(Backend::Gpu) {
+        return false;
+    }
+    let was_available = runtime.status.available;
+    let now = Instant::now();
+    if state
+        .capture_measurement
+        .as_ref()
+        .is_none_or(|m| m.capture_id != state.capture_id)
+    {
+        let result = match (state.gpu.as_mut(), state.capture.gpu_images.get(slot)) {
+            (Some(gpu), Some((image, _))) => gpu.measure_luminance(
+                image,
+                state.capture.y_invert,
+                runtime.canvas_size.0,
+                runtime.canvas_size.1,
+            ),
+            _ => Err(anyhow::anyhow!("Completed GPU source image unavailable")),
+        };
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: state.capture_id,
+            result: result.map_err(|error| format!("{error:#}")),
+            measured_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            cost_ms: now.elapsed().as_secs_f64() * 1000.0,
+        });
+    }
+    let measurement = state.capture_measurement.as_ref().unwrap();
+    runtime.status.measurement_ms = Some(measurement.cost_ms);
+    // A settled source has no timer. Do not apply minutes of idle time to
+    // a target that arrived only with this capture's scene cut.
+    if !runtime.controller.needs_tick() {
+        runtime.controller.tick(now);
+    }
+    match measurement.result.clone() {
+        Ok((luminance, count)) => {
+            runtime.controller.measure_with_capture(
+                luminance,
+                u64::from(count),
+                Some(state.capture_id),
+            );
+            if count > 0 && luminance.is_finite() {
+                runtime.status.available = true;
+                runtime.status.stale = false;
+                runtime.status.reason = None;
+                runtime.status.capture_id = Some(state.capture_id);
+                runtime.status.sample_count = count;
+                runtime.status.luminance = Some(luminance);
+                runtime.status.measured_at_unix_ms = Some(measurement.measured_at_unix_ms);
+                runtime.status.sample_age_ms = Some(0);
+            } else {
+                runtime.status.available = false;
+                runtime.status.stale = true;
+                runtime.status.reason =
+                    Some("Zero samples: retaining the last valid target".into());
+            }
+        }
+        Err(error) => {
+            runtime.controller.unavailable();
+            runtime.status.available = false;
+            runtime.status.stale = false;
+            runtime.status.reason = Some(format!("Source measurement unavailable: {error:#}"));
+        }
+    }
+    runtime.status.logical_generation = state.timing.snapshot_id;
+    // The first valid sample must clear "waiting" even when it already puts
+    // the controller at its target and therefore schedules no controller
+    // tick. Once a valid status has been reported, later moving-source
+    // captures retain the normal 100 ms report bound.
+    let report_now = !runtime.status.available || !was_available;
+    let reported = runtime.report(Instant::now(), report_now);
+    runtime.next_tick = if runtime.controller.needs_tick() {
+        let controller_tick = Instant::now() + super::adaptive::CONTROLLER_TICK;
+        Some(
+            runtime
+                .next_tick
+                .map_or(controller_tick, |scheduled| scheduled.min(controller_tick)),
+        )
+    } else if reported {
+        None
+    } else {
+        // A settled controller has no adaptation tick to wake it after a
+        // throttled report. Reuse the report deadline as a report-only wakeup
+        // so a later static-source sample cannot remain invisible forever.
+        Some(runtime.next_report)
+    };
+    reported
+}
+
+fn tick_adaptive(state: &mut State) {
+    tick_adaptive_at(state, Instant::now());
+}
+
+fn tick_adaptive_at(state: &mut State, now: Instant) {
+    let Some(runtime) = &mut state.adaptive else {
+        return;
+    };
+    if runtime.next_tick.is_none_or(|at| now < at) {
+        return;
+    }
+    let tick = runtime.controller.tick(now);
+    runtime.next_tick = runtime
+        .controller
+        .needs_tick()
+        .then_some(now + super::adaptive::CONTROLLER_TICK);
+    if tick.changed {
+        // Presentation identity advances, but the completed capture ID and
+        // measurement timestamp stay unchanged while static content settles.
+        state.new_snapshot();
+    }
+    let runtime = state.adaptive.as_mut().unwrap();
+    runtime.status.logical_generation = state.timing.snapshot_id;
+    runtime.report(now, tick.settled);
 }
 
 /// Never draw into a buffer still owned by the compositor.
@@ -1720,15 +1971,16 @@ impl State {
 
 pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     let nonexact = requested_warp(spec)?;
+    let requires_linear_sampling = requires_linear_sampling(spec).map_err(anyhow::Error::msg)?;
     if nonexact && spec.renderer == Renderer::Cpu {
         report_capability(
             spec,
             Renderer::Cpu,
             false,
-            Some("renderer:cpu supports rectangles only".into()),
+            Some("renderer:cpu does not support geometric warp correction".into()),
             true,
         );
-        anyhow::bail!("warp_unavailable: renderer:cpu supports rectangles only");
+        anyhow::bail!("warp_unavailable: renderer:cpu does not support geometric warp correction");
     }
     let connection = Connection::connect_to_env()?;
     let (globals, mut queue) = registry_queue_init::<State>(&connection)?;
@@ -1771,8 +2023,12 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         gate_blocked_since: None,
         warp_updates: None,
         warp_available: false,
+        requires_linear_sampling,
         static_canvases: Vec::new(),
         gpu_retry_after: None,
+        adaptive: None,
+        capture_id: 0,
+        capture_measurement: None,
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
@@ -1887,6 +2143,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             busy: Vec::new(),
             next_buffer: 0,
             transfer: Vec::new(),
+            dynamic_table: None,
             warp: None,
             warp_revision: 0,
             warp_reported_revision: None,
@@ -2065,6 +2322,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     loop {
         let waiting_from = Instant::now();
         apply_warp_updates(&mut state)?;
+        tick_adaptive(&mut state);
         while !state.capture.ready && !state.capture.failed && !state.can_present() {
             if state.warp_updates.is_some() || state.gpu_retry_after.is_some() {
                 dispatch_until(
@@ -2074,6 +2332,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                     Instant::now() + Duration::from_secs(60),
                 )?;
                 apply_warp_updates(&mut state)?;
+                tick_adaptive(&mut state);
             } else {
                 queue.blocking_dispatch(&mut state)?;
             }
@@ -2117,6 +2376,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             state.capture.first_copy_done = true;
             record_capture_interval(&mut state);
             state.stats.captured += 1;
+            state.capture_id += 1;
             // Marks every presenter `stale` (both backends' due-presenter
             // selection reads this) and runs the stall-callback timeout
             // check — needed on the GPU path too, not just CPU.
@@ -2140,6 +2400,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 // this call blocks on it.
                 current.destroy();
                 let filled_slot = state.capture.gpu_slot;
+                measure_adaptive(&mut state, filled_slot);
                 state.capture.gpu_slot = (filled_slot + 1) % GPU_CAPTURE_SLOTS;
                 // The newest complete frame, held for the gate rather than
                 // blended here: whether it goes out now or in a moment is
@@ -2230,22 +2491,37 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
 }
 
 fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
-    let mut requested =
-        spec.layout.is_some() || spec.slices.iter().any(|s| s.source_rect.is_some());
+    let mut requested = false;
     for slice in &spec.slices {
         anyhow::ensure!(
             slice.source.width > 0 && slice.source.height > 0,
             "source dimensions must be positive"
         );
-        requested |= super::warp_update::sampling_warp(
-            spec,
-            slice,
-            (slice.source.width as u32, slice.source.height as u32),
-        )
-        .map_err(anyhow::Error::msg)?
-        .is_some();
+        // A source rectangle can crop and scale through the identity mapper
+        // on either renderer.  Capability is only about retained geometric
+        // correction, whose malformed form must still be rejected here.
+        requested |= slice.geometry.as_ref().is_some_and(|geometry| {
+            geometry
+                .warp(slice.source.width as u32, slice.source.height as u32)
+                .map_or(true, |warp| warp.is_some())
+        });
     }
     Ok(requested)
+}
+
+/// Whether the source mapping reaches the shader's linearly filtered path.
+/// This includes identity geometry carrying a fractional or scaled shared
+/// crop, but excludes the exact integer-copy proof.
+fn requires_linear_sampling(spec: &SlicerSpec) -> Result<bool, String> {
+    spec.slices.iter().try_fold(false, |required, slice| {
+        Ok(required
+            || super::warp_update::sampling_warp(
+                spec,
+                slice,
+                (slice.source.width as u32, slice.source.height as u32),
+            )?
+            .is_some())
+    })
 }
 
 fn report_capability(
@@ -2292,12 +2568,9 @@ fn initialize_warp_control(
         Renderer::Cpu
     };
     let reason = if effective == Renderer::Cpu {
-        Some(
-            state
-                .gpu_error
-                .clone()
-                .unwrap_or_else(|| "selected CPU pipeline supports rectangles only".into()),
-        )
+        Some(state.gpu_error.clone().unwrap_or_else(|| {
+            "selected CPU pipeline does not support geometric warp correction".into()
+        }))
     } else if spec.pattern.is_none()
         && state
             .capture
@@ -2321,6 +2594,7 @@ fn initialize_warp_control(
         anyhow::bail!("warp_unavailable: {}", reason.unwrap());
     }
     if effective == Renderer::Cpu {
+        configure_adaptive(state, spec, 0);
         return Ok(());
     }
     let controller = super::warp_update::Controller::new(
@@ -2425,6 +2699,7 @@ fn static_pattern_rgba(
         black_lift: 0.0,
         rect,
         pattern: Some(pattern),
+        canvas_size: Some([spec.canvas_width as u32, spec.canvas_height as u32]),
         ramps: Vec::new(),
     };
     let rgb = super::pattern::render(width, height, &fake);
@@ -2534,25 +2809,57 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
             .get(output.index)
             .is_some_and(|p| p.name == output.name && p.configured == Some(output.size))
     });
+    let filtering_restart = prepared.outputs.iter().any(|output| output.warp.is_some())
+        && state
+            .capture
+            .gpu_images
+            .first()
+            .is_some_and(|(image, _)| !image.linear_filter_supported());
     let upload = Instant::now();
     let result = if !validated {
         Err(anyhow::anyhow!("output topology changed; restart required"))
-    } else if prepared.outputs.iter().any(|o| o.warp.is_some()) && !state.warp_available {
+    } else if filtering_restart {
         Err(anyhow::anyhow!(
-            "warp_unavailable: negotiated pipeline supports rectangles only"
+            "capture format/modifier does not support linear filtering required by the source crop; restarting with CPU"
+        ))
+    } else if prepared
+        .outputs
+        .iter()
+        .any(super::warp_update::Output::has_geometric_correction)
+        && !state.warp_available
+    {
+        Err(anyhow::anyhow!(
+            "warp_unavailable: negotiated pipeline does not support geometric correction"
         ))
     } else if let Some(gpu) = state.gpu.as_mut() {
-        let updates: Vec<_> = prepared
-            .outputs
-            .iter()
-            .map(|o| gpu::TransferUpdate {
-                index: o.index,
-                width: o.size.0,
-                height: o.size.1,
-                table: &o.table,
-            })
-            .collect();
-        gpu.replace_transfers(&updates)
+        if prepared.outputs.iter().any(|o| o.dynamic_table.is_some()) {
+            let updates: Vec<_> = prepared
+                .outputs
+                .iter()
+                .map(|o| gpu::PackedTransferUpdate {
+                    index: o.index,
+                    width: o.size.0,
+                    height: o.size.1,
+                    table: o
+                        .dynamic_table
+                        .as_deref()
+                        .expect("one transfer mode per generation"),
+                })
+                .collect();
+            gpu.replace_packed_transfers(&updates)
+        } else {
+            let updates: Vec<_> = prepared
+                .outputs
+                .iter()
+                .map(|o| gpu::TransferUpdate {
+                    index: o.index,
+                    width: o.size.0,
+                    height: o.size.1,
+                    table: &o.table,
+                })
+                .collect();
+            gpu.replace_transfers(&updates)
+        }
     } else {
         Err(anyhow::anyhow!("GPU unavailable"))
     };
@@ -2563,12 +2870,12 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
             .as_ref()
             .unwrap()
             .reject(prepared.generation, error.to_string());
-        if !validated || !state.warp_updates.as_ref().unwrap().initialized() {
+        if !validated || filtering_restart || !state.warp_updates.as_ref().unwrap().initialized() {
             return Err(error);
         }
         return Ok(());
     }
-    let changed: Vec<_> = prepared.outputs.iter().map(|o| o.name.clone()).collect();
+    let mut changed: Vec<_> = prepared.outputs.iter().map(|o| o.name.clone()).collect();
     let sampling_modes = prepared
         .outputs
         .iter()
@@ -2587,10 +2894,25 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     for output in &mut prepared.outputs {
         let presenter = &mut state.presenters[output.index];
         presenter.transfer = std::mem::take(&mut output.table);
+        presenter.dynamic_table = output.dynamic_table.take();
         presenter.warp = output.warp.take();
         presenter.source = output.source;
         presenter.warp_revision = prepared.generation;
         presenter.stale = true;
+    }
+    let uniform_changed = state
+        .adaptive
+        .as_ref()
+        .map(|runtime| runtime.controller.config())
+        != prepared.spec.adaptive_lift;
+    if prepared.spec.adaptive_lift.is_some() && (prepared.outputs.is_empty() || uniform_changed) {
+        for presenter in &mut state.presenters {
+            presenter.warp_revision = prepared.generation;
+            if !changed.contains(&presenter.name) {
+                changed.push(presenter.name.clone());
+            }
+        }
+        state.new_snapshot();
     }
     let controller = state.warp_updates.as_mut().unwrap();
     controller.installed(&prepared);
@@ -2603,6 +2925,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
             upload_ms: Some(upload_ms),
         },
     );
+    configure_adaptive(state, &prepared.spec, prepared.generation);
     Ok(())
 }
 
@@ -2732,7 +3055,27 @@ fn ensure_capture_buffer(
         Some(Backend::Gpu) => {
             let dmabuf =
                 dmabuf.expect("decide_backend only ever returns Backend::Gpu when dmabuf is Some");
-            ensure_gpu_capture_buffer(state, dmabuf, handle)
+            ensure_gpu_capture_buffer(state, dmabuf, handle)?;
+            let linear_filter_supported = state
+                .capture
+                .gpu_images
+                .get(state.capture.gpu_slot)
+                .is_some_and(|(image, _)| image.linear_filter_supported());
+            if !state.requires_linear_sampling || linear_filter_supported {
+                return Ok(());
+            }
+            let reason =
+                "capture format/modifier does not support linear filtering required by the source crop";
+            if state.renderer == Renderer::Gpu {
+                anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
+            }
+            eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
+            for (_, buffer) in state.capture.gpu_images.drain(..) {
+                buffer.destroy();
+            }
+            state.capture.backend = Some(Backend::Cpu);
+            state.gpu_error = Some(reason.into());
+            ensure_shm_capture_buffer(&mut state.capture, shm, handle)
         }
         _ => ensure_shm_capture_buffer(&mut state.capture, shm, handle),
     }
@@ -3321,7 +3664,11 @@ fn ensure_gpu_present_buffers(
         return;
     }
     let name = presenter.name.clone();
-    let old_transfer_matches = presenter.transfer.len() == width as usize * height as usize;
+    let old_transfer_matches = presenter
+        .dynamic_table
+        .as_ref()
+        .map_or(presenter.transfer.len(), Vec::len)
+        == width as usize * height as usize;
 
     let State {
         presenters, gpu, ..
@@ -3383,7 +3730,12 @@ fn ensure_gpu_present_buffers(
         ),
     );
     if old_transfer_matches {
-        if let Err(error) = gpu.set_transfer(index, width, height, &presenter.transfer) {
+        let result = if let Some(table) = &presenter.dynamic_table {
+            gpu.set_packed_transfer(index, width, height, table)
+        } else {
+            gpu.set_transfer(index, width, height, &presenter.transfer)
+        };
+        if let Err(error) = result {
             eprintln!("slicer: output {name}: set_transfer after resize failed: {error:#}");
         }
     } else {
@@ -3522,6 +3874,14 @@ fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
 /// `can_present`), so a configured presenter that was not due simply had
 /// nothing new to show and is not owed a re-blend later.
 fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
+    if let (Some(runtime), Some(gpu)) = (&state.adaptive, &mut state.gpu) {
+        // Validated configured coverage and controller bounds make this
+        // update infallible. One value is shared by every job in this draw.
+        if let Err(error) = gpu.set_dynamic_lift(runtime.controller.level(), runtime.maximum) {
+            eprintln!("slicer: invalid adaptive uniform: {error:#}");
+            return Vec::new();
+        }
+    }
     let signal = state.gate_signal();
     let State {
         capture,
@@ -3748,19 +4108,6 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         if !due {
             continue;
         }
-        let source_x = presenter.source.x.max(0) as u32;
-        let source_y = presenter.source.y.max(0) as u32;
-        let rows = height.min(usable_height.saturating_sub(source_y));
-        let copy_width = width.min(usable_width.saturating_sub(source_x)) as usize;
-        if copy_width == 0 || rows == 0 {
-            // A slice the snapshot does not reach (a mid-resize race) gets
-            // no commit, so it must be marked shown by hand: otherwise it
-            // stays `stale` with nothing pending, `can_present` never goes
-            // false, and the loop spins at full CPU presenting nothing.
-            presenter.stale = false;
-            continue;
-        }
-
         let len = presenter.buffers.len();
         // Rotate only through released buffers.
         let Some(slot) = free_present_slot(&presenter.busy, presenter.next_buffer) else {
@@ -3776,7 +4123,11 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
             // Split-borrow again: the transfer table is read while this
             // presenter's buffer is written.
             let Presenter {
-                transfer, buffers, ..
+                transfer,
+                buffers,
+                warp,
+                source,
+                ..
             } = presenter;
             let (_, map) = &mut buffers[slot];
             let blend = Blend {
@@ -3785,30 +4136,37 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 format,
                 stride,
                 y_invert,
+                usable_width,
                 usable_height,
-                source_x,
-                source_y,
+                source_x: source.x.max(0) as u32,
+                source_y: source.y.max(0) as u32,
                 width,
-                copy_width,
+                warp: warp.as_ref(),
             };
 
             let row_bytes = width as usize * 4;
-            let painted = &mut map[..rows as usize * row_bytes];
-            let workers = blend_workers(rows);
+            // A crop can extend beyond the captured canvas.  Clear every
+            // output-sized destination first so those clipped pixels are
+            // opaque black rather than stale bytes from a reused buffer.
+            for pixel in map[..height as usize * row_bytes].chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0, 0, 0, 255]);
+            }
+            let painted = &mut map[..height as usize * row_bytes];
+            let workers = blend_workers(height);
             if workers <= 1 {
-                blend.rows(painted, 0, rows);
+                blend.rows(painted, 0, height);
             } else {
                 // Rows are independent, so each worker owns a disjoint band of
                 // the destination and nothing needs synchronising. Scoped
                 // threads borrow the canvas and the table directly, which is
                 // why this needs no channel and no Arc.
-                let band = rows.div_ceil(workers);
+                let band = height.div_ceil(workers);
                 std::thread::scope(|scope| {
                     for (index, chunk) in painted.chunks_mut(band as usize * row_bytes).enumerate()
                     {
                         let blend = &blend;
                         let first = index as u32 * band;
-                        let count = band.min(rows - first);
+                        let count = band.min(height - first);
                         scope.spawn(move || blend.rows(chunk, first, count));
                     }
                 });
@@ -3855,41 +4213,117 @@ struct Blend<'a> {
     format: PixelFormat,
     stride: u32,
     y_invert: bool,
+    usable_width: u32,
     usable_height: u32,
     source_x: u32,
     source_y: u32,
     width: u32,
-    copy_width: usize,
+    /// `Some` is the common fractional crop/scale path. `None` is the
+    /// exact integer-copy proof and deliberately retains its old sampling.
+    warp: Option<&'a super::warp::Warp>,
 }
 
 impl Blend<'_> {
+    fn shade(a: u16, b: u8, value: u8) -> u8 {
+        (((a as u32 * value as u32) >> 8) + b as u32).min(255) as u8
+    }
+
+    fn write_black(dst: &mut [u8]) {
+        dst.copy_from_slice(&[0, 0, 0, 255]);
+    }
+
+    fn sample(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        if self.warp.is_none() {
+            let source_x = self.source_x.checked_add(x)?;
+            let source_y = self.source_y.checked_add(y)?;
+            if source_x >= self.usable_width || source_y >= self.usable_height {
+                return None;
+            }
+            let source_y = if self.y_invert {
+                self.usable_height - 1 - source_y
+            } else {
+                source_y
+            };
+            let offset =
+                source_y as usize * self.stride as usize + source_x as usize * self.format.bytes;
+            return Some([
+                self.canvas[offset + self.format.blue],
+                self.canvas[offset + self.format.green],
+                self.canvas[offset + self.format.red],
+            ]);
+        }
+        let [source_x, source_y] = self.warp.unwrap().clamped_canvas_at(
+            f64::from(x) + 0.5,
+            f64::from(y) + 0.5,
+            [f64::from(self.source_x), f64::from(self.source_y)],
+        )?;
+        // Source positions are texel centres.  This check is intentionally
+        // before clamping to the captured image: a crop outside the canvas
+        // is black, including when an old frame's buffer is being reused.
+        if source_x < 0.5
+            || source_y < 0.5
+            || source_x > f64::from(self.usable_width) - 0.5
+            || source_y > f64::from(self.usable_height) - 0.5
+        {
+            return None;
+        }
+        let source_y = if self.y_invert {
+            f64::from(self.usable_height) - source_y
+        } else {
+            source_y
+        };
+        // The exact path remains a byte-for-byte texel copy.  Fractional
+        // source rectangles use bilinear texel-centre sampling, matching the
+        // GPU's linearly filtered source mapping.
+        let x0 = (source_x - 0.5).floor() as u32;
+        let y0 = (source_y - 0.5).floor() as u32;
+        let x1 = (x0 + 1).min(self.usable_width - 1);
+        let y1 = (y0 + 1).min(self.usable_height - 1);
+        let tx = source_x - (f64::from(x0) + 0.5);
+        let ty = source_y - (f64::from(y0) + 0.5);
+        let channel = |pixel_x: u32, pixel_y: u32, index: usize| {
+            self.canvas[pixel_y as usize * self.stride as usize
+                + pixel_x as usize * self.format.bytes
+                + index] as f64
+        };
+        let interpolate = |index| {
+            ((1.0 - ty) * ((1.0 - tx) * channel(x0, y0, index) + tx * channel(x1, y0, index))
+                + ty * ((1.0 - tx) * channel(x0, y1, index) + tx * channel(x1, y1, index)))
+            .round() as u8
+        };
+        Some([
+            interpolate(self.format.blue),
+            interpolate(self.format.green),
+            interpolate(self.format.red),
+        ])
+    }
+
     /// Shade `count` destination rows, `dst` starting at row `first`.
     fn rows(&self, dst: &mut [u8], first: u32, count: u32) {
         let row_bytes = self.width as usize * 4;
         for y in 0..count {
             let target = first + y;
-            let canvas_row = self.source_y + target;
-            let canvas_row = if self.y_invert {
-                self.usable_height - 1 - canvas_row
-            } else {
-                canvas_row
-            };
-            let src_row = canvas_row as usize * self.stride as usize;
             let dst_row = y as usize * row_bytes;
             let transfer_row = target as usize * self.width as usize;
-            for x in 0..self.copy_width {
-                let src = src_row + (self.source_x as usize + x) * self.format.bytes;
+            for x in 0..self.width as usize {
                 let (a, b) = self
                     .transfer
                     .get(transfer_row + x)
                     .copied()
                     .unwrap_or((256, 0));
-                let shade = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
                 let out = &mut dst[dst_row + x * 4..dst_row + x * 4 + 4];
+                if a == 0 && b == 0 {
+                    Self::write_black(out);
+                    continue;
+                }
+                let Some(sample) = self.sample(x as u32, target) else {
+                    Self::write_black(out);
+                    continue;
+                };
                 // Presenters are always BGRA, opaque.
-                out[0] = shade(self.canvas[src + self.format.blue]);
-                out[1] = shade(self.canvas[src + self.format.green]);
-                out[2] = shade(self.canvas[src + self.format.red]);
+                out[0] = Self::shade(a, b, sample[0]);
+                out[1] = Self::shade(a, b, sample[1]);
+                out[2] = Self::shade(a, b, sample[2]);
                 out[3] = 255;
             }
         }
@@ -3925,6 +4359,7 @@ fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::
             black_lift: 0.0,
             rect: slice.source,
             pattern: Some(pattern),
+            canvas_size: Some([spec.canvas_width as u32, spec.canvas_height as u32]),
             ramps: Vec::new(),
         };
         let rgb = super::pattern::render(width, height, &fake);
@@ -3965,7 +4400,8 @@ fn animated(pattern: TestPattern) -> bool {
         | TestPattern::White
         | TestPattern::Black
         | TestPattern::Gamma
-        | TestPattern::Identify => false,
+        | TestPattern::Identify
+        | TestPattern::WarpAlignment => false,
     }
 }
 
@@ -4145,6 +4581,11 @@ fn dispatch_until(
         .gpu_retry_after
         .filter(|at| *at > Instant::now())
         .map_or(deadline, |retry| deadline.min(retry));
+    let deadline = state
+        .adaptive
+        .as_ref()
+        .and_then(|runtime| runtime.next_tick)
+        .map_or(deadline, |tick| deadline.min(tick));
     let millis = deadline
         .saturating_duration_since(Instant::now())
         .as_millis()
@@ -4959,11 +5400,12 @@ mod tests {
             },
             stride: 40,
             y_invert: false,
+            usable_width: 10,
             usable_height: 9,
             source_x: 2,
             source_y: 1,
             width: 6,
-            copy_width: 5,
+            warp: None,
         }
     }
 
@@ -5023,6 +5465,168 @@ mod tests {
             blend.rows(chunk, index as u32 * 2, 2);
         }
         assert_eq!(split, whole);
+    }
+
+    fn sampled_blend<'a>(
+        canvas: &'a [u8],
+        transfer: &'a [(u16, u8)],
+        warp: &'a super::super::warp::Warp,
+        width: u32,
+    ) -> Blend<'a> {
+        Blend {
+            canvas,
+            transfer,
+            format: PixelFormat {
+                bytes: 4,
+                red: 2,
+                green: 1,
+                blue: 0,
+            },
+            stride: 16,
+            y_invert: false,
+            usable_width: 4,
+            usable_height: 1,
+            source_x: 0,
+            source_y: 0,
+            width,
+            warp: Some(warp),
+        }
+    }
+
+    #[test]
+    fn cpu_simple_downscale_uses_bilinear_sampling() {
+        let mut canvas = vec![0u8; 16];
+        for (index, value) in [0u8, 100, 200, 255].into_iter().enumerate() {
+            canvas[index * 4..index * 4 + 4].copy_from_slice(&[value, value, value, 255]);
+        }
+        let transfer = vec![(256, 0); 2];
+        let warp = super::super::warp::Warp::identity(2, 1)
+            .with_source_rect([0.0, 0.0, 4.0, 1.0])
+            .unwrap();
+        let blend = sampled_blend(&canvas, &transfer, &warp, 2);
+        let mut output = vec![0u8; 8];
+        blend.rows(&mut output, 0, 1);
+
+        assert_eq!(&output[..4], &[50, 50, 50, 255]);
+        assert_eq!(&output[4..], &[228, 228, 228, 255]);
+    }
+
+    #[test]
+    fn cpu_simple_upscale_uses_bilinear_sampling() {
+        let canvas = vec![0, 0, 0, 255, 200, 200, 200, 255];
+        let transfer = vec![(256, 0); 4];
+        let warp = super::super::warp::Warp::identity(4, 1)
+            .with_source_rect([0.0, 0.0, 2.0, 1.0])
+            .unwrap();
+        let blend = Blend {
+            canvas: &canvas,
+            transfer: &transfer,
+            format: PixelFormat {
+                bytes: 4,
+                red: 2,
+                green: 1,
+                blue: 0,
+            },
+            stride: 8,
+            y_invert: false,
+            usable_width: 2,
+            usable_height: 1,
+            source_x: 0,
+            source_y: 0,
+            width: 4,
+            warp: Some(&warp),
+        };
+        let mut output = vec![0u8; 16];
+        blend.rows(&mut output, 0, 1);
+
+        assert_eq!(
+            output
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>(),
+            vec![0, 50, 150, 200]
+        );
+        assert!(output.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    #[test]
+    fn cpu_simple_fractional_crop_honours_y_inversion() {
+        let mut canvas = vec![0u8; 4 * 3 * 4];
+        for (y, row) in canvas.chunks_exact_mut(16).enumerate() {
+            for pixel in row.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[(y * 100) as u8, (y * 100) as u8, (y * 100) as u8, 255]);
+            }
+        }
+        let transfer = vec![(256, 0); 4];
+        let warp = super::super::warp::Warp::identity(2, 2)
+            .with_source_rect([0.5, 0.25, 2.0, 2.0])
+            .unwrap();
+        let blend = Blend {
+            canvas: &canvas,
+            transfer: &transfer,
+            format: PixelFormat {
+                bytes: 4,
+                red: 2,
+                green: 1,
+                blue: 0,
+            },
+            stride: 16,
+            y_invert: true,
+            usable_width: 4,
+            usable_height: 3,
+            source_x: 0,
+            source_y: 0,
+            width: 2,
+            warp: Some(&warp),
+        };
+        let mut output = vec![0u8; 16];
+        blend.rows(&mut output, 0, 2);
+
+        assert_eq!(&output[..4], &[175, 175, 175, 255]);
+        assert_eq!(&output[8..12], &[75, 75, 75, 255]);
+    }
+
+    #[test]
+    fn cpu_simple_unit_density_copy_preserves_source_bytes() {
+        let pixels = canvas(9, 40);
+        let transfer = vec![(256, 0); 6];
+        let blend = blend_for(&pixels, &transfer);
+        let mut output = vec![0u8; 6 * 4];
+        blend.rows(&mut output, 0, 1);
+
+        for x in 0..6usize {
+            let source = 40usize + (2 + x) * 4;
+            assert_eq!(
+                &output[x * 4..x * 4 + 4],
+                &[pixels[source], pixels[source + 1], pixels[source + 2], 255]
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_simple_crop_clips_outside_canvas_to_opaque_black() {
+        let mut canvas = vec![0u8; 16];
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[80, 80, 80, 255]);
+        }
+        let transfer = vec![(256, 0); 4];
+        let warp = super::super::warp::Warp::identity(4, 1)
+            .with_source_rect([-0.25, 0.0, 4.0, 1.0])
+            .unwrap();
+        let blend = sampled_blend(&canvas, &transfer, &warp, 4);
+        let mut output = vec![0u8; 16];
+        blend.rows(&mut output, 0, 1);
+
+        assert_eq!(&output[..4], &[0, 0, 0, 255]);
+        assert_eq!(&output[4..8], &[80, 80, 80, 255]);
+    }
+
+    #[test]
+    fn fractional_shared_crop_requires_linear_capture_filtering() {
+        let mut spec = pattern_spec();
+        assert!(!requires_linear_sampling(&spec).unwrap());
+        spec.slices[0].source_rect = Some([30.25, 20.0, 240.0, 180.0]);
+        assert!(requires_linear_sampling(&spec).unwrap());
     }
 
     // --- presentation-feedback settling --------------------------------
@@ -5515,9 +6119,234 @@ mod tests {
             gate_blocked_since: None,
             warp_updates: None,
             warp_available: false,
+            requires_linear_sampling: false,
             static_canvases: Vec::new(),
             gpu_retry_after: None,
+            adaptive: None,
+            capture_id: 0,
+            capture_measurement: None,
         }
+    }
+
+    fn adaptive_spec() -> SlicerSpec {
+        let mut spec = pattern_spec();
+        spec.adaptive_lift = Some(crate::model::AdaptiveBlackLift {
+            level: 0.2,
+            dark_threshold: 0.02,
+            bright_threshold: 0.2,
+            rise_ms: 1000.0,
+            fall_ms: 250.0,
+            slew_per_second: 0.1,
+        });
+        spec.black_lift = 0.2;
+        spec
+    }
+
+    #[test]
+    fn adaptive_static_source_converges_without_recapture_or_table_builds() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        configure_adaptive(&mut state, &adaptive_spec(), 7);
+        state.capture_id = 41;
+        let start = Instant::now();
+        let runtime = state.adaptive.as_mut().unwrap();
+        runtime
+            .controller
+            .measure_with_capture(1.0, 65536, Some(41));
+        runtime.status.capture_id = Some(41);
+        runtime.next_tick = Some(start + super::super::adaptive::CONTROLLER_TICK);
+        for n in 1..=500 {
+            tick_adaptive_at(&mut state, start + Duration::from_millis(n * 20));
+        }
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert_eq!(runtime.controller.level(), 0.0);
+        assert!(runtime.next_tick.is_none());
+        assert_eq!(runtime.status.capture_id, Some(41));
+        assert_eq!(state.capture_id, 41);
+        assert_eq!(state.stats.captured, 0);
+        assert!(state.timing.snapshot_id > 1);
+        assert!(
+            state.warp_updates.is_none(),
+            "lift does not enlist a table worker"
+        );
+        let settled_generation = state.timing.snapshot_id;
+        tick_adaptive_at(&mut state, start + Duration::from_secs(30));
+        assert_eq!(state.timing.snapshot_id, settled_generation);
+    }
+
+    #[test]
+    fn first_settled_measurement_is_reported_without_removing_the_rate_bound() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        configure_adaptive(&mut state, &adaptive_spec(), 7);
+        state.capture_id = 41;
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 41,
+            result: Ok((0.0, 65536)),
+            measured_at_unix_ms: 1000,
+            cost_ms: 2.0,
+        });
+        // Keep the report window shut so this specifically exercises the
+        // first-valid-sample transition, rather than an ordinary timer tick.
+        state.adaptive.as_mut().unwrap().next_report = Instant::now() + Duration::from_secs(1);
+
+        assert!(measure_adaptive(&mut state, 0));
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert!(runtime.status.available);
+        assert!(runtime.status.reason.is_none());
+        assert!(
+            runtime.next_tick.is_none(),
+            "the sample is already at target"
+        );
+
+        // A subsequent settled capture remains subject to the 100 ms report
+        // bound even though it also needs no controller tick.
+        state.capture_id = 42;
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 42,
+            result: Ok((0.0, 65536)),
+            measured_at_unix_ms: 1001,
+            cost_ms: 2.0,
+        });
+        state.adaptive.as_mut().unwrap().next_report = Instant::now() + Duration::from_secs(1);
+        assert!(!measure_adaptive(&mut state, 0));
+        let report_at = state.adaptive.as_ref().unwrap().next_tick.unwrap();
+        tick_adaptive_at(&mut state, report_at);
+        assert!(state.adaptive.as_ref().unwrap().next_tick.is_none());
+    }
+
+    #[test]
+    fn repeated_moving_measurements_do_not_postpone_controller_tick() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        configure_adaptive(&mut state, &adaptive_spec(), 7);
+        state.capture_id = 41;
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 41,
+            result: Ok((1.0, 65536)),
+            measured_at_unix_ms: 1000,
+            cost_ms: 2.0,
+        });
+        assert!(measure_adaptive(&mut state, 0));
+        let deadline = Instant::now() + Duration::from_millis(5);
+        state.adaptive.as_mut().unwrap().next_tick = Some(deadline);
+        state.capture_id = 42;
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 42,
+            result: Ok((1.0, 65536)),
+            measured_at_unix_ms: 1001,
+            cost_ms: 2.0,
+        });
+        let _ = measure_adaptive(&mut state, 0);
+        assert_eq!(state.adaptive.as_ref().unwrap().next_tick, Some(deadline));
+    }
+
+    #[test]
+    fn adaptive_cpu_and_patterns_report_fixed_fallback_without_timer() {
+        let mut state = bare_state(vec![]);
+        let mut spec = adaptive_spec();
+        state.capture.backend = Some(Backend::Cpu);
+        configure_adaptive(&mut state, &spec, 0);
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert!(!runtime.status.available);
+        assert!(runtime
+            .status
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("GPU capture"));
+        assert_eq!(runtime.controller.level(), spec.black_lift);
+        assert!(runtime.next_tick.is_none());
+        // Patterns are a new child lifetime, as enforced by topology checks.
+        state.adaptive = None;
+        state.capture.backend = Some(Backend::Gpu);
+        spec.pattern = Some(TestPattern::White);
+        configure_adaptive(&mut state, &spec, 0);
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert!(runtime.status.paused);
+        assert_eq!(runtime.controller.level(), spec.black_lift);
+        assert!(runtime.next_tick.is_none());
+    }
+
+    #[test]
+    fn geometry_config_install_preserves_measurement_and_controller_progress() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        let spec = adaptive_spec();
+        configure_adaptive(&mut state, &spec, 7);
+        let now = Instant::now();
+        let runtime = state.adaptive.as_mut().unwrap();
+        runtime.controller.measure_with_capture(1.0, 100, Some(8));
+        runtime.controller.tick(now + Duration::from_millis(100));
+        let prior = runtime.controller.level();
+        configure_adaptive(&mut state, &spec, 9);
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert_eq!(runtime.generation, 9);
+        assert_eq!(runtime.controller.level(), prior);
+        assert_eq!(runtime.controller.last_capture_id(), Some(8));
+    }
+
+    #[test]
+    fn adaptive_settings_and_mode_changes_reuse_the_static_capture_measurement() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        state.capture.last_blended_slot = Some(0);
+        state.capture_id = 42;
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 42,
+            result: Ok((1.0, 65536)),
+            measured_at_unix_ms: 1000,
+            cost_ms: 2.0,
+        });
+        let mut spec = adaptive_spec();
+        configure_adaptive(&mut state, &spec, 1);
+        assert_eq!(state.adaptive.as_ref().unwrap().controller.target(), 0.0);
+        assert!(state.adaptive.as_ref().unwrap().next_tick.is_some());
+        spec.adaptive_lift.as_mut().unwrap().level = 0.3;
+        spec.black_lift = 0.3;
+        configure_adaptive(&mut state, &spec, 2);
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert_eq!(runtime.controller.target(), 0.0);
+        assert_eq!(runtime.status.capture_id, Some(42));
+        assert_eq!(runtime.status.measured_at_unix_ms, Some(1000));
+        spec.adaptive_lift = None;
+        configure_adaptive(&mut state, &spec, 3);
+        assert!(state.adaptive.is_none());
+        configure_adaptive(&mut state, &adaptive_spec(), 4);
+        assert_eq!(state.adaptive.as_ref().unwrap().controller.target(), 0.0);
+        assert_eq!(state.capture_id, 42);
+        assert!(
+            state.gpu.is_none(),
+            "all transitions used the one cached measurement"
+        );
+    }
+
+    #[test]
+    fn scene_cut_after_idle_uses_elapsed_time_since_the_measurement() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        let spec = adaptive_spec();
+        configure_adaptive(&mut state, &spec, 0);
+        state.adaptive.as_mut().unwrap().controller =
+            super::super::adaptive::AdaptiveController::new(
+                spec.adaptive_lift.unwrap(),
+                Instant::now() - Duration::from_secs(3600),
+            );
+        state.capture_id = 1;
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 1,
+            result: Ok((1.0, 65536)),
+            measured_at_unix_ms: 1000,
+            cost_ms: 0.0,
+        });
+        measure_adaptive(&mut state, 0);
+        let next = state.adaptive.as_ref().unwrap().next_tick.unwrap();
+        tick_adaptive_at(&mut state, next);
+        let level = state.adaptive.as_ref().unwrap().controller.level();
+        assert!(
+            level > 0.19 && level < 0.2,
+            "an hour of idle time must not bypass the scene-cut slew: {level}"
+        );
     }
 
     #[test]
@@ -5916,6 +6745,7 @@ mod tests {
             TestPattern::Black,
             TestPattern::Gamma,
             TestPattern::Identify,
+            TestPattern::WarpAlignment,
         ] {
             assert!(!animated(pattern), "{pattern:?} must stay one-shot");
         }
@@ -5963,6 +6793,7 @@ mod tests {
                     black_lift: 0.0,
                     rect: slice.source,
                     pattern: Some(pattern),
+                    canvas_size: None,
                     ramps: vec![],
                 },
             );
@@ -6039,6 +6870,7 @@ mod tests {
                     black_lift: 0.0,
                     rect: slice.source,
                     pattern: Some(pattern),
+                    canvas_size: None,
                     ramps: Vec::new(),
                 },
             );
@@ -6144,6 +6976,7 @@ mod tests {
                 busy: vec![false; 2],
                 next_buffer: 0,
                 transfer: vec![(256, 0); 16],
+                dynamic_table: None,
                 warp: None,
                 warp_revision: 7,
                 warp_reported_revision: None,

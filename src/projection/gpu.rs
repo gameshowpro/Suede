@@ -96,6 +96,7 @@ use ash::vk;
 
 const VERT_SPV: &[u8] = include_bytes!("shaders/blend.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("shaders/blend.frag.spv");
+const MEASURE_FRAG_SPV: &[u8] = include_bytes!("shaders/measure.frag.spv");
 
 // DRM fourccs this module understands, and their little-endian byte order —
 // see the format mapping table below.
@@ -328,6 +329,18 @@ pub struct TransferUpdate<'a> {
     pub table: &'a [(u16, u8)],
 }
 
+/// A pre-packed transfer table. Entries whose high bit is clear retain the
+/// legacy fixed `(a,b)` representation. Entries with high bit set are the
+/// adaptive representation: bits 0..15 are ramp UNORM16, 16..23 are border
+/// coverage UNORM8, 24..27 are configured-footprint coverage `n` (0..=8),
+/// and 28..30 are reserved zero. `n == 0` is outside-picture black.
+pub struct PackedTransferUpdate<'a> {
+    pub index: usize,
+    pub width: u32,
+    pub height: u32,
+    pub table: &'a [u32],
+}
+
 /// Everything that outlives a single `Gpu::new()` call's setup and is shared
 /// with every `DmabufImage` it creates, via `Arc`. Kept separate from `Gpu`
 /// itself (which holds the pipeline, descriptor pool, and per-frame command
@@ -408,6 +421,9 @@ struct PushConstants {
     warp_enabled: u32,
     padding: u32,
     source_rect: [f32; 4],
+    dynamic_lift: f32,
+    dynamic_maximum: u32,
+    dynamic_padding: [u32; 2],
 }
 
 impl PushConstants {
@@ -440,6 +456,9 @@ impl PushConstants {
                     size[1] as f64,
                 ])
                 .map(|v| v as f32),
+            dynamic_lift: 0.0,
+            dynamic_maximum: 0,
+            dynamic_padding: [0; 2],
         }
     }
 
@@ -490,6 +509,7 @@ struct HostBuffer {
     memory: vk::DeviceMemory,
     mapped: *mut u8,
     bytes: vk::DeviceSize,
+    coherent: bool,
 }
 
 struct StagedTransfer {
@@ -515,6 +535,142 @@ unsafe impl Send for HostBuffer {}
 struct PipelineState {
     format: vk::Format,
     pipeline: vk::Pipeline,
+}
+
+/// Push constants for the source-space measurement shader. The grid is
+/// capped at 256 on either axis; source dimensions describe only logical
+/// canvas pixels, never dmabuf allocation padding.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MeasurePushConstants {
+    source_width: u32,
+    source_height: u32,
+    grid_width: u32,
+    grid_height: u32,
+    y_invert: u32,
+}
+
+impl MeasurePushConstants {
+    fn as_bytes(&self) -> &[u8] {
+        // Safety: repr(C) primitive fields with no uninitialized bytes.
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(self).cast::<u8>(),
+                std::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+/// Short-lived, bounded private resources for one source measurement. The
+/// canvas itself remains foreign-owned; only this 256x256 target is local.
+struct MeasurementPass {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    readback: HostBuffer,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    descriptor_set: vk::DescriptorSet,
+    initialized: bool,
+}
+
+/// Owns the partially-built optional measurement resources until they can be
+/// published as a retained [`MeasurementPass`]. This makes an unavailable
+/// measurement path bounded even when a driver fails midway through creation.
+struct MeasurementCleanup<'a> {
+    device: &'a ash::Device,
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    view: vk::ImageView,
+    readback: Option<HostBuffer>,
+    descriptor_set_layout: vk::DescriptorSetLayout,
+    descriptor_pool: vk::DescriptorPool,
+    pipeline_layout: vk::PipelineLayout,
+    fragment: vk::ShaderModule,
+    pipeline: vk::Pipeline,
+}
+
+impl MeasurementCleanup<'_> {
+    fn defuse(mut self, descriptor_set: vk::DescriptorSet) -> MeasurementPass {
+        let pass = MeasurementPass {
+            image: self.image,
+            memory: self.memory,
+            view: self.view,
+            readback: self.readback.take().expect("readback initialized"),
+            descriptor_set_layout: self.descriptor_set_layout,
+            descriptor_pool: self.descriptor_pool,
+            pipeline_layout: self.pipeline_layout,
+            pipeline: self.pipeline,
+            descriptor_set,
+            initialized: false,
+        };
+        self.image = vk::Image::null();
+        self.memory = vk::DeviceMemory::null();
+        self.view = vk::ImageView::null();
+        self.descriptor_set_layout = vk::DescriptorSetLayout::null();
+        self.descriptor_pool = vk::DescriptorPool::null();
+        self.pipeline_layout = vk::PipelineLayout::null();
+        self.pipeline = vk::Pipeline::null();
+        pass
+    }
+}
+
+impl Drop for MeasurementCleanup<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if self.pipeline != vk::Pipeline::null() {
+                self.device.destroy_pipeline(self.pipeline, None);
+            }
+            if self.fragment != vk::ShaderModule::null() {
+                self.device.destroy_shader_module(self.fragment, None);
+            }
+            if self.pipeline_layout != vk::PipelineLayout::null() {
+                self.device
+                    .destroy_pipeline_layout(self.pipeline_layout, None);
+            }
+            if self.descriptor_pool != vk::DescriptorPool::null() {
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+            }
+            if self.descriptor_set_layout != vk::DescriptorSetLayout::null() {
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            }
+            if self.view != vk::ImageView::null() {
+                self.device.destroy_image_view(self.view, None);
+            }
+            if self.image != vk::Image::null() {
+                self.device.destroy_image(self.image, None);
+            }
+            if self.memory != vk::DeviceMemory::null() {
+                self.device.free_memory(self.memory, None);
+            }
+        }
+        if let Some(readback) = self.readback.take() {
+            readback.destroy(self.device);
+        }
+    }
+}
+
+impl MeasurementPass {
+    fn destroy(self, device: &ash::Device) {
+        // Safety: called only after the measurement fence has completed (or
+        // before any command references these resources on construction
+        // failure); all handles are owned by this pass.
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+            device.destroy_image_view(self.view, None);
+            device.destroy_image(self.image, None);
+            device.free_memory(self.memory, None);
+        }
+        self.readback.destroy(device);
+    }
 }
 
 pub struct Gpu {
@@ -550,6 +706,14 @@ pub struct Gpu {
     /// observed complete. This keeps a failed command recording from leaving
     /// later resource replacement waiting forever on an unsignalled fence.
     fence_in_flight: bool,
+    /// Shared dynamic-transfer globals. They are pushed for every draw, so a
+    /// lift tick never reallocates or rewrites an output table.
+    dynamic_lift: f32,
+    dynamic_maximum: u32,
+    /// Lazily allocated bounded source-measurement target, descriptor set,
+    /// readback buffer, and pipeline. Optional adaptive measurement never
+    /// participates in `Gpu::new`, so its absence cannot disable blending.
+    measurement: Option<MeasurementPass>,
     /// Deterministic post-stage failure used only by the hardware readback
     /// transaction test. `Some(n)` fails just before staging item `n`, after
     /// the preceding inactive tables have proved their cleanup path.
@@ -875,6 +1039,9 @@ impl Gpu {
             last_canvas: None,
             placeholder: None,
             fence_in_flight: false,
+            dynamic_lift: 0.0,
+            dynamic_maximum: 0,
+            measurement: None,
             #[cfg(test)]
             transfer_stage_fail_after: None,
         })
@@ -1644,6 +1811,84 @@ impl Gpu {
             prepared.push((update.index, update.width, update.height, packed));
         }
 
+        self.replace_prepared_transfers(prepared)
+    }
+
+    /// Install an already packed table. This is the dynamic-transfer entry
+    /// point; callers that need legacy byte-exact fixed transfer should keep
+    /// using [`Gpu::set_transfer`] or [`Gpu::replace_transfers`].
+    pub fn set_packed_transfer(
+        &mut self,
+        index: usize,
+        width: u32,
+        height: u32,
+        table: &[u32],
+    ) -> anyhow::Result<()> {
+        self.replace_packed_transfers(&[PackedTransferUpdate {
+            index,
+            width,
+            height,
+            table,
+        }])
+    }
+
+    /// Atomically replace one or more tables in the documented packed
+    /// representation. Fixed and dynamic entries may coexist across outputs,
+    /// but every dynamic entry is range-checked before any active descriptor
+    /// can change.
+    pub fn replace_packed_transfers(
+        &mut self,
+        updates: &[PackedTransferUpdate<'_>],
+    ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut seen = [false; MAX_OUTPUTS];
+        let mut prepared = Vec::with_capacity(updates.len());
+        for update in updates {
+            if update.index >= MAX_OUTPUTS {
+                bail!("replace_packed_transfers: output index {} exceeds the {MAX_OUTPUTS}-output descriptor pool", update.index);
+            }
+            if seen[update.index] {
+                bail!(
+                    "replace_packed_transfers: output index {} appears more than once",
+                    update.index
+                );
+            }
+            seen[update.index] = true;
+            if update.width == 0 || update.height == 0 {
+                bail!("replace_packed_transfers: dimensions must be nonzero");
+            }
+            let entries = update
+                .width
+                .checked_mul(update.height)
+                .ok_or_else(|| anyhow!("replace_packed_transfers: dimensions overflow"))?;
+            let entries = usize::try_from(entries)
+                .context("replace_packed_transfers: dimensions do not fit in host memory")?;
+            if update.table.len() != entries {
+                bail!("replace_packed_transfers: output {} has {} entries, expected {}x{} = {entries}", update.index, update.table.len(), update.width, update.height);
+            }
+            for &entry in update.table {
+                validate_packed_transfer(entry)?;
+            }
+            let packed = update.table.to_vec();
+            let unchanged = self.outputs.get(update.index).and_then(Option::as_ref).is_some_and(|output| {
+                output.size == [update.width, update.height]
+                    && output.capacity == (packed.len() * std::mem::size_of::<u32>()) as vk::DeviceSize
+                    // Safety: the active persistently-mapped table covers its capacity.
+                    && unsafe { std::slice::from_raw_parts(output.mapped.cast::<u32>(), packed.len()) == packed.as_slice() }
+            });
+            if !unchanged {
+                prepared.push((update.index, update.width, update.height, packed));
+            }
+        }
+        self.replace_prepared_transfers(prepared)
+    }
+
+    fn replace_prepared_transfers(
+        &mut self,
+        prepared: Vec<(usize, u32, u32, Vec<u32>)>,
+    ) -> anyhow::Result<()> {
         if prepared.is_empty() {
             return Ok(());
         }
@@ -2045,6 +2290,232 @@ impl Gpu {
         Ok(())
     }
 
+    fn create_measurement_pass(&self) -> anyhow::Result<MeasurementPass> {
+        let device = &self.device.device;
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let features = unsafe {
+            self.device
+                .instance
+                .get_physical_device_format_properties(self.device.physical_device, format)
+        }
+        .optimal_tiling_features;
+        anyhow::ensure!(
+            features.contains(
+                vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::TRANSFER_SRC
+            ),
+            "source measurement unavailable: local RGBA measurement target is unsupported"
+        );
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D {
+                width: 256,
+                height: 256,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { device.create_image(&image_info, None) }
+            .context("vkCreateImage source measurement")?;
+        let requirements = unsafe { device.get_image_memory_requirements(image) };
+        let properties = unsafe {
+            self.device
+                .instance
+                .get_physical_device_memory_properties(self.device.physical_device)
+        };
+        let memory_type = memory_type_index(
+            &properties,
+            requirements.memory_type_bits,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )
+        .ok_or_else(|| anyhow!("source measurement unavailable: no DEVICE_LOCAL target memory"))?;
+        let memory = match unsafe {
+            device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(requirements.size)
+                    .memory_type_index(memory_type),
+                None,
+            )
+        } {
+            Ok(memory) => memory,
+            Err(error) => {
+                unsafe { device.destroy_image(image, None) };
+                return Err(error).context("vkAllocateMemory source measurement");
+            }
+        };
+        if let Err(error) = unsafe { device.bind_image_memory(image, memory, 0) } {
+            unsafe {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None)
+            };
+            return Err(error).context("vkBindImageMemory source measurement");
+        }
+        let view = match unsafe {
+            device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(format)
+                    .subresource_range(color_subresource_range()),
+                None,
+            )
+        } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe {
+                    device.destroy_image(image, None);
+                    device.free_memory(memory, None)
+                };
+                return Err(error).context("vkCreateImageView source measurement");
+            }
+        };
+        let readback = match allocate_readback_buffer(&self.device, 256 * 256 * 4) {
+            Ok(buffer) => buffer,
+            Err(error) => {
+                unsafe {
+                    device.destroy_image_view(view, None);
+                    device.destroy_image(image, None);
+                    device.free_memory(memory, None)
+                };
+                return Err(error).context("source measurement readback buffer");
+            }
+        };
+        let mut cleanup = MeasurementCleanup {
+            device,
+            image,
+            memory,
+            view,
+            readback: Some(readback),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            fragment: vk::ShaderModule::null(),
+            pipeline: vk::Pipeline::null(),
+        };
+        let immutable = [self.sampler];
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT)
+                .immutable_samplers(&immutable),
+        ];
+        let descriptor_set_layout = unsafe {
+            device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .context("vkCreateDescriptorSetLayout source measurement")?;
+        cleanup.descriptor_set_layout = descriptor_set_layout;
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1),
+        ];
+        let descriptor_pool = unsafe {
+            device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(1)
+                    .pool_sizes(&pool_sizes),
+                None,
+            )
+        }
+        .context("vkCreateDescriptorPool source measurement")?;
+        cleanup.descriptor_pool = descriptor_pool;
+        let layouts = [descriptor_set_layout];
+        let descriptor_set = unsafe {
+            device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .context("vkAllocateDescriptorSets source measurement")?[0];
+        let range = [vk::PushConstantRange {
+            stage_flags: vk::ShaderStageFlags::FRAGMENT,
+            offset: 0,
+            size: std::mem::size_of::<MeasurePushConstants>() as u32,
+        }];
+        let pipeline_layout = unsafe {
+            device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts)
+                    .push_constant_ranges(&range),
+                None,
+            )
+        }
+        .context("vkCreatePipelineLayout source measurement")?;
+        cleanup.pipeline_layout = pipeline_layout;
+        let fragment = create_shader_module(device, MEASURE_FRAG_SPV, "measurement fragment")?;
+        cleanup.fragment = fragment;
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(self.vert_module)
+                .name(entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment)
+                .name(entry),
+        ];
+        let vertex = vk::PipelineVertexInputStateCreateInfo::default();
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let attachment = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachment);
+        let dynamic = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic);
+        let formats = [format];
+        let mut rendering =
+            vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&formats);
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex)
+            .input_assembly_state(&assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .push_next(&mut rendering);
+        let pipeline =
+            unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &[info], None) }
+                .map_err(|(_, e)| e)
+                .context("vkCreateGraphicsPipelines source measurement")?[0];
+        cleanup.pipeline = pipeline;
+        unsafe { device.destroy_shader_module(fragment, None) };
+        cleanup.fragment = vk::ShaderModule::null();
+        Ok(cleanup.defuse(descriptor_set))
+    }
+
     /// Blend every job from `canvas` into its target, submit, and wait for the
     /// GPU to finish. Returns how long the wait took. `y_invert` means the
     /// canvas is stored bottom-up (screencopy's flag).
@@ -2118,6 +2589,361 @@ impl Gpu {
     /// something else.
     pub fn sync(&mut self, jobs: &[BlendJob<'_>]) -> anyhow::Result<Duration> {
         self.render(Source::Sync, jobs)
+    }
+
+    /// Set the shared adaptive lift state used by tagged transfer entries.
+    /// This only changes push constants for later draws; it never rebuilds or
+    /// uploads geometry-derived tables. `maximum` is the configured physical
+    /// footprint coverage maximum and is deliberately bounded by the packed
+    /// entry's four-bit count domain.
+    pub fn set_dynamic_lift(&mut self, level: f64, maximum: u32) -> anyhow::Result<()> {
+        if !level.is_finite() || !(0.0..=1.0).contains(&level) {
+            bail!("dynamic lift must be finite and within 0..=1");
+        }
+        if maximum > 8 {
+            bail!("dynamic lift maximum must be within 0..=8");
+        }
+        self.dynamic_lift = level as f32;
+        self.dynamic_maximum = maximum;
+        Ok(())
+    }
+
+    /// Measure mean pre-transfer linear Rec.709 luminance from a nearest-texel
+    /// source grid. The grid is at most 256×256 and covers the supplied
+    /// logical domain once; `width` and `height` deliberately exclude any
+    /// allocation padding in `canvas`. Failure is non-destructive: callers
+    /// can retain the fixed-lift renderer and surface this error as the
+    /// adaptive-mode unavailable reason.
+    pub fn measure_luminance(
+        &mut self,
+        canvas: &DmabufImage,
+        y_invert: bool,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(f64, u32)> {
+        if width == 0 || height == 0 || width > canvas.width || height > canvas.height {
+            bail!("source measurement domain must be nonzero and fit the capture canvas");
+        }
+        self.measure_luminance_inner(canvas.image, canvas.view, true, y_invert, width, height)
+    }
+
+    #[cfg(test)]
+    fn measure_static_luminance(
+        &mut self,
+        canvas: &StaticCanvas,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(f64, u32)> {
+        if width == 0 || height == 0 || width > canvas.width || height > canvas.height {
+            bail!("source measurement domain must be nonzero and fit the static canvas");
+        }
+        self.measure_luminance_inner(canvas.image, canvas.view, false, false, width, height)
+    }
+
+    fn measure_luminance_inner(
+        &mut self,
+        source_image: vk::Image,
+        source_view: vk::ImageView,
+        foreign_source: bool,
+        y_invert: bool,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<(f64, u32)> {
+        self.wait_for_pending_work()?;
+        let grid = [width.min(256), height.min(256)];
+        if self.measurement.is_none() {
+            self.measurement = Some(self.create_measurement_pass()?);
+        }
+        let (
+            measurement_image,
+            measurement_view,
+            measurement_readback,
+            measurement_set,
+            measurement_layout,
+            measurement_pipeline,
+            measurement_memory,
+            measurement_coherent,
+            measurement_initialized,
+        ) = {
+            let pass = self
+                .measurement
+                .as_ref()
+                .expect("measurement just initialized");
+            (
+                pass.image,
+                pass.view,
+                pass.readback.buffer,
+                pass.descriptor_set,
+                pass.pipeline_layout,
+                pass.pipeline,
+                pass.readback.memory,
+                pass.readback.coherent,
+                pass.initialized,
+            )
+        };
+        let measurement_mapped = self
+            .measurement
+            .as_ref()
+            .expect("measurement just initialized")
+            .readback
+            .mapped;
+        let result = (|| -> anyhow::Result<(f64, u32)> {
+            let device = &self.device.device;
+            let queue_family = self.device.queue_family;
+            let color_range = color_subresource_range();
+            let canvas_info = [vk::DescriptorImageInfo::default()
+                .image_view(source_view)
+                .image_layout(vk::ImageLayout::GENERAL)];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(measurement_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&canvas_info)];
+            // Safety: the descriptor and source view belong to this device;
+            // source ownership is transferred in the command below.
+            unsafe { device.update_descriptor_sets(&write, &[]) };
+            unsafe {
+                device
+                    .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+            }
+            .context("vkResetCommandBuffer for source measurement")?;
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            unsafe { device.begin_command_buffer(self.command_buffer, &begin) }
+                .context("vkBeginCommandBuffer for source measurement")?;
+
+            let acquire_canvas = vk::ImageMemoryBarrier::default()
+                .src_access_mask(if foreign_source {
+                    vk::AccessFlags::empty()
+                } else {
+                    vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ
+                })
+                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(if foreign_source {
+                    vk::QUEUE_FAMILY_FOREIGN_EXT
+                } else {
+                    vk::QUEUE_FAMILY_IGNORED
+                })
+                .dst_queue_family_index(if foreign_source {
+                    queue_family
+                } else {
+                    vk::QUEUE_FAMILY_IGNORED
+                })
+                .image(source_image)
+                .subresource_range(color_range);
+            let initialize_target = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .old_layout(if measurement_initialized {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                })
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(measurement_image)
+                .subresource_range(color_range);
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    if foreign_source {
+                        vk::PipelineStageFlags::TOP_OF_PIPE
+                    } else {
+                        vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER
+                    },
+                    vk::PipelineStageFlags::FRAGMENT_SHADER
+                        | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[acquire_canvas, initialize_target],
+                )
+            };
+
+            let attachment = [vk::RenderingAttachmentInfo::default()
+                .image_view(measurement_view)
+                .image_layout(vk::ImageLayout::GENERAL)
+                .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                .store_op(vk::AttachmentStoreOp::STORE)];
+            let rendering = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: grid[0],
+                        height: grid[1],
+                    },
+                })
+                .layer_count(1)
+                .color_attachments(&attachment);
+            unsafe { device.cmd_begin_rendering(self.command_buffer, &rendering) };
+            unsafe {
+                device.cmd_bind_pipeline(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    measurement_pipeline,
+                );
+                device.cmd_set_viewport(
+                    self.command_buffer,
+                    0,
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: grid[0] as f32,
+                        height: grid[1] as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
+                );
+                device.cmd_set_scissor(
+                    self.command_buffer,
+                    0,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: grid[0],
+                            height: grid[1],
+                        },
+                    }],
+                );
+                device.cmd_bind_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    measurement_layout,
+                    0,
+                    &[measurement_set],
+                    &[],
+                );
+                let constants = MeasurePushConstants {
+                    source_width: width,
+                    source_height: height,
+                    grid_width: grid[0],
+                    grid_height: grid[1],
+                    y_invert: u32::from(y_invert),
+                };
+                device.cmd_push_constants(
+                    self.command_buffer,
+                    measurement_layout,
+                    vk::ShaderStageFlags::FRAGMENT,
+                    0,
+                    constants.as_bytes(),
+                );
+                device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
+                device.cmd_end_rendering(self.command_buffer);
+            }
+            let readable_target = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(measurement_image)
+                .subresource_range(color_range);
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[readable_target],
+                )
+            };
+            let region = vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: grid[0],
+                    height: grid[1],
+                    depth: 1,
+                });
+            unsafe {
+                device.cmd_copy_image_to_buffer(
+                    self.command_buffer,
+                    measurement_image,
+                    vk::ImageLayout::GENERAL,
+                    measurement_readback,
+                    &[region],
+                )
+            };
+            let host_read = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(measurement_readback)
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            let release_canvas = vk::ImageMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_READ)
+                .dst_access_mask(vk::AccessFlags::empty())
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(if foreign_source {
+                    queue_family
+                } else {
+                    vk::QUEUE_FAMILY_IGNORED
+                })
+                .dst_queue_family_index(if foreign_source {
+                    vk::QUEUE_FAMILY_FOREIGN_EXT
+                } else {
+                    vk::QUEUE_FAMILY_IGNORED
+                })
+                .image(source_image)
+                .subresource_range(color_range);
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[host_read],
+                    &[release_canvas],
+                )
+            };
+            unsafe { device.end_command_buffer(self.command_buffer) }
+                .context("vkEndCommandBuffer for source measurement")?;
+            unsafe { device.reset_fences(&[self.fence]) }
+                .context("vkResetFences for source measurement")?;
+            let cbs = [self.command_buffer];
+            let submit = vk::SubmitInfo::default().command_buffers(&cbs);
+            unsafe { device.queue_submit(self.device.queue, &[submit], self.fence) }
+                .context("vkQueueSubmit source measurement")?;
+            self.fence_in_flight = true;
+            unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
+                .context("vkWaitForFences source measurement")?;
+            self.fence_in_flight = false;
+            // Readback allocation may fall back to noncoherent host-visible
+            // memory, which must be invalidated after the GPU write.
+            if !measurement_coherent {
+                let range = [vk::MappedMemoryRange::default()
+                    .memory(measurement_memory)
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE)];
+                unsafe { device.invalidate_mapped_memory_ranges(&range) }
+                    .context("vkInvalidateMappedMemoryRanges source measurement")?;
+            }
+            let count = grid[0] * grid[1];
+            let bytes =
+                unsafe { std::slice::from_raw_parts(measurement_mapped, count as usize * 4) };
+            Ok((mean_linear_luminance_rgba(bytes), count))
+        })();
+        if result.is_ok() {
+            self.measurement
+                .as_mut()
+                .expect("measurement remains retained")
+                .initialized = true;
+        }
+        result
     }
 
     fn wait_for_pending_work(&mut self) -> anyhow::Result<()> {
@@ -2380,6 +3206,8 @@ impl Gpu {
             );
             push_constants.mode = mode;
             push_constants.groups = output.sync_groups;
+            push_constants.dynamic_lift = self.dynamic_lift;
+            push_constants.dynamic_maximum = self.dynamic_maximum;
             unsafe {
                 device.cmd_push_constants(
                     self.command_buffer,
@@ -2501,6 +3329,9 @@ impl Drop for Gpu {
                 device.destroy_image(placeholder.image, None);
                 device.free_memory(placeholder.memory, None);
             }
+            if let Some(measurement) = self.measurement.take() {
+                measurement.destroy(device);
+            }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
         }
@@ -2593,6 +3424,19 @@ fn format_for_fourcc(fourcc: u32) -> anyhow::Result<vk::Format> {
 /// blend.rs produces up to 256), so it never collides with `b`'s low byte.
 fn pack_transfer(a: u16, b: u8) -> u32 {
     (u32::from(a) << 8) | u32::from(b)
+}
+
+fn validate_packed_transfer(entry: u32) -> anyhow::Result<()> {
+    if entry & 0x8000_0000 == 0 {
+        if entry >> 17 != 0 || ((entry >> 8) & 0x1ff) > 256 {
+            bail!("packed fixed transfer has reserved bits or a gain outside 0..=256");
+        }
+    } else if entry & 0x7000_0000 != 0 {
+        bail!("packed dynamic transfer has nonzero reserved bits 28..30");
+    } else if ((entry >> 24) & 0x0f) > 8 {
+        bail!("packed dynamic transfer has coverage count outside 0..=8");
+    }
+    Ok(())
 }
 
 fn validate_filtering(linear_filter: bool, warped: bool) -> anyhow::Result<()> {
@@ -2711,7 +3555,109 @@ fn allocate_host_buffer_with_usage(
         memory,
         mapped,
         bytes,
+        coherent: true,
     })
+}
+
+/// Readback may use noncoherent host-visible memory on small Vulkan devices.
+/// Unlike transfer/shape buffers it is written only by the GPU, so callers
+/// invalidate it after the fence before reading the persistent mapping.
+fn allocate_readback_buffer(
+    device: &Arc<DeviceState>,
+    bytes: vk::DeviceSize,
+) -> anyhow::Result<HostBuffer> {
+    let dev = &device.device;
+    let info = vk::BufferCreateInfo::default()
+        .size(bytes)
+        .usage(vk::BufferUsageFlags::TRANSFER_DST)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buffer = unsafe { dev.create_buffer(&info, None) }.context("vkCreateBuffer readback")?;
+    let requirements = unsafe { dev.get_buffer_memory_requirements(buffer) };
+    let properties = unsafe {
+        device
+            .instance
+            .get_physical_device_memory_properties(device.physical_device)
+    };
+    let memory_type_index =
+        match readback_memory_type_index(&properties, requirements.memory_type_bits) {
+            Some(index) => index,
+            None => {
+                unsafe { dev.destroy_buffer(buffer, None) };
+                bail!("no HOST_VISIBLE memory type for a {bytes}-byte readback buffer");
+            }
+        };
+    let coherent = properties.memory_types[memory_type_index as usize]
+        .property_flags
+        .contains(vk::MemoryPropertyFlags::HOST_COHERENT);
+    let memory = match unsafe {
+        dev.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type_index),
+            None,
+        )
+    } {
+        Ok(memory) => memory,
+        Err(error) => {
+            unsafe { dev.destroy_buffer(buffer, None) };
+            return Err(error).context("vkAllocateMemory readback");
+        }
+    };
+    if let Err(error) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
+        unsafe {
+            dev.destroy_buffer(buffer, None);
+            dev.free_memory(memory, None)
+        };
+        return Err(error).context("vkBindBufferMemory readback");
+    }
+    let mapped =
+        match unsafe { dev.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
+            Ok(mapped) => mapped.cast::<u8>(),
+            Err(error) => {
+                unsafe {
+                    dev.destroy_buffer(buffer, None);
+                    dev.free_memory(memory, None)
+                };
+                return Err(error).context("vkMapMemory readback");
+            }
+        };
+    Ok(HostBuffer {
+        buffer,
+        memory,
+        mapped,
+        bytes,
+        coherent,
+    })
+}
+
+/// CPU reduction reads every sample. Prefer cached host memory over an
+/// earlier write-combined type; explicit invalidation handles noncoherent
+/// cached memory. Devices without cached memory retain the visible fallback.
+fn readback_memory_type_index(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+) -> Option<u32> {
+    memory_type_index(
+        properties,
+        type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED,
+    )
+    .or_else(|| memory_type_index(properties, type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE))
+}
+
+/// Mean linear-light Rec.709 luminance of RGBA8 source samples. The source
+/// compositor supplies sRGB signal values; conversion happens before the
+/// 0.2126/0.7152/0.0722 weighting so dark content is not biased upward.
+fn mean_linear_luminance_rgba(bytes: &[u8]) -> f64 {
+    debug_assert_eq!(bytes.len() % 4, 0);
+    if bytes.is_empty() {
+        return 0.0;
+    }
+    bytes
+        .chunks_exact(4)
+        .map(|p| crate::projection::adaptive::rgb8_luminance([p[0], p[1], p[2]]))
+        .sum::<f64>()
+        / (bytes.len() / 4) as f64
 }
 
 /// The first memory type (by index — the order `VkPhysicalDeviceMemoryProperties`
@@ -3009,6 +3955,27 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_transfer_tag_and_reserved_bits_are_unambiguous() {
+        let dynamic = 0x8000_0000 | 0x0000_beef | (127 << 16) | (8 << 24);
+        assert!(validate_packed_transfer(dynamic).is_ok());
+        assert!(validate_packed_transfer(dynamic | (1 << 28)).is_err());
+        assert!(validate_packed_transfer(0x8000_0000 | (9 << 24)).is_err());
+        assert!(validate_packed_transfer(pack_transfer(256, 255)).is_ok());
+        assert!(validate_packed_transfer(257 << 8).is_err());
+    }
+
+    #[test]
+    fn source_luminance_uses_linear_rec709_not_signal_average() {
+        let black = [0, 0, 0, 255];
+        let white = [255, 255, 255, 255];
+        assert_eq!(mean_linear_luminance_rgba(&black), 0.0);
+        assert!((mean_linear_luminance_rgba(&white) - 1.0).abs() < 1e-12);
+        // Mid-signal gray is about 0.214 in linear light, not 0.5.
+        let middle = [128, 128, 128, 0];
+        assert!((mean_linear_luminance_rgba(&middle) - 0.215_86).abs() < 0.001);
+    }
+
+    #[test]
     fn static_canvas_requires_sampling_linear_filtering_and_upload() {
         let required = vk::FormatFeatureFlags::SAMPLED_IMAGE
             | vk::FormatFeatureFlags::SAMPLED_IMAGE_FILTER_LINEAR
@@ -3024,12 +3991,14 @@ mod tests {
 
     #[test]
     fn push_constants_match_warp_shader_layout() {
-        assert_eq!(std::mem::size_of::<PushConstants>(), 112);
+        assert_eq!(std::mem::size_of::<PushConstants>(), 128);
         assert_eq!(std::mem::offset_of!(PushConstants, inverse_rows), 32);
         assert_eq!(std::mem::offset_of!(PushConstants, center), 80);
         assert_eq!(std::mem::offset_of!(PushConstants, warp_enabled), 88);
         assert_eq!(std::mem::offset_of!(PushConstants, padding), 92);
         assert_eq!(std::mem::offset_of!(PushConstants, source_rect), 96);
+        assert_eq!(std::mem::offset_of!(PushConstants, dynamic_lift), 112);
+        assert_eq!(std::mem::offset_of!(PushConstants, dynamic_maximum), 116);
         assert_eq!(std::mem::align_of::<PushConstants>(), 4);
         // Vulkan guarantees only 128 bytes of push constants, and a device
         // that offers exactly that must still take this block.
@@ -3070,6 +4039,22 @@ mod tests {
         // exactly the case `major()`/`minor()` exist to get right.
         let dev = ((226u64 & 0xfff) << 8) | (300 & 0xff) | ((300u64 & !0xff) << 12);
         assert_eq!(dev_major_minor(dev), (226, 300));
+    }
+
+    #[test]
+    fn readback_prefers_cached_memory_and_retains_visible_fallback() {
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            ..Default::default()
+        };
+        properties.memory_types[0].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        properties.memory_types[1].property_flags = vk::MemoryPropertyFlags::HOST_CACHED;
+        properties.memory_types[2].property_flags =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_CACHED;
+        assert_eq!(readback_memory_type_index(&properties, 0b111), Some(2));
+        assert_eq!(readback_memory_type_index(&properties, 0b011), Some(0));
+        assert_eq!(readback_memory_type_index(&properties, 0b010), None);
     }
 
     #[test]

@@ -95,7 +95,6 @@ mod tests {
             "/wallpapers",
             "/config/revert",
             "/ports",
-            "/projection/convert",
             "/projection/recommendation",
             "/projection/stats",
         ] {
@@ -222,7 +221,7 @@ mod tests {
             "the Displays tab offers no way to choose one"
         );
         assert!(
-            INDEX.contains("display-buttons"),
+            INDEX.contains("output-table"),
             "the output editor is reachable only by clicking the diagram"
         );
     }

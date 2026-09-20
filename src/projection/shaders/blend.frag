@@ -60,6 +60,12 @@ layout(push_constant) uniform PushConstants {
     uint padding;
     // Absolute canvas pixel-boundary x, y, width, height, at byte 96.
     vec4 source_rect;
+    // Global adaptive-lift state. Dynamic transfer entries use these fields;
+    // the legacy fixed `(a,b)` path deliberately does not observe them.
+    float dynamic_lift;
+    uint dynamic_maximum;
+    uint dynamic_padding0;
+    uint dynamic_padding1;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -71,6 +77,18 @@ void main() {
     ivec2 p = ivec2(gl_FragCoord.xy);
     uvec3 c;
     uint ab = table[p.y * pc.width + p.x];
+    bool dynamic = (ab & 0x80000000u) != 0u;
+    uint dynamic_count = (ab >> 24u) & 0x0fu;
+
+    // Dynamic entries are tagged with bit 31. Their bits are:
+    // 0..15 r as UNORM16, 16..23 picture-border coverage as UNORM8,
+    // 24..27 configured-footprint coverage count (0..8), 28..30 reserved
+    // zero. Count zero is an authoritative outside-picture sentinel, so it
+    // remains black even if the shared lift is nonzero.
+    if (dynamic && dynamic_count == 0u) {
+        outColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
 
     if (pc.warp_enabled != 0u && ab == 0u) {
         // A zero transfer entry is outside the covered destination.  Return
@@ -205,8 +223,24 @@ void main() {
         // first so both paths start from the identical integer.
         c = uvec3(round(t.rgb * 255.0));
     }
-    uint a = ab >> 8u;
-    uint b = ab & 0xffu;
-    uvec3 o = min(((a * c) >> 8u) + b, uvec3(255u));
-    outColor = vec4(vec3(o) / 255.0, 1.0);
+    if (dynamic) {
+        float r = float(ab & 0xffffu) / 65535.0;
+        float e = float((ab >> 16u) & 0xffu) / 255.0;
+        float n = float(dynamic_count);
+        float shortfall = max(float(pc.dynamic_maximum) - n, 0.0) / n;
+        float lift = clamp(pc.dynamic_lift * shortfall, 0.0, 1.0);
+        vec3 signal = vec3(c) / 255.0;
+        // `floor(x + .5)` fixes the rounding rule across drivers. Saturate
+        // before converting to uint so a white at any lift remains white.
+        uvec3 o = uvec3(floor(min(255.0 * e * ((1.0 - lift) * r * signal + lift),
+                                 vec3(255.0)) + vec3(0.5)));
+        outColor = vec4(vec3(o) / 255.0, 1.0);
+    } else {
+        // Keep this legacy path byte-for-byte unchanged: fixed lift remains
+        // the precomputed `(a,b)` arithmetic used by the CPU renderer.
+        uint a = ab >> 8u;
+        uint b = ab & 0xffu;
+        uvec3 o = min(((a * c) >> 8u) + b, uvec3(255u));
+        outColor = vec4(vec3(o) / 255.0, 1.0);
+    }
 }

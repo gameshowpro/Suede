@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en-US">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Brain manual testing</title>
+<style>
+body{font:17px/1.5 system-ui;background:#111827;color:#e5e7eb;max-width:850px;margin:32px auto;padding:0 20px}
+a{color:#93c5fd}button{font:inherit;padding:12px 18px;margin:5px;border:1px solid #64748b;border-radius:6px;cursor:pointer}
+button[aria-pressed=true]{background:#2563eb;color:white}pre{white-space:pre-wrap}small{color:#cbd5e1}
+</style>
+<h1>Brain manual testing</h1>
+<p><a id="editor" target="_blank" rel="noopener">Open geometry editor</a> · <a id="second" target="_blank" rel="noopener">Open a second editor</a></p>
+<p>These buttons change the real source on the physical displays. In the editor, choose <strong>Test pattern → None — show content</strong> to see it.</p>
+<div id="modes"><button data-mode="grid">Static grid</button><button data-mode="dark">Static dark</button><button data-mode="bright">Static bright</button><button data-mode="moving">Moving content</button></div>
+<p id="message" role="status"></p>
+<pre id="probe">Waiting for the source browser…</pre>
+<small>The moving pattern is synthetic. Add your usual content observations separately. Saving in the editor saves this temporary test configuration.</small>
+<details><summary>What to check alongside free-form feedback</summary>
+<ol>
+<li>Every output: all eight handles, numeric edits, keyboard arrows, and touch if available. Only the selected picture should change.</li>
+<li>Static grid: sustained dragging should update continuously and settle without jumping back. Source dimensions above should stay unchanged.</li>
+<li>Invalid geometry: cross corners or collapse a quad. A useful error should appear and the last valid picture should remain.</li>
+<li>Save, Cancel, and reload: the final saved edit should persist; canceled edits should stay canceled, including rapid actions.</li>
+<li>Two editors: conflicting saves should offer explicit conflict recovery without silently overwriting another edit.</li>
+<li>Simple/Warp switching: retained calibration should return. Canvas adoption should deliberately resize the source; Cancel should restore it.</li>
+<li>Every diagnostic pattern: Grid, White, Black, Gamma, Identify, and Sync; then None to restore content.</li>
+<li>Image quality: straight lines, tilted edges, skew, clipping, moving content, and seams where physical overlap exists.</li>
+<li>Fixed and Adaptive compensation: dark/bright cuts, smooth transitions, pattern pause/content resume, and Save/Cancel/reload.</li>
+<li>Finish: request restoration below and confirm the installed presentation returns.</li>
+</ol>
+<p>Report the check, Pass/Fail/Blocked, output connector, steps, and what happened. Mark checks requiring unavailable touch or optical overlap as Blocked.</p>
+</details>
+<p id="lease"></p>
+<p><button id="restore">Finish testing and restore installed service</button></p>
+<p id="restored" hidden>The session is stopping. <a id="installed">Open the installed service</a> after a few seconds.</p>
+<script>
+const host=location.hostname;
+document.querySelector('#editor').href=document.querySelector('#second').href=`http://${host}:9088/editor`;
+document.querySelector('#installed').href=`http://${host}:9088/`;
+let finished=false;
+async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error(`${r.status} ${r.statusText}`);}
+for(const b of document.querySelectorAll('[data-mode]'))b.onclick=async()=>{try{await post('/source-mode',{mode:b.dataset.mode});document.querySelector('#message').textContent=`Requested ${b.textContent.toLowerCase()}.`;}catch(e){document.querySelector('#message').textContent=e.message;}};
+document.querySelector('#restore').onclick=async()=>{if(!confirm('End this manual session and restore brain’s installed service? Test saves remain in the session evidence directory.'))return;try{await post('/stop');finished=true;document.querySelector('#restored').hidden=false;}catch(e){document.querySelector('#message').textContent=e.message;}};
+async function refresh(){if(finished)return;try{const [s,p,c]=await Promise.all(['/session','/probe','/command'].map(p=>fetch(p,{cache:'no-store'}).then(r=>r.json())));document.querySelector('#lease').textContent=`Session ${s.status}. Automatic restoration: ${new Date(s.expiresAt).toLocaleString()}.`;for(const b of document.querySelectorAll('[data-mode]'))b.setAttribute('aria-pressed',String(b.dataset.mode===c.mode));const v=p.probe;document.querySelector('#probe').textContent=v?`Source: ${v.window.innerWidth} × ${v.window.innerHeight}; DPR ${v.window.devicePixelRatio}\nCanvas/WebGL: ${v.canvas.backingWidth} × ${v.canvas.backingHeight} / ${v.webgl.drawingBufferWidth} × ${v.webgl.drawingBufferHeight}\nResponsive layout: ${v.responsiveLayout}; source mode: ${v.mode}\nUpdated: ${v.timestamp}`:'Waiting for the source browser…';}catch(e){document.querySelector('#message').textContent=`Session unavailable: ${e.message}`;}}
+refresh();setInterval(refresh,1500);
+</script>
+</html>

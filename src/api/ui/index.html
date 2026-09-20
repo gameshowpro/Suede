@@ -126,12 +126,16 @@ legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
   border-radius: 8px; height: 230px; overflow: hidden; margin-bottom: 14px; }
 .screen { position: absolute; border: 2px solid var(--accent); border-radius: 4px;
   background: color-mix(in srgb, var(--accent) 12%, transparent); display: flex; flex-direction: column;
-  align-items: center; justify-content: center; font-size: 12px; cursor: pointer; overflow: hidden;
-  padding: 4px; text-align: center; }
+  align-items: center; justify-content: center; font-size: 12px; cursor: grab; overflow: hidden;
+  padding: 4px; text-align: center; user-select: none; touch-action: none;
+  transition: box-shadow .15s ease, outline-color .15s ease; }
+.screen:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 .screen.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
 .screen.offline { border-color: var(--warn); border-style: dashed;
   background: color-mix(in srgb, var(--warn) 8%, transparent); }
 .screen.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
+.screen.dragging { cursor: grabbing; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
+.canvas-frame { position: absolute; border: 1px dashed var(--muted); pointer-events: none; box-sizing: border-box; }
 .screen b { font-size: 13px; }
 .screen .offline-mark { color: var(--warn); font-weight: 600; cursor: help; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
@@ -172,10 +176,10 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
   border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.28);
   padding: 22px 26px; max-width: 34em; text-align: center; }
 #offline h2 { margin: 0 0 8px; font-size: 17px; }
-#offline p { margin: 0 0 6px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+#offline p { margin: 0 0 16px; color: var(--muted); }
 #offline .row { justify-content: center; margin-top: 16px; }
-#offline .spinner { width: 17px; height: 17px; margin: 0 auto 12px;
-  border: 2px solid var(--line); border-top-color: var(--accent);
+#offline .spinner { display: inline-block; width: 18px; height: 18px;
+  border: 2px solid var(--accent); border-top-color: transparent;
   border-radius: 50%; animation: spin 900ms linear infinite; }
 #offline.failed .spinner { display: none; }
 @keyframes spin { to { transform: rotate(360deg); } }
@@ -188,6 +192,35 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
 #warp-editor [data-handle]:focus { fill: var(--accent); outline: none; }
 #warp-editor [data-handle].rejected { fill: var(--bad); stroke: var(--bad); }
 #warp-error { color: var(--bad); min-height: 1.5em; }
+.mode-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.mode-toggle button { border: 0; border-radius: 0; background: transparent; color: var(--ink); }
+.mode-toggle button[aria-pressed="true"] { background: var(--accent); color: white; }
+button.pin-toggle { float: right; min-width: 2.2em; padding: 2px 6px; border-radius: 6px; cursor: pointer; transition: all .15s ease; user-select: none; }
+button.pin-toggle svg { width: 1.1em; height: 1.1em; vertical-align: -.15em; fill: currentColor; }
+button.pin-toggle[aria-pressed="true"] { background: var(--accent); color: white; border-color: var(--accent); box-shadow: 0 1px 3px rgba(59, 91, 219, 0.35); }
+button.pin-toggle[aria-pressed="true"]:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 85%, #000); border-color: color-mix(in srgb, var(--accent) 85%, #000); }
+button.pin-toggle[aria-pressed="false"] { background: transparent; color: var(--muted); border-color: var(--line); opacity: 0.65; }
+button.pin-toggle[aria-pressed="false"]:hover:not(:disabled) { opacity: 1; color: var(--ink); border-color: var(--muted); background: var(--sunken); }
+button.pin-toggle:disabled { opacity: 0.3; cursor: not-allowed; }
+#output-table tr { cursor: pointer; }
+#output-table tr.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
+#canvas-presets[hidden] { display: none; }
+dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; max-width: min(34em, calc(100vw - 32px)); }
+#arrange-dialog { max-width: min(42em, calc(100vw - 32px)); border-radius: 12px; }
+#arrange-dialog form { padding: 24px 28px; }
+#arrange-dialog h2 { margin-top: 0; margin-bottom: 8px; }
+#arrange-dialog .fields { gap: 14px; margin-bottom: 12px; }
+#arrange-dialog .row { margin-top: 14px; }
+.warp-matrix { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin: 14px 0; align-items: stretch; }
+@media (max-width: 760px) { .warp-matrix { grid-template-columns: 1fr 1fr; } }
+.warp-cell { background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
+.warp-cell.warp-center { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); background: color-mix(in srgb, var(--accent) 7%, var(--sunken)); }
+.warp-cell.warp-empty { background: transparent; border: 1px dashed transparent; }
+.warp-cell-title { font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .03em; }
+.warp-pair { display: flex; gap: 8px; }
+.warp-pair > div { flex: 1; min-width: 0; }
+.warp-pair label { font-size: 11px; margin-bottom: 2px; }
+.warp-pair input { padding: 5px 7px; font-size: 13px; font-family: ui-monospace, Consolas, monospace; }
 </style>
 </head>
 <body>
@@ -255,12 +288,30 @@ window.addEventListener("error", (event) => {
   <section id="tab-displays">
     <div class="panel">
       <h2>Layout</h2>
+      <fieldset id="warp-canvas">
+        <legend>Canvas</legend>
+        <div class="fields">
+          <div><label for="canvas-aspect">Aspect (width / height)</label><input id="canvas-aspect" type="number" min="0.001" step="any"></div>
+          <div><label for="canvas-width">Render width</label><input id="canvas-width" type="number" min="1" max="32768" step="1"></div>
+          <div><label>Derived height</label><output id="canvas-height">—</output></div>
+          <div><label>Recommended width</label><output id="canvas-recommendation">Calculating…</output></div>
+          <div><label>Rendering scale</label><output id="canvas-rendering-scale">—</output></div>
+        </div>
+        <div class="row" id="canvas-presets" hidden aria-label="Recommended render width presets"></div>
+        <p id="canvas-current" class="hint"></p>
+      </fieldset>
       <div id="layout"></div>
       <p class="hint" id="layout-hint">Click a display to configure it.</p>
       <p class="hint" id="layout-size"></p>
-      <!-- The diagram alone left the editor undiscoverable, so every display
-           in the layout also gets a plain button that opens it. -->
-      <div class="row" id="display-buttons" style="margin-top:10px"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="action ghost" id="arrange-outputs">Arrange automatically…</button>
+        <div class="mode-toggle" role="group" aria-label="Projection mode">
+          <button type="button" id="mode-simple" aria-pressed="false">Simple</button>
+          <button type="button" id="mode-warp" aria-pressed="false">Warp</button>
+        </div>
+      </div>
+      <p class="hint" id="warp-capability" role="status"></p>
+      <table id="output-table"><thead><tr><th>Output</th><th>Display</th><th>Status</th><th>Resolution</th></tr></thead><tbody></tbody></table>
       <!-- The commissioning action: freeze every attached display's settled
            mode/scale/transform into stated intent in one preview, so the
            wall stops drifting the moment it looks right. -->
@@ -287,6 +338,7 @@ window.addEventListener("error", (event) => {
         <div class="row">
           <select id="tp-pattern">
             <option value="">None — show content</option>
+            <option value="warp-alignment">Warp alignment — 10% grid and center circle</option>
             <option value="grid">Grid — geometry, identity and seam alignment</option>
             <option value="white">White — inspect the blend ramps</option>
             <option value="black">Black — tune the black-level lift</option>
@@ -308,63 +360,32 @@ window.addEventListener("error", (event) => {
       <div class="fields">
         <div><label for="o-enable">Enabled</label>
           <input type="checkbox" role="switch" class="switch" id="o-enable"></div>
-        <div><label for="o-mode">Mode</label><select id="o-mode"></select>
+        <div><label for="o-mode">Mode <button class="action ghost pin-toggle" type="button" id="pin-mode" aria-pressed="false" aria-label="Pin mode" title="Pin mode"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-mode"></select>
           <span class="hint" id="o-mode-note" hidden></span>
           <span class="hint" id="o-mode-hint"></span></div>
-        <div><label for="o-x">Position X</label><input id="o-x" type="number" step="1"></div>
-        <div><label for="o-y">Position Y</label><input id="o-y" type="number" step="1"></div>
-        <div><label for="o-scale">Scale</label><input id="o-scale" type="number" step="0.25" min="0.25">
-          <span class="hint" id="o-scale-hint"></span></div>
-        <div><label for="o-transform">Transform</label><select id="o-transform">
+        <div><label for="o-scale">Display scale (HiDPI) <button class="action ghost pin-toggle" type="button" id="pin-output-scale" aria-pressed="false" aria-label="Pin display scale" title="Pin display scale"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><input id="o-scale" type="number" step="any" min="0.25">
+          <span class="hint" id="o-scale-hint"></span>
+          <span class="hint">Compositor/OS display scaling (typically 1.0 for projectors; 2.0 for 4K). Not content scale.</span></div>
+        <div><label for="o-transform">Transform <button class="action ghost pin-toggle" type="button" id="pin-transform" aria-pressed="false" aria-label="Pin transform" title="Pin transform"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-transform">
           <option value="">Leave to sway</option>
           <option>normal</option><option>90</option><option>180</option><option>270</option>
           <option>flipped</option><option>flipped-90</option><option>flipped-180</option><option>flipped-270</option>
         </select>
           <span class="hint" id="o-transform-hint"></span></div>
-        <div><label for="o-adaptive">Adaptive sync</label>
-          <input type="checkbox" role="switch" class="switch" id="o-adaptive"></div>
-        <div><label for="o-tearing">Allow tearing</label>
-          <input type="checkbox" role="switch" class="switch" id="o-tearing"></div>
-        <div><label for="o-mrt">Max render time (ms)</label>
-          <input id="o-mrt" type="number" min="1" placeholder="off"></div>
       </div>
 
-      <fieldset>
-        <legend>Background</legend>
-        <p class="hint">Shown whenever no window covers this output — during a
-          relaunch, or before the first app starts.</p>
+      <fieldset id="shared-content">
+        <legend>Shared content selection</legend>
+        <p class="hint">Simple and Warp use this same source crop and content scale (100% = 1:1 pixel sampling). Destination pins remain Warp calibration.</p>
         <div class="fields">
-          <div><label for="o-bg">Background</label><select id="o-bg"></select></div>
-          <div class="span2" id="o-bg-summary-wrap">
-            <label>&nbsp;</label>
-            <div id="o-bg-summary" class="preview small"></div>
-          </div>
+          <div><label for="source-x">Crop X (source px)</label><input id="source-x" type="number" step="any"></div>
+          <div><label for="source-y">Crop Y (source px)</label><input id="source-y" type="number" step="any"></div>
+          <div><label for="content-scale">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any"><span class="hint" id="source-size"></span></div>
         </div>
-        <p class="hint">Backgrounds are defined on the
-          <a href="#" id="o-bg-link">Backgrounds</a> tab.</p>
       </fieldset>
 
-      <div class="row" style="margin-top:14px">
-        <button class="action" id="o-save">Save</button>
-        <button class="action ghost" id="o-pin">Pin current settings</button>
-        <button class="action ghost" id="o-pin-clear">Clear pinned values</button>
-        <button class="action ghost" id="o-remove">Remove from config</button>
-        <button class="action ghost" id="o-cancel">Cancel</button>
-        <span class="hint" id="o-note"></span>
-      </div>
-    </div>
-
-    <div class="panel" id="projection-panel">
-      <h2>Projection</h2>
-      <fieldset>
-        <legend>Geometry</legend>
-        <div class="fields">
-          <div><label for="warp-mode">Requested mode</label><select id="warp-mode"><option value="simple">Simple rectangles</option><option value="warp">Warp</option></select></div>
-          <div><label for="warp-output">Output to edit</label><select id="warp-output"></select></div>
-        </div>
-        <p class="hint" id="warp-capability" role="status"></p>
-        <div class="row"><button class="action ghost" id="warp-convert">Replace warp settings from rectangles</button></div>
-        <p class="hint">Conversion replaces retained warp settings as an unsaved edit. Switching modes preserves both layouts.</p>
+      <fieldset id="output-warp" hidden>
+        <legend>Warp &amp; geometry</legend>
         <div id="warp-controls" hidden>
           <p class="hint">Destination pins move the picture within this output. Drag a handle or focus it and use arrow keys (0.001; Shift: 0.01). The two ends of each center line share one fraction. Pin edits keep source placement and browser dimensions fixed.</p>
           <svg id="warp-editor" viewBox="-0.2 -0.2 1.4 1.4" preserveAspectRatio="none" role="group" aria-label="Destination geometry editor">
@@ -383,46 +404,73 @@ window.addEventListener("error", (event) => {
           <p id="warp-error" role="alert"></p>
           <div class="fields" id="warp-numbers"></div>
           <div class="row"><button class="action ghost" id="warp-reset-centers">Reset centers</button><button class="action ghost" id="warp-reset-pins">Reset pins</button></div>
-          <details><summary>Source placement and physical raster footprint</summary>
-            <p class="hint">Canvas units: width 1, height 1/aspect. Source placement selects browser content; the raster footprint describes physical light coverage. These are separate from destination pins.</p>
-            <div class="fields" id="warp-source"></div>
-          </details>
         </div>
         <p class="hint" id="warp-status" role="status"></p>
-        <div class="row"><button class="action" id="warp-save">Save</button><button class="action ghost" id="warp-cancel">Cancel</button></div>
-      </fieldset>
-      <fieldset id="warp-canvas">
-        <legend>Warp canvas</legend>
-        <p id="canvas-current" class="hint"></p>
-        <div class="fields">
-          <div><label for="canvas-aspect">Aspect (width / height)</label><input id="canvas-aspect" type="number" min="0.001" step="0.001"></div>
-          <div><label for="canvas-width">Chosen render width</label><input id="canvas-width" type="number" min="1" max="32768" step="1"></div>
-          <div><label for="canvas-scale">Recorded scale</label><input id="canvas-scale" type="number" min="0.001" step="0.05"></div>
-        </div>
-        <p class="hint">Adopting dimensions can resize and reflow the browser page. A scale below one loses one-to-one sampling. Recommendations use the current accepted canvas aspect. Pin dragging never adopts a recommendation.</p>
-        <div class="row"><button class="action ghost" id="canvas-adopt">Adopt chosen dimensions</button><button class="action ghost" id="canvas-recommend">Get recommendation</button></div>
-        <p class="hint" id="canvas-recommendation"></p><div class="row" id="canvas-presets"></div>
       </fieldset>
 
+      <fieldset>
+        <legend>Background</legend>
+        <p class="hint">Shown whenever no window covers this output — during a
+          relaunch, or before the first app starts.</p>
+        <div class="fields">
+          <div><label for="o-bg">Background</label><select id="o-bg"></select></div>
+          <div class="span2" id="o-bg-summary-wrap">
+            <label>&nbsp;</label>
+            <div id="o-bg-summary" class="preview small"></div>
+          </div>
+        </div>
+        <p class="hint">Backgrounds are defined on the
+          <a href="#" id="o-bg-link">Backgrounds</a> tab.</p>
+      </fieldset>
+
+      <div class="row" style="margin-top:14px">
+        <button class="action ghost" id="o-remove">Remove from config</button>
+        <span class="hint" id="o-note"></span>
+      </div>
+    </div>
+
+    <div class="panel" id="edge-blending-panel">
+      <h2>Edge blending</h2>
       <p class="hint">The overlaps come from the layout above: drag the
         displays so they overlap exactly as the beams do on the surface — every
         seam its own amount. Suede renders the app once into that canvas and
         slices it per projector; with blending on, each seam is faded from
         both sides so the doubled light adds up to one seamless picture.</p>
-      <p class="hint" id="pj-idle" hidden><strong>These settings are
-        inactive: no displays overlap in the layout above.</strong> With no
-        overlaps there is nothing to blend, so the displays are tiled
-        directly and none of this applies. Position displays so they overlap
-        — as the projector beams do on the surface — and blending engages.
-        The test pattern is with the layout above, and works whether or not
-        anything overlaps.</p>
+      <p class="hint" id="pj-idle" hidden><strong>These settings are inactive:
+        no shared canvas is configured yet.</strong> Add or arrange a display
+        to create the shared content mapping.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <input type="checkbox" role="switch" class="switch" id="pj-blend"></div>
         <div><label for="pj-gamma">Projector gamma</label>
-          <input id="pj-gamma" type="number" step="0.05" min="1" max="4" value="2.2"></div>
+          <input id="pj-gamma" type="number" step="any" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
-          <input id="pj-lift" type="number" step="0.01" min="0" max="0.5" value="0"></div>
+          <input id="pj-lift" type="number" step="any" min="0" max="0.5" value="0"></div>
+        <div><label for="pj-lift-mode">Compensation mode</label>
+          <select id="pj-lift-mode"><option value="fixed">Fixed</option><option value="adaptive">Adaptive</option></select></div>
+      </div>
+      <div id="pj-adaptive-fields" hidden><div class="fields">
+        <div><label for="pj-dark">Dark luminance threshold</label><input id="pj-dark" type="number" min="0" max="1" step="any" value="0.02"></div>
+        <div><label for="pj-bright">Bright luminance threshold</label><input id="pj-bright" type="number" min="0" max="1" step="any" value="0.2"></div>
+        <div><label for="pj-rise">Rise time (ms)</label><input id="pj-rise" type="number" min="1" max="3600000" step="any" value="1000"></div>
+        <div><label for="pj-fall">Fall time (ms)</label><input id="pj-fall" type="number" min="1" max="3600000" step="any" value="250"></div>
+        <div><label for="pj-slew">Maximum lift change per second</label><input id="pj-slew" type="number" min="0.000001" max="10" step="any" value="0.1"></div>
+      </div>
+      </div><p class="hint" id="pj-lift-status" hidden></p>
+      <p class="hint">Gamma shapes the fall-off — the projectors' transfer
+        curve, usually 2.2. If seams glow on dark scenes (projector black is
+        not zero light), raise the compensation until the rest of the picture
+        matches them.</p>
+      <div class="row" style="margin-top:10px">
+        <button class="action" id="pj-save">Save</button>
+        <button class="action ghost" id="pj-cancel">Cancel</button>
+        <span class="hint" id="pj-note"></span>
+      </div>
+    </div>
+
+    <div class="panel" id="frame-timing-panel">
+      <h2>Frame timing</h2>
+      <div class="fields">
         <div><label for="pj-free">Free-run displays</label>
           <input type="checkbox" role="switch" class="switch" id="pj-free"></div>
         <div><label for="pj-renderer">Renderer</label>
@@ -432,10 +480,6 @@ window.addEventListener("error", (event) => {
             <option value="gpu">GPU</option>
           </select></div>
       </div>
-      <p class="hint">Gamma shapes the fall-off — the projectors' transfer
-        curve, usually 2.2. If seams glow on dark scenes (projector black is
-        not zero light), raise the compensation until the rest of the picture
-        matches them.</p>
       <p class="hint">Off, every display takes each frame together and the
         next frame waits until all of them have taken it. On, each display
         takes the newest frame as soon as it is ready — only for displays
@@ -446,13 +490,8 @@ window.addEventListener("error", (event) => {
         which it picked and why. CPU always uses the fallback path. GPU
         forces the GPU path and refuses to start if it is unavailable,
         rather than silently running slower.</p>
-      <div class="row" style="margin-top:10px">
-        <button class="action" id="pj-save">Save</button>
-        <button class="action ghost" id="pj-cancel">Cancel</button>
-        <span class="hint" id="pj-note"></span>
-      </div>
       <div id="pj-timing" hidden style="margin-top:14px">
-        <h3 style="margin:0 0 8px">Frame timing</h3>
+        <h3 style="margin:0 0 8px">Telemetry</h3>
         <p class="hint" id="pj-timing-silent" hidden>The slicer is running.
           No frames have been reported yet — the loop only runs while the
           content is drawing.</p>
@@ -474,6 +513,20 @@ window.addEventListener("error", (event) => {
           milliseconds and no straddles.</p>
       </div>
     </div>
+    <dialog id="arrange-dialog" aria-labelledby="arrange-title">
+      <form method="dialog">
+        <h2 id="arrange-title">Arrange outputs</h2>
+        <p class="hint">Enabled outputs are placed left to right, then top to bottom. Content scale (100% = 1:1 pixel sampling) and overlap are linked: changing one calculates the other to fill the canvas.</p>
+        <div class="fields">
+          <div><label for="arrange-rows">Rows</label><input id="arrange-rows" type="number" min="1" step="1" value="1"></div>
+          <div><label for="arrange-columns">Columns</label><input id="arrange-columns" type="number" min="1" step="1" value="1"></div>
+          <div><label for="arrange-scale">Content scale (%)</label><input id="arrange-scale" type="number" min="0.01" step="any"></div>
+          <div><label for="arrange-overlap">Overlap (%)</label><input id="arrange-overlap" type="number" min="0" max="99" step="any" value="0"></div>
+        </div>
+        <p class="hint" id="arrange-preview"></p>
+        <div class="row"><button class="action" type="button" id="arrange-apply">Apply arrangement</button><button class="action ghost" id="arrange-cancel" value="cancel">Cancel</button></div>
+      </form>
+    </dialog>
   </section>
 
   <!-- Apps -->
@@ -760,6 +813,9 @@ window.addEventListener("error", (event) => {
 <script>
 const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
+// Keep the diagnostic at the top of Layout, before the canvas diagram and
+// selected-output table, without duplicating the control in the markup.
+$("layout").before($("pattern-row"));
 let outputs = [], config = null, apps = [], sinks = [], checks = [], status = null,
     wallpapers = [], selected = null, editingApp = null, editingBackground = null,
     // The other two lists GET /av returns alongside the sinks above.
@@ -835,11 +891,21 @@ function toast(message, isError) {
 
 const escape = (v) => String(v ?? "").replace(/[&<>"]/g,
   (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-// Numbers follow the browser's locale (a German browser shows 6,7 ms, not
-// 6.7 ms); the precision is fixed here so a value never gains or loses
-// digits between renders.
-const num = (value, digits = 1) => Number(value).toLocaleString(undefined,
-  { minimumFractionDigits: digits, maximumFractionDigits: digits });
+// Formatting is presentation only. Never parse this text back into config:
+// crop, pin, and calibration values retain the precision supplied by the API.
+function displayNumber(value, maximumFractionDigits = 1, minimumFractionDigits = 0) {
+  if (!Number.isFinite(Number(value))) return "—";
+  const rounded = Math.abs(Number(value)) < .5 * 10 ** -maximumFractionDigits ? 0 : Number(value);
+  return rounded.toLocaleString(undefined, { minimumFractionDigits, maximumFractionDigits });
+}
+const num = (value, digits = 1) => displayNumber(value, digits, digits);
+function editNumber(value, digits) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  if (number !== 0 && Math.abs(number) < .5 * 10 ** -digits) return number.toExponential(2);
+  const text = number.toFixed(digits).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
+  return text === "-0" ? "0" : text;
+}
 // Refresh rates: up to three decimals, trailing zeros dropped (60 Hz, 59.939 Hz).
 const hz = (value) => Number(value).toLocaleString(undefined,
   { minimumFractionDigits: 0, maximumFractionDigits: 3 });
@@ -857,6 +923,10 @@ let previewTimer = null, previewActive = false, previewQueued = null;
 let previewFlight = null, writeTail = Promise.resolve(), lastPreviewAt = -Infinity;
 let editVersion = 0, configLoadSerial = 0, configConflict = false, configBusy = false;
 let recommendation = null;
+let recommendationTimer = null, recommendationFlight = null, recommendationPending = null;
+let recommendationInput = 0;
+let displayValidationError = null;
+function setDisplayError(message) { displayValidationError = message || null; $("warp-error").textContent = message || ""; }
 
 function configHeaders() {
   if (configGeneration == null || configEpoch == null) throw new Error("Reload configuration to establish a working-copy version.");
@@ -889,16 +959,59 @@ async function writeConfig(path, options) {
     throw error;
   }
 }
-function pushPreview() {
+function pushPreview(material = false) {
   if (configBusy || configConflict) return;
   editVersion++;
   previewActive = true;
-  recommendation = null;
-  $("canvas-presets").replaceChildren();
-  $("canvas-recommendation").textContent = "Settings changed. Request a fresh recommendation.";
+  if (material) invalidateRecommendation();
   previewQueued = structuredClone(config);
   schedulePreview();
   renderWarpStatus();
+}
+function invalidateRecommendation() {
+  recommendation = null;
+  recommendationInput++;
+  clearTimeout(recommendationTimer);
+  $("canvas-presets").replaceChildren();
+  delete $("canvas-presets").dataset.key;
+  $("canvas-presets").hidden = true;
+  $("canvas-recommendation").textContent = "Calculating…";
+  scheduleRecommendation(recommendationInput);
+}
+function scheduleRecommendation(input = recommendationInput) {
+  clearTimeout(recommendationTimer);
+  recommendationTimer = setTimeout(() => requestRecommendation(input), 250);
+}
+async function requestRecommendation(input) {
+  if (!config || configBusy || configConflict || input !== recommendationInput) return;
+  if (recommendationFlight) { recommendationPending = input; return; }
+  // Reserve the only request slot before waiting for the preview queue; a
+  // pointer move can schedule another recommendation during that await.
+  recommendationFlight = { input, waiting: true };
+  try {
+    await flushPreviews();
+    if (input !== recommendationInput) return;
+    const generation = configGeneration, revision = config.revision, epoch = configEpoch;
+    const signature = recommendationSignature();
+    recommendationFlight = { input, generation, revision, epoch, signature };
+    const result = await api("/projection/recommendation");
+    if (input !== recommendationInput || signature !== recommendationSignature() ||
+        String(result.generation) !== String(generation) || result.revision !== revision) return;
+    recommendation = result;
+    renderCanvas();
+  } catch (error) {
+    if (input === recommendationInput) $("canvas-recommendation").textContent = `Recommendation unavailable: ${error.message}`;
+  } finally {
+    recommendationFlight = null;
+    const pending = recommendationPending; recommendationPending = null;
+    if (pending != null && pending !== input) requestRecommendation(pending);
+  }
+}
+function recommendationSignature() {
+  const canvas = config?.projection?.canvas;
+  return JSON.stringify({ canvas: canvas && { aspect: canvas.aspect, renderWidth: canvas.renderWidth }, mode: config?.projection?.mode,
+    outputs: (config?.outputs ?? []).filter(o => o.enable !== false).map(o => ({ key: outputKey(o), mode: o.mode, transform: o.transform,
+      source: o.geometry?.source, corners: o.geometry?.corners, center: o.geometry?.center })) });
 }
 function schedulePreview() {
   clearTimeout(previewTimer);
@@ -920,7 +1033,7 @@ function sendPreview() {
     if (!configConflict) {
       previewQueued = null;
       if (acceptedConfig) config = structuredClone(acceptedConfig);
-      $("warp-error").textContent = error.message;
+    setDisplayError(error.message);
       renderWarpEditor();
     }
     toast(error.message, true);
@@ -1190,6 +1303,14 @@ function configEntry(name) {
 function canvasRect(known) {
   const configured = configEntry(known.name);
   const rect = known.output?.rect;
+  const source = configured?.geometry?.source, canvas = canvasPixels();
+  if (source && canvas) return {
+    x: source.x * canvas.width,
+    y: source.y * canvas.yDensity,
+    width: source.width * canvas.width,
+    height: source.height * canvas.yDensity,
+    configured,
+  };
   return {
     x: configured?.position?.x ?? rect?.x ?? 0,
     y: configured?.position?.y ?? rect?.y ?? 0,
@@ -1216,14 +1337,15 @@ function unusedOutputs() {
 function addToLayout(name) {
   if (!loaded()) return;
   const known = knownOutputs().find((k) => k.name === name);
-  const entries = layoutEntries().filter(({ r }) => r.width > 0);
-  const right = entries.length ? Math.max(...entries.map(({ r }) => r.x + r.width)) : 0;
   const mode = known?.output?.currentMode ?? COMMON_MODES[0];
+  const canvas = canvasPixels();
+  const source = canvas ? { x: 0, y: 0, width: mode.width / canvas.width, height: mode.height / canvas.yDensity } :
+    { x: 0, y: 0, width: 1, height: 1 };
   (config.outputs ??= []).push({
     match: { name },
     enable: true,
     mode: { width: mode.width, height: mode.height, refreshHz: mode.refreshHz },
-    position: { x: right, y: 0 },
+    geometry: identityGeometry(source),
     scale: 1,
     transform: "normal",
     adaptiveSync: false,
@@ -1283,6 +1405,8 @@ const OFFLINE_TOOLTIP =
   "exactly what they show now; this region is simply dark until something " +
   "is plugged back in.";
 
+let layoutDrag = null;
+
 function renderLayout() {
   const container = $("layout");
   container.innerHTML = "";
@@ -1296,8 +1420,9 @@ function renderLayout() {
         ? "Nothing in the layout yet. Add a display from the list below."
         : "No outputs detected.");
 
-  const spanX = Math.max(...entries.map(({ r }) => r.x + r.width), 1920);
-  const spanY = Math.max(...entries.map(({ r }) => r.y + r.height), 1080);
+  const canvas = canvasPixels();
+  const spanX = canvas?.width ?? Math.max(...entries.map(({ r }) => r.x + r.width), 1920);
+  const spanY = canvas?.height ?? Math.max(...entries.map(({ r }) => r.y + r.height), 1080);
   const box = container.getBoundingClientRect();
 
   // The diagram's width is fixed by the panel, so that sets the scale and the
@@ -1321,7 +1446,16 @@ function renderLayout() {
   const legible = Math.max(MIN_SIDE.h / smallest.h, MIN_SIDE.w / smallest.w);
   const capped = (PREFERRED_MAX - PAD) / spanY;
   const scale = Math.min(byWidth, Math.max(capped, legible));
+  container.dataset.scale = String(scale);
   container.style.height = `${Math.round(spanY * scale) + PAD}px`;
+  if (canvas) {
+    const frame = document.createElement("div");
+    frame.className = "canvas-frame";
+    frame.style.left = "10px"; frame.style.top = "10px";
+    frame.style.width = `${spanX * scale}px`; frame.style.height = `${spanY * scale}px`;
+    frame.title = `Shared canvas ${canvas.width} × ${canvas.height}`;
+    container.appendChild(frame);
+  }
 
   entries.forEach(({ known, r }, index) => {
     const enabled = r.configured?.enable ?? true;
@@ -1329,6 +1463,10 @@ function renderLayout() {
     el.className = "screen" + (enabled ? "" : " inactive")
                  + (known.connected ? "" : " offline")
                  + (selected === known.name ? " selected" : "");
+    el.dataset.name = known.name;
+    el.tabIndex = 0;
+    el.setAttribute("role", "button");
+    el.setAttribute("aria-label", `Display ${known.name}`);
     if (r.width > 0) {
       el.style.left = `${10 + r.x * scale}px`;
       el.style.top = `${10 + r.y * scale}px`;
@@ -1346,21 +1484,123 @@ function renderLayout() {
         : `<span class="offline-mark" title="${escape(OFFLINE_TOOLTIP)}">⚠ not connected</span>`) +
       (r.configured?.background
         ? `<span class="muted">bg: ${escape(backgroundLabel(r.configured.background))}</span>` : "");
-    el.onclick = () => selectOutput(known.name);
+
+    if (r.width > 0) {
+      el.addEventListener("pointerdown", (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        el.focus();
+        selectOutput(known.name, false);
+
+        const currentScale = parseFloat(container.dataset.scale) || scale || 1;
+        const currentConfig = configEntry(known.name);
+        if (!currentConfig) return;
+
+        try {
+          el.setPointerCapture(event.pointerId);
+        } catch (_) {}
+        layoutDrag = {
+          pointerId: event.pointerId,
+          screen: el,
+          name: known.name,
+          startX: event.clientX,
+          startY: event.clientY,
+          initialLeft: parseFloat(el.style.left) || 10,
+          initialTop: parseFloat(el.style.top) || 10,
+          initialSource: currentConfig.geometry?.source ? structuredClone(currentConfig.geometry.source) : null,
+          initialPosition: currentConfig.position ? structuredClone(currentConfig.position) : null,
+          scale: currentScale,
+          moved: false,
+        };
+        el.classList.add("dragging");
+      });
+
+      el.addEventListener("pointermove", (event) => {
+        if (!layoutDrag || layoutDrag.pointerId !== event.pointerId) return;
+        const dx = event.clientX - layoutDrag.startX;
+        const dy = event.clientY - layoutDrag.startY;
+        if (Math.abs(dx) > 1 || Math.abs(dy) > 1) {
+          layoutDrag.moved = true;
+        }
+        const output = configEntry(layoutDrag.name);
+        if (!output) return;
+
+        const pixels = canvasPixels();
+        if (pixels) {
+          layoutDrag.initialSource ??= {
+            x: r.x / pixels.width,
+            y: r.y / pixels.yDensity,
+            width: r.width / pixels.width,
+            height: r.height / pixels.yDensity,
+          };
+          output.geometry ??= identityGeometry(layoutDrag.initialSource);
+          output.geometry.source = {
+            x: layoutDrag.initialSource.x + dx / (layoutDrag.scale * pixels.width),
+            y: layoutDrag.initialSource.y + dy / (layoutDrag.scale * pixels.yDensity),
+            width: layoutDrag.initialSource.width,
+            height: layoutDrag.initialSource.height,
+          };
+        }
+        if (layoutDrag.initialPosition || !pixels) {
+          output.position = {
+            x: Math.round((layoutDrag.initialPosition?.x ?? r.x) + dx / layoutDrag.scale),
+            y: Math.round((layoutDrag.initialPosition?.y ?? r.y) + dy / layoutDrag.scale),
+          };
+        }
+
+        el.style.left = `${layoutDrag.initialLeft + dx}px`;
+        el.style.top = `${layoutDrag.initialTop + dy}px`;
+
+        renderSharedContent();
+        renderLayoutSize();
+        drawWarp();
+        pushPreview(true);
+      });
+
+      const endDrag = (event) => {
+        if (!layoutDrag || layoutDrag.pointerId !== event.pointerId) return;
+        el.classList.remove("dragging");
+        try {
+          if (el.hasPointerCapture(event.pointerId)) {
+            el.releasePointerCapture(event.pointerId);
+          }
+        } catch (_) {}
+        const wasMoved = layoutDrag.moved;
+        layoutDrag = null;
+        renderLayout();
+        renderSharedContent();
+        renderCanvas();
+        drawWarp();
+        if (wasMoved) {
+          pushPreview(true);
+        }
+      };
+      el.addEventListener("pointerup", endDrag);
+      el.addEventListener("pointercancel", endDrag);
+      el.addEventListener("lostpointercapture", endDrag);
+    }
+
+    el.onclick = () => {
+      if (layoutDrag?.moved) return;
+      selectOutput(known.name);
+    };
     container.appendChild(el);
   });
 
   renderLayoutSize();
 
-  const buttons = $("display-buttons");
-  buttons.innerHTML = "";
-  for (const { known } of entries) {
-    const button = document.createElement("button");
-    button.className = "action" + (selected === known.name ? "" : " ghost");
-    const display = displayName(known);
-    button.textContent = "Configure " + known.name + (display ? ` — ${display}` : "");
-    button.onclick = () => selectOutput(known.name);
-    buttons.appendChild(button);
+  const outputRows = $("output-table").querySelector("tbody");
+  outputRows.replaceChildren();
+  for (const { known, r } of entries) {
+    const row = document.createElement("tr");
+    row.className = selected === known.name ? "selected" : "";
+    row.tabIndex = 0;
+    row.innerHTML = `<td class="mono">${escape(known.name)}</td><td>${escape(displayName(known) ?? "—")}</td>` +
+      `<td>${r.configured?.enable === false ? "Disabled" : known.connected ? "Connected" : "Disconnected"}</td>` +
+      `<td>${rasterDimensions(r.configured)?.width ?? "—"}×${rasterDimensions(r.configured)?.height ?? "—"}</td>`;
+    row.onclick = () => selectOutput(known.name);
+    row.onkeydown = event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); selectOutput(known.name); } };
+    outputRows.appendChild(row);
   }
 
   // Everything the hardware has that the layout does not use yet, including
@@ -1420,12 +1660,13 @@ function renderLayoutSize() {
   renderProjectionAvailability(overlaps);
   if (entries.length === 0) { el.textContent = ""; return; }
 
-  const left = Math.min(...entries.map(({ r }) => r.x));
-  const top = Math.min(...entries.map(({ r }) => r.y));
-  const width = Math.max(...entries.map(({ r }) => r.x + r.width)) - left;
-  const height = Math.max(...entries.map(({ r }) => r.y + r.height)) - top;
+  const canvas = canvasPixels();
+  const left = canvas ? 0 : Math.min(...entries.map(({ r }) => r.x));
+  const top = canvas ? 0 : Math.min(...entries.map(({ r }) => r.y));
+  const width = canvas?.width ?? Math.max(...entries.map(({ r }) => r.x + r.width)) - left;
+  const height = canvas?.height ?? Math.max(...entries.map(({ r }) => r.y + r.height)) - top;
 
-  let text = `App canvas: ${width} × ${height} — author content to this size.`;
+  let text = `Shared app canvas: ${width} × ${height} — author content to this size.`;
   text += overlaps > 0
     ? ` ${overlaps} overlapping region${overlaps === 1 ? "" : "s"}: rendered` +
       ` once, projected by both displays` +
@@ -1434,7 +1675,79 @@ function renderLayoutSize() {
   el.textContent = text;
 }
 
-function selectOutput(name) {
+window.addEventListener("keydown", (event) => {
+  const delta = {
+    ArrowLeft: [-1, 0],
+    ArrowRight: [1, 0],
+    ArrowUp: [0, -1],
+    ArrowDown: [0, 1],
+  }[event.key];
+  if (!delta) return;
+
+  const active = document.activeElement;
+  if (active && ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName)) return;
+  if (active?.closest("#warp-editor")) return;
+  if (active?.closest("nav[role='tablist']")) return;
+  if (document.querySelector("dialog[open]")) return;
+
+  const displaysTab = $("tab-displays");
+  if (!displaysTab || displaysTab.classList.contains("hidden")) return;
+  if (!selected) return;
+
+  const output = configEntry(selected);
+  if (!output) return;
+
+  event.preventDefault();
+
+  const stepPx = event.shiftKey ? 10 : (event.altKey ? 0.1 : 1);
+  const dxPx = delta[0] * stepPx;
+  const dyPx = delta[1] * stepPx;
+
+  const pixels = canvasPixels();
+  const known = knownOutputs().find((k) => k.name === selected);
+  const r = canvasRect(known);
+
+  if (pixels) {
+    output.geometry ??= identityGeometry({
+      x: r.x / pixels.width,
+      y: r.y / pixels.yDensity,
+      width: r.width / pixels.width,
+      height: r.height / pixels.yDensity,
+    });
+    output.geometry.source.x += dxPx / pixels.width;
+    output.geometry.source.y += dyPx / pixels.yDensity;
+  }
+  if (output.position || !pixels) {
+    output.position = {
+      x: (output.position?.x ?? r.x) + dxPx,
+      y: (output.position?.y ?? r.y) + dyPx,
+    };
+  }
+
+  const wasScreenFocused = active?.classList?.contains("screen");
+  renderLayout();
+  if (wasScreenFocused) {
+    const screen = $("layout").querySelector(`.screen[data-name="${selected}"]`);
+    screen?.focus();
+  }
+  renderSharedContent();
+  renderLayoutSize();
+  drawWarp();
+  pushPreview(true);
+});
+
+window.addEventListener("blur", () => {
+  if (layoutDrag) {
+    if (layoutDrag.screen.hasPointerCapture(layoutDrag.pointerId)) {
+      layoutDrag.screen.releasePointerCapture(layoutDrag.pointerId);
+    }
+    layoutDrag.screen.classList.remove("dragging");
+    layoutDrag = null;
+    renderLayout();
+  }
+});
+
+function selectOutput(name, redrawLayout = true) {
   const known = knownOutputs().find((k) => k.name === name);
   if (!known) return;
   selected = name;
@@ -1472,16 +1785,11 @@ function selectOutput(name) {
   if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
   renderModeNote();
 
-  $("o-x").value = existing?.position?.x ?? output?.rect.x ?? 0;
-  $("o-y").value = existing?.position?.y ?? output?.rect.y ?? 0;
   // Scale must be able to show "unset": a blank input with a placeholder
   // naming the value actually in effect, rather than a coerced 1.
   $("o-scale").value = existing?.scale ?? "";
   $("o-scale").placeholder = num(existing?.adopted?.scale ?? output?.scale ?? 1, 2);
   $("o-transform").value = existing?.transform ?? "";
-  $("o-adaptive").checked = existing?.adaptiveSync ?? false;
-  $("o-tearing").checked = existing?.allowTearing ?? false;
-  $("o-mrt").value = existing?.maxRenderTimeMs ?? "";
 
   renderOutputBackgroundChoices(existing?.background);
 
@@ -1491,7 +1799,18 @@ function selectOutput(name) {
     : "nothing is plugged into this connector — its place in the canvas is kept";
 
   refreshFieldHints(name);
-  renderLayout();
+  renderSharedContent();
+  renderWarpEditor();
+  if (redrawLayout) {
+    renderLayout();
+  } else {
+    for (const screen of $("layout").querySelectorAll(".screen")) {
+      screen.classList.toggle("selected", screen.dataset.name === name);
+    }
+    for (const row of $("output-table").querySelectorAll("tbody tr")) {
+      row.classList.toggle("selected", row.firstElementChild?.textContent === name);
+    }
+  }
 }
 
 // What "Pin current settings" and "Pin all displays" write: whatever is
@@ -1554,17 +1873,15 @@ function renderFieldProvenance(hintId, operatorValue, observedValue, adopted, ke
   const hint = $(hintId);
   const adoptedValue = adopted?.[key] ?? null;
   if (operatorValue != null) {
-    hint.textContent = observedValue != null
-      ? `Running ${format(observedValue)}`
-      : `Set to ${format(operatorValue)}`;
+    hint.textContent = `Pinned ${format(operatorValue)}` + (observedValue != null ? `; running ${format(observedValue)}` : "");
   } else if (adoptedValue != null) {
     const display = adopted?.display;
     const from = display && (display.make || display.model)
       ? ` — pinned from ${[display.make, display.model].filter(Boolean).join(" ")}`
       : "";
-    hint.textContent = `Running ${format(adoptedValue)}${from}`;
+    hint.textContent = `Automatic — adopted ${format(adoptedValue)}${from}`;
   } else {
-    hint.textContent = "Not set; sway will choose";
+    hint.textContent = "Automatic — waiting for a display value";
   }
 }
 
@@ -1581,9 +1898,13 @@ function refreshFieldHints(name) {
   renderFieldProvenance("o-scale-hint", existing?.scale, output?.scale, existing?.adopted, "scale", (v) => `${num(v, 2)}×`);
   renderFieldProvenance("o-transform-hint", existing?.transform, output?.transform, existing?.adopted, "transform", (v) => v);
 
-  $("o-pin").disabled = !pinWouldChange(known, existing);
-  $("o-pin-clear").disabled =
-    !(existing?.mode != null || existing?.scale != null || existing?.transform != null);
+  for (const [id, key] of [["pin-mode", "mode"], ["pin-output-scale", "scale"], ["pin-transform", "transform"]]) {
+    const button = $(id), pinned = existing?.[key] != null;
+    button.setAttribute("aria-pressed", String(pinned));
+    button.setAttribute("aria-label", `${pinned ? "Unpin" : "Pin"} ${key}`);
+    button.title = `${pinned ? "Unpin" : "Pin"} ${key}`;
+    button.disabled = !pinned && !pinnableFields(known, existing)[key];
+  }
 }
 
 // Two outputs at different refresh rates drift a frame apart every so
@@ -1610,36 +1931,39 @@ function renderModeNote() {
     " — pick the same rate so the displays stay in step";
 }
 
-function outputEntryFromForm() {
-  const name = $("output-name").textContent;
-  const [width, height, refreshHz] = ($("o-mode").value || "").split("x").map(Number);
-  // A preset is sent as its bare name; the API accepts that or a full object.
-  const background = $("o-bg").value || null;
-  const mrt = $("o-mrt").value.trim();
-  // Both must be able to say "unset", not just "leave to sway"/blank: a
-  // coerced 1 or "normal" here silently turns every defaulted value into a
-  // specified one the moment the operator opens the editor and hits Save.
-  const scale = $("o-scale").value.trim();
-  return {
-    ...configEntry(name),
-    match: configEntry(name)?.match ?? { name },
-    enable: $("o-enable").checked,
-    mode: width ? { width, height, refreshHz } : null,
-    position: { x: Number($("o-x").value) || 0, y: Number($("o-y").value) || 0 },
-    scale: scale === "" ? null : Number(scale),
-    transform: $("o-transform").value || null,
-    adaptiveSync: $("o-adaptive").checked,
-    allowTearing: $("o-tearing").checked,
-    maxRenderTimeMs: mrt ? Number(mrt) : null,
-    background,
-  };
-}
-
 // Every edit lands on the outputs immediately (as an unsaved preview) and
 // redraws the layout, so dragging the numbers shows the displays responding.
-function outputEdited() {
+function outputEdited(field = document.activeElement?.id) {
   if (!selected || !loaded()) return;
-  const entry = outputEntryFromForm();
+  const previous = configEntry(selected);
+  const entry = structuredClone(previous ?? { match: { name: selected }, enable: true, adaptiveSync: false,
+    allowTearing: false, maxRenderTimeMs: null, background: null });
+  if (field === "o-enable") entry.enable = $("o-enable").checked;
+  else if (field === "o-mode") {
+    const [width, height, refreshHz] = ($("o-mode").value || "").split("x").map(Number);
+    entry.mode = width ? { width, height, refreshHz } : null;
+  } else if (field === "o-scale") {
+    const value = $("o-scale").value.trim(); entry.scale = value === "" ? null : Number(value);
+  } else if (field === "o-transform") entry.transform = $("o-transform").value || null;
+  else if (field === "o-bg") entry.background = $("o-bg").value || null;
+  else return;
+  // A deliberate output-mode change keeps the viewed content anchored in
+  // source pixels and retains the prior scalar enlargement. The normalized
+  // rectangle is intentionally untouched for a render-width-only edit.
+  if (field === "o-mode" && previous?.geometry?.source && previous.mode && entry.mode) {
+    const pixels = canvasPixels(), source = previous.geometry.source;
+    if (pixels) {
+      const oldRaster = rasterDimensions(previous), newRaster = rasterDimensions(entry);
+      const scale = oldRaster.width / (source.width * pixels.width);
+      entry.geometry = structuredClone(previous.geometry);
+      entry.geometry.source = {
+        x: source.x,
+        y: source.y,
+        width: newRaster.width / (scale * pixels.width),
+        height: newRaster.height / (scale * pixels.yDensity),
+      };
+    }
+  }
   const index = (config.outputs ?? []).findIndex((o) => o.match?.name === selected);
   if (index >= 0) config.outputs[index] = entry;
   else (config.outputs ??= []).push(entry);
@@ -1650,54 +1974,326 @@ function outputEdited() {
   // The provenance hints and the Pin/Clear buttons describe `existing`,
   // which this edit just changed.
   refreshFieldHints(selected);
-  pushPreview();
+  pushPreview(["o-enable", "o-mode", "o-transform"].includes(field));
 }
-for (const id of ["o-enable", "o-mode", "o-x", "o-y", "o-scale", "o-transform",
-                  "o-adaptive", "o-tearing", "o-mrt", "o-bg"]) {
-  $(id).addEventListener("input", outputEdited);
+for (const id of ["o-enable", "o-mode", "o-scale", "o-transform", "o-bg"]) {
+  $(id).addEventListener("input", () => outputEdited(id));
 }
 $("o-mode").addEventListener("input", renderModeNote);
 $("o-mode").addEventListener("change", renderModeNote);
 
-$("o-save").onclick = () => run(async () => {
-  outputEdited();
-  clearTimeout(previewTimer);
-  await saveCommitted();
-}, "saved display configuration");
+function canvasPixels(canvas = config?.projection?.canvas) {
+  const width = canvas?.renderWidth, aspect = canvas?.aspect;
+  if (!(Number.isFinite(width) && Number.isFinite(aspect) && width > 0 && aspect > 0)) return null;
+  return { width, height: Math.max(1, Math.round(width / aspect)), yDensity: aspect * Math.max(1, Math.round(width / aspect)) };
+}
+function rasterDimensions(output) {
+  const mode = output?.mode;
+  if (!mode) return null;
+  return ["90", "270"].includes(String(output.transform ?? "normal"))
+    ? { width: mode.height, height: mode.width } : mode;
+}
+function selectedGeometry() { return configEntry(selected)?.geometry ?? null; }
+function renderSharedContent() {
+  const geometry = selectedGeometry(), mode = rasterDimensions(configEntry(selected)), pixels = canvasPixels();
+  const container = $("shared-content");
+  container.hidden = !geometry || !mode || !pixels;
+  if (container.hidden || container.contains(document.activeElement)) return;
+  const source = geometry.source;
+  const scale = mode.width / (source.width * pixels.width);
+  $("source-x").value = editNumber(source.x * pixels.width, 1);
+  $("source-y").value = editNumber(source.y * pixels.yDensity, 1);
+  $("content-scale").value = editNumber(scale * 100, 2);
+  const heightScale = mode.height / (source.height * pixels.yDensity);
+  $("source-size").textContent = `Crop ${editNumber(source.width * pixels.width, 1)} × ${editNumber(source.height * pixels.yDensity, 1)} px; ` +
+    (Math.abs(scale - heightScale) < 1e-8 ? "uniform" : `vertical density ${displayNumber(heightScale * 100, 2)}%`);
+}
+function editSharedContent(change) {
+  const output = configEntry(selected), pixels = canvasPixels();
+  if (!output?.geometry || !pixels) return;
+  const source = structuredClone(output.geometry.source);
+  try {
+    change(source, pixels, rasterDimensions(output));
+    if (![source.x, source.y, source.width, source.height].every(Number.isFinite) || source.width <= 0 || source.height <= 0)
+      throw new Error("Crop values must be finite and the crop size must be positive.");
+    output.geometry.source = source;
+    setDisplayError("");
+    pushPreview(true); renderSharedContent(); renderCanvas(); renderLayout(); renderLayoutSize();
+  } catch (error) { setDisplayError(error.message); }
+}
+$("source-x").onchange = event => editSharedContent((source, pixels) => { source.x = Number(event.target.value) / pixels.width; });
+$("source-y").onchange = event => editSharedContent((source, pixels) => { source.y = Number(event.target.value) / pixels.yDensity; });
+$("content-scale").onchange = event => editSharedContent((source, pixels, mode) => {
+  const scale = Number(event.target.value) / 100;
+  if (!(scale > 0)) throw new Error("Content scale must be positive.");
+  source.width = mode.width / (scale * pixels.width);
+  source.height = mode.height / (scale * pixels.yDensity);
+});
 
-// Fills the controls from whatever is actually running — the adopted pin if
-// there is one, else the observed mode/scale/transform — then goes through
-// the same edit path as typing into the controls by hand: an ordinary
-// preview the operator can inspect and Cancel, not a new endpoint, and not
-// a confirmation dialog, because nothing changes on the display until Save.
-// It overwrites all three, including a field the operator already set: that
-// is what makes it useful on a `mode_unsupported` divergence, where "pin
-// current settings" means "stop asking for what this display cannot do,
-// and state what it is actually showing instead."
-$("o-pin").onclick = () => {
-  if (!selected) return;
-  const known = knownOutputs().find((k) => k.name === selected);
+// Pure, deterministic grid solver with linked content scale and overlap.
+// If content scale is specified, slices fill the canvas at that scale with natural overlaps.
+// If overlap is specified, scale is calculated to guarantee at least that overlap in both dimensions.
+function getArrangementMetrics(outputs, rows, columns, canvas) {
+  if (!Number.isInteger(rows) || !Number.isInteger(columns) || rows < 1 || columns < 1 || outputs.length > rows * columns)
+    throw new Error("Choose positive rows and columns with a slot for every enabled output.");
+  if (!canvas?.width || !canvas?.height || !canvas?.yDensity) throw new Error("Canvas dimensions are unavailable.");
+  if (outputs.some(o => !(rasterDimensions(o)?.width > 0 && rasterDimensions(o)?.height > 0))) throw new Error("Every enabled output needs a known raster size.");
+
+  const colWidth = Array(columns).fill(0), rowHeight = Array(rows).fill(0);
+  outputs.forEach((o, index) => {
+    const row = Math.floor(index / columns), column = index % columns;
+    const raster = rasterDimensions(o);
+    colWidth[column] = Math.max(colWidth[column], raster.width);
+    rowHeight[row] = Math.max(rowHeight[row], raster.height);
+  });
+
+  const sumW = colWidth.reduce((a, b) => a + b, 0);
+  const sumH = rowHeight.reduce((a, b) => a + b, 0);
+  let divW = 0;
+  for (let i = 1; i < columns; i++) divW += Math.min(colWidth[i - 1], colWidth[i]);
+  let divH = 0;
+  for (let j = 1; j < rows; j++) divH += Math.min(rowHeight[j - 1], rowHeight[j]);
+
+  return { colWidth, rowHeight, sumW, sumH, divW, divH, Wc: canvas.width, Hc: canvas.height };
+}
+
+function scaleFromOverlap(metrics, overlap) {
+  const { sumW, divW, sumH, divH, Wc, Hc, colWidth, rowHeight } = metrics;
+  const hasX = colWidth.length > 1 && divW > 0;
+  const hasY = rowHeight.length > 1 && divH > 0;
+  const sx = hasX ? (sumW - overlap * divW) / Wc : sumW / Wc;
+  const sy = hasY ? (sumH - overlap * divH) / Hc : sumH / Hc;
+  if (hasX && hasY) return Math.min(sx, sy);
+  if (hasX) return sx;
+  if (hasY) return sy;
+  return Math.min(sx, sy);
+}
+
+function overlapsFromScale(metrics, scale) {
+  const { sumW, divW, sumH, divH, Wc, Hc, colWidth, rowHeight } = metrics;
+  const hasX = colWidth.length > 1 && divW > 0;
+  const hasY = rowHeight.length > 1 && divH > 0;
+  const ox = hasX ? (sumW - scale * Wc) / divW : 0;
+  const oy = hasY ? (sumH - scale * Hc) / divH : 0;
+  return {
+    ox,
+    oy,
+    minOverlap: (hasX && hasY) ? Math.min(ox, oy) : (hasX ? ox : (hasY ? oy : 0)),
+  };
+}
+
+function solveArrangement(outputs, rows, columns, scaleOrOpts, canvas) {
+  const metrics = getArrangementMetrics(outputs, rows, columns, canvas);
+  let scale;
+  if (typeof scaleOrOpts === "object" && scaleOrOpts !== null) {
+    scale = scaleOrOpts.scale ?? scaleFromOverlap(metrics, scaleOrOpts.overlap ?? 0);
+  } else {
+    scale = Number(scaleOrOpts);
+  }
+  if (!(scale > 0 && Number.isFinite(scale))) throw new Error("Content scale must be positive.");
+  const { colWidth, rowHeight, sumW, sumH, divW, divH, Wc, Hc } = metrics;
+  const { ox, oy, minOverlap } = overlapsFromScale(metrics, scale);
+  if ((colWidth.length > 1 && ox >= 1.0) || (rowHeight.length > 1 && oy >= 1.0)) {
+    throw new Error("Content scale is too small for this grid: overlap cannot reach 100%.");
+  }
+
+  const xOrigins = [0];
+  for (let i = 1; i < columns; i++) {
+    const seam = ox * Math.min(colWidth[i - 1], colWidth[i]);
+    xOrigins.push(Math.max(xOrigins[i - 1], xOrigins[i - 1] + (colWidth[i - 1] - seam) / scale));
+  }
+  const yOrigins = [0];
+  for (let j = 1; j < rows; j++) {
+    const seam = oy * Math.min(rowHeight[j - 1], rowHeight[j]);
+    yOrigins.push(Math.max(yOrigins[j - 1], yOrigins[j - 1] + (rowHeight[j - 1] - seam) / scale));
+  }
+
+  if (columns === 1) {
+    xOrigins[0] = Math.max(0, (Wc - colWidth[0] / scale) / 2);
+  }
+  if (rows === 1) {
+    yOrigins[0] = Math.max(0, (Hc - rowHeight[0] / scale) / 2);
+  }
+
+  return outputs.map((output, index) => {
+    const row = Math.floor(index / columns), column = index % columns;
+    const raster = rasterDimensions(output);
+    return {
+      output,
+      source: {
+        x: xOrigins[column] / canvas.width,
+        y: yOrigins[row] / canvas.yDensity,
+        width: raster.width / (scale * canvas.width),
+        height: raster.height / (scale * canvas.yDensity),
+      },
+      scale,
+      fit: 1 / scale,
+      ox,
+      oy,
+      minOverlap,
+      unused: { width: 0, height: 0 },
+    };
+  });
+}
+function identityGeometry(source) {
+  return { source: structuredClone(source), corners: structuredClone(unitPins), center: [.5, .5], rasterFootprint: structuredClone(source) };
+}
+
+let lastArrangeEdit = "overlap";
+
+function updateArrangeFromOverlap() {
+  lastArrangeEdit = "overlap";
+  try {
+    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
+    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
+    const canvas = canvasPixels();
+    if (!entries.length || !canvas) return;
+    const metrics = getArrangementMetrics(entries, rows, columns, canvas);
+    const overlapVal = Number($("arrange-overlap").value);
+    const overlap = Number.isFinite(overlapVal) ? overlapVal / 100 : 0;
+    const scale = scaleFromOverlap(metrics, overlap);
+    if (scale > 0 && Number.isFinite(scale)) {
+      $("arrange-scale").value = editNumber(scale * 100, 2);
+    }
+  } catch (_) {}
+  arrangementPreview();
+}
+
+function updateArrangeFromScale() {
+  lastArrangeEdit = "scale";
+  try {
+    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
+    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
+    const canvas = canvasPixels();
+    if (!entries.length || !canvas) return;
+    const metrics = getArrangementMetrics(entries, rows, columns, canvas);
+    const scaleVal = Number($("arrange-scale").value);
+    const scale = Number.isFinite(scaleVal) ? scaleVal / 100 : 1;
+    if (scale > 0 && Number.isFinite(scale)) {
+      const { minOverlap } = overlapsFromScale(metrics, scale);
+      $("arrange-overlap").value = editNumber(Math.max(0, Math.min(99.9, minOverlap * 100)), 1);
+    }
+  } catch (_) {}
+  arrangementPreview();
+}
+
+function updateArrangeGrid() {
+  if (lastArrangeEdit === "scale") {
+    updateArrangeFromScale();
+  } else {
+    updateArrangeFromOverlap();
+  }
+}
+
+function arrangementPreview() {
+  try {
+    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
+    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
+    const canvas = canvasPixels();
+    const metrics = getArrangementMetrics(entries, rows, columns, canvas);
+    let scale = Number($("arrange-scale").value) / 100;
+    if (!(scale > 0 && Number.isFinite(scale))) {
+      const overlapVal = Number($("arrange-overlap").value);
+      const overlap = Number.isFinite(overlapVal) ? overlapVal / 100 : 0;
+      scale = scaleFromOverlap(metrics, overlap);
+      $("arrange-scale").value = editNumber(scale * 100, 2);
+    }
+    const result = solveArrangement(entries, rows, columns, scale, canvas);
+    const first = result[0];
+    let msg = `Content scale ${displayNumber(scale * 100, 2)}%`;
+    if (columns > 1 || rows > 1) {
+      msg += ` · Overlap: ${columns > 1 ? `${displayNumber(first.ox * 100, 1)}% H` : ""}${columns > 1 && rows > 1 ? ", " : ""}${rows > 1 ? `${displayNumber(first.oy * 100, 1)}% V` : ""}`;
+    } else {
+      msg += " (single output fills canvas)";
+    }
+    if (first.ox < -0.001 || first.oy < -0.001) {
+      msg += " · ⚠ Canvas is larger than outputs at this scale (gap).";
+    } else if (first.ox > 0.8 || first.oy > 0.8) {
+      msg += " · ⚠ Overlap is very high (>80%); outputs almost entirely cover each other.";
+    } else {
+      msg += " · Slices fill canvas.";
+    }
+    $("arrange-preview").textContent = msg;
+    $("arrange-apply").disabled = false;
+  } catch (error) {
+    $("arrange-preview").textContent = error.message;
+    $("arrange-apply").disabled = true;
+  }
+}
+
+$("arrange-outputs").onclick = () => {
+  const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
+  if (!entries.length) {
+    toast("No enabled outputs to arrange.");
+    return;
+  }
+  const count = entries.length;
+  let rows = Number($("arrange-rows").value) || 1;
+  let cols = Number($("arrange-columns").value) || count;
+  if (rows * cols < count) {
+    if (count === 4) { rows = 2; cols = 2; }
+    else if (count === 6) { rows = 2; cols = 3; }
+    else { rows = 1; cols = count; }
+    $("arrange-rows").value = rows;
+    $("arrange-columns").value = cols;
+  }
+  const canvas = canvasPixels();
+  if (canvas) {
+    try {
+      const metrics = getArrangementMetrics(entries, rows, cols, canvas);
+      let overlapVal = Number($("arrange-overlap").value);
+      if (!Number.isFinite(overlapVal) || overlapVal < 0 || overlapVal >= 100) {
+        overlapVal = 0;
+        $("arrange-overlap").value = "0";
+      }
+      const scale = scaleFromOverlap(metrics, overlapVal / 100);
+      $("arrange-scale").value = editNumber(scale * 100, 2);
+    } catch (_) {}
+  }
+  arrangementPreview();
+  $("arrange-dialog").showModal();
+};
+
+$("arrange-overlap").onchange = updateArrangeFromOverlap;
+$("arrange-scale").onchange = updateArrangeFromScale;
+$("arrange-rows").onchange = updateArrangeGrid;
+$("arrange-columns").onchange = updateArrangeGrid;
+
+$("arrange-apply").onclick = () => {
+  try {
+    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
+    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
+    const canvas = canvasPixels();
+    const scale = Number($("arrange-scale").value) / 100;
+    for (const item of solveArrangement(entries, rows, columns, scale, canvas)) {
+      item.output.geometry ??= identityGeometry(item.source);
+      item.output.geometry.source = item.source;
+    }
+    $("arrange-dialog").close();
+    pushPreview(true);
+    renderLayout();
+    renderSharedContent();
+    renderWarpEditor();
+  } catch (error) {
+    $("arrange-preview").textContent = error.message;
+  }
+};
+
+function togglePin(key) {
+  if (!selected || !loaded()) return;
+  const known = knownOutputs().find(k => k.name === selected);
   const existing = configEntry(selected);
   const fields = pinnableFields(known, existing);
-  $("o-mode").value = fields.mode
-    ? `${fields.mode.width}x${fields.mode.height}x${fields.mode.refreshHz}` : "";
-  $("o-scale").value = fields.scale ?? "";
-  $("o-transform").value = fields.transform ?? "";
-  outputEdited();
-  toast("pinned — Save to keep, Cancel to undo");
-};
-
-// The opposite direction: back to "nothing settled yet", so the daemon
-// re-adopts on its next settled pass. Position is never touched by either
-// button — it is never adopted in the first place.
-$("o-pin-clear").onclick = () => {
-  if (!selected) return;
-  $("o-mode").value = "";
-  $("o-scale").value = "";
-  $("o-transform").value = "";
-  outputEdited();
-  toast("cleared — Save to keep, Cancel to undo");
-};
+  const controls = { mode: "o-mode", scale: "o-scale", transform: "o-transform" };
+  const control = $(controls[key]);
+  if (existing?.[key] != null) control.value = "";
+  else if (key === "mode") control.value = fields.mode ? `${fields.mode.width}x${fields.mode.height}x${fields.mode.refreshHz}` : "";
+  else control.value = fields[key] ?? "";
+  outputEdited(controls[key]);
+}
+$("pin-mode").onclick = () => togglePin("mode");
+$("pin-output-scale").onclick = () => togglePin("scale");
+$("pin-transform").onclick = () => togglePin("transform");
 
 $("o-remove").onclick = () => {
   // A layout edit like any other: it goes to the outputs immediately, Save
@@ -1706,12 +2302,6 @@ $("o-remove").onclick = () => {
   removeFromLayout($("output-name").textContent);
   toast("removed from the layout — Save to keep, Cancel to undo");
 };
-$("o-cancel").onclick = () => run(async () => {
-  await cancelPreview();
-  $("output-editor").classList.add("hidden");
-  selected = null;
-  renderLayout();
-}, "reverted");
 
 // --- apps ----------------------------------------------------------------
 
@@ -2033,8 +2623,8 @@ function paintCapabilities(r) {
 // output, needs neither overlaps nor a canvas, and is most wanted on the
 // plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
-  const idle = overlaps === 0 && config?.projection?.mode !== "warp";
-  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free"]) {
+  const idle = !config?.projection?.canvas;
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free"]) {
     $(id).disabled = idle;
   }
   $("pj-idle").hidden = !idle;
@@ -2050,28 +2640,67 @@ function renderProjection(force = false) {
   // left alone because an edit is in progress, so a config reload from
   // another client does not blank it.
   renderProjectionTiming();
+  renderBlackLiftStatus();
   renderWarpEditor();
-  const panel = $("projection-panel");
-  if (!force && panel.contains(document.activeElement)) return;
+  const panel = $("edge-blending-panel") || $("projection-panel");
+  const timingPanel = $("frame-timing-panel");
+  if (!force && ((panel && panel.contains(document.activeElement)) || (timingPanel && timingPanel.contains(document.activeElement)))) return;
 
   const projection = config?.projection;
   $("pj-blend").checked = !!projection && projection.blend !== false;
-  $("pj-gamma").value = projection?.gamma ?? 2.2;
-  $("pj-lift").value = projection?.blackLift ?? 0;
+  $("pj-gamma").value = editNumber(projection?.gamma ?? 2.2, 2);
+  const lift = projection?.blackLift;
+  $("pj-lift").value = editNumber(typeof lift === "object" && lift ? lift.level : (lift ?? 0), 3);
+  $("pj-lift-mode").value = lift?.mode === "adaptive" ? "adaptive" : "fixed";
+  $("pj-adaptive-fields").hidden = $("pj-lift-mode").value !== "adaptive";
+  for (const [id, key, fallback, digits] of [["pj-dark", "darkThreshold", .02, 4], ["pj-bright", "brightThreshold", .2, 4], ["pj-rise", "riseMs", 1000, 1], ["pj-fall", "fallMs", 250, 1], ["pj-slew", "slewPerSecond", .1, 6]]) $(id).value = editNumber(lift?.[key] ?? fallback, digits);
   $("pj-free").checked = projection?.freeRun ?? false;
   $("pj-renderer").value = projection?.renderer ?? "auto";
 }
 
-function projectionFromForm() {
-  const blend = $("pj-blend").checked;
-  const gamma = Number($("pj-gamma").value) || 2.2;
-  const blackLift = Number($("pj-lift").value) || 0;
-  const freeRun = $("pj-free").checked;
-  const renderer = $("pj-renderer").value || "auto";
-  const testPattern = $("tp-pattern").value || null;
-  return { ...config?.projection, mode: config?.projection?.mode ?? "simple",
-    blend, gamma, blackLift, freeRun, renderer, testPattern };
+function updateProjectionField(field) {
+  const projection = config?.projection ? structuredClone(config.projection) : { mode: "simple" };
+  const level = typeof projection.blackLift === "object" && projection.blackLift ? projection.blackLift.level : (projection.blackLift ?? 0);
+  const adaptiveLift = () => ({ mode: "adaptive", level,
+    darkThreshold: .02, brightThreshold: .2, riseMs: 1000, fallMs: 250, slewPerSecond: .1,
+    ...(typeof projection.blackLift === "object" ? projection.blackLift : {}) });
+  if (field === "tp-pattern") projection.testPattern = $("tp-pattern").value || null;
+  else if (field === "pj-blend") projection.blend = $("pj-blend").checked;
+  else if (field === "pj-gamma") projection.gamma = Number($("pj-gamma").value);
+  else if (field === "pj-free") projection.freeRun = $("pj-free").checked;
+  else if (field === "pj-renderer") projection.renderer = $("pj-renderer").value || "auto";
+  else if (field === "pj-lift-mode") projection.blackLift = $("pj-lift-mode").value === "adaptive" ? adaptiveLift() : level;
+  else if (field === "pj-lift") {
+    if (typeof projection.blackLift === "object" && projection.blackLift) projection.blackLift = { ...projection.blackLift, level: Number($("pj-lift").value) };
+    else projection.blackLift = Number($("pj-lift").value);
+  } else if (["pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew"].includes(field)) {
+    const keys = { "pj-dark": "darkThreshold", "pj-bright": "brightThreshold", "pj-rise": "riseMs", "pj-fall": "fallMs", "pj-slew": "slewPerSecond" };
+    projection.blackLift = { ...adaptiveLift(), [keys[field]]: Number($(field).value) };
+  }
+  $("pj-adaptive-fields").hidden = projection.blackLift?.mode !== "adaptive";
+  config.projection = projection;
 }
+
+let liftStatusClock = null;
+function renderBlackLiftStatus() {
+  const status = projectionStats?.control?.blackLift;
+  const adaptive = config?.projection?.blackLift?.mode === "adaptive";
+  const node = $("pj-lift-status");
+  node.hidden = !adaptive;
+  if (!adaptive) return;
+  if (!status || !projectionStats?.running) {
+    node.textContent = "Adaptive compensation is waiting for an active source measurement. Configured fixed level applies until measurement is available.";
+    return;
+  }
+  if (liftStatusClock?.status !== status) liftStatusClock = { status, received: performance.now() };
+  const sampleAge = Math.round((status.sampleAgeMs ?? 0) + performance.now() - liftStatusClock.received);
+  const prefix = status.paused ? "Calibration: fixed compensation." : status.stale ? "Adaptive compensation: retaining the last valid target." : status.available ? "Adaptive compensation." : "Adaptive unavailable: fixed compensation.";
+  const sample = status.luminance == null ? "No valid source measurement." :
+    `Linear luminance ${status.luminance.toFixed(4)} · ${status.sampleCount} samples · capture ${status.captureId} · age ${sampleAge} ms.`;
+  node.textContent = `${prefix} Applied ${status.applied.toFixed(4)} · target ${status.target.toFixed(4)}. ${sample} ${status.reason ?? ""}`;
+  node.title = status.metric;
+}
+setInterval(renderBlackLiftStatus, 1000);
 
 // --- destination geometry editor -----------------------------------------
 const outputKey = o => {
@@ -2079,7 +2708,7 @@ const outputKey = o => {
   return m.name != null && m.make == null && m.model == null && m.serial == null ? m.name :
     `edid:${m.name ?? ""}:${m.make ?? ""}:${m.model ?? ""}:${m.serial ?? ""}`;
 };
-const warpOutput = () => config?.outputs?.find(o => outputKey(o) === $("warp-output").value);
+const warpOutput = () => configEntry(selected);
 const warpAvailable = () => projectionStats?.geometry?.warpAvailable === true && config?.projection?.renderer !== "cpu";
 const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy && !configConflict;
 let warpDrag = null, rejectedHandle = null;
@@ -2135,15 +2764,17 @@ function editGeometry(change, handle = null) {
   const next = structuredClone(warpOutput().geometry);
   try {
     change(next); validatePins(next);
-    rejectedHandle = null; $("warp-error").textContent = "";
+    rejectedHandle = null; setDisplayError("");
     // Pointer-up often repeats the final move. Its state is already accepted,
     // in flight, or in the newest queued slot; do not create a second preview.
     if (JSON.stringify(next) === JSON.stringify(warpOutput().geometry)) { drawWarp(); return; }
+    const material = JSON.stringify({ source: next.source, corners: next.corners, center: next.center }) !==
+      JSON.stringify({ source: warpOutput().geometry.source, corners: warpOutput().geometry.corners, center: warpOutput().geometry.center });
     warpOutput().geometry = next;
-    pushPreview(); drawWarp(); renderCanvas();
+    pushPreview(material); drawWarp(); renderCanvas();
     if (!warpDrag) renderWarpNumbers();
   } catch (error) {
-    rejectedHandle = handle; $("warp-error").textContent = error.message; drawWarp();
+    rejectedHandle = handle; setDisplayError(error.message); drawWarp();
   }
 }
 function moveHandle(index, point) {
@@ -2174,38 +2805,65 @@ function drawWarp() {
 function renderWarpNumbers() {
   const g = warpOutput()?.geometry;
   if (!g) return;
-  const input = (id,label,value) => `<div><label for="${id}">${label}</label><input id="${id}" type="number" step="0.001" value="${value}" ${warpEditable()?"":"disabled"}></div>`;
-  $("warp-numbers").innerHTML = g.corners.map((p,i) => p.map((v,a) => input(`pin-${i}-${a}`,`${["Top left","Top right","Bottom right","Bottom left"][i]} ${a?"Y":"X"}`,v)).join("")).join("") +
-    g.center.map((v,a)=>input(`center-${a}`,`${a?"Horizontal":"Vertical"} center fraction`,v)).join("");
+  const editable = warpEditable();
+  const pinIn = (i, a, label) =>
+    `<div><label for="pin-${i}-${a}">${label}</label><input id="pin-${i}-${a}" type="number" step="any" value="${editNumber(g.corners[i][a], 4)}" ${editable ? "" : "disabled"}></div>`;
+  const centerIn = (a, label) =>
+    `<div><label for="center-${a}">${label}</label><input id="center-${a}" type="number" step="any" value="${editNumber(g.center[a], 4)}" ${editable ? "" : "disabled"}></div>`;
+
+  $("warp-numbers").innerHTML = `
+    <div class="warp-matrix" role="group" aria-label="Corner and center geometry numbers">
+      <div class="warp-cell warp-top-left">
+        <div class="warp-cell-title">Top Left</div>
+        <div class="warp-pair">${pinIn(0, 0, "X")}${pinIn(0, 1, "Y")}</div>
+      </div>
+      <div class="warp-cell warp-empty"></div>
+      <div class="warp-cell warp-top-right">
+        <div class="warp-cell-title">Top Right</div>
+        <div class="warp-pair">${pinIn(1, 0, "X")}${pinIn(1, 1, "Y")}</div>
+      </div>
+
+      <div class="warp-cell warp-empty"></div>
+      <div class="warp-cell warp-center">
+        <div class="warp-cell-title">Center Lines</div>
+        <div class="warp-pair">${centerIn(0, "Vertical (X)")}${centerIn(1, "Horizontal (Y)")}</div>
+      </div>
+      <div class="warp-cell warp-empty"></div>
+
+      <div class="warp-cell warp-bottom-left">
+        <div class="warp-cell-title">Bottom Left</div>
+        <div class="warp-pair">${pinIn(3, 0, "X")}${pinIn(3, 1, "Y")}</div>
+      </div>
+      <div class="warp-cell warp-empty"></div>
+      <div class="warp-cell warp-bottom-right">
+        <div class="warp-cell-title">Bottom Right</div>
+        <div class="warp-pair">${pinIn(2, 0, "X")}${pinIn(2, 1, "Y")}</div>
+      </div>
+    </div>
+  `;
   g.corners.forEach((p,i)=>p.forEach((v,a)=>$( `pin-${i}-${a}`).onchange = e => editGeometry(n=>n.corners[i][a]=Number(e.target.value),i)));
   g.center.forEach((v,a)=>$(`center-${a}`).onchange = e => editGeometry(n=>n.center[a]=Number(e.target.value),a?6:4));
-  $("warp-source").innerHTML = ["source","rasterFootprint"].map(field => Object.entries(g[field]).map(([key,value]) => input(`${field}-${key}`,`${field === "source" ? "Source" : "Raster footprint"} ${key}`,value)).join("")).join("");
-  for (const field of ["source","rasterFootprint"]) for (const key of ["x","y","width","height"])
-    $(`${field}-${key}`).onchange = e => editGeometry(n => {
-      const value = Number(e.target.value);
-      if (!Number.isFinite(value) || (["width","height"].includes(key) && value <= 0)) throw new Error("Source and footprint dimensions must be finite and positive.");
-      n[field][key] = value;
-    });
 }
 function renderWarpEditor() {
   if (!config || warpDrag) return;
-  $("warp-mode").value = config.projection?.mode ?? "simple";
-  const chosen = $("warp-output").value;
-  $("warp-output").innerHTML = (config.outputs ?? []).filter(o=>o.enable !== false).map(o=>`<option value="${escape(outputKey(o))}">${escape(outputKey(o))}</option>`).join("");
-  if ([...$("warp-output").options].some(o=>o.value===chosen)) $("warp-output").value = chosen;
-  $("warp-controls").hidden = !warpOutput()?.geometry;
+  const visibleWarp = warpAvailable() && config.projection?.mode === "warp";
+  const show = !!(warpOutput()?.geometry && visibleWarp);
+  $("warp-controls").hidden = !show;
+  if ($("output-warp")) $("output-warp").hidden = !show;
   const mode = warpOutput()?.mode;
   $("warp-editor").style.aspectRatio = mode ? `${mode.width} / ${mode.height}` : "16 / 9";
-  drawWarp(); renderWarpNumbers(); renderWarpStatus(); renderCanvas();
+  drawWarp(); renderWarpNumbers(); renderWarpStatus(); renderCanvas(); renderSharedContent();
 }
 function renderWarpStatus() {
   const g = projectionStats?.geometry, c = projectionStats?.control;
-  $("warp-capability").textContent = `Effective mode: ${g?.effectiveMode ?? "unknown"}. ` +
-    (warpAvailable() ? "Warp capability verified. " : `Warp editing unavailable: ${g?.reason ?? "waiting for capability verification"}. `) +
-    (g?.retainedWarp || config?.projection?.canvas ? "Stored warp settings are retained." : "Convert rectangles to create warp settings.");
-  $("warp-mode").disabled = configConflict || configBusy;
-  $("warp-mode").querySelector('[value="warp"]').disabled = !warpAvailable();
-  for (const id of ["warp-convert","canvas-adopt","canvas-recommend"]) $(id).disabled = !warpAvailable() || configConflict || configBusy;
+  const requested = config?.projection?.mode ?? "simple", forcedSimple = requested === "warp" && !warpAvailable();
+  $("warp-capability").textContent = forcedSimple
+    ? "Simple is selected while Warp intent and calibration are retained."
+    : requested === "warp" ? "Warp capability verified. Shared crop edits keep the calibration." : "Simple uses the shared canvas and crop without geometric correction.";
+  $("mode-simple").setAttribute("aria-pressed", String(forcedSimple || requested === "simple"));
+  $("mode-warp").setAttribute("aria-pressed", String(!forcedSimple && requested === "warp"));
+  $("mode-simple").disabled = configConflict || configBusy;
+  $("mode-warp").disabled = !warpAvailable() || configConflict || configBusy;
   for (const id of ["warp-reset-pins","warp-reset-centers"]) $(id).disabled = !warpEditable();
   $("warp-controls").inert = !warpEditable();
   let message = previewActive || config?.committed === false ? "Unsaved edits. " : "";
@@ -2226,82 +2884,78 @@ function oneToOneStatus() {
   const h = Math.max(1, Math.round(c.renderWidth / c.aspect));
   const source = [g.source.x*c.renderWidth, g.source.y*c.aspect*h,
     g.source.width*c.renderWidth, g.source.height*c.aspect*h];
-  const exact = (c.scale ?? 1) >= 1 && g.center.every(v=>v===.5) &&
+  const exact = g.center.every(v=>v===.5) &&
     g.corners.every((p,i)=>p.every((v,a)=>v===unitPins[i][a])) &&
     source.every(Number.isInteger) && source[2]===mode.width && source[3]===mode.height;
   return exact ? "Selected output: one-to-one sampling." : "Selected output: resampled (not one-to-one).";
 }
 function renderCanvas() {
   const c = config?.projection?.canvas;
-  $("canvas-current").textContent = c ? `Current: ${c.renderWidth} × ${Math.max(1,Math.round(c.renderWidth/c.aspect))}; aspect ${c.aspect}. ` +
-    oneToOneStatus() : "No retained warp canvas. Convert rectangles first.";
+  const pixels = canvasPixels(c);
+  const mp = (c && pixels) ? (c.renderWidth * pixels.height / 1e6).toFixed(1) : null;
+  $("canvas-current").textContent = (c && pixels)
+    ? `Canvas ${c.renderWidth} × ${pixels.height} (${mp} MP); aspect ${displayNumber(c.aspect, 4)}. ${oneToOneStatus()}`
+    : "Canvas unavailable.";
   if (!$("warp-canvas").contains(document.activeElement)) {
-    $("canvas-aspect").value = c?.aspect ?? ""; $("canvas-width").value = c?.renderWidth ?? ""; $("canvas-scale").value = c?.scale ?? 1;
+    $("canvas-aspect").value = c ? editNumber(c.aspect, 4) : "";
+    $("canvas-width").value = c?.renderWidth ?? "";
   }
-  if (!recommendation) { $("canvas-presets").replaceChildren(); $("canvas-recommendation").textContent = "Recommendations are approximate and never applied automatically."; }
-}
-async function convertedRectangles() {
-  return api("/projection/convert", {method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({outputs:config.outputs})});
-}
-$("warp-convert").onclick = () => run(async () => {
-  const version = editVersion, result = await convertedRectangles();
-  if (version !== editVersion) throw new Error("Layout changed during conversion. Try again.");
-  if (!warpAvailable()) throw new Error("Warp capability is unavailable.");
-  const geometries = new Map(result.outputs.map(o=>[o.key,o.geometry]));
-  for (const o of config.outputs) if (geometries.has(outputKey(o))) o.geometry=geometries.get(outputKey(o));
-  config.projection = {...projectionFromForm(),canvas:result.canvas,mode:"warp"};
-  pushPreview(); renderWarpEditor();
-});
-$("warp-mode").onchange = e => {
-  if (!config) return;
-  if (e.target.value === "warp" && (!warpAvailable() || !config.projection?.canvas)) {
-    toast("Convert rectangles first, or wait for warp capability.",true); renderWarpEditor(); return;
-  }
-  config.projection = {...projectionFromForm(),mode:e.target.value}; pushPreview(); renderWarpEditor(); renderLayoutSize();
-};
-$("warp-output").onchange = renderWarpEditor;
-$("warp-save").onclick = () => $("pj-save").click();
-$("warp-cancel").onclick = () => $("pj-cancel").click();
-$("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
-$("warp-reset-pins").onclick = () => run(async () => {
-  const version=editVersion, key=$("warp-output").value, candidate=await convertedRectangles();
-  if (version!==editVersion || key!==$("warp-output").value) throw new Error("Selection changed during reset. Try again.");
-  const geometry = candidate.outputs.find(o=>o.key===key)?.geometry;
-  if (geometry) editGeometry(g=>g.corners=geometry.corners);
-});
-function adoptCanvas(aspect,width,scale) {
-  if (!warpAvailable() || !config?.projection?.canvas) throw new Error("Convert rectangles with warp capability verified first.");
-  const height=Math.max(1,Math.round(width/aspect));
-  if (![aspect,width,scale].every(v=>Number.isFinite(v)&&v>0) || !Number.isInteger(width) || width>32768 || height>32768 || width*height>64000000)
-    throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP, and a positive recorded scale.");
-  config.projection.canvas = {aspect,renderWidth:width,scale};
-  $("canvas-aspect").value=aspect; $("canvas-width").value=width; $("canvas-scale").value=scale;
-  pushPreview(); renderCanvas();
-}
-$("canvas-adopt").onclick = () => run(async () => adoptCanvas(Number($("canvas-aspect").value),Number($("canvas-width").value),Number($("canvas-scale").value)));
-$("canvas-recommend").onclick = () => run(async () => {
-  await flushPreviews();
-  const version=editVersion, result=await api("/projection/recommendation");
-  if (version!==editVersion || String(result.generation)!==String(configGeneration) || result.revision!==config.revision)
-    throw new Error("Recommendation is stale. Request another after the current edit settles.");
-  recommendation=result;
-  $("canvas-recommendation").textContent = `Approximate ideal: ${result.idealWidth} × ${result.idealHeight}; admissible: ${result.admissibleWidth} × ${result.admissibleHeight}. ` +
-    `Limits: ${result.knownLimits.maxDimension} per axis, ${result.knownLimits.maxCanvasPixels} canvas pixels, ${result.knownLimits.maxOutputPixels ?? 32000000} pixels per output. ` +
-    [...result.warnings,...result.unknownLimits.map(v=>`Unknown: ${v}`)].join(" ");
+  $("canvas-height").textContent = pixels ? `${pixels.height} (${mp} MP)` : "—";
+  if (!recommendation) return;
+  $("canvas-recommendation").textContent = `${recommendation.idealWidth} px`;
+  const ratio = c?.renderWidth / recommendation.idealWidth;
+  $("canvas-rendering-scale").textContent = Number.isFinite(ratio) ? `${displayNumber(ratio * 100, 1)}%` : "—";
+  const focused = document.activeElement === $("canvas-width") || $("canvas-presets").contains(document.activeElement);
+  $("canvas-presets").hidden = !focused;
+  if (!focused) return;
+  const presetKey = `${recommendationInput}:${recommendation.idealWidth}:${c?.aspect}`;
+  if ($("canvas-presets").dataset.key === presetKey) return;
   $("canvas-presets").replaceChildren();
-  for (const preset of result.presets) {
-    const button=document.createElement("button"); button.className="action ghost";
-    button.textContent=`Adopt ${preset.width} × ${preset.height} (${preset.scale}×)`;
-    button.onclick=()=>run(async()=>{
-      await flushPreviews();
-      const latest={}, current=await rawApi("/config",undefined,latest);
-      if (recommendation!==result || version!==editVersion || String(result.generation)!==String(latest.generation) || latest.epoch!==configEpoch || current.revision!==result.revision)
-        throw new Error("Recommendation is stale. Request another before adoption.");
-      adoptCanvas(result.requestedAspect,preset.width,preset.scale);
-    });
+  for (const percent of [.25, .5, .75, 1]) {
+    const target = Math.round(recommendation.idealWidth * percent);
+    const valid = recommendation.presets?.find(p => Math.abs((p.scale ?? p.width / recommendation.idealWidth) - percent) < .001) ??
+      recommendation.presets?.find(p => p.width === target);
+    const width = valid?.width, height = valid?.height ?? (width && Math.round(width / c.aspect));
+    const limits = recommendation.knownLimits ?? {};
+    const available = valid?.available !== false && Number.isInteger(width) && width > 0 && height > 0 &&
+      (!limits.maxDimension || width <= limits.maxDimension && height <= limits.maxDimension) &&
+      (!limits.maxCanvasPixels || width * height <= limits.maxCanvasPixels);
+    const button = document.createElement("button"); button.className = "action ghost"; button.type = "button";
+    button.textContent = `${percent * 100}%${width ? ` (${width}px)` : " unavailable"}`;
+    button.disabled = !available;
+    button.onclick = () => setCanvasWidth(width);
     $("canvas-presets").append(button);
   }
-});
+  $("canvas-presets").dataset.key = presetKey;
+}
+function setProjectionMode(mode) {
+  if (!config || (mode === "warp" && !warpAvailable())) return;
+  config.projection = { ...config.projection, mode };
+  pushPreview(true); renderWarpEditor(); renderLayoutSize();
+}
+$("mode-simple").onclick = () => setProjectionMode("simple");
+$("mode-warp").onclick = () => setProjectionMode("warp");
+$("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
+$("warp-reset-pins").onclick = () => editGeometry(g=>g.corners=structuredClone(unitPins));
+function adoptCanvas(aspect,width, preserveAspectPixels = false) {
+  if (!config?.projection?.canvas) throw new Error("Canvas settings are unavailable.");
+  const height=Math.max(1,Math.round(width/aspect));
+  if (![aspect,width].every(v=>Number.isFinite(v)&&v>0) || !Number.isInteger(width) || width>32768 || height>32768 || width*height>64000000)
+    throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP.");
+  const old = canvasPixels(config.projection.canvas);
+  if (preserveAspectPixels && old) for (const output of config.outputs ?? []) {
+    const source = output.geometry?.source;
+    if (!source) continue;
+    source.y = source.y * old.yDensity / (aspect * height);
+    source.height = source.height * old.yDensity / (aspect * height);
+  }
+  config.projection.canvas = { ...config.projection.canvas, aspect, renderWidth:width };
+  pushPreview(true); renderCanvas(); renderSharedContent();
+}
+function setCanvasWidth(width) { adoptCanvas(config?.projection?.canvas?.aspect, Number(width)); }
+$("canvas-width").onchange = () => { try { setCanvasWidth(Number($("canvas-width").value)); } catch (error) { setDisplayError(error.message); } };
+$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), config?.projection?.canvas?.renderWidth, true); } catch (error) { setDisplayError(error.message); } };
+for (const event of ["focusin", "focusout"]) $("warp-canvas").addEventListener(event, () => setTimeout(renderCanvas));
 const warpSvg = $("warp-editor");
 function pointerPoint(event) {
   const p = new DOMPoint(event.clientX,event.clientY).matrixTransform(warpSvg.getScreenCTM().inverse());
@@ -2312,7 +2966,9 @@ warpSvg.addEventListener("pointerdown",event=>{
   if (!handle || !warpEditable()) return;
   event.preventDefault(); handle.focus();
   warpDrag={id:event.pointerId,index:Number(handle.dataset.handle)};
-  warpSvg.setPointerCapture(event.pointerId);
+  try {
+    warpSvg.setPointerCapture(event.pointerId);
+  } catch (_) {}
 });
 warpSvg.addEventListener("pointermove",event=>{
   if (warpDrag?.id===event.pointerId) moveHandle(warpDrag.index,pointerPoint(event));
@@ -2321,7 +2977,9 @@ function endWarpDrag(event) {
   if (warpDrag?.id!==event.pointerId) return;
   if (event.type === "pointerup") moveHandle(warpDrag.index,pointerPoint(event));
   warpDrag=null;
-  if (warpSvg.hasPointerCapture(event.pointerId)) warpSvg.releasePointerCapture(event.pointerId);
+  try {
+    if (warpSvg.hasPointerCapture(event.pointerId)) warpSvg.releasePointerCapture(event.pointerId);
+  } catch (_) {}
   // pushPreview keeps the final valid state in the single newest-state slot.
   renderWarpNumbers(); schedulePreview();
 }
@@ -2418,21 +3076,23 @@ function renderProjectionTiming() {
     `<td class="mono">${lagCell(o.lagFrames)}</td></tr>`).join("");
 }
 
-for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-free", "pj-renderer", "tp-pattern"]) {
+for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-renderer", "tp-pattern"]) {
   $(id).addEventListener("input", () => {
     // Silently, not with a toast: a restored form value is not a user asking
     // for anything, and a complaint about it would be the same noise in a
     // different colour.
     if (!config) return;
-    config.projection = projectionFromForm();
+    updateProjectionField(id);
     renderLayoutSize();
-    pushPreview();
+    pushPreview(false);
   });
 }
 
 $("pj-save").onclick = () => run(async () => {
   document.activeElement?.blur();
   if (!loaded()) return;
+  if (displayValidationError || document.querySelector("#tab-displays :invalid"))
+    throw new Error(displayValidationError || "Fix the invalid Displays field before saving.");
   // Input handlers already updated the working copy. Do not reconstruct it
   // from form values that may predate an accepted reload.
   // Blending settings are saved; the test pattern never is. An appliance
@@ -2961,8 +3621,9 @@ async function loadConfig(force = false) {
   $("config-conflict").hidden = true;
   if (document.activeElement !== $("config-json")) $("config-json").value = JSON.stringify(config, null, 2);
   renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
-  if (selected) renderOutputBackgroundChoices(
-    (config?.outputs ?? []).find((o) => o.match?.name === selected)?.background);
+  invalidateRecommendation();
+  if (!selected) selected = layoutEntries()[0]?.known.name ?? null;
+  if (selected) selectOutput(selected);
 }
 $("config-discard").onclick = () => run(async () => {
   clearTimeout(previewTimer); previewQueued = null;

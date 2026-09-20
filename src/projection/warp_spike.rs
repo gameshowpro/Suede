@@ -390,6 +390,7 @@ mod tests {
             canvas_height: 8,
             gamma: 2.2,
             black_lift: 0.1,
+            adaptive_lift: None,
             pattern: None,
             free_run: false,
             renderer: Default::default(),
