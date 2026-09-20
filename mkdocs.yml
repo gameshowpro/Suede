@@ -57,6 +57,10 @@ nav:
       - Deployment: developer/deployment.md
       - Versioning: developer/versioning.md
       - Specification: specification.md
+  - Plans:
+      - Overview: plans/index.md
+      - Black Offset: plans/black-offset.md
+      - Direct-to-Display (VK_KHR_display): plans/VK_KHR_display.md
 
 markdown_extensions:
   - admonition

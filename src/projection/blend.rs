@@ -1522,6 +1522,38 @@ mod tests {
     }
 
     #[test]
+    fn non_overlapping_topology_forces_lift_to_zero() {
+        // When there are no overlaps anywhere (max coverage <= 1), black lift
+        // is forced to zero everywhere to avoid unnecessary contrast degradation.
+        let single = Coverage::new([Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }]);
+        assert_eq!(single.max(), 1);
+        assert_eq!(single.lift(0.2, 500.0, 500.0), 0.0);
+
+        let tiled = Coverage::new([
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            Rect {
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+        ]);
+        assert_eq!(tiled.max(), 1);
+        assert_eq!(tiled.lift(0.2, 500.0, 500.0), 0.0);
+        assert_eq!(tiled.lift(0.2, 2500.0, 500.0), 0.0);
+    }
+
+    #[test]
     fn dynamic_shape_packing_rounds_saturates_and_reserves_bits() {
         let value = pack_dynamic_shape(0.5, 0.5, 9);
         assert_eq!(value & DYNAMIC_TRANSFER_TAG, DYNAMIC_TRANSFER_TAG);

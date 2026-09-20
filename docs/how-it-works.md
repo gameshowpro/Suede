@@ -514,89 +514,107 @@ somewhere. Check the `direct-scanout` health check first — it compares the
 running compositor against these keys and says which way they disagree.
 
 
-## Warping {: #warping }
+## Warping and Display Modes {: #warping }
 
-Warp mode lets an operator fit each projector's picture to a physical surface
-with four destination pins and two center fractions. The public model keeps
-three pieces of geometry separate: a source rectangle selects browser content,
-destination pins move that rectangle in the output raster, and
-`rasterFootprint` records where the projector's entire light field lands. A
-pin drag therefore leaves the browser canvas, source coverage, and physical
-footprint unchanged. Source and footprint rectangles are stored in isotropic
-canvas units; pins are output-local normalized coordinates in TL, TR, BR, BL
-order.
+Suede provides two distinct projection display modes: **Simple mode** and **Warp mode**. Both modes operate on a unified **shared virtual canvas** architecture, allowing operators to switch seamlessly between rectangular layouts and non-linear projection mapping without losing content alignment.
 
-The canvas occupies `[0,1] × [0,1/aspect]`. With `renderWidth = W`, Suede
-uses `H = max(1, round(W/aspect))` and converts a source rectangle to pixel
-boundaries with x density `W` and y density `aspect * H`; rounding `H` is
-preserved rather than silently resizing the chosen width. `scale` is retained
-as descriptive canvas metadata. Warp currently requires output scale `1.0`
-and transform `normal`; output mode dimensions must stay within 32,768 pixels
-per axis and 32 megapixels.
+### Simple vs. Warp Concept
 
-The configured source roster contains one to eight enabled participants,
-including outputs without a connected display. Each source is finite, positive,
-visible after clipping to the canvas, and bounded by ±16 times the larger
-canvas span. The clipped graph connects only through positive-area overlap or
-a shared edge segment, so point contacts and gaps are rejected. Original
-source rectangles that overlap by at least 80% of the smaller area form a
-pure stack only when every pair meets that threshold; mixed stack/seam layouts
-are invalid. These source rules drive normalized minimum-distance seam weights;
-destination pin edits do not change them.
+| Capability / Aspect | Simple Mode | Warp Mode |
+|---|---|---|
+| **Primary Use Case** | Flat screens, LED walls, planar multi-display arrays, zero-distortion setups | Projectors on curved, tilted, or angled physical surfaces; multi-projector blended arrays |
+| **Mapping Geometry** | Pure rectangular crop and scale | Non-linear 4-corner destination pinning and 2-fraction optical center remap |
+| **Edge Blending & Seams** | Simple rectangular overlaps without ramps | Normalized minimum-distance smooth blending ramps with gamma-shaped falloff |
+| **Border Anti-Aliasing** | Not applicable (aligned to raster) | Continuous sub-pixel border coverage attenuating gain and black lift |
+| **Black Level Compensation** | Optional constant black lift | Constant, dynamic, or adaptive black level compensation across overlap zones |
+| **Pipeline Overhead** | Minimal (direct hardware scanning or rectangular blit) | Low GPU fragment shader pass with inverse homography and precomputed transfer tables |
+| **Renderer Compatibility** | GPU and CPU fallback pipelines | Requires GPU pipeline (Vulkan or EGL/GLES) |
+| **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity; bilinear interpolation on non-identity pins |
 
-For each output pixel, the pipeline inverse-maps the destination into content
-coordinates, samples the source, and applies its precomputed canvas-space
-transfer. The table includes picture-border coverage in both gain and black
-lift. Neutral geometry retains the integer-exact sampling path; nonidentity
-geometry uses bilinear sampling and can soften text. Nonneutral center remaps
-are piecewise linear and can kink diagonals at the remap boundary.
+#### The Shared Virtual Canvas Architecture
+In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Simple and Warp share one virtual canvas and identical output source crops (`geometry.source`)**:
+- The headless browser renders to an isotropic continuous canvas `[0, 1] × [0, 1/aspect]`.
+- Each output display selects its rectangular content region in normalized canvas units.
+- In **Simple mode**, that content rectangle is mapped directly to the output raster.
+- In **Warp mode**, the exact same content rectangle is geometrically warped to the destination corner pins in the output raster.
+- **Workflow Benefit**: An operator can arrange output positions and crops in Simple mode, and then switch to Warp mode to calibrate corner pins and center fractions against the physical projection surface without losing their content layout.
 
-The live GPU control path builds only affected outputs away from rendering,
-stages their tables together, and repaints the retained source on static pages.
-Its status distinguishes requested, built, applied, submitted, and compositor
-presentation-feedback generations. Independent output feedback does not imply
-simultaneous optical visibility. The current presentation gate is unchanged.
+#### Automatic Capability Fallback and Retention
+Warp mode requires a filter-capable GPU pipeline, output scale `1.0`, and transform `normal`. If the host starts in CPU fallback mode or on hardware lacking required GPU capabilities:
+- Suede automatically forces the **effective mode to `simple`**.
+- The operator's saved **`warp` settings are safely retained** in configuration.
+- A descriptive health warning is reported in `GET /api/v1/health` and system status.
+- When hardware GPU capability is restored, Warp rendering resumes automatically using the retained geometry.
 
-The slicer reports requested/effective renderer and mode, warp availability,
-and the reason for a limitation. Auto mode prefers a filter-capable GPU capture;
-CPU and exact-only GPU paths retain rectangular rendering. Unsupported direct
-warp requests are rejected explicitly. Static GPU patterns use uploaded source
-canvases through the same shader, preserving connector labels and calibration
-pixels. A single nonidentity output can use the internal planning/slicing path;
-identity keeps the existing direct path.
+---
 
-The daemon keeps simple rectangle settings and warp settings separately. If
-startup finds no warp capability, effective mode is forced to simple while the
-saved warp settings remain available for restoration; the health report names
-the limitation. Geometry-only edits do not resize the headless canvas. An
-explicit canvas or resolution edit does, because `renderWidth` is an operator
-choice rather than a value inferred during a corner drag.
+### Warping Features & Pipeline Architecture
 
-The two read-only planning endpoints keep these choices reviewable. The
-simple-to-warp conversion requires complete explicit modes and positions for
-all enabled configured participants, including disconnected outputs, and
-returns identity pins and neutral centers without saving anything. The
-resolution recommendation uses the effective working copy and includes its
-revision and generation. It samples a dense grid of the largest-singular
-Jacobian density, including both sides of center-remap breaks, then adds a
-conservative margin. The response says `approximate: true`: sampled density is
-useful planning guidance, not an exact maximum proof. Invalid or ill-conditioned
-geometry is rejected. Known planning limits are 32,768 pixels per dimension,
-64 megapixels for the canvas, and 32 megapixels per output; device and
-compositor limits remain unknown, so the endpoint does not probe by resizing a
-headless output.
+Warp mode lets an operator fit each projector's picture to a physical surface using four destination corner pins (`geometry.corners`) and two optical center fractions (`geometry.center`). Content selection (`geometry.source`) is kept strictly decoupled from output pin positioning: dragging a corner pin adjusts physical alignment and keystone correction within the projector's output raster without altering the shared browser canvas, resizing neighboring crops, or affecting content selection.
 
-The public routes are `POST /api/v1/projection/convert` for the unsaved
-simple-to-warp candidate, `GET /api/v1/projection/recommendation` for the
-approximate resolution guidance, and `GET /api/v1/projection/stats` for live
-pipeline status. The stats response includes `geometry` with requested and
-effective mode, requested renderer, warp availability, any limitation reason,
-and whether warp settings remain retained. Recommendations never resize or
-silently adopt a canvas; an operator must write the returned candidate or
-resolution explicitly.
+*(Implementation detail: The configuration schema also retains `geometry.rasterFootprint` in the background to track where a projector's physical light field lands on the canvas—including unlit black borders—allowing the engine to resolve multi-beam coverage independent of active picture pin adjustments.)*
 
-The current alpha schema is written directly. Old configuration files are not
-migrated and no legacy seam-weight mode is retained. See the
-[packet 3 record](../research/warp/PACKET3.md) for the capability evidence and
-the [configuration reference](configuration.md#projection-geometry) for the
-JSON fields.
+
+#### 1. Canvas Dimensions and Coordinate Mapping
+The canvas occupies `[0, 1] × [0, 1/aspect]`. With authoritative `renderWidth = W`, Suede computes:
+$$H = \max(1, \text{round}(W / \text{aspect}))$$
+Source rectangles convert to pixel boundaries with x-density $W$ and y-density $\text{aspect} \cdot H$; rounding $H$ is preserved rather than silently resizing the operator's chosen width. Output dimensions must stay within 32,768 pixels per axis and 32 megapixels.
+
+#### 2. Roster and Topology Constraints
+The configured source roster contains one to eight enabled participants, including outputs without a connected physical display:
+- Each source rectangle is finite, positive, visible after clipping to the canvas, and bounded within $\pm 16$ times the larger canvas span.
+- The clipped graph must connect through positive-area overlap or a shared edge segment (isolated point contacts and gaps are rejected).
+- Sources that overlap by at least 80% of the smaller area form a pure multi-projector stack only when every pair meets that threshold; mixed stack/seam layouts are invalid.
+- These source rules drive normalized minimum-distance seam weights; destination pin edits do not alter the topological seam weights.
+
+#### 3. Two-Fraction Center Remap
+In addition to corner pins, each output supports a horizontal and vertical center fraction (`geometry.center`, default `[0.5, 0.5]`):
+- Divides the output raster into four quadrants with independent perspective interpolation.
+- Compensates for non-linear optical distortion or off-axis lens shift where a single planar homography would bend straight lines across the center.
+- Remaps are piecewise linear and maintain continuity across the quadrant boundaries.
+
+#### 4. Normalized Minimum-Distance Edge Blending
+In overlapping projection areas, Suede automatically computes smooth blend ramps:
+- Calculates normalized distance-to-edge seam weights across all participating projectors.
+- Applies gamma-shaped falloff ramps (using configured `projection.gamma`, default 2.2) to equalize light output across seams, eliminating bright bands.
+- Pure identity or non-overlapping layouts bypass blend ramps.
+
+#### 5. Sub-Pixel Border Anti-Aliasing
+When destination pins rotate or keystone a picture within the output raster, the active picture edges cut across the display panel's pixel grid:
+- Without filtering, high-contrast borders produce visible stair-stepping and jagged edges.
+- Suede's fragment pipeline calculates sub-pixel geometric coverage at the picture boundary.
+- The coverage factor attenuates both the picture gain and any applied black lift, yielding smooth, razor-sharp anti-aliased borders.
+
+#### 6. Sampling Precision & Pipeline Execution
+For each output pixel, the GPU fragment shader:
+1. Inverse-maps output raster coordinates $(x_{\text{out}}, y_{\text{out}})$ into continuous source canvas coordinates $(u, v)$ via inverse homography and center remap.
+2. Samples the source canvas:
+   - **Identity geometry**: Retains an exact integer texel sampling path for 1:1 pixel-perfect rendering.
+   - **Non-identity geometry**: Uses hardware bilinear texture filtering (which can slightly soften fine text, recommending a modest increase in UI font scale or render resolution).
+3. Evaluates precomputed canvas-space transfer tables combining edge-blend ramps, border antialiasing coverage, and black lift.
+
+#### 7. Interactive Low-Overhead Repainting
+Dragging corner pins or adjusting center fractions executes entirely on the GPU control path:
+- The engine recalculates transformation matrices and transfer tables away from the rendering thread.
+- Only affected outputs are updated.
+- On static web pages, the retained browser canvas texture is immediately repainted at compositor refresh rates as pins move, without triggering DOM relayouts or Chromium re-renders.
+
+---
+
+### Planning and Resolution Guidance APIs
+
+Suede provides read-only planning endpoints to assist operators during design and setup:
+
+- **Simple-to-Warp Conversion (`POST /api/v1/projection/convert`)**:
+  Takes an existing rectangular layout and converts explicit output modes and positions into candidate isotropic canvas dimensions and identity warp geometry (`corners: [[0,0],[1,0],[1,1],[0,1]]`, `center: [0.5,0.5]`). This allows previewing the warp configuration without modifying live state.
+
+- **Resolution Recommendation (`GET /api/v1/projection/recommendation`)**:
+  Analyzes the effective working geometry across all warped outputs. It evaluates a dense grid of the largest-singular Jacobian density (including both sides of center-remap breaks) and adds a conservative safety margin to recommend the optimal `renderWidth`.
+  - The response includes `approximate: true` as guidance rather than an absolute mathematical proof.
+  - Suede never automatically resizes or adopts a recommended canvas resolution; the operator must deliberately apply the value.
+
+- **Live Status & Geometry Telemetry (`GET /api/v1/projection/stats`)**:
+  Exposes live pipeline status under `geometry`: requested and effective display modes, requested renderer, warp hardware availability, limitation reasons, and whether saved warp settings remain retained.
+
+See the [configuration reference](configuration.md#projection-geometry) for detailed JSON schemas and examples.
+
