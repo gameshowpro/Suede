@@ -469,8 +469,8 @@ window.addEventListener("error", (event) => {
         slices it per projector; with blending on, each seam is faded from
         both sides so the doubled light adds up to one seamless picture.</p>
       <p class="hint" id="pj-idle" hidden><strong>These settings are inactive:
-        no shared canvas is configured yet.</strong> Add or arrange a display
-        to create the shared content mapping.</p>
+        no displays overlap and no shared canvas is configured.</strong> Position displays so they overlap
+        — as the projector beams do on the wall — or calibrate geometry to engage blending.</p>
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <input type="checkbox" role="switch" class="switch" id="pj-blend"></div>
@@ -2043,6 +2043,21 @@ function canvasPixels(canvas = config?.projection?.canvas) {
   if (!(Number.isFinite(width) && Number.isFinite(aspect) && width > 0 && aspect > 0)) return null;
   return { width, height: Math.max(1, Math.round(width / aspect)), yDensity: aspect * Math.max(1, Math.round(width / aspect)) };
 }
+function defaultLayoutDimensions() {
+  const entries = layoutEntries().filter(({ r }) => r.width > 0 && (r.configured?.enable ?? true));
+  if (!entries.length) return { width: 1920, height: 1080, aspect: 16 / 9 };
+  const left = Math.min(...entries.map(({ r }) => r.x));
+  const top = Math.min(...entries.map(({ r }) => r.y));
+  const width = Math.max(1, Math.max(...entries.map(({ r }) => r.x + r.width)) - left);
+  const height = Math.max(1, Math.max(...entries.map(({ r }) => r.y + r.height)) - top);
+  return { width, height, aspect: width / height };
+}
+function defaultCanvasAspect() {
+  return config?.projection?.canvas?.aspect ?? recommendation?.requestedAspect ?? defaultLayoutDimensions().aspect;
+}
+function defaultCanvasWidth() {
+  return config?.projection?.canvas?.renderWidth ?? recommendation?.idealWidth ?? defaultLayoutDimensions().width;
+}
 function rasterDimensions(output) {
   const mode = output?.mode;
   if (!mode) return null;
@@ -2679,7 +2694,7 @@ function paintCapabilities(r) {
 // output, needs neither overlaps nor a canvas, and is most wanted on the
 // plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
-  const idle = !config?.projection?.canvas;
+  const idle = overlaps === 0 && config?.projection?.mode !== "warp" && !config?.projection?.canvas;
   for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free"]) {
     $(id).disabled = idle;
   }
@@ -2950,43 +2965,55 @@ function renderCanvas() {
   const c = config?.projection?.canvas;
   const pixels = canvasPixels(c);
   const mp = (c && pixels) ? (c.renderWidth * pixels.height / 1e6).toFixed(1) : null;
+  const aspect = defaultCanvasAspect();
+  const width = c?.renderWidth ?? defaultCanvasWidth();
+  const derivedHeight = Math.max(1, Math.round(width / aspect));
+  const derivedMp = (width * derivedHeight / 1e6).toFixed(1);
   $("canvas-current").textContent = (c && pixels)
     ? `Canvas ${c.renderWidth} × ${pixels.height} (${mp} MP); aspect ${displayNumber(c.aspect, 4)}. ${oneToOneStatus()}`
-    : "Canvas unavailable.";
+    : `Canvas derived from layout: ${width} × ${derivedHeight} (${derivedMp} MP); aspect ${displayNumber(aspect, 4)}. ${oneToOneStatus()}`;
   if (!$("warp-canvas").contains(document.activeElement)) {
-    $("canvas-aspect").value = c ? editNumber(c.aspect, 4) : "";
-    $("canvas-width").value = c?.renderWidth ?? "";
+    $("canvas-aspect").value = c ? editNumber(c.aspect, 4) : editNumber(aspect, 4);
+    $("canvas-width").value = c?.renderWidth ?? width;
   }
-  $("canvas-height").textContent = pixels ? `${pixels.height} (${mp} MP)` : "—";
+  $("canvas-height").textContent = pixels ? `${pixels.height} (${mp} MP)` : `${derivedHeight} (${derivedMp} MP)`;
   if (!recommendation) return;
   $("canvas-recommendation").textContent = `${recommendation.idealWidth} px`;
-  const ratio = c?.renderWidth / recommendation.idealWidth;
+  const ratio = width / recommendation.idealWidth;
   $("canvas-rendering-scale").textContent = Number.isFinite(ratio) ? `${displayNumber(ratio * 100, 1)}%` : "—";
   const focused = document.activeElement === $("canvas-width") || $("canvas-presets").contains(document.activeElement);
   $("canvas-presets").hidden = !focused;
   if (!focused) return;
-  const presetKey = `${recommendationInput}:${recommendation.idealWidth}:${c?.aspect}`;
+  const presetKey = `${recommendationInput}:${recommendation.idealWidth}:${aspect}`;
   if ($("canvas-presets").dataset.key === presetKey) return;
   $("canvas-presets").replaceChildren();
   for (const percent of [.25, .5, .75, 1]) {
     const target = Math.round(recommendation.idealWidth * percent);
     const valid = recommendation.presets?.find(p => Math.abs((p.scale ?? p.width / recommendation.idealWidth) - percent) < .001) ??
       recommendation.presets?.find(p => p.width === target);
-    const width = valid?.width, height = valid?.height ?? (width && Math.round(width / c.aspect));
+    const pWidth = valid?.width, pHeight = valid?.height ?? (pWidth && Math.round(pWidth / aspect));
     const limits = recommendation.knownLimits ?? {};
-    const available = valid?.available !== false && Number.isInteger(width) && width > 0 && height > 0 &&
-      (!limits.maxDimension || width <= limits.maxDimension && height <= limits.maxDimension) &&
-      (!limits.maxCanvasPixels || width * height <= limits.maxCanvasPixels);
+    const available = valid?.available !== false && Number.isInteger(pWidth) && pWidth > 0 && pHeight > 0 &&
+      (!limits.maxDimension || pWidth <= limits.maxDimension && pHeight <= limits.maxDimension) &&
+      (!limits.maxCanvasPixels || pWidth * pHeight <= limits.maxCanvasPixels);
     const button = document.createElement("button"); button.className = "action ghost"; button.type = "button";
-    button.textContent = `${percent * 100}%${width ? ` (${width}px)` : " unavailable"}`;
+    button.textContent = `${percent * 100}%${pWidth ? ` (${pWidth}px)` : " unavailable"}`;
     button.disabled = !available;
-    button.onclick = () => setCanvasWidth(width);
+    button.onclick = () => setCanvasWidth(pWidth);
     $("canvas-presets").append(button);
   }
   $("canvas-presets").dataset.key = presetKey;
 }
 function setProjectionMode(mode) {
   if (!config || (mode === "warp" && !warpAvailable())) return;
+  if (mode === "warp" && !config.projection?.canvas) {
+    if (!config.projection) config.projection = { mode: "warp", blend: true, gamma: 2.2, blackLift: 0.0, freeRun: false, renderer: "auto" };
+    config.projection.canvas = {
+      aspect: defaultCanvasAspect(),
+      renderWidth: defaultCanvasWidth(),
+      scale: 1.0,
+    };
+  }
   config.projection = { ...config.projection, mode };
   pushPreview(true); renderWarpEditor(); renderLayoutSize();
 }
@@ -2994,10 +3021,13 @@ $("mode-simple").onclick = () => setProjectionMode("simple");
 $("mode-warp").onclick = () => setProjectionMode("warp");
 $("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
 $("warp-reset-pins").onclick = () => editGeometry(g=>g.corners=structuredClone(unitPins));
-function adoptCanvas(aspect,width, preserveAspectPixels = false) {
-  if (!config?.projection?.canvas) throw new Error("Canvas settings are unavailable.");
-  const height=Math.max(1,Math.round(width/aspect));
-  if (![aspect,width].every(v=>Number.isFinite(v)&&v>0) || !Number.isInteger(width) || width>32768 || height>32768 || width*height>64000000)
+function adoptCanvas(aspect, width, preserveAspectPixels = false) {
+  if (!config) return;
+  if (!config.projection) config.projection = { mode: "simple", blend: true, gamma: 2.2, blackLift: 0.0, freeRun: false, renderer: "auto" };
+  aspect = Number(aspect) || defaultCanvasAspect();
+  width = Number(width) || defaultCanvasWidth();
+  const height = Math.max(1, Math.round(width / aspect));
+  if (![aspect, width].every(v => Number.isFinite(v) && v > 0) || !Number.isInteger(width) || width > 32768 || height > 32768 || width * height > 64000000)
     throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP.");
   const old = canvasPixels(config.projection.canvas);
   if (preserveAspectPixels && old) for (const output of config.outputs ?? []) {
@@ -3006,12 +3036,12 @@ function adoptCanvas(aspect,width, preserveAspectPixels = false) {
     source.y = source.y * old.yDensity / (aspect * height);
     source.height = source.height * old.yDensity / (aspect * height);
   }
-  config.projection.canvas = { ...config.projection.canvas, aspect, renderWidth:width };
+  config.projection.canvas = { ...(config.projection.canvas ?? {}), aspect, renderWidth: width, scale: config.projection.canvas?.scale ?? 1.0 };
   pushPreview(true); renderCanvas(); renderSharedContent();
 }
-function setCanvasWidth(width) { adoptCanvas(config?.projection?.canvas?.aspect, Number(width)); }
+function setCanvasWidth(width) { adoptCanvas(defaultCanvasAspect(), Number(width)); }
 $("canvas-width").onchange = () => { try { setCanvasWidth(Number($("canvas-width").value)); } catch (error) { setDisplayError(error.message); } };
-$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), config?.projection?.canvas?.renderWidth, true); } catch (error) { setDisplayError(error.message); } };
+$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), defaultCanvasWidth(), true); } catch (error) { setDisplayError(error.message); } };
 for (const event of ["focusin", "focusout"]) $("warp-canvas").addEventListener(event, () => setTimeout(renderCanvas));
 const warpSvg = $("warp-editor");
 function pointerPoint(event) {
