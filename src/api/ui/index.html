@@ -2045,12 +2045,12 @@ function canvasPixels(canvas = config?.projection?.canvas) {
 }
 function defaultLayoutDimensions() {
   const entries = layoutEntries().filter(({ r }) => r.width > 0 && (r.configured?.enable ?? true));
-  if (!entries.length) return { width: 1920, height: 1080, aspect: 16 / 9 };
+  if (!entries.length) return { width: 1920, height: 1080, aspect: 16 / 9, left: 0, top: 0 };
   const left = Math.min(...entries.map(({ r }) => r.x));
   const top = Math.min(...entries.map(({ r }) => r.y));
   const width = Math.max(1, Math.max(...entries.map(({ r }) => r.x + r.width)) - left);
   const height = Math.max(1, Math.max(...entries.map(({ r }) => r.y + r.height)) - top);
-  return { width, height, aspect: width / height };
+  return { width, height, aspect: width / height, left, top };
 }
 function defaultCanvasAspect() {
   return config?.projection?.canvas?.aspect ?? recommendation?.requestedAspect ?? defaultLayoutDimensions().aspect;
@@ -2206,8 +2206,32 @@ function solveArrangement(outputs, rows, columns, scaleOrOpts, canvas) {
     };
   });
 }
+const unitPins = [[0,0],[1,0],[1,1],[0,1]];
 function identityGeometry(source) {
   return { source: structuredClone(source), corners: structuredClone(unitPins), center: [.5, .5], rasterFootprint: structuredClone(source) };
+}
+function ensureWarpGeometries() {
+  const dim = defaultLayoutDimensions();
+  const width = dim.width;
+  const left = dim.left ?? 0;
+  const top = dim.top ?? 0;
+  for (const entry of config?.outputs ?? []) {
+    if (entry.geometry) continue;
+    const known = knownOutputs().find(k => k.name === entry.match?.name);
+    const r = known ? canvasRect(known) : {
+      x: entry.position?.x ?? 0,
+      y: entry.position?.y ?? 0,
+      width: entry.mode?.width ?? 1920,
+      height: entry.mode?.height ?? 1080,
+    };
+    const source = {
+      x: (r.x - left) / width,
+      y: (r.y - top) / width,
+      width: (r.width || 1920) / width,
+      height: (r.height || 1080) / width,
+    };
+    entry.geometry = identityGeometry(source);
+  }
 }
 
 let lastArrangeEdit = "overlap";
@@ -2805,7 +2829,7 @@ function homography(from, to) {
   }
   return rows.map(row => row[8]).concat(1);
 }
-const unitPins = [[0,0],[1,0],[1,1],[0,1]];
+
 function projectPoint(h, [x,y]) {
   const d = h[6]*x + h[7]*y + h[8];
   if (!Number.isFinite(d) || Math.abs(d) < 1e-10) throw new Error("Perspective map crosses a pole.");
@@ -3006,13 +3030,16 @@ function renderCanvas() {
 }
 function setProjectionMode(mode) {
   if (!config || (mode === "warp" && !warpAvailable())) return;
-  if (mode === "warp" && !config.projection?.canvas) {
+  if (mode === "warp") {
     if (!config.projection) config.projection = { mode: "warp", blend: true, gamma: 2.2, blackLift: 0.0, freeRun: false, renderer: "auto" };
-    config.projection.canvas = {
-      aspect: defaultCanvasAspect(),
-      renderWidth: defaultCanvasWidth(),
-      scale: 1.0,
-    };
+    if (!config.projection.canvas) {
+      config.projection.canvas = {
+        aspect: defaultCanvasAspect(),
+        renderWidth: defaultCanvasWidth(),
+        scale: 1.0,
+      };
+    }
+    ensureWarpGeometries();
   }
   config.projection = { ...config.projection, mode };
   pushPreview(true); renderWarpEditor(); renderLayoutSize();
@@ -3037,6 +3064,7 @@ function adoptCanvas(aspect, width, preserveAspectPixels = false) {
     source.height = source.height * old.yDensity / (aspect * height);
   }
   config.projection.canvas = { ...(config.projection.canvas ?? {}), aspect, renderWidth: width, scale: config.projection.canvas?.scale ?? 1.0 };
+  ensureWarpGeometries();
   pushPreview(true); renderCanvas(); renderSharedContent();
 }
 function setCanvasWidth(width) { adoptCanvas(defaultCanvasAspect(), Number(width)); }
