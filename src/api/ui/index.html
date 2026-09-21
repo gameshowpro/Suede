@@ -32,6 +32,8 @@ main { padding: 18px 20px 60px; max-width: 1180px; margin: 0 auto; }
   padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
 .pill { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
   border: 1px solid var(--line); white-space: nowrap; }
+#sync { width: 76px; flex-shrink: 0; box-sizing: border-box; padding: 3px 0;
+  display: inline-flex; align-items: center; justify-content: center; text-align: center; }
 .pill.ok { color: var(--ok); border-color: currentColor; }
 .pill.warn { color: var(--warn); border-color: currentColor; }
 .pill.bad { color: var(--bad); border-color: currentColor; }
@@ -3499,8 +3501,11 @@ function renderOutputChoices() {
 
 function renderStatus() {
   const pill = $("sync");
-  pill.textContent = status?.state ?? "—";
-  pill.className = "pill " + ({ synced: "ok", degraded: "bad", reconciling: "warn" }[status?.state] ?? "muted");
+  const state = status?.state;
+  const labels = { synced: "synced", reconciling: "syncing", degraded: "degraded" };
+  pill.textContent = labels[state] ?? (state || "—");
+  pill.className = "pill " + ({ synced: "ok", degraded: "bad", reconciling: "warn" }[state] ?? "muted");
+  pill.title = state ? `Status: ${state}` : "";
   renderAlerts();
   renderDirtyStatus();
 }
