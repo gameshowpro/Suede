@@ -1364,6 +1364,11 @@ function configEntry(name) {
 // Where an output sits in canvas space. The configuration is the authority —
 // that is what makes the layout survive a display being unplugged — and only
 // an output that is both attached and unpinned falls back to what it runs.
+// A slice's size in canvas pixels, at the precision that matters for it.
+function sizeLabel(r) {
+  const digits = r.configured?.geometry?.source ? cropDigits(r.configured, r.configured.geometry.source) : 0;
+  return `${editNumber(r.width, digits)}×${editNumber(r.height, digits)}`;
+}
 function canvasRect(known) {
   const configured = configEntry(known.name);
   const rect = known.output?.rect;
@@ -1543,7 +1548,7 @@ function renderLayout() {
     const display = displayName(known);
     el.innerHTML = `<b>${escape(known.name)}</b>` +
       (display ? `<span class="muted">${escape(display)}</span>` : "") +
-      `<span>${r.width}×${r.height}${enabled ? "" : " (disabled)"}</span>` +
+      `<span>${sizeLabel(r)}${enabled ? "" : " (disabled)"}</span>` +
       (known.connected ? ""
         : `<span class="offline-mark" title="${escape(OFFLINE_TOOLTIP)}">⚠ not connected</span>`) +
       (r.configured?.background
@@ -2105,11 +2110,14 @@ function renderSharedContent() {
   if (container.hidden || container.contains(document.activeElement)) return;
   const source = geometry.source;
   const scale = mode.width / (source.width * pixels.width);
-  $("source-x").value = editNumber(source.x * pixels.width, 1);
-  $("source-y").value = editNumber(source.y * pixels.yDensity, 1);
-  $("content-scale").value = editNumber(scale * 100, 2);
+  const digits = cropDigits(configEntry(selected), source, pixels);
+  // One percent of content scale moves the far edge by raster/100 pixels.
+  const scaleDigits = detectableDigits(mode.width / 100);
+  $("source-x").value = editNumber(source.x * pixels.width, digits);
+  $("source-y").value = editNumber(source.y * pixels.yDensity, digits);
+  $("content-scale").value = editNumber(scale * 100, scaleDigits);
   const heightScale = mode.height / (source.height * pixels.yDensity);
-  $("source-size").textContent = `Crop ${editNumber(source.width * pixels.width, 1)} × ${editNumber(source.height * pixels.yDensity, 1)} px; ` +
+  $("source-size").textContent = `Crop ${editNumber(source.width * pixels.width, digits)} × ${editNumber(source.height * pixels.yDensity, digits)} px; ` +
     (Math.abs(scale - heightScale) < 1e-8 ? "uniform" : `vertical density ${displayNumber(heightScale * 100, 2)}%`);
 }
 function editSharedContent(change) {
@@ -2948,6 +2956,20 @@ function drawWarp() {
 // need up to five. D is the output's own raster axis, in pixels — width for
 // X, height for Y — so a display error bound in canvas units still applies
 // once this fraction lands on the physical output.
+// Digits worth showing for a value: those at which one unit of the last digit
+// moves the output by at least one output pixel. `effect` is output pixels per
+// unit of the value. Canonical values keep full precision; this is display only.
+function detectableDigits(effect) {
+  if (!(effect > 0) || !Number.isFinite(effect)) return 0;
+  return Math.max(0, Math.floor(Math.log10(effect)));
+}
+// Crop position and size are in canvas pixels; one canvas pixel moves the
+// output by (raster / crop) pixels, so at 100% content scale integers suffice.
+function cropDigits(output, source = output?.geometry?.source, pixels = canvasPixels()) {
+  const raster = rasterDimensions(output);
+  if (!raster || !source || !pixels) return 1;
+  return detectableDigits(raster.width / (source.width * pixels.width));
+}
 function warpPinPrecision(axis) {
   const raster = rasterDimensions(warpOutput());
   const d = axis === 0 ? raster?.width : raster?.height;
