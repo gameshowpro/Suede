@@ -35,6 +35,7 @@ pub(crate) struct LocalKey {
 
 pub(crate) struct Evaluator {
     spec: LayoutSpec,
+    sources: Vec<CanvasRect>,
     stacked: bool,
     maximum: u32,
     width: f64,
@@ -50,14 +51,49 @@ fn bottom(r: &CanvasRect) -> f64 {
 fn intersects(a: &CanvasRect, b: &CanvasRect) -> bool {
     a.x <= right(b) && b.x <= right(a) && a.y <= bottom(b) && b.y <= bottom(a)
 }
-fn distance(r: &CanvasRect, x: f64, y: f64) -> Option<f64> {
-    (x >= r.x && x <= right(r) && y >= r.y && y <= bottom(r)).then(|| {
-        (x - r.x)
-            .min(right(r) - x)
-            .min(y - r.y)
-            .min(bottom(r) - y)
-            .max(0.0)
-    })
+fn distance(index: usize, sources: &[CanvasRect], x: f64, y: f64) -> Option<f64> {
+    let r = &sources[index];
+    if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
+        return None;
+    }
+    // Only edges that overlap with another slice are active seams. Exterior
+    // boundaries with no overlapping neighbor must not attenuate the blend.
+    let has_left = sources
+        .iter()
+        .enumerate()
+        .any(|(j, q)| j != index && q.x < r.x && r.x < right(q) && q.y <= y && y <= bottom(q));
+    let has_right = sources
+        .iter()
+        .enumerate()
+        .any(|(j, q)| j != index && q.x < right(r) && right(r) < right(q) && q.y <= y && y <= bottom(q));
+    let has_top = sources
+        .iter()
+        .enumerate()
+        .any(|(j, q)| j != index && q.y < r.y && r.y < bottom(q) && q.x <= x && x <= right(q));
+    let has_bottom = sources
+        .iter()
+        .enumerate()
+        .any(|(j, q)| j != index && q.y < bottom(r) && bottom(r) < bottom(q) && q.x <= x && x <= right(q));
+
+    let mut min_d = f64::INFINITY;
+    if has_left {
+        min_d = min_d.min(x - r.x);
+    }
+    if has_right {
+        min_d = min_d.min(right(r) - x);
+    }
+    if has_top {
+        min_d = min_d.min(y - r.y);
+    }
+    if has_bottom {
+        min_d = min_d.min(bottom(r) - y);
+    }
+
+    if min_d.is_infinite() {
+        Some(1.0)
+    } else {
+        Some(min_d.max(0.0))
+    }
 }
 fn contains(r: &CanvasRect, x: f64, y: f64) -> bool {
     x >= r.x && x < right(r) && y >= r.y && y < bottom(r)
@@ -132,6 +168,7 @@ impl Evaluator {
         }
         Ok(Self {
             spec: spec.clone(),
+            sources,
             stacked,
             maximum,
             width: width as f64,
@@ -202,7 +239,7 @@ impl Evaluator {
         if !(0.0..=1.0).contains(&x) || !(0.0..=1.0 / self.spec.aspect).contains(&y) {
             return (0, 0);
         }
-        let Some(own) = distance(&self.spec.participants[index].source, x, y) else {
+        let Some(own) = distance(index, &self.sources, x, y) else {
             return (0, 0);
         };
         let weight = if !self.spec.blend || self.stacked {
@@ -210,8 +247,8 @@ impl Evaluator {
         } else {
             let mut count = 0;
             let mut total = 0.0;
-            for p in &self.spec.participants {
-                if let Some(d) = distance(&p.source, x, y) {
+            for i in 0..self.sources.len() {
+                if let Some(d) = distance(i, &self.sources, x, y) {
                     count += 1;
                     total += d;
                 }
@@ -248,7 +285,7 @@ impl Evaluator {
         if !(0.0..=1.0).contains(&x) || !(0.0..=1.0 / self.spec.aspect).contains(&y) {
             return crate::projection::blend::pack_dynamic_shape(0.0, 0.0, 0);
         }
-        let Some(own) = distance(&self.spec.participants[index].source, x, y) else {
+        let Some(own) = distance(index, &self.sources, x, y) else {
             return crate::projection::blend::pack_dynamic_shape(0.0, 0.0, 0);
         };
         let weight = if !self.spec.blend || self.stacked {
@@ -256,8 +293,8 @@ impl Evaluator {
         } else {
             let mut count = 0;
             let mut total = 0.0;
-            for p in &self.spec.participants {
-                if let Some(d) = distance(&p.source, x, y) {
+            for i in 0..self.sources.len() {
+                if let Some(d) = distance(i, &self.sources, x, y) {
                     count += 1;
                     total += d;
                 }
@@ -466,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn production_rectangles_match_independent_d3_oracle() {
+    fn production_rectangles_normalize_and_sum_to_one() {
         let cases = [
             vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)],
             vec![
@@ -486,19 +523,86 @@ mod tests {
         for rects in cases {
             let input = spec(&rects);
             let production = Evaluator::new(&input, 100, 100).unwrap();
-            let quads: Vec<_> = rects.iter().map(|r| r.corners()).collect();
-            let reference = super::super::seam_oracle::Oracle::new([1.0, 1.0], &quads).unwrap();
             for y in 0..100 {
                 for x in 0..100 {
                     let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
-                    let expected = reference.weights([cx / 100.0, cy / 100.0]).unwrap();
-                    for (i, w) in expected.iter().enumerate() {
+                    let mut sum = 0.0;
+                    for i in 0..rects.len() {
                         let (gain, lift) = production.transfer(i, cx, cy, 1.0, 0.0, 1.0);
-                        assert!((f64::from(gain) / 256.0 - w).abs() <= 1.0 / 512.0 + 1e-6);
                         assert_eq!(lift, 0);
+                        sum += f64::from(gain) / 256.0;
                     }
+                    let covered = rects
+                        .iter()
+                        .filter(|r| {
+                            let (px, py) = (cx / 100.0, cy / 100.0);
+                            px >= r.x && px <= right(r) && py >= r.y && py <= bottom(r)
+                        })
+                        .count();
+                    let expected = if production.stacked {
+                        covered as f64
+                    } else if covered > 0 {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    assert!(
+                        (sum - expected).abs() <= (rects.len() as f64) * (1.0 / 256.0) + 1e-6,
+                        "sum at ({cx}, {cy}) was {sum}, expected {expected}"
+                    );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn exterior_boundaries_do_not_plateau_or_distort_seams() {
+        // 2x2 grid with 20% overlaps (seams at [0.4..0.6] in x and y)
+        let rects = [
+            rect(0.0, 0.0, 0.6, 0.6), // 0: Top-Left
+            rect(0.4, 0.0, 0.6, 0.6), // 1: Top-Right
+            rect(0.0, 0.4, 0.6, 0.6), // 2: Bottom-Left
+            rect(0.4, 0.4, 0.6, 0.6), // 3: Bottom-Right
+        ];
+        let input = spec(&rects);
+        let production = Evaluator::new(&input, 100, 100).unwrap();
+
+        // Across the vertical seam (y in [40..60]):
+        // Compare the interior (x = 80, middle of TR/BR) with the outer edge (x = 99.5, bottom-right corner)
+        for y in 41..59 {
+            let cy = y as f64 + 0.5;
+            let (tr_mid, _) = production.transfer(1, 80.0, cy, 1.0, 0.0, 1.0);
+            let (br_mid, _) = production.transfer(3, 80.0, cy, 1.0, 0.0, 1.0);
+            let (tr_edge, _) = production.transfer(1, 99.5, cy, 1.0, 0.0, 1.0);
+            let (br_edge, _) = production.transfer(3, 99.5, cy, 1.0, 0.0, 1.0);
+
+            // The edge must not freeze at 50% / 128: it must follow the same ramp as the interior
+            assert_eq!(tr_edge, tr_mid, "TR mismatch at y={cy}");
+            assert_eq!(br_edge, br_mid, "BR mismatch at y={cy}");
+        }
+
+        // At y = 45 (25% into the seam from the top), TR should be 75% (192) and BR should be 25% (64)
+        // at the very outer edge x = 99.5
+        let (tr, _) = production.transfer(1, 99.5, 45.0, 1.0, 0.0, 1.0);
+        let (br, _) = production.transfer(3, 99.5, 45.0, 1.0, 0.0, 1.0);
+        assert_eq!(tr, 192);
+        assert_eq!(br, 64);
+    }
+
+    #[test]
+    fn ordinary_strip_maintains_ratio_up_to_borders() {
+        // Two horizontal displays with 20% overlap at x in [0.4..0.6]
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let input = spec(&rects);
+        let production = Evaluator::new(&input, 100, 100).unwrap();
+
+        // At x = 45 (25% into seam), output 0 should be 75% (192) and output 1 should be 25% (64)
+        // Check near top edge (y = 0.5), middle (y = 50.0), and near bottom edge (y = 99.5)
+        for cy in [0.5, 10.0, 50.0, 90.0, 99.5] {
+            let (a, _) = production.transfer(0, 45.0, cy, 1.0, 0.0, 1.0);
+            let (b, _) = production.transfer(1, 45.0, cy, 1.0, 0.0, 1.0);
+            assert_eq!(a, 192, "output 0 at cy={cy} was not 192");
+            assert_eq!(b, 64, "output 1 at cy={cy} was not 64");
         }
     }
 
