@@ -49,6 +49,34 @@ button.action.ghost { background: transparent; color: var(--accent); border: 1px
 button.action.danger { background: transparent; color: var(--bad); border: 1px solid var(--line); }
 button.action:disabled { opacity: .5; cursor: not-allowed; }
 input:disabled, select:disabled { opacity: .5; cursor: not-allowed; }
+button.header-action {
+  font-size: 12px; font-weight: 600; padding: 3px 12px; border-radius: 999px;
+  border: 1px solid var(--line); background: transparent; color: var(--muted);
+  cursor: pointer; white-space: nowrap; font-family: inherit; line-height: inherit;
+  transition: all .15s ease; display: inline-flex; align-items: center; justify-content: center;
+}
+button.header-action:hover:not(:disabled) {
+  color: var(--ink); border-color: var(--muted); background: var(--sunken);
+}
+button.header-action:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 1px;
+}
+button.header-action.dirty#pj-save {
+  background: var(--accent); color: #fff; border-color: var(--accent);
+  box-shadow: 0 1px 4px rgba(59, 91, 219, 0.35);
+}
+button.header-action.dirty#pj-save:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 85%, #000);
+  border-color: color-mix(in srgb, var(--accent) 85%, #000);
+}
+button.header-action.dirty#pj-cancel {
+  color: var(--warn); border-color: currentColor;
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+button.header-action.dirty#pj-cancel:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--warn) 22%, transparent);
+  color: var(--warn);
+}
 dialog { border: 1px solid var(--line); border-radius: 12px; background: var(--panel);
   color: var(--ink); padding: 0; width: min(760px, calc(100vw - 32px)); max-width: none;
   box-shadow: 0 14px 44px rgba(0,0,0,.3); }
@@ -263,6 +291,8 @@ window.addEventListener("error", (event) => {
   <h1>Suede</h1>
   <span class="pill muted" id="version">—</span>
   <span class="grow"></span>
+  <button type="button" class="header-action" id="pj-cancel" title="Revert to saved configuration">Revert</button>
+  <button type="button" class="header-action" id="pj-save" title="Save configuration to disk">Save</button>
   <span class="pill muted" id="live">connecting…</span>
   <span class="pill muted" id="sync">—</span>
 </header>
@@ -461,11 +491,6 @@ window.addEventListener("error", (event) => {
         curve, usually 2.2. If seams glow on dark scenes (projector black is
         not zero light), raise the compensation until the rest of the picture
         matches them.</p>
-      <div class="row" style="margin-top:10px">
-        <button class="action" id="pj-save">Save</button>
-        <button class="action ghost" id="pj-cancel">Cancel</button>
-        <span class="hint" id="pj-note"></span>
-      </div>
     </div>
 
     <div class="panel" id="frame-timing-panel">
@@ -1065,12 +1090,41 @@ async function finishConfigWrite(path, options) {
   } finally { configBusy = false; document.querySelector("main").inert = false; }
 }
 async function cancelPreview() {
+  clearTimeout(previewTimer);
+  previewQueued = null;
   config = await api("/config/revert", { method: "POST" });
   configSnapshot = structuredClone(config);
   acceptedConfig = structuredClone(config);
+  previewActive = false;
   renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
   if (selected) selectOutput(selected);
+  renderDirtyStatus();
 }
+
+function isDirty() {
+  return Boolean(
+    previewActive ||
+    previewQueued != null ||
+    previewFlight != null ||
+    (config && config.committed === false) ||
+    (status && status.committed === false)
+  );
+}
+
+function renderDirtyStatus() {
+  const dirty = isDirty();
+  const saveBtn = $("pj-save");
+  const cancelBtn = $("pj-cancel");
+  if (saveBtn) {
+    saveBtn.classList.toggle("dirty", dirty);
+    saveBtn.title = dirty ? "Save configuration to disk" : "Configuration is saved";
+  }
+  if (cancelBtn) {
+    cancelBtn.classList.toggle("dirty", dirty);
+    cancelBtn.title = dirty ? "Revert to saved configuration" : "Revert configuration";
+  }
+}
+
 function saveCommitted() {
   const next = structuredClone(config);
   if (next.projection) next.projection.testPattern = null;
@@ -2877,6 +2931,7 @@ function renderWarpStatus() {
     ` Selected output: presentation receipt for control generation ${output.presentedGeneration} (not optical visibility).`;
   if (c?.lastFailure) message += ` ${c.lastFailure.reason ?? c.lastFailure.message ?? "Projection update failed."}`;
   $("warp-status").textContent = message;
+  renderDirtyStatus();
 }
 function oneToOneStatus() {
   const g = warpOutput()?.geometry, mode = warpOutput()?.mode, c = config?.projection?.canvas;
@@ -3102,7 +3157,7 @@ $("pj-save").onclick = () => run(async () => {
   if (config.projection) config.projection.testPattern = null;
   clearTimeout(previewTimer);
   await saveCommitted();
-}, "saved projection");
+}, "saved configuration");
 $("pj-cancel").onclick = () => run(async () => {
   await cancelPreview();
 }, "reverted");
@@ -3447,6 +3502,7 @@ function renderStatus() {
   pill.textContent = status?.state ?? "—";
   pill.className = "pill " + ({ synced: "ok", degraded: "bad", reconciling: "warn" }[status?.state] ?? "muted");
   renderAlerts();
+  renderDirtyStatus();
 }
 
 function renderSystem(system) {
@@ -3624,6 +3680,7 @@ async function loadConfig(force = false) {
   invalidateRecommendation();
   if (!selected) selected = layoutEntries()[0]?.known.name ?? null;
   if (selected) selectOutput(selected);
+  renderDirtyStatus();
 }
 $("config-discard").onclick = () => run(async () => {
   clearTimeout(previewTimer); previewQueued = null;
