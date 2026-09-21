@@ -125,7 +125,12 @@ check "projection null clears it" "200" \
 check "uncommitted write applies" "200"   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config"      -H 'content-type: application/json'      -d "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;d=json.load(sys.stdin);d["committed"]=False;print(json.dumps(d))')")"
 check "the document now reads uncommitted" "False"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["committed"])')"
 check "the revision did not move" "3"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
-check "revert restores the committed document" "True"   "$(curl -s -X POST "${BASE}/api/v1/config/revert" | python3 -c 'import sys,json;print(json.load(sys.stdin)["committed"])')"
+# While a working copy is live, a write, preview or revert must name it: an
+# unconditional revert is refused, so another session cannot discard it.
+check "unconditional revert is refused while a preview is live" "409" \
+  "$(curl -s -o /dev/null -w '%{http_code}' -X POST "${BASE}/api/v1/config/revert")"
+generation="$(curl -s -D - -o /dev/null "${BASE}/api/v1/config" | tr -d '\r' | awk 'tolower($1)=="x-config-generation:"{print $2}')"
+check "revert restores the committed document" "True"   "$(curl -s -X POST "${BASE}/api/v1/config/revert" -H "If-Config-Generation: ${generation}" | python3 -c 'import sys,json;print(json.load(sys.stdin)["committed"])')"
 
 echo
 echo "Reconciliation"
