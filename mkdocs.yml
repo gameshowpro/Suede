@@ -1,5 +1,5 @@
 site_name: Suede
-site_description: Remote management for Sway-based display appliances. Configure outputs, route audio, supervise kiosk browsers, and survive reboots.
+site_description: Remote management for Sway-based display appliances. Configure outputs, route audio, supervise kiosk browsers, project onto overlapping and warped surfaces, and survive reboots.
 site_url: https://suede.gameshow.pro/
 repo_url: https://github.com/gameshowpro/Suede
 repo_name: gameshowpro/Suede
@@ -57,10 +57,10 @@ nav:
       - Deployment: developer/deployment.md
       - Versioning: developer/versioning.md
       - Specification: specification.md
-  - Plans:
-      - Overview: plans/index.md
-      - Black Offset: plans/black-offset.md
-      - Direct-to-Display (VK_KHR_display): plans/VK_KHR_display.md
+      - Plans:
+          - Overview: plans/index.md
+          - Black lift: plans/black-offset.md
+          - Direct-to-Display (VK_KHR_display): plans/VK_KHR_display.md
 
 markdown_extensions:
   - admonition

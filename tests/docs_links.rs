@@ -29,11 +29,17 @@ fn repo_root() -> PathBuf {
 fn referenced_links(source: &str) -> BTreeSet<String> {
     let mut links = BTreeSet::new();
     for candidate in source.split('"') {
-        // A docs path is `page/#anchor` — relative, one segment, no scheme.
+        // A docs path is `page/#anchor` — relative, no scheme. `page` may
+        // itself contain subdirectory segments (`developer/architecture`,
+        // `plans/black-offset`), so a slash inside it does not disqualify
+        // the candidate; each segment still has to look like a path
+        // component rather than prose.
         if let Some((page, anchor)) = candidate.split_once("/#") {
             let plausible = !page.is_empty()
                 && !anchor.is_empty()
-                && !page.contains(['/', ' ', ':'])
+                && page
+                    .split('/')
+                    .all(|segment| !segment.is_empty() && !segment.contains([' ', ':']))
                 && !anchor.contains([' ', '/']);
             if plausible {
                 links.insert(candidate.to_string());

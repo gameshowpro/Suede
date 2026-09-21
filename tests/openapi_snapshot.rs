@@ -20,7 +20,7 @@ fn openapi_document_matches_the_snapshot() {
         let mut document: serde_json::Value =
             serde_json::from_str(&generated).expect("generated document is valid JSON");
         blank_the_version(&mut document);
-        let text = serde_json::to_string_pretty(&document).expect("snapshot is serialisable");
+        let text = serde_json::to_string_pretty(&document).expect("snapshot is serializable");
         std::fs::write(&path, format!("{text}\n")).expect("failed to write snapshot");
         eprintln!("updated {}", path.display());
         return;

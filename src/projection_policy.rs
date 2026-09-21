@@ -151,7 +151,6 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 1.0,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });
@@ -375,11 +374,18 @@ mod tests {
         let mut requested = baseline.clone();
         requested.committed = false;
         requested.projection.as_mut().unwrap().mode = ProjectionMode::Warp;
-        let put = |d: &DesiredState| {
+        // Every write names the document it read, the way a real client does:
+        // once a working copy is live, an unconditional write is refused so
+        // that it cannot discard a second operator's unsaved edit.
+        let store = h.state.store.clone();
+        let put = move |d: &DesiredState| {
+            let (_, version) = store.effective_with_version();
             Request::builder()
                 .method("PUT")
                 .uri("/api/v1/config")
                 .header("content-type", "application/json")
+                .header("if-config-generation", version.generation.to_string())
+                .header("if-config-epoch", version.epoch)
                 .body(Body::from(serde_json::to_vec(d).unwrap()))
                 .unwrap()
         };
@@ -427,6 +433,10 @@ mod tests {
                     Request::builder()
                         .method("POST")
                         .uri("/api/v1/config/revert")
+                        .header(
+                            "if-config-generation",
+                            h.state.store.generation().to_string(),
+                        )
                         .body(Body::empty())
                         .unwrap()
                 )

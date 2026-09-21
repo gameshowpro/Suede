@@ -178,8 +178,9 @@ void main() {
             }
         }
         // Full white or full black, so the transfer below is the only thing
-        // between this and the projector — which is the point: the ramps and
-        // the black lift shape the counter exactly as they shape content.
+        // between this and the projector — which is the point: the layout's
+        // blend weight and the black lift shape the counter exactly as they
+        // shape content.
         c = uvec3(lit * 255u);
     } else if (pc.warp_enabled != 0u) {
         vec2 source = pc.source_rect.xy + unit * pc.source_rect.zw;

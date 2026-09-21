@@ -89,8 +89,8 @@ codegen-units = 1
 #   gdb -e suede-unstripped -p $(systemctl --user show suede -p MainPID --value)
 #
 # That matters because a stripped daemon in a deadlock reports every frame of
-# every thread as `??`, and this failure could only be characterised by shape
-# until a symbolised build was put on the machine.
+# every thread as `??`, and this failure could only be characterized by shape
+# until a symbolized build was put on the machine.
 strip = true
 
 # Packaging is driven entirely from here; there is no separate packaging tree
@@ -134,4 +134,7 @@ assets = [
     ["README.md", "usr/share/doc/suede/README.md", "644"],
     ["docs/examples/suede.toml", "usr/share/doc/suede/examples/suede.toml", "644"],
     ["docs/examples/four-output-appliance.json", "usr/share/doc/suede/examples/four-output-appliance.json", "644"],
+    ["docs/examples/four-output-warp.json", "usr/share/doc/suede/examples/four-output-warp.json", "644"],
+    ["docs/examples/four-output-shared-canvas.json", "usr/share/doc/suede/examples/four-output-shared-canvas.json", "644"],
+    ["docs/examples/four-output-adaptive.json", "usr/share/doc/suede/examples/four-output-adaptive.json", "644"],
 ]

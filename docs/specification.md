@@ -1,10 +1,11 @@
 # Suede
 
-Suede is a daemon with a name that is a hilarious pun on the word "Swayed". It integrates with [Sway](https://swaywm.org/) to turn a headless-ish Linux box into a remotely manageable display appliance. It adds three headline features:
+Suede is a daemon with a name that is a hilarious pun on the word "Swayed". It integrates with [Sway](https://swaywm.org/) to turn a headless-ish Linux box into a remotely manageable display appliance. It adds four headline features:
 
 1. Remote management through a well-documented REST + SSE API.
 2. A reference implementation of the API served as a local web UI.
 3. State persistence and restoration at boot.
+4. Projection and edge blending: overlapping outputs are sliced from one shared canvas with gamma-correct seam blending and, in Warp mode, per-output corner/center geometry correction. See [Projection and edge blending](configuration.md#projection-edge-blending) and [How it works](how-it-works.md#the-path-of-a-frame).
 
 Window launching and termination is particularly focused on the browsers Chromium and Firefox, running in kiosk mode.
 
@@ -88,7 +89,8 @@ Status conventions: `400` malformed JSON, `404` unknown resource, `409` revision
 | `GET` | `/av` | Every AV device PipeWire reports, in three lists: `audioOutputs` (sinks: stable id from `node.name`, description, whether it is Suede's null sink, and `isDefault`), `audioInputs` (sources: id, description, `card`), and `videoInputs` (sources: id, description, `path` such as `/dev/video0`, and `card`). Only audio outputs have a default. Exposed so an app in the kiosk browser, which may not enumerate devices itself, can ask for the right one: a browser labels an audio device by its `description` and a video device by its `card`. See [Audio routing](#audio-routing). |
 | `GET` | `/apps/{id}/status` | Runtime status of a managed app: `running` \| `starting` \| `stopped` \| `crashed` \| `backoff`, pid, start time, restart count, matched window ids. |
 | `GET` | `/status` | Overall reconciliation status: `synced` \| `degraded` \| `reconciling`, a list of divergences (e.g. "output HDMI-A-3 in desired state but not connected"), whether the applied document is the saved one (`committed`), the desired-state document's revision right now (`currentRevision`, which outruns the applied `revision` while a write is still being reconciled), a summary of the last environment health-check run (`checks`: `pass`/`warn`/`fail` counts, `null` if none has run), and the app `activeApp` names alongside its runtime state (`activeApp`: `id`, `state`, `detail`; `null` when no app is active). See [below](#is-the-appliance-doing-what-i-asked) for how to read these together. |
-| `GET` | `/projection/stats` | What the slicer measured over its last interval: canvas and presented frame rates, per-frame cost, the inter-output presentation offset (mean/max ms), straddles (frames shown on different refreshes), per-output presented/discarded counts and measured refresh. `null` when no slicer is running. |
+| `GET` | `/projection/stats` | What the slicer measured over its last interval: canvas and presented frame rates, per-frame cost, the inter-output presentation offset (mean/max ms), straddles (frames shown on different refreshes), per-output presented/discarded counts and measured refresh, live `geometry` status (requested/effective mode, warp availability and reason), and `control.blackLift` (adaptive measurement and applied level). `null` when no slicer is running. |
+| `GET` | `/projection/recommendation` | Read-only canvas sizing guidance for the current working copy: ideal and admissible render widths, and `0.25`/`0.5`/`0.75`/`1.0` scale presets with availability flags. See [Canvas and warp geometry](configuration.md#projection-geometry). |
 | `GET` | `/system` | Suede version, Sway version, relevant package versions (sway, chromium, firefox, …), hostname, uptime. |
 | `GET` | `/system/checks` | Environment health checks: id, status (`pass` \| `warn` \| `fail`), detail, and whether an automated fix is available. See [Environment preparation](#environment-preparation-and-health-checks). |
 | `GET` | `/healthz` | Liveness: 200 when the HTTP server and Sway IPC connection are up. Unversioned, unauthenticated. |

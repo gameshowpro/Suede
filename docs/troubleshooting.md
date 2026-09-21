@@ -133,7 +133,7 @@ When a display stays dark on a mode it claims to support:
 
 1. Try the display's **preferred mode** first (the top of its `modes` list) —
    that one, it syncs.
-2. Then try the neighbouring refresh variant — `59.94` instead of `60` (or
+2. Then try the neighboring refresh variant — `59.94` instead of `60` (or
    `29.97` instead of `30`). The broadcast-rate variants are usually the
    CEA-861 timings, which HDMI-native displays are built around; an exact
    fractional refresh selects a single advertised mode instead of letting
@@ -167,6 +167,86 @@ any pass that actually changed which outputs are enabled, whether or not the
 compositor removes the global. A `systemctl --user restart suede` remains a
 manual fix for the same condition, and a fast way to confirm the diagnosis,
 but should no longer be necessary.
+
+## Warp mode will not activate
+
+Only relevant to an overlapping (edge-blended) layout with `projection.mode`
+set to `warp`. Check `geometry.warpAvailable` and `geometry.reason` in
+`GET /api/v1/projection/stats`:
+
+```bash
+curl -s http://appliance:9088/api/v1/projection/stats | python3 -c \
+  'import json,sys; print(json.load(sys.stdin)["geometry"])'
+```
+
+`warpAvailable` is tri-state: `true` (active), `false` (refused, with a
+`reason`), or `null` (not yet verified — a capability probe is pending, or
+none has run). A `false` result never discards the saved corner/center
+calibration; it is retained and warp resumes automatically once the
+condition clears. `reason` is one of:
+
+- **"this build has no projection machinery; install a projection-enabled
+  build"** — the running binary was compiled without the `projection` cargo
+  feature. Install a build that has it; there is nothing to fix at runtime.
+- **"warping requires allow_overlaps=true and the canvas slicer"** —
+  `allow_overlaps` is not set in `suede.toml`. Re-run provisioning with
+  `--allow-overlaps`, or set the key by hand and restart Sway. See
+  [Overlapping layouts and direct scanout](configuration.md#direct-scanout).
+- **"the selected CPU renderer supports simple rectangles only; select Auto
+  or GPU to probe warp support"** — `projection.renderer` is explicitly
+  `cpu`, which never attempts warp. Set it to `auto` (the default) or `gpu`.
+- **A probe-in-progress or probe-not-yet-run message** ("waiting for the
+  current capture/presentation capability probe", or "warp capability is not
+  verified; run content or a calibration pattern to probe the selected
+  pipeline") — warp has not been ruled in or out yet. Activate an app or a
+  test pattern so the slicer starts and can negotiate the GPU path; if it
+  stays `null`, check the daemon log for the capability probe's own error.
+
+A dynamic reason from the running slicer child (a negotiation failure it
+reported itself) can also appear here; it is not one of the four fixed
+messages above and describes its own remediation.
+
+### The wall falls back to a plain, unoverlapped arrangement {: #canvas-plan-failed }
+
+A `canvas_plan_failed` divergence in `GET /api/v1/status` means the
+configured canvas layout (Simple with a shared canvas, or Warp) could not be
+turned into a plan at all — usually a momentarily inconsistent edit, such as
+a source rectangle mid-drag, rather than a lastingly broken document. Two
+things happen while it lasts, and the divergence's `detail` says which:
+
+- If a plan had previously been computed successfully, that last good
+  arrangement keeps running — stale, but exactly as it looked a moment ago,
+  and still not overlapping.
+- If no plan has ever succeeded (for example, straight after a fresh
+  configuration write that has not yet settled), the outputs fall back to a
+  plain edge-to-edge tiling with no cropping or correction applied, rather
+  than the raw configured positions — which, for an overlapping layout,
+  would otherwise show the same pixels on more than one projector.
+
+Check `GET /api/v1/config/projection` and each output's `geometry` for the
+specific problem the divergence names (commonly a source rectangle or a
+corner pin that has drifted outside the canvas). Once the write that fixes
+it lands, this divergence clears on the next reconciliation pass and the
+wall returns to the configured arrangement.
+
+### An output's settled value was rejected, not pinned {: #adopted-value-invalid }
+
+`adopted_value_invalid` in `GET /api/v1/status` means an output settled on a
+mode, scale, or transform that Sway reports back, but which the saved
+document cannot actually hold — the leading case is a Warp output whose
+compositor scale settles on anything other than `1.0`, which Warp mode does
+not yet support. Ordinarily Suede pins ("adopts") whatever an output settles
+on so a reboot keeps today's picture rather than re-negotiating from
+scratch; this is the one case where it deliberately does not, because saving
+that value would produce a document the daemon itself refuses to load again
+next time.
+
+The divergence's `subject` names the output and `detail` names the rejected
+value. Nothing is lost — the previously saved value, or Sway's own default,
+stays in effect — but the display will make the same unsupported choice
+again at the next restart unless the configuration sets the value
+explicitly (or the output leaves Warp mode, where the constraint does not
+apply).
 
 ## A browser will not start
 
@@ -510,15 +590,48 @@ until the appliance user logs in again — on an auto-login appliance, reboot.
 
 ## Configuration was lost
 
-It should not be. Desired state lives in `$XDG_STATE_HOME/suede/state.json`, is written atomically, and keeps a `.bak`. Package upgrades do not touch it.
-
-If Suede fell back to an empty document, the log says so at startup. The backup is still on disk:
+It should not be. Desired state lives in `$XDG_STATE_HOME/suede/state.json`, is written atomically, and keeps a `.bak` copy of the last successful save. Package upgrades do not touch it.
 
 ```bash
 ls -la ~/.local/state/suede/
 ```
 
 A `state.json` written by a *newer* Suede is refused rather than downgraded, so rolling back a version can look like lost configuration. The file is intact; install the newer version again.
+
+### The saved file needed repair at startup {: #state-document-repaired }
+
+An old, hand-edited, or otherwise malformed `state.json` does not stop the
+daemon from starting. Instead it is repaired field by field — an unknown
+field is dropped, a section that cannot be read falls back to its defaults,
+and a document that still fails validation is degraded piece by piece until
+it passes — and a `state_document_repaired` divergence appears in
+`GET /api/v1/status` for every repair that was needed, naming what changed.
+This is normal after restoring a very old backup or editing the file by
+hand; it is not normal after an ordinary restart.
+
+Nothing about the file as found is silently rewritten: it is copied to
+`state.json.rejected` before the repaired document is saved over it, so the
+original is always available to compare against or recover fields from by
+hand:
+
+```bash
+diff <(python3 -m json.tool ~/.local/state/suede/state.json.rejected) \
+     <(python3 -m json.tool ~/.local/state/suede/state.json)
+```
+
+Once the document has been re-saved through the API (even unchanged), the
+repaired shape becomes the new saved one and the divergence stops appearing.
+
+### A change is live but was not saved {: #state-not-persisted }
+
+`state_not_persisted` in `GET /api/v1/status` means a write was accepted and
+is already running on the outputs, but the save to `state.json` itself
+failed — commonly a full or read-only state directory. `detail` names the
+revision affected and the underlying error. The appliance is not
+misconfigured; it is one restart away from losing exactly that change, so
+treat this the same as a low-disk-space warning: free space or fix the
+directory's permissions, then repeat the write (or any write — the next
+successful save clears the divergence regardless of which one it was).
 
 ## Everything reconciles constantly
 

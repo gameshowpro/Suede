@@ -517,11 +517,6 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
-          },
-          "scale": {
-            "description": "Deprecated descriptive metadata, retained for document compatibility.\nDoes not control rendering or express the current recommendation ratio;\n`renderWidth` is the authoritative raster width.",
-            "format": "double",
-            "type": "number"
           }
         },
         "required": [
@@ -612,7 +607,7 @@
             ]
           },
           "gpuVendor": {
-            "description": "From `WEBGL_debug_renderer_info`. `null` when WebGL is unavailable or\nthe browser masks it — itself a finding, since a software rasteriser\nusually announces itself here (`SwiftShader`, `llvmpipe`).",
+            "description": "From `WEBGL_debug_renderer_info`. `null` when WebGL is unavailable or\nthe browser masks it — itself a finding, since a software rasterizer\nusually announces itself here (`SwiftShader`, `llvmpipe`).",
             "type": [
               "string",
               "null"
@@ -820,65 +815,6 @@
         "required": [
           "revision",
           "section"
-        ],
-        "type": "object"
-      },
-      "ConvertLayoutRequest": {
-        "additionalProperties": false,
-        "description": "Request body for `POST /api/v1/projection/convert`.",
-        "properties": {
-          "outputs": {
-            "description": "The complete configured participant roster. Disabled entries are\nretained in the request but do not participate in the candidate.",
-            "items": {
-              "$ref": "#/components/schemas/OutputConfig"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "outputs"
-        ],
-        "type": "object"
-      },
-      "ConvertLayoutResponse": {
-        "description": "Candidate returned by the conversion endpoint.",
-        "properties": {
-          "canvas": {
-            "$ref": "#/components/schemas/CanvasConfig"
-          },
-          "outputs": {
-            "items": {
-              "$ref": "#/components/schemas/ConvertedOutput"
-            },
-            "type": "array"
-          },
-          "warnings": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array"
-          }
-        },
-        "required": [
-          "canvas",
-          "outputs",
-          "warnings"
-        ],
-        "type": "object"
-      },
-      "ConvertedOutput": {
-        "description": "One converted output, addressed by its stable configuration key.",
-        "properties": {
-          "geometry": {
-            "$ref": "#/components/schemas/OutputGeometry"
-          },
-          "key": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "key",
-          "geometry"
         ],
         "type": "object"
       },
@@ -1868,7 +1804,7 @@
             ]
           },
           "measurementMs": {
-            "description": "Duration of the most recent sampling pass and host readback.",
+            "description": "Submission to collection of the most recent sampling pass. The\nmeasurement is asynchronous, so this is pipeline latency and not time\nthe render thread spent waiting: it is bounded below by the pass and\nits readback and above by how soon the next capture collected it.",
             "format": "double",
             "type": [
               "number",
@@ -1920,6 +1856,65 @@
           "applied",
           "logicalGeneration"
         ],
+        "type": "object"
+      },
+      "ProjectionChildGenerations": {
+        "description": "Control-protocol generation counters, local to the current child\nsession's own sequence. These reset to zero whenever the slicer process\nrestarts and must never be compared against a desired-state document\ngeneration — see [`ProjectionConfigGenerations`] for those.",
+        "properties": {
+          "accepted": {
+            "description": "Highest accepted generation reported by this child.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "applied": {
+            "description": "Highest generation installed as a complete render revision.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "built": {
+            "description": "Highest generation built for any affected output.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "presented": {
+            "description": "Highest generation presented by any output. Independent heads need\nnot physically present a generation at the same instant.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "requested": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "submitted": {
+            "description": "Highest generation submitted by any output. This does not mean all\noutputs have submitted it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "ProjectionConfig": {
@@ -1996,6 +1991,30 @@
         },
         "type": "object"
       },
+      "ProjectionConfigGenerations": {
+        "description": "Desired-state document generations this slicer session has processed.\nNever comparable with [`ProjectionChildGenerations`]'s child-local\ncontrol sequence.",
+        "properties": {
+          "applied": {
+            "description": "Working-copy generation whose projection snapshot the slicer has\ninstalled. It advances only on an `applied` event from the current\nslicer session, or when an unchanged effective snapshot is already\nknown to have been installed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "requested": {
+            "description": "Working-copy generation whose effective projection snapshot the\nmanager most recently asked this slicer session to realize.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ProjectionControlFailure": {
         "description": "A rejected revision or a closed control channel, retained until a newer\nsuccessful update supersedes it.",
         "properties": {
@@ -2047,10 +2066,14 @@
             ]
           },
           "samplingMode": {
-            "description": "Filled when the slicer reports its effective sampling path.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SamplingMode",
+                "description": "Filled when the slicer reports its effective sampling path."
+              }
             ]
           },
           "submittedGeneration": {
@@ -2070,33 +2093,6 @@
       "ProjectionControlStatus": {
         "description": "Observed progress of the complete snapshots sent to the slicer.",
         "properties": {
-          "acceptedGeneration": {
-            "description": "Highest accepted generation reported by this child.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "appliedConfigGeneration": {
-            "description": "Working-copy generation whose projection snapshot the slicer has\ninstalled. It advances only on an `applied` event from the current\nslicer session, or when an unchanged effective snapshot is already\nknown to have been installed. It must never be compared with the\nchild-local control generations.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "appliedGeneration": {
-            "description": "Highest generation installed as a complete render revision.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "blackLift": {
             "oneOf": [
               {
@@ -2115,19 +2111,22 @@
               "null"
             ]
           },
-          "builtGeneration": {
-            "description": "Highest generation built for any affected output.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
+          "childGeneration": {
+            "$ref": "#/components/schemas/ProjectionChildGenerations",
+            "description": "Control-protocol generation counters, local to the current child\nsession's own sequence."
+          },
+          "configGeneration": {
+            "$ref": "#/components/schemas/ProjectionConfigGenerations",
+            "description": "Desired-state document generations this slicer session has\nprocessed."
           },
           "effectiveMode": {
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectionMode"
+              }
             ]
           },
           "effectiveRenderer": {
@@ -2157,37 +2156,15 @@
             },
             "type": "array"
           },
-          "presentedGeneration": {
-            "description": "Highest generation presented by any output. Independent heads need\nnot physically present a generation at the same instant.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "requestedConfigGeneration": {
-            "description": "Working-copy generation whose effective projection snapshot the\nmanager most recently asked this slicer session to realize. This is\ndeliberately separate from `requested_generation`: the latter is a\nchild-local control sequence, while this identifies the configuration\nresponse the editor received.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "requestedGeneration": {
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "requestedMode": {
-            "description": "Requested operator mode and the mode the negotiated pipeline runs.",
-            "type": [
-              "string",
-              "null"
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectionMode",
+                "description": "Requested operator mode and the mode the negotiated pipeline runs, as\nreported by the child's own `Capability` event. This is the child's\nself-report, not the public policy answer: see\n[`ProjectionGeometryStatus::effective_mode`] for the one authoritative\neffective mode a client should read, which also accounts for feature\ngating, `allowOverlaps`, and capability-probe hysteresis this field\nknows nothing about."
+              }
             ]
           },
           "requestedRenderer": {
@@ -2205,15 +2182,6 @@
             "description": "Session of the currently running child, when it has accepted a live\ncontrol message.",
             "type": [
               "string",
-              "null"
-            ]
-          },
-          "submittedGeneration": {
-            "description": "Highest generation submitted by any output. This does not mean all\noutputs have submitted it.",
-            "format": "int64",
-            "minimum": 0,
-            "type": [
-              "integer",
               "null"
             ]
           },
@@ -2568,7 +2536,7 @@
         "type": "object"
       },
       "Renderer": {
-        "description": "Which pipeline the slicer uses to composite the canvas onto each output.\n\n`Auto` (the default) prefers the GPU path — the compositor blits the\ncanvas into a Vulkan image exported as a dmabuf, a fragment shader blends\nit straight into each output's own dmabuf, and no pixel ever crosses to\nsystem memory — falling back to the CPU path (shared-memory screencopy,\nblended on the CPU) whenever the compositor does not offer dmabuf capture\nor Vulkan fails to initialise. `Cpu` forces the fallback path even on\nhardware that could do better. `Gpu` forces the GPU path and is a startup\nerror if the machine cannot actually provide it — the slicer exits and\nthe daemon respawns it on its next reconcile, rather than silently\nrunning the slower path — for a rig where that would go unnoticed.",
+        "description": "Which pipeline the slicer uses to composite the canvas onto each output.\n\n`Auto` (the default) prefers the GPU path — the compositor blits the\ncanvas into a Vulkan image exported as a dmabuf, a fragment shader blends\nit straight into each output's own dmabuf, and no pixel ever crosses to\nsystem memory — falling back to the CPU path (shared-memory screencopy,\nblended on the CPU) whenever the compositor does not offer dmabuf capture\nor Vulkan fails to initialize. `Cpu` forces the fallback path even on\nhardware that could do better. `Gpu` forces the GPU path and is a startup\nerror if the machine cannot actually provide it — the slicer exits and\nthe daemon respawns it on its next reconcile, rather than silently\nrunning the slower path — for a rig where that would go unnoticed.",
         "enum": [
           "auto",
           "cpu",
@@ -2645,6 +2613,14 @@
           "windowNeverAppeared",
           "configChanged",
           "apiRequest"
+        ],
+        "type": "string"
+      },
+      "SamplingMode": {
+        "description": "How a slicer output actually sampled its captured source.\n\nDistinct from [`ProjectionMode`]: a Simple-mode crop that happens to sit\non an integer pixel boundary samples `Exact` just like an identity Warp\noutput would, while a fractional crop or corner pin in either mode needs\n`Bilinear`. This is a report of the sampling path taken, not of which\npipeline requested it.",
+        "enum": [
+          "exact",
+          "bilinear"
         ],
         "type": "string"
       },
@@ -2729,7 +2705,7 @@
               },
               {
                 "$ref": "#/components/schemas/CheckSummary",
-                "description": "How the environment health checks last came out, by status.\n\nDivergences and checks are different axes: a machine can apply its\nconfiguration perfectly while its browser is missing hardware video\ndecode. Summarised here so the common question takes one call; the\ndetail stays at `GET /system/checks`.\n\n`None` rather than an all-zero [`CheckSummary`] wherever the counts\nare not actually known. A reconciliation pass never runs the checks\nitself — they shell out to other programs, and a pass must stay\ncheap — so the `Status` it publishes over SSE cannot honestly fill\nthis in; a zeroed summary there would read as \"everything passed\",\nwhich is a claim nobody made. `GET /status` always fills it in from\nthe check runner's last results, because it has one to ask."
+                "description": "How the environment health checks last came out, by status.\n\nDivergences and checks are different axes: a machine can apply its\nconfiguration perfectly while its browser is missing hardware video\ndecode. Summarized here so the common question takes one call; the\ndetail stays at `GET /system/checks`.\n\n`None` rather than an all-zero [`CheckSummary`] wherever the counts\nare not actually known. A reconciliation pass never runs the checks\nitself — they shell out to other programs, and a pass must stay\ncheap — so the `Status` it publishes over SSE cannot honestly fill\nthis in; a zeroed summary there would read as \"everything passed\",\nwhich is a claim nobody made. `GET /status` always fills it in from\nthe check runner's last results, because it has one to ask."
               }
             ]
           },
@@ -3639,7 +3615,29 @@
                 }
               }
             },
-            "description": "Configured apps"
+            "description": "Configured apps, from the effective document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -3757,7 +3755,29 @@
                 }
               }
             },
-            "description": "The app configuration"
+            "description": "The app configuration, from the effective document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           },
           "404": {
             "description": "No such app"
@@ -3833,7 +3853,29 @@
                 }
               }
             },
-            "description": "Defined background presets"
+            "description": "Defined background presets, from the effective document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -4001,7 +4043,29 @@
                 }
               }
             },
-            "description": "Configured outputs"
+            "description": "Configured outputs, from the effective document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -4119,7 +4183,29 @@
                 }
               }
             },
-            "description": "The output configuration"
+            "description": "The output configuration, from the effective document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           },
           "404": {
             "description": "No such entry"
@@ -4172,9 +4258,55 @@
                 }
               }
             },
-            "description": "The persisted document"
+            "description": "The persisted document. Retention note: while the effective projection mode is Simple, omitting `geometry` here (or leaving it out of a full PUT /config) keeps the previously saved geometry rather than clearing it, so a Simple-mode save cannot accidentally discard retained Warp calibration. PUT is otherwise literal. To actually clear one output's geometry, use DELETE on this same path with an additional /geometry segment."
           }
         },
+        "tags": [
+          "config"
+        ]
+      }
+    },
+    "/api/v1/config/outputs/{key}/geometry": {
+      "delete": {
+        "operationId": "delete_output_geometry",
+        "parameters": [
+          {
+            "description": "Match key",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "in": "query",
+            "name": "wait",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            },
+            "description": "The persisted document, with this output's geometry cleared"
+          },
+          "404": {
+            "description": "No such output"
+          }
+        },
+        "summary": "Explicit calibration clear. A full-document or section PUT cannot do\nthis while the effective mode is Simple: `preserve_retained` treats an\nomitted `geometry` as \"leave it\", precisely so an ordinary Simple-mode\nsave cannot discard retained Warp correction by accident (see\n[`crate::projection_policy::preserve_retained`]). This route bypasses\nthat retention deliberately and is the only way to clear one output's\ngeometry. Idempotent: a second call on an output that already has no\ngeometry still succeeds, since the end state (no geometry) is what was\nasked for either way.",
         "tags": [
           "config"
         ]
@@ -4199,7 +4331,29 @@
                 }
               }
             },
-            "description": "The projection configuration; null when none is set"
+            "description": "The projection configuration from the effective document; null when none is set",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -4246,12 +4400,46 @@
                 }
               }
             },
-            "description": "The persisted document"
+            "description": "The persisted document. `null` removes the whole projection section. Retention note: while the effective mode is Simple, an otherwise-present projection body that omits `canvas` keeps the previously saved canvas rather than clearing it, so a Simple-mode save cannot accidentally discard a retained Warp canvas. PUT is otherwise literal. To actually clear the shared canvas, use DELETE /config/projection/canvas."
           },
           "422": {
             "description": "Validation failed"
           }
         },
+        "tags": [
+          "config"
+        ]
+      }
+    },
+    "/api/v1/config/projection/canvas": {
+      "delete": {
+        "operationId": "delete_projection_canvas",
+        "parameters": [
+          {
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "in": "query",
+            "name": "wait",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            },
+            "description": "The persisted document, with the shared canvas cleared"
+          }
+        },
+        "summary": "Explicit canvas clear, for the same reason `DELETE\n/config/outputs/{key}/geometry` exists: `preserve_retained` deliberately\nrefills an omitted `canvas` while the effective mode is Simple, so\nordinary section and full-document PUTs cannot clear it. A document with\nno `projection` section at all, or one whose canvas is already absent,\nis left as it is — clearing an already-clear canvas is still success.",
         "tags": [
           "config"
         ]
@@ -4354,7 +4542,29 @@
                 }
               }
             },
-            "description": "Daemon settings"
+            "description": "Daemon settings, from the effective document",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
           }
         },
         "tags": [
@@ -4496,40 +4706,6 @@
         },
         "tags": [
           "observed"
-        ]
-      }
-    },
-    "/api/v1/projection/convert": {
-      "post": {
-        "operationId": "convert_layout",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ConvertLayoutRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ConvertLayoutResponse"
-                }
-              }
-            },
-            "description": "Converted candidate"
-          },
-          "422": {
-            "description": "The layout is incomplete or invalid"
-          }
-        },
-        "summary": "`POST /api/v1/projection/convert` — derive a warp candidate without saving.",
-        "tags": [
-          "projection"
         ]
       }
     },

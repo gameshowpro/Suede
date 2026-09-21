@@ -830,7 +830,6 @@ mod tests {
     #[cfg(feature = "projection")]
     fn d1_moves_the_picture_and_overlap_without_changing_source_selection() {
         use crate::model::Rect;
-        use crate::projection::blend::{transfer_at, FadeTo, RampSpec};
         let a_source = Rect {
             x: 0,
             y: 0,
@@ -851,15 +850,6 @@ mod tests {
         )
         .unwrap();
         let b = Warp::identity(1000, 1000);
-        let ramp = RampSpec {
-            rect: Rect {
-                x: 900,
-                y: 0,
-                width: 100,
-                height: 1000,
-            },
-            fade_to: FadeTo::Right,
-        };
         for (u, v) in [
             (0.0, 0.0),
             (1.0, 0.0),
@@ -884,10 +874,13 @@ mod tests {
         }
         let destination = a.destination_at(0.95, 0.5).unwrap();
         let local = a.source_at(destination[0], destination[1]).unwrap();
-        assert_eq!(
-            transfer_at(&[ramp], 1.0, 0.0, local[0], local[1], 1.0),
-            (128, 0)
-        );
+        // A left-to-right ramp over local[0] in [900, 1000] would sit
+        // exactly half-way (gain 128/256) here; check that arithmetic
+        // directly (`blend::RampSpec`/`transfer_at` were retired in favor of
+        // `layout::Evaluator`, the single blend-weight rule) to keep this
+        // fixed-point precision check on `source_at`'s round trip.
+        let transmitted = (1.0 - (local[0] - 900.0) / 100.0).clamp(0.0, 1.0);
+        assert_eq!((transmitted * 256.0).round() as u16, 128);
         let b_local = b.source_at(50.0, 500.0).unwrap();
         assert_point(
             Some([b_source.x as f64 + b_local[0], b_local[1]]),

@@ -19,7 +19,7 @@ pub enum WallpaperError {
     InvalidId(String),
     #[error("no wallpaper named {0}")]
     NotFound(String),
-    #[error("unrecognised image format; PNG and JPEG are supported")]
+    #[error("unrecognized image format; PNG and JPEG are supported")]
     UnsupportedFormat,
     #[error("image is {size} bytes, over the {MAX_BYTES} byte limit")]
     TooLarge { size: usize },

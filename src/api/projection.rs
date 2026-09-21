@@ -17,16 +17,6 @@ use crate::model::{
     validate_sources, CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, ProjectionMode,
     Transform,
 };
-use crate::state::StateStore;
-
-/// Request body for `POST /api/v1/projection/convert`.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ConvertLayoutRequest {
-    /// The complete configured participant roster. Disabled entries are
-    /// retained in the request but do not participate in the candidate.
-    pub outputs: Vec<OutputConfig>,
-}
 
 /// One converted output, addressed by its stable configuration key.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -89,9 +79,9 @@ pub struct RecommendationResponse {
 }
 
 const LIMITS: ResolutionLimits = ResolutionLimits {
-    max_dimension: 32_768,
-    max_canvas_pixels: 64_000_000,
-    max_output_pixels: 32_000_000,
+    max_dimension: crate::model::limits::MAX_DIMENSION,
+    max_canvas_pixels: crate::model::limits::MAX_CANVAS_PIXELS,
+    max_output_pixels: crate::model::limits::MAX_OUTPUT_PIXELS,
 };
 
 /// Convert a complete simple rectangle layout into the canonical warp model.
@@ -203,7 +193,6 @@ pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayou
     let canvas = CanvasConfig {
         aspect,
         render_width: width_u32,
-        scale: 1.0,
     };
     canvas
         .dimensions()
@@ -253,25 +242,6 @@ pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayou
     })
 }
 
-/// `POST /api/v1/projection/convert` — derive a warp candidate without saving.
-#[utoipa::path(
-    post,
-    path = "/api/v1/projection/convert",
-    tag = "projection",
-    request_body = ConvertLayoutRequest,
-    responses(
-        (status = 200, description = "Converted candidate", body = ConvertLayoutResponse),
-        (status = 422, description = "The layout is incomplete or invalid")
-    )
-)]
-pub async fn convert_layout(
-    Json(body): Json<ConvertLayoutRequest>,
-) -> ApiResult<Json<ConvertLayoutResponse>> {
-    convert_layout_candidate(&body.outputs)
-        .map(Json)
-        .map_err(ApiError::Validation)
-}
-
 /// `GET /api/v1/projection/recommendation` — estimate a useful canvas density.
 #[utoipa::path(
     get,
@@ -283,15 +253,21 @@ pub async fn recommend_resolution(
     State(state): State<crate::api::ApiState>,
 ) -> ApiResult<Json<RecommendationResponse>> {
     let (document, generation) = state.store.effective_with_generation();
-    recommend_for_state(&state.store, &document, generation)
+    // The Jacobian sampling below is pure CPU work (33x33 grid, a handful of
+    // finite differences per point) with no I/O, but it is real work all
+    // the same; keeping it off the async executor means one slow
+    // recommendation request cannot stall unrelated requests sharing the
+    // same worker thread.
+    tokio::task::spawn_blocking(move || recommend_for_state(&document, generation))
+        .await
+        .map_err(|error| ApiError::Internal(format!("recommendation task panicked: {error}")))?
         .map(Json)
         .map_err(ApiError::Validation)
 }
 
-/// Pure recommendation implementation, kept separate so tests can prove it
-/// does not mutate the store or adopt a stale recommendation.
+/// Pure recommendation implementation, kept separate so tests can call it
+/// synchronously without going through the executor or an `ApiState`.
 pub fn recommend_for_state(
-    _store: &StateStore,
     document: &crate::model::DesiredState,
     generation: u64,
 ) -> Result<RecommendationResponse, String> {
@@ -442,7 +418,6 @@ pub fn recommend_for_state(
         let validation_canvas = CanvasConfig {
             aspect: requested_aspect,
             render_width: 1,
-            scale: 1.0,
         };
         geometry
             .validate_for_output(&validation_canvas, width, height)
@@ -562,17 +537,28 @@ fn canvas_height_unbounded(width: u64, aspect: f64) -> Result<u64, String> {
 }
 
 fn admissible_width(aspect: f64) -> Result<u32, String> {
-    // The known limit is small enough that a descending search is clearer and
-    // less error-prone than trying to combine dimension and pixel constraints
-    // algebraically around positive half-up height rounding.
-    for width in (1..=LIMITS.max_dimension).rev() {
-        if let Ok(height) = canvas_height(width, aspect) {
-            if height > 0 {
-                return Ok(width);
-            }
+    // `canvas_height(width, aspect)` is monotonic in `width` for a fixed
+    // positive aspect: the derived height is non-decreasing, so both the
+    // dimension-limit and pixel-count checks it applies, once tripped, stay
+    // tripped for every larger width. The admissible widths are therefore a
+    // prefix of `1..=MAX_DIMENSION`, and its end can be found with a binary
+    // search instead of the up-to-32768-step linear scan this replaces.
+    let ok = |width: u32| canvas_height(width, aspect).is_ok();
+    if !ok(1) {
+        return Err("canvas aspect cannot fit within the known limits".into());
+    }
+    let (mut lo, mut hi) = (1u32, LIMITS.max_dimension);
+    while lo < hi {
+        // Bias the midpoint up so `lo` always advances, even when
+        // `hi == lo + 1`.
+        let mid = lo + (hi - lo).div_ceil(2);
+        if ok(mid) {
+            lo = mid;
+        } else {
+            hi = mid - 1;
         }
     }
-    Err("canvas aspect cannot fit within the known limits".into())
+    Ok(lo)
 }
 
 fn width_for_density(target_density: f64, aspect: f64) -> Result<f64, String> {
@@ -631,38 +617,48 @@ fn sample_density(
     const GRID: usize = 32;
     const STEP: f64 = 1.0 / 1024.0;
     let mut max_density: f64 = 0.0;
+    // A single point's contribution to `max_density`, shared by the main
+    // grid and the center-seam probes below so neither has to repeat the
+    // other's work.
+    let mut probe = |u: f64, v: f64| -> Result<(), String> {
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return Ok(());
+        }
+        let du = derivative_axis(warp, u, v, true)?;
+        let dv = derivative_axis(warp, u, v, false)?;
+        let j00 = du[0] / source_width;
+        let j10 = du[1] / source_width;
+        let j01 = dv[0] / source_height;
+        let j11 = dv[1] / source_height;
+        let a = j00 * j00 + j10 * j10;
+        let b = j00 * j01 + j10 * j11;
+        let c = j01 * j01 + j11 * j11;
+        let trace = a + c;
+        let determinant = (a * c - b * b).max(0.0);
+        let largest = ((trace + (trace * trace - 4.0 * determinant).max(0.0).sqrt()) * 0.5).sqrt();
+        if largest.is_finite() {
+            max_density = max_density.max(largest);
+        }
+        Ok(())
+    };
     for iy in 0..=GRID {
+        let v = iy as f64 / GRID as f64;
+        // The horizontal center-seam neighborhood only depends on this row's
+        // `v`, so it is sampled once per row here rather than once per
+        // (row, column) grid point below.
+        probe(0.5 - 2.0 * STEP, v)?;
+        probe(0.5 + 2.0 * STEP, v)?;
         for ix in 0..=GRID {
             let u = ix as f64 / GRID as f64;
-            let v = iy as f64 / GRID as f64;
-            for (u, v) in [
-                (u, v),
-                (0.5 - 2.0 * STEP, v),
-                (0.5 + 2.0 * STEP, v),
-                (u, 0.5 - 2.0 * STEP),
-                (u, 0.5 + 2.0 * STEP),
-            ] {
-                if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
-                    continue;
-                }
-                let du = derivative_axis(warp, u, v, true)?;
-                let dv = derivative_axis(warp, u, v, false)?;
-                let j00 = du[0] / source_width;
-                let j10 = du[1] / source_width;
-                let j01 = dv[0] / source_height;
-                let j11 = dv[1] / source_height;
-                let a = j00 * j00 + j10 * j10;
-                let b = j00 * j01 + j10 * j11;
-                let c = j01 * j01 + j11 * j11;
-                let trace = a + c;
-                let determinant = (a * c - b * b).max(0.0);
-                let largest =
-                    ((trace + (trace * trace - 4.0 * determinant).max(0.0).sqrt()) * 0.5).sqrt();
-                if largest.is_finite() {
-                    max_density = max_density.max(largest);
-                }
-            }
+            probe(u, v)?;
         }
+    }
+    for ix in 0..=GRID {
+        let u = ix as f64 / GRID as f64;
+        // Likewise, the vertical center-seam neighborhood only depends on
+        // this column's `u`: once per column, not once per grid point.
+        probe(u, 0.5 - 2.0 * STEP)?;
+        probe(u, 0.5 + 2.0 * STEP)?;
     }
     (max_density.is_finite() && max_density > 0.0)
         .then_some(max_density)
@@ -720,6 +716,7 @@ fn derivative_axis(
 mod tests {
     use super::*;
     use crate::model::{Mode, OutputMatch, Position, ProjectionMode};
+    use crate::state::StateStore;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
@@ -837,25 +834,14 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 1.0,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });
-        let identity_rec = recommend_for_state(
-            &StateStore::ephemeral(std::env::temp_dir()),
-            &identity_state,
-            0,
-        )
-        .unwrap();
+        let identity_rec = recommend_for_state(&identity_state, 0).unwrap();
 
         let mut keystone_state = identity_state.clone();
         keystone_state.outputs = vec![keystone];
-        let keystone_rec = recommend_for_state(
-            &StateStore::ephemeral(std::env::temp_dir()),
-            &keystone_state,
-            0,
-        )
-        .unwrap();
+        let keystone_rec = recommend_for_state(&keystone_state, 0).unwrap();
         assert!(keystone_rec.ideal_width > identity_rec.ideal_width);
     }
 
@@ -887,19 +873,16 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 16.0 / 9.0,
                 render_width: 101,
-                scale: 1.0,
             }),
             ..Default::default()
         });
-        let simple =
-            recommend_for_state(&StateStore::ephemeral(std::env::temp_dir()), &state, 0).unwrap();
+        let simple = recommend_for_state(&state, 0).unwrap();
 
         configured.geometry.as_mut().unwrap().corners =
             [[0.0, 0.0], [1.0, 0.0], [1.4, 1.0], [0.0, 1.0]];
         state.outputs[0] = configured;
         state.projection.as_mut().unwrap().mode = ProjectionMode::Warp;
-        let warp =
-            recommend_for_state(&StateStore::ephemeral(std::env::temp_dir()), &state, 0).unwrap();
+        let warp = recommend_for_state(&state, 0).unwrap();
         assert!(warp.ideal_width > simple.ideal_width);
     }
 
@@ -929,12 +912,10 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 1.6,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });
-        let store = StateStore::ephemeral(std::env::temp_dir());
-        let first = recommend_for_state(&store, &state, 1).unwrap();
+        let first = recommend_for_state(&state, 1).unwrap();
         state
             .projection
             .as_mut()
@@ -943,7 +924,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .render_width = 101;
-        let second = recommend_for_state(&store, &state, 2).unwrap();
+        let second = recommend_for_state(&state, 2).unwrap();
         assert_eq!(first.ideal_width, second.ideal_width);
         assert_eq!(first.ideal_height, second.ideal_height);
     }
@@ -978,7 +959,6 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 2.0,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });
@@ -986,18 +966,17 @@ mod tests {
             outputs: vec![rotated],
             ..normal_state.clone()
         };
-        let store = StateStore::ephemeral(std::env::temp_dir());
-        let normal_rec = recommend_for_state(&store, &normal_state, 0).unwrap();
-        let rotated_rec = recommend_for_state(&store, &rotated_state, 0).unwrap();
+        let normal_rec = recommend_for_state(&normal_state, 0).unwrap();
+        let rotated_rec = recommend_for_state(&rotated_state, 0).unwrap();
         assert!(rotated_rec.ideal_width > normal_rec.ideal_width);
 
         rotated_state.outputs[0].scale = Some(1.0);
-        let rotated_without_scale = recommend_for_state(&store, &rotated_state, 0).unwrap();
+        let rotated_without_scale = recommend_for_state(&rotated_state, 0).unwrap();
         assert_eq!(rotated_rec.ideal_width, rotated_without_scale.ideal_width);
 
         let mut converted_rotated = rotated_state.clone();
         converted_rotated.outputs[0].geometry = None;
-        let converted = recommend_for_state(&store, &converted_rotated, 0).unwrap();
+        let converted = recommend_for_state(&converted_rotated, 0).unwrap();
         assert_eq!(rotated_without_scale.ideal_width, converted.ideal_width);
     }
 
@@ -1027,12 +1006,10 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 1.0,
                 render_width: 32768,
-                scale: 1.0,
             }),
             ..Default::default()
         });
-        let response =
-            recommend_for_state(&StateStore::ephemeral(std::env::temp_dir()), &state, 9).unwrap();
+        let response = recommend_for_state(&state, 9).unwrap();
         assert!(response.admissible_width <= 32768);
         assert!(u64::from(response.admissible_width) < response.ideal_width);
         assert!(response.admissible_height >= 1);
@@ -1081,7 +1058,6 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 1.0,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });
@@ -1089,7 +1065,7 @@ mod tests {
         let initial_generation = store.generation();
         store.set_preview(Some(preview));
         let (effective, generation) = store.effective_with_generation();
-        let response = recommend_for_state(&store, &effective, generation).unwrap();
+        let response = recommend_for_state(&effective, generation).unwrap();
         assert_eq!(response.revision, 0);
         assert!(response.generation > initial_generation);
         assert!(store.get().projection.is_none());
@@ -1129,7 +1105,6 @@ mod tests {
             canvas: Some(CanvasConfig {
                 aspect: 1.0,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });

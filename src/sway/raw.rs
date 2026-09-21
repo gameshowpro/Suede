@@ -76,7 +76,7 @@ impl From<RawOutput> for Output {
     fn from(value: RawOutput) -> Self {
         let mut modes: Vec<Mode> = Vec::with_capacity(value.modes.len());
         // Sway reports duplicates that differ only in fields it does not expose
-        // (colour depth, interlacing), so collapse them.
+        // (color depth, interlacing), so collapse them.
         for mode in value.modes.into_iter().map(Mode::from) {
             if !modes.iter().any(|existing| existing.matches(&mode)) {
                 modes.push(mode);

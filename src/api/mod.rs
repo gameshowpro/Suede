@@ -64,45 +64,31 @@ impl ApiState {
     /// Writes return once *saved*, not once applied: application is
     /// asynchronous and may currently be impossible. `wait` opts into blocking
     /// until reconciliation settles.
+    ///
+    /// Unconditional, so it is refused with a 409 while somebody else has a
+    /// working copy live; see [`StateStore::stage_replace_if`].
     pub async fn commit(
         &self,
-        mut next: DesiredState,
+        next: DesiredState,
         section: &str,
         wait: Option<u64>,
     ) -> ApiResult<DesiredState> {
-        self.validate_configuration(&mut next)?;
-
-        let saved = self
-            .store
-            .replace(next)
-            .map_err(|error| ApiError::Internal(error.to_string()))?;
-
-        self.events
-            .publish(ServerEvent::ConfigChanged(ConfigChange {
-                revision: saved.revision,
-                section: section.to_string(),
-            }));
-
-        match wait {
-            Some(seconds) => {
-                let timeout = std::time::Duration::from_secs(seconds.clamp(1, 120));
-                if tokio::time::timeout(timeout, self.reconciler.reconcile())
-                    .await
-                    .is_err()
-                {
-                    tracing::warn!(section, "reconciliation did not settle within the wait");
-                }
-            }
-            None => self.trigger.request("config write"),
-        }
-
-        Ok(saved)
+        self.commit_if(StatePrecondition::default(), section, wait, move |_| {
+            Ok(next)
+        })
+        .await
+        .map(|(document, _)| document)
     }
 
-    /// Commit a configuration transition only if both optional document
-    /// identities still match. Building, validation, persistence, and the
-    /// version comparison happen under the state-store write lock, so a
-    /// competing preview or section write cannot slip between them.
+    /// Commit a configuration transition only if the document identities the
+    /// caller read still hold.
+    ///
+    /// Building, validation and the version comparison happen under the
+    /// state-store write lock, so a competing preview or section write cannot
+    /// slip between them. The capability status validation needs is read
+    /// *before* that lock is taken, and the disk write happens *after* it is
+    /// released, on a blocking thread: the store's lock covers the document
+    /// and nothing else.
     pub async fn commit_if<F>(
         &self,
         expected: StatePrecondition,
@@ -113,14 +99,22 @@ impl ApiState {
     where
         F: FnOnce(&DesiredState) -> ApiResult<DesiredState>,
     {
+        let context = self.validation_context();
         let (saved, version) = self
             .store
-            .replace_if(expected, |current, effective| {
-                let mut next = prepare(current)?;
-                self.validate_configuration_against(&mut next, effective)?;
+            .stage_replace_if(expected, |basis| {
+                let mut next = prepare(basis)?;
+                validate_configuration_against(&mut next, basis, &context)?;
                 Ok(next)
             })
             .map_err(map_conditional_write_error)?;
+
+        // The change is accepted and live from here on: it is published and
+        // reconciled even if the save fails, because the alternative is a
+        // daemon whose outputs and whose clients disagree about what the
+        // document says. A failed save is reported to this caller as a 500
+        // and stays visible in `/status` until one succeeds.
+        let persisted = self.persist().await;
 
         self.events
             .publish(ServerEvent::ConfigChanged(ConfigChange {
@@ -141,7 +135,77 @@ impl ApiState {
             None => self.trigger.request("config write"),
         }
 
+        persisted?;
         Ok((saved, version))
+    }
+
+    /// Like [`Self::commit_if`], but the document `prepare` returns is
+    /// committed literally: `preserve_retained`'s calibration refill does
+    /// not run.
+    ///
+    /// Used only by the geometry/canvas DELETE routes. An ordinary
+    /// Simple-mode PUT that omits `geometry` or `canvas` means "leave this
+    /// alone", so [`validate_configuration_against`] refills it from the
+    /// previous document — and would silently undo an explicit clear made
+    /// by the very same mechanism if the DELETE handlers' own writes went
+    /// through it too. See [`crate::projection_policy::preserve_retained`].
+    pub async fn commit_literal_if<F>(
+        &self,
+        expected: StatePrecondition,
+        section: &str,
+        wait: Option<u64>,
+        prepare: F,
+    ) -> ApiResult<(DesiredState, StateVersion)>
+    where
+        F: FnOnce(&DesiredState) -> ApiResult<DesiredState>,
+    {
+        let context = self.validation_context();
+        let (saved, version) = self
+            .store
+            .stage_replace_if(expected, |basis| {
+                let mut next = prepare(basis)?;
+                validate_configuration_literal(&mut next, basis, &context)?;
+                Ok(next)
+            })
+            .map_err(map_conditional_write_error)?;
+
+        let persisted = self.persist().await;
+
+        self.events
+            .publish(ServerEvent::ConfigChanged(ConfigChange {
+                revision: saved.revision,
+                section: section.to_string(),
+            }));
+
+        match wait {
+            Some(seconds) => {
+                let timeout = std::time::Duration::from_secs(seconds.clamp(1, 120));
+                if tokio::time::timeout(timeout, self.reconciler.reconcile())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(section, "reconciliation did not settle within the wait");
+                }
+            }
+            None => self.trigger.request("config write"),
+        }
+
+        persisted?;
+        Ok((saved, version))
+    }
+
+    /// Run the state store's blocking disk write off the async executor.
+    async fn persist(&self) -> ApiResult<()> {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || store.flush()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(ApiError::Internal(format!(
+                "the change is live but was not saved and will be lost on restart: {error}"
+            ))),
+            Err(error) => Err(ApiError::Internal(format!(
+                "the change is live but the save did not run: {error}"
+            ))),
+        }
     }
 
     /// Apply an uncommitted working copy under the same atomic precondition
@@ -151,10 +215,11 @@ impl ApiState {
         expected: StatePrecondition,
         mut next: DesiredState,
     ) -> ApiResult<(DesiredState, StateVersion)> {
+        let context = self.validation_context();
         let mut projection_only = false;
-        let result = self.store.set_preview_if(expected, |effective| {
-            self.validate_configuration_against(&mut next, effective)?;
-            projection_only = projection_only_change(effective, &next);
+        let result = self.store.set_preview_if(expected, |basis| {
+            validate_configuration_against(&mut next, basis, &context)?;
+            projection_only = projection_only_change(basis, &next);
             Ok(next)
         });
         let accepted = result.map_err(map_conditional_write_error)?;
@@ -181,26 +246,18 @@ impl ApiState {
     }
 
     pub fn validate_configuration(&self, next: &mut DesiredState) -> ApiResult<()> {
+        let context = self.validation_context();
         let previous = self.store.effective();
-        self.validate_configuration_against(next, &previous)
+        validate_configuration_against(next, &previous, &context)
     }
 
-    fn validate_configuration_against(
-        &self,
-        next: &mut DesiredState,
-        previous: &DesiredState,
-    ) -> ApiResult<()> {
-        crate::projection_policy::preserve_retained(next, previous);
-        next.validate(self.bootstrap.allow_overlaps)
-            .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
-        crate::projection_policy::validate_activation(
-            next,
-            previous,
-            &self.snapshot.projection_control(),
-            self.snapshot.slicer_running(),
-            self.bootstrap.allow_overlaps,
-        )
-        .map_err(ApiError::Validation)
+    /// Read everything a validation needs from outside the state store.
+    ///
+    /// Called before the store is entered, never from inside a `prepare`
+    /// closure: the closure runs under the document write lock, and taking a
+    /// snapshot lock there is the nesting that deadlocked an appliance once.
+    fn validation_context(&self) -> ValidationContext {
+        ValidationContext::from_snapshot(&self.snapshot, self.bootstrap.allow_overlaps)
     }
 
     /// Reject a write whose `If-Match` revision is stale.
@@ -223,6 +280,64 @@ impl ApiState {
     }
 }
 
+/// The facts a document validation needs that do not live in the document.
+///
+/// Gathered in one place because they have to be gathered *early*: every
+/// validation below runs inside a state-store transition, and nothing inside
+/// one may take another lock. The reconciler builds one of these too, so an
+/// adoption is validated exactly like a client's write.
+pub struct ValidationContext {
+    control: crate::model::ProjectionControlStatus,
+    slicer_running: bool,
+    allow_overlaps: bool,
+}
+
+impl ValidationContext {
+    pub fn from_snapshot(snapshot: &Snapshot, allow_overlaps: bool) -> Self {
+        Self {
+            control: snapshot.projection_control(),
+            slicer_running: snapshot.slicer_running(),
+            allow_overlaps,
+        }
+    }
+}
+
+/// Validate `next` as a replacement for `previous`, the one document this
+/// transition builds on.
+///
+/// Takes no lock of its own, so it is safe to call from inside a state-store
+/// transition — which is where it has to run, or another client's write could
+/// land between the check and the swap.
+pub fn validate_configuration_against(
+    next: &mut DesiredState,
+    previous: &DesiredState,
+    context: &ValidationContext,
+) -> ApiResult<()> {
+    crate::projection_policy::preserve_retained(next, previous);
+    validate_configuration_literal(next, previous, context)
+}
+
+/// As [`validate_configuration_against`], but without the retention refill:
+/// `next` is validated and activated exactly as given. Used by
+/// [`ApiState::commit_literal_if`] for writes — the geometry/canvas DELETE
+/// routes — that must not have an omitted field resurrected from `previous`.
+pub fn validate_configuration_literal(
+    next: &mut DesiredState,
+    previous: &DesiredState,
+    context: &ValidationContext,
+) -> ApiResult<()> {
+    next.validate(context.allow_overlaps)
+        .map_err(|errors| ApiError::Validation(errors.join("; ")))?;
+    crate::projection_policy::validate_activation(
+        next,
+        previous,
+        &context.control,
+        context.slicer_running,
+        context.allow_overlaps,
+    )
+    .map_err(ApiError::Validation)
+}
+
 /// Projection-only previews cannot change Sway output placement, apps, or
 /// other settings. Classify under the same state lock as the accepted edit;
 /// reading the old document outside that lock would race another operator.
@@ -240,26 +355,41 @@ fn projection_only_change(previous: &DesiredState, next: &DesiredState) -> bool 
     other_fields == *previous
 }
 
-fn map_conditional_write_error(error: ConditionalWriteError<ApiError>) -> ApiError {
+pub fn map_conditional_write_error(error: ConditionalWriteError<ApiError>) -> ApiError {
     match error {
-        ConditionalWriteError::Precondition { current } => ApiError::Conflict(format!(
-            "document is at revision {} and generation {}",
-            current.revision, current.generation
-        )),
         ConditionalWriteError::Rejected(error) => error,
+        ConditionalWriteError::Precondition { current } => stale_precondition(&current),
+        ConditionalWriteError::WorkingCopy { current } => working_copy_live(&current),
         ConditionalWriteError::State(error) => ApiError::Internal(error.to_string()),
     }
 }
 
 fn map_revert_error(error: ConditionalWriteError<std::convert::Infallible>) -> ApiError {
     match error {
-        ConditionalWriteError::Precondition { current } => ApiError::Conflict(format!(
-            "document is at revision {} and generation {}",
-            current.revision, current.generation
-        )),
         ConditionalWriteError::Rejected(never) => match never {},
+        ConditionalWriteError::Precondition { current } => stale_precondition(&current),
+        ConditionalWriteError::WorkingCopy { current } => working_copy_live(&current),
         ConditionalWriteError::State(error) => ApiError::Internal(error.to_string()),
     }
+}
+
+fn stale_precondition(current: &StateVersion) -> ApiError {
+    ApiError::Conflict(format!(
+        "document is at revision {} and generation {}",
+        current.revision, current.generation
+    ))
+}
+
+/// Unconditional writes keep working until somebody is mid-edit. From then on
+/// every write names the working copy it is replacing, so one client's save
+/// cannot discard another client's unsaved work unseen.
+fn working_copy_live(current: &StateVersion) -> ApiError {
+    ApiError::Conflict(format!(
+        "a working copy is live at revision {} and generation {}: repeat this write with \
+         If-Config-Generation: {} and If-Config-Epoch: {} to build on it, or discard it first \
+         with POST /config/revert",
+        current.revision, current.generation, current.generation, current.epoch
+    ))
 }
 
 /// Build the complete application router.
@@ -273,7 +403,6 @@ pub fn router(state: ApiState) -> Router {
         .route("/av", get(observed::list_av_devices))
         .route("/status", get(observed::get_status))
         .route("/projection/stats", get(observed::get_projection_stats))
-        .route("/projection/convert", post(projection::convert_layout))
         .route(
             "/projection/recommendation",
             get(projection::recommend_resolution),
@@ -333,6 +462,10 @@ pub fn router(state: ApiState) -> Router {
             delete(config_routes::delete_output),
         )
         .route(
+            "/config/outputs/{key}/geometry",
+            delete(config_routes::delete_output_geometry),
+        )
+        .route(
             "/config/backgrounds",
             get(config_routes::get_backgrounds).put(config_routes::put_backgrounds),
         )
@@ -354,6 +487,10 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/config/projection",
             get(config_routes::get_projection).put(config_routes::put_projection),
+        )
+        .route(
+            "/config/projection/canvas",
+            delete(config_routes::delete_projection_canvas),
         )
         .route("/config/revert", post(config_routes::revert_config))
         // Imperative escape hatches.

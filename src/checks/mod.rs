@@ -562,7 +562,7 @@ impl CheckRunner {
     /// An appliance whose compositor drives no physical display shows nothing,
     /// however healthy everything else looks.
     ///
-    /// wlroots names outputs after its backend: `HEADLESS-n` when synthesising
+    /// wlroots names outputs after its backend: `HEADLESS-n` when synthesizing
     /// them, `WL-n` when nested inside another compositor, `X11-n` under X.
     /// Real connectors are `DP-1`, `HDMI-A-1`, `eDP-1` and so on. Getting this
     /// wrong is easy — a compositor that inherits `WAYLAND_DISPLAY` will nest
@@ -1924,7 +1924,7 @@ fn judge_direct_scanout(
 /// should be saying. Pure, so every verdict is table-testable.
 ///
 /// The rules are the ones field measurements taught:
-/// - a software rasteriser in the renderer string means no GPU acceleration
+/// - a software rasterizer in the renderer string means no GPU acceleration
 ///   of any kind, which makes every other answer moot — warn;
 /// - a real GPU with zero hardware codecs is the classic silent fallback
 ///   (an NVIDIA machine without `VaapiOnNvidiaGPUs` looked exactly like
@@ -1943,7 +1943,7 @@ fn judge_report(report: &crate::model::CapabilityReport) -> (CheckStatus, String
             CheckStatus::Warn,
             format!(
                 "the browser is software-rendering ({renderer}): no GPU \
-                 acceleration of any kind — decode, rasterisation or WebGL"
+                 acceleration of any kind — decode, rasterization or WebGL"
             ),
         );
     }
@@ -2806,7 +2806,7 @@ mod tests {
     }
 
     #[test]
-    fn a_software_rasteriser_warns_regardless_of_codecs() {
+    fn a_software_rasterizer_warns_regardless_of_codecs() {
         let (status, detail) = judge_report(&measured(
             "llvmpipe (LLVM 17.0.6, 256 bits)",
             vec![codec("H.264", true, Some(true))],
@@ -3162,7 +3162,7 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_outputs_are_recognised() {
+    fn synthetic_outputs_are_recognized() {
         // These are the names wlroots gives when it is not driving a connector.
         for name in ["HEADLESS-1", "WL-2", "X11-1"] {
             assert!(is_synthetic_output(name), "{name} should be synthetic");

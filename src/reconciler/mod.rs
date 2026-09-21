@@ -136,6 +136,22 @@ pub struct Reconciler {
     /// Blend-overlay processes, one per projector output with seams.
     #[cfg(feature = "projection")]
     blend: Mutex<crate::projection::BlendManager>,
+    /// The most recently *successfully* planned canvas layout. Kept so a
+    /// transient planning failure — a briefly-invalid geometry mid-edit, or
+    /// a disconnected output whose mode just changed — can fall back to the
+    /// last good arrangement instead of handing sway the raw, possibly
+    /// overlapping desired positions (see `plan_canvas`). A plain
+    /// `std::sync::Mutex`, not the `tokio::sync::Mutex` used elsewhere in
+    /// this struct: `plan_canvas` is synchronous and must never `.await`.
+    #[cfg(feature = "projection")]
+    last_good_canvas_plan: std::sync::Mutex<Option<crate::projection::CanvasPlan>>,
+    /// Divergences raised by the most recent `plan_canvas` call. `plan_canvas`
+    /// itself keeps its original `Option<CanvasPlan>` return type — several
+    /// unit tests call it directly and only care about the plan — so this
+    /// side channel is how it also reports a planning failure. `reconcile`
+    /// drains it immediately after calling `plan_canvas`.
+    #[cfg(feature = "projection")]
+    canvas_plan_divergences: std::sync::Mutex<Vec<Divergence>>,
 }
 
 /// Everything a [`Reconciler`] collaborates with.
@@ -195,6 +211,10 @@ impl Reconciler {
             cursor_parked_at: Mutex::new(None),
             #[cfg(feature = "projection")]
             blend,
+            #[cfg(feature = "projection")]
+            last_good_canvas_plan: std::sync::Mutex::new(None),
+            #[cfg(feature = "projection")]
+            canvas_plan_divergences: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -336,28 +356,12 @@ impl Reconciler {
                     self.snapshot.projection_report(),
                 )));
         }
-        if geometry_status.requested_mode == crate::model::ProjectionMode::Warp
-            && geometry_status.effective_mode == crate::model::ProjectionMode::Simple
+        // The only place `warp_unavailable` is raised — see
+        // `warp_unavailable_divergence`'s own doc for why the child-local
+        // capability-report path that used to duplicate this was removed.
+        if let Some(divergence) = warp_unavailable_divergence(&geometry_status, self.allow_overlaps)
         {
-            #[cfg(feature = "projection")]
-            let fallback_detail = if self.allow_overlaps {
-                "using the shared canvas and content crop without geometric correction"
-            } else {
-                "shared canvas rendering is unavailable while allowOverlaps is disabled"
-            };
-            #[cfg(not(feature = "projection"))]
-            let fallback_detail = "shared canvas rendering is unavailable in this build";
-            divergences.push(Divergence::new(
-                "warp_unavailable",
-                "projection",
-                format!(
-                    "{}; {fallback_detail}. Saved Warp calibration remains available for restoration",
-                    geometry_status
-                        .reason
-                        .clone()
-                        .unwrap_or_else(|| "warp support is unavailable".into())
-                ),
-            ));
+            divergences.push(divergence);
         }
         #[cfg(feature = "projection")]
         if geometry_status.effective_mode == crate::model::ProjectionMode::Warp {
@@ -372,6 +376,8 @@ impl Reconciler {
             }
         }
         let canvas_plan = self.plan_canvas(&desired);
+        #[cfg(feature = "projection")]
+        divergences.extend(self.canvas_plan_divergences.lock().unwrap().drain(..));
         let sway_outputs = self.outputs_for_sway(&desired, canvas_plan.as_ref());
 
         // --- outputs ---
@@ -508,8 +514,37 @@ impl Reconciler {
         // measurements. A pass that cannot reach sway has verified nothing,
         // so it adopts nothing either — the outputs below are stale.
         if self.sway.is_connected() {
-            self.adopt_settled_outputs(&desired, config_generation, &divergences)
+            let adoption = self
+                .adopt_settled_outputs(&desired, config_generation, &divergences)
                 .await;
+            divergences.extend(adoption);
+        }
+
+        // --- the document itself ---
+        // What it cost to read the saved document at boot, and whether what
+        // is live has actually reached disk. Both are facts about the
+        // configuration rather than about sway, and `/status` is where an
+        // operator looks for "is this appliance running what I think it is".
+        for repair in self.store.load_repairs() {
+            divergences.push(Divergence::new(
+                "state_document_repaired",
+                "state.json",
+                format!(
+                    "the saved configuration could not be used as found and was repaired at \
+                     startup: {repair}. The file as found was kept as state.json.rejected."
+                ),
+            ));
+        }
+        if let Some(failure) = self.store.persist_failure() {
+            divergences.push(Divergence::new(
+                "state_not_persisted",
+                "state.json",
+                format!(
+                    "revision {} is live on the outputs but could not be saved ({}), so a \
+                     restart would lose it. The next successful save clears this.",
+                    failure.revision, failure.detail
+                ),
+            ));
         }
 
         // A pass that could not reach sway has not verified anything: the
@@ -781,9 +816,6 @@ impl Reconciler {
             manager.restart_slicer();
         }
         divergences.extend(manager.sync_slicer(slicer.as_ref(), config_generation));
-        if let Some(divergence) = warp_unavailable_divergence(&self.snapshot.projection_control()) {
-            divergences.push(divergence);
-        }
         // `sync_slicer` above already reaped a dead child before deciding
         // whether to respawn, so the manager knows definitively whether one
         // is alive now — publish that rather than leaving the API and the
@@ -870,12 +902,48 @@ impl Reconciler {
                 .filter(|output| output.enable)
                 .all(|output| output.geometry.is_some())
         {
-            return crate::projection::layout::canvas_plan_with_correction(
+            match crate::projection::layout::canvas_plan_with_correction(
                 desired,
                 &self.snapshot.outputs(),
                 policy.effective_mode == crate::model::ProjectionMode::Warp,
-            )
-            .ok();
+            ) {
+                Ok(plan) => {
+                    *self.last_good_canvas_plan.lock().unwrap() = Some(plan.clone());
+                    return Some(plan);
+                }
+                Err(error) => {
+                    // Never let a failed plan reach `outputs_for_sway`: with
+                    // no plan at all it falls back to the configured
+                    // (possibly overlapping) positions verbatim, which is
+                    // exactly the "sway gets the raw overlapping positions"
+                    // defect this closes. Two explicit fallbacks, in order
+                    // of preference: the last plan that DID succeed, stale
+                    // as it may be, since a wall still showing yesterday's
+                    // good layout is better than one showing nothing or a
+                    // broken overlap; and only when there has never been a
+                    // good one, the plain participant-rect tiling below,
+                    // which — by construction — never sends sway an
+                    // overlapping position even though the configured
+                    // (currently invalid) correction cannot be applied yet.
+                    let last_good = self.last_good_canvas_plan.lock().unwrap().clone();
+                    self.canvas_plan_divergences.lock().unwrap().push(Divergence::new(
+                        "canvas_plan_failed",
+                        "projection",
+                        format!(
+                            "the configured canvas layout could not be planned: {error}; {}",
+                            if last_good.is_some() {
+                                "showing the last successfully planned layout until it is fixed"
+                            } else {
+                                "falling back to a plain, non-overlapping arrangement until it is fixed"
+                            }
+                        ),
+                    ));
+                    if last_good.is_some() {
+                        return last_good;
+                    }
+                    return self.plan_canvas_with_warp(desired, false);
+                }
+            }
         }
         // A retained warp configuration can probe the actual pipeline while
         // displaying its separate simple layout, including a single output.
@@ -1066,7 +1134,7 @@ impl Reconciler {
                 continue;
             }
 
-            // PipeWire's own figure is quantised, and a comparison of floats
+            // PipeWire's own figure is quantized, and a comparison of floats
             // that came back through a decibel conversion needs slack: a
             // hundredth of a dB is far below anything audible or meaningful.
             if sink
@@ -1135,7 +1203,7 @@ impl Reconciler {
         desired: &crate::model::DesiredState,
         config_generation: u64,
         divergences: &[Divergence],
-    ) {
+    ) -> Vec<Divergence> {
         let observed = self.snapshot.outputs();
         let mut history = self.previous_observations.lock().await;
 
@@ -1174,7 +1242,7 @@ impl Reconciler {
         drop(history);
 
         if pins.is_empty() {
-            return;
+            return Vec::new();
         }
 
         // What each pin is replacing, captured before the write, so the log
@@ -1192,27 +1260,89 @@ impl Reconciler {
             })
             .collect();
 
-        match self.store.replace_if(
+        // Adoption writes the document like any client, so it is validated
+        // like any client's write. Warp validation keys off *effective*
+        // values (`model::desired`), so a display that settles on scale 2 or
+        // a rotated transform while warp is configured would otherwise
+        // persist a document that fails validation — and the `.bak` beside it
+        // would have been written from the same sequence. The capability
+        // status this needs is read here, outside the store, because the
+        // closure below runs under the document write lock.
+        let context =
+            crate::api::ValidationContext::from_snapshot(&self.snapshot, self.allow_overlaps);
+        let mut refused: Vec<(String, String)> = Vec::new();
+        let staged = self.store.stage_replace_if(
             StatePrecondition {
                 revision: Some(desired.revision),
                 generation: Some(config_generation),
                 epoch: None,
             },
-            |current, _| {
-                let mut next = current.clone();
-                for output in &mut next.outputs {
-                    if let Some((_, adopted)) = pins
-                        .iter()
-                        .find(|(rule, _)| rule.key() == output.r#match.key())
-                    {
-                        output.adopted = Some(adopted.clone());
+            |basis| {
+                let mut next = basis.clone();
+                // One pin at a time: one display settling on something the
+                // document cannot hold must not cost the other three their
+                // adoption.
+                for (rule, adopted) in &pins {
+                    let mut candidate = next.clone();
+                    let Some(output) = candidate
+                        .outputs
+                        .iter_mut()
+                        .find(|output| output.r#match.key() == rule.key())
+                    else {
+                        continue;
+                    };
+                    output.adopted = Some(adopted.clone());
+                    match crate::api::validate_configuration_against(
+                        &mut candidate.clone(),
+                        basis,
+                        &context,
+                    ) {
+                        Ok(()) => next = candidate,
+                        Err(error) => refused.push((rule.key(), error.to_string())),
                     }
                 }
-                Ok::<_, std::convert::Infallible>(next)
+                if next == *basis {
+                    return Err("no settled value survived validation".to_string());
+                }
+                crate::api::validate_configuration_against(&mut next, basis, &context)
+                    .map_err(|error| error.to_string())?;
+                Ok(next)
             },
-        ) {
+        );
+
+        let refused_outputs: Vec<String> =
+            refused.iter().map(|(output, _)| output.clone()).collect();
+        let divergences: Vec<Divergence> = refused
+            .into_iter()
+            .map(|(output, detail)| {
+                tracing::warn!(
+                    output = %output,
+                    %detail,
+                    "refused to pin what this output settled on: the document would not validate"
+                );
+                Divergence::new(
+                    "adopted_value_invalid",
+                    &output,
+                    format!(
+                        "{output} settled on a value the saved configuration cannot hold \
+                         ({detail}), so it was not pinned. Set the value explicitly, or leave \
+                         warp mode, or the display will pick it again at the next restart."
+                    ),
+                )
+            })
+            .collect();
+
+        match staged {
             Ok(_) => {
+                if let Err(error) = self.persist().await {
+                    tracing::warn!(%error, "failed to persist adopted output values");
+                }
                 for (rule, adopted) in &pins {
+                    // Only what was actually written: the rest are reported
+                    // as divergences above.
+                    if refused_outputs.contains(&rule.key()) {
+                        continue;
+                    }
                     let previous = previous_adopted.get(&rule.key()).cloned().flatten();
                     let event = match &previous {
                         None => "first pin",
@@ -1231,7 +1361,8 @@ impl Reconciler {
                     );
                 }
             }
-            Err(ConditionalWriteError::Precondition { current }) => {
+            Err(ConditionalWriteError::Precondition { current })
+            | Err(ConditionalWriteError::WorkingCopy { current }) => {
                 tracing::debug!(
                     expected_revision = desired.revision,
                     expected_generation = config_generation,
@@ -1243,7 +1374,24 @@ impl Reconciler {
             Err(ConditionalWriteError::State(error)) => {
                 tracing::warn!(%error, "failed to persist adopted output values");
             }
-            Err(ConditionalWriteError::Rejected(never)) => match never {},
+            // Everything settled was refused: reported above, nothing written.
+            Err(ConditionalWriteError::Rejected(detail)) => {
+                tracing::debug!(%detail, "nothing was adopted this pass");
+            }
+        }
+
+        divergences
+    }
+
+    /// Run the state store's blocking disk write off the reconciler's task.
+    async fn persist(&self) -> Result<(), crate::state::StateError> {
+        let store = self.store.clone();
+        match tokio::task::spawn_blocking(move || store.flush()).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, "the state save task did not run");
+                Ok(())
+            }
         }
     }
 
@@ -1442,22 +1590,48 @@ impl Reconciler {
     }
 }
 
-/// Surface a rejected direct warp as reconciliation divergence while keeping
-/// legacy CPU/simple installations quiet. The capability record remains the
-/// richer health/status explanation and survives until the child changes.
-#[cfg(any(feature = "projection", test))]
+/// The sole place `warp_unavailable` is raised: Warp was requested but this
+/// pass is rendering Simple. A second copy of this check used to live in
+/// `sync_projection`, reading the child's own `ProjectionControlStatus`
+/// directly and wording the divergence differently — the "two paths emit
+/// `warp_unavailable` with different wording" defect. `geometry_status` is
+/// `projection_policy::status`'s single computed answer, already built from
+/// the child's capability report plus the feature gate, `allowOverlaps`,
+/// and capability-probe hysteresis that the child alone cannot know about,
+/// so it is the one input this needs. Not feature-gated: `run` calls this
+/// unconditionally, the same as `geometry_status` itself — the projection
+/// configuration schema, and this divergence over whether it is fulfilled,
+/// are both meaningful even in a build with no projection machinery to run
+/// it (see `ProjectionGeometryStatus`'s own "this build has no projection
+/// machinery" reason string).
 fn warp_unavailable_divergence(
-    control: &crate::model::ProjectionControlStatus,
+    geometry: &crate::model::observed::ProjectionGeometryStatus,
+    allow_overlaps: bool,
 ) -> Option<Divergence> {
-    (control.warp_available == Some(false) && control.requested_mode.as_deref() == Some("warp"))
+    (geometry.requested_mode == crate::model::ProjectionMode::Warp
+        && geometry.effective_mode == crate::model::ProjectionMode::Simple)
         .then(|| {
+            #[cfg(feature = "projection")]
+            let fallback_detail = if allow_overlaps {
+                "using the shared canvas and content crop without geometric correction"
+            } else {
+                "shared canvas rendering is unavailable while allowOverlaps is disabled"
+            };
+            #[cfg(not(feature = "projection"))]
+            let fallback_detail = {
+                let _ = allow_overlaps;
+                "shared canvas rendering is unavailable in this build"
+            };
             Divergence::new(
                 "warp_unavailable",
                 "projection",
-                control
-                    .warp_reason
-                    .clone()
-                    .unwrap_or_else(|| "the negotiated pipeline cannot apply warp".to_string()),
+                format!(
+                    "{}; {fallback_detail}. Saved Warp calibration remains available for restoration",
+                    geometry
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "warp support is unavailable".into())
+                ),
             )
         })
 }
@@ -1466,7 +1640,6 @@ fn warp_unavailable_divergence(
 mod tests {
     use super::*;
     use crate::audio::mock::MockAudio;
-    #[cfg(feature = "projection")]
     use crate::model::Output;
     use crate::model::{
         AppConfig, AudioConfig, Launcher, Mode, OutputConfig, OutputMatch, Position, RestartPolicy,
@@ -1543,7 +1716,6 @@ mod tests {
         config
     }
 
-    #[cfg(feature = "projection")]
     fn warp_output(name: &str, x: i32, corners: [[f64; 2]; 4]) -> OutputConfig {
         let mut config = configured_output(name, x);
         let source = crate::model::CanvasRect {
@@ -1561,7 +1733,6 @@ mod tests {
         config
     }
 
-    #[cfg(feature = "projection")]
     fn warp_layout(mode: crate::model::ProjectionMode) -> crate::model::DesiredState {
         let mut desired = crate::model::DesiredState::new();
         desired.projection = Some(crate::model::ProjectionConfig {
@@ -1569,7 +1740,6 @@ mod tests {
             canvas: Some(crate::model::CanvasConfig {
                 aspect: 3680.0 / 1080.0,
                 render_width: 3680,
-                scale: 1.0,
             }),
             ..Default::default()
         });
@@ -1601,22 +1771,35 @@ mod tests {
 
     #[test]
     fn only_requested_warp_becomes_a_capability_divergence() {
-        let unavailable_warp = crate::model::ProjectionControlStatus {
-            warp_available: Some(false),
-            requested_mode: Some("warp".into()),
-            warp_reason: Some("linear filtering is unavailable".into()),
+        let unavailable_warp = crate::model::observed::ProjectionGeometryStatus {
+            requested_mode: crate::model::ProjectionMode::Warp,
+            effective_mode: crate::model::ProjectionMode::Simple,
+            reason: Some("linear filtering is unavailable".into()),
             ..Default::default()
         };
-        let divergence = warp_unavailable_divergence(&unavailable_warp).unwrap();
+        let divergence = warp_unavailable_divergence(&unavailable_warp, true).unwrap();
         assert_eq!(divergence.kind, "warp_unavailable");
         assert!(divergence.detail.contains("linear filtering"));
 
-        let cpu_simple = crate::model::ProjectionControlStatus {
-            warp_available: Some(false),
-            requested_mode: Some("simple".into()),
+        let requested_and_effective_simple = crate::model::observed::ProjectionGeometryStatus {
+            requested_mode: crate::model::ProjectionMode::Simple,
+            effective_mode: crate::model::ProjectionMode::Simple,
             ..Default::default()
         };
-        assert!(warp_unavailable_divergence(&cpu_simple).is_none());
+        assert!(
+            warp_unavailable_divergence(&requested_and_effective_simple, true).is_none(),
+            "a Simple install that never asked for Warp must stay quiet"
+        );
+
+        let warp_requested_and_delivered = crate::model::observed::ProjectionGeometryStatus {
+            requested_mode: crate::model::ProjectionMode::Warp,
+            effective_mode: crate::model::ProjectionMode::Warp,
+            ..Default::default()
+        };
+        assert!(
+            warp_unavailable_divergence(&warp_requested_and_delivered, true).is_none(),
+            "Warp actually running must not be reported as unavailable"
+        );
     }
 
     #[cfg(feature = "projection")]
@@ -1640,7 +1823,9 @@ mod tests {
             .expect("internal nonidentity activation must make one output sliceable");
         assert_eq!((plan.canvas_width, plan.canvas_height), (1920, 1080));
         assert_eq!(plan.slices.len(), 1);
-        assert!(plan.slices[0].ramps.is_empty());
+        // Legacy layouts synthesize a `layout::LayoutSpec` too (P2), so even
+        // this single-output activation seam carries one.
+        assert_eq!(plan.layout.as_ref().unwrap().participants.len(), 1);
     }
 
     #[cfg(feature = "projection")]
@@ -1686,6 +1871,100 @@ mod tests {
         assert_eq!(first.slices[0].source, second.slices[0].source);
         assert_eq!(first.slices[0].source_rect, second.slices[0].source_rect);
         assert_ne!(first.slices[0].geometry, second.slices[0].geometry);
+    }
+
+    /// A13: `plan_canvas` used to swallow `canvas_plan_with_correction`'s
+    /// error with `.ok()`, so sway received the raw (possibly overlapping)
+    /// configured positions and nothing appeared in `/status`. It must now
+    /// report a divergence and pick an explicit, documented fallback: reuse
+    /// the last plan that DID succeed when one exists.
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn a_broken_layout_falls_back_to_the_last_good_plan_and_reports_it() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        mark_gpu_warp_available(&harness);
+        let mut desired = warp_layout(crate::model::ProjectionMode::Warp);
+
+        let good = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("a valid layout must produce a plan");
+        assert!(
+            harness
+                .reconciler
+                .canvas_plan_divergences
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "a plan that succeeds must not report a planning failure"
+        );
+
+        // Break one output's source rectangle so the plan can no longer be
+        // computed at all.
+        desired.outputs[0].geometry.as_mut().unwrap().source.width = 0.0;
+        let fallback = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("a previously good plan must be reused rather than giving up");
+        assert_eq!(fallback.canvas_width, good.canvas_width);
+        assert_eq!(fallback.canvas_height, good.canvas_height);
+        assert_eq!(fallback.sway_positions, good.sway_positions);
+        let divergences = harness
+            .reconciler
+            .canvas_plan_divergences
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert_eq!(divergences[0].kind, "canvas_plan_failed");
+        assert!(
+            divergences[0].detail.contains("last successfully planned"),
+            "{}",
+            divergences[0].detail
+        );
+    }
+
+    /// A13, the other half: with no previously successful plan to fall back
+    /// to, the reconciler must still never hand sway the configured
+    /// (potentially overlapping) positions verbatim — it falls back to the
+    /// plain participant-rect tiling instead, which never overlaps.
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn a_layout_broken_from_the_start_falls_back_to_a_non_overlapping_arrangement() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .snapshot
+            .set_outputs(harness.sway.get_outputs().await.unwrap());
+        mark_gpu_warp_available(&harness);
+        let mut desired = warp_layout(crate::model::ProjectionMode::Warp);
+        desired.outputs[0].geometry.as_mut().unwrap().source.width = 0.0;
+
+        let fallback = harness
+            .reconciler
+            .plan_canvas(&desired)
+            .expect("no prior good plan, but the plain tiling must still produce one");
+        // The plain tiling places participants edge-to-edge in x, unlike the
+        // canvas-space positions (0 and 1760) the broken correction plan
+        // would have used.
+        let xs: Vec<i32> = fallback.sway_positions.iter().map(|(_, x, _)| *x).collect();
+        assert_eq!(xs, vec![0, 1920], "outputs must be tiled, not overlapping");
+        let divergences = harness
+            .reconciler
+            .canvas_plan_divergences
+            .lock()
+            .unwrap()
+            .clone();
+        assert_eq!(divergences.len(), 1, "{divergences:?}");
+        assert!(
+            divergences[0]
+                .detail
+                .contains("falling back to a plain, non-overlapping arrangement"),
+            "{}",
+            divergences[0].detail
+        );
     }
 
     #[cfg(feature = "projection")]
@@ -1758,7 +2037,17 @@ mod tests {
         let expected_sources: Vec<_> = desired
             .outputs
             .iter()
-            .map(|output| Some(output.geometry.as_ref().unwrap().source.pixel_rect(canvas)))
+            .map(|output| {
+                Some(
+                    output
+                        .geometry
+                        .as_ref()
+                        .unwrap()
+                        .source
+                        .pixel_rect(canvas)
+                        .unwrap(),
+                )
+            })
             .collect();
         assert!(simple.slices.iter().all(|slice| slice.geometry.is_none()));
         assert!(simple
@@ -1845,7 +2134,6 @@ mod tests {
             canvas: Some(crate::model::CanvasConfig {
                 aspect: 1.0,
                 render_width: 100,
-                scale: 1.0,
             }),
             ..Default::default()
         });
@@ -2175,7 +2463,7 @@ mod tests {
                 state.active_app = Some("renderer".into());
                 // An overlapping layout wants a canvas, but the mock
                 // compositor has no headless backend, so it can never
-                // materialise.
+                // materialize.
                 state.outputs.push(configured_output("HDMI-A-1", 0));
                 state.outputs.push(configured_output("HDMI-A-2", 1760));
             })
@@ -2452,6 +2740,79 @@ mod tests {
         );
         assert_eq!(after_third.outputs[0].adopted, Some(adopted));
         harness.supervisor.shutdown().await;
+    }
+
+    /// A4: adoption writes the document, so it is validated like any other
+    /// write. Warp refuses a scale other than 1.0, and warp validation keys
+    /// off the *effective* scale — so a projector that settles on 2.0 would
+    /// otherwise have persisted a document that no longer loads, with the
+    /// `.bak` beside it written from the same sequence.
+    #[tokio::test]
+    async fn an_adopted_value_the_document_cannot_hold_is_reported_not_saved() {
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .store
+            .replace(warp_layout(crate::model::ProjectionMode::Warp))
+            .unwrap();
+        harness
+            .store
+            .get()
+            .validate(true)
+            .expect("the layout under test is valid until something is adopted");
+
+        // Both projectors report a raster scale the operator never asked for,
+        // on two consecutive passes, which is what makes it "settled".
+        let observed: Vec<Output> = ["HDMI-A-1", "HDMI-A-2"]
+            .iter()
+            .map(|name| Output {
+                name: (*name).into(),
+                active: true,
+                make: None,
+                model: None,
+                serial: None,
+                current_mode: Some(Mode {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 60.0,
+                }),
+                modes: vec![],
+                rect: Default::default(),
+                scale: Some(2.0),
+                transform: Some("normal".into()),
+                adaptive_sync_status: None,
+            })
+            .collect();
+        harness.snapshot.set_outputs(observed);
+
+        let (desired, generation) = harness.store.effective_with_generation();
+        let revision = desired.revision;
+        let first = harness
+            .reconciler
+            .adopt_settled_outputs(&desired, generation, &[])
+            .await;
+        assert!(first.is_empty(), "one sighting settles nothing");
+
+        let divergences = harness
+            .reconciler
+            .adopt_settled_outputs(&desired, generation, &[])
+            .await;
+        let reported = divergences
+            .iter()
+            .find(|divergence| divergence.kind == "adopted_value_invalid")
+            .expect("the refusal has to be visible somewhere: {divergences:?}");
+        assert_eq!(reported.subject, "HDMI-A-1");
+        assert!(
+            reported.detail.contains("scale must be 1.0 in warp mode"),
+            "{}",
+            reported.detail
+        );
+
+        let saved = harness.store.get();
+        assert_eq!(saved.revision, revision, "nothing was written");
+        assert!(saved.outputs.iter().all(|output| output.adopted.is_none()));
+        saved
+            .validate(true)
+            .expect("the saved document is still one that loads");
     }
 
     #[tokio::test]

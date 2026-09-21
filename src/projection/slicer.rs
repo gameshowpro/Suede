@@ -5,7 +5,7 @@
 //! overlap is managed here instead. The outputs sit edge to edge in sway
 //! (nothing overlaps, nothing bleeds); the app renders once into a headless
 //! canvas of `Σwidths − (n−1)·overlap`; and this process captures that
-//! canvas each frame, cuts it into per-projector slices whose neighbours
+//! canvas each frame, cuts it into per-projector slices whose neighbors
 //! *repeat* the seam columns, applies the gamma-shaped blend ramps and black
 //! lift, and presents each slice fullscreen on its own physical output.
 //! Each projector gets its own buffer, so the two sides of a seam can carry
@@ -65,7 +65,7 @@
 //! as the single-buffered version did for its one.
 //!
 //! `renderer: auto` (the default) picks the GPU path when the compositor
-//! offers dmabuf capture and Vulkan initialises, falling back to the CPU
+//! offers dmabuf capture and Vulkan initializes, falling back to the CPU
 //! path — logged, with the reason — otherwise; `cpu`/`gpu` force one or the
 //! other, `gpu` fatally if it turns out not to be available. See
 //! `decide_backend` and the doc on [`crate::model::Renderer`] itself.
@@ -160,7 +160,7 @@
 //!
 //! The binary strip beside the digits carries the low sixteen bits of the
 //! same counter, which is what makes a one-frame difference readable when a
-//! DLP projector's colour wheel has smeared the digits across the exposure —
+//! DLP projector's color wheel has smeared the digits across the exposure —
 //! and what distinguishes 99 → 00 from a stall. Photograph two consecutive
 //! frames on DLP for the same reason. The pattern needs the slicer, so it
 //! needs `allow_overlaps = true`; the tiled path's static overlays show a
@@ -258,7 +258,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-use super::blend::{pixel_transfer, Coverage, OverlaySpec, SlicerSpec};
+use super::blend::{Coverage, OverlaySpec, SlicerSpec};
 use super::pattern::{SyncGroup, SyncRect};
 use super::{dmabuf, gpu};
 use crate::model::{
@@ -446,6 +446,12 @@ struct Presenter {
     /// Tagged shape table for adaptive mode; fixed tables remain byte exact.
     dynamic_table: Option<Vec<u32>>,
     warp: Option<super::warp::Warp>,
+    /// [`AxisSamples`] for `warp`, rebuilt only when `warp_revision` moves
+    /// past `sample_revision` — see `present_frame_cpu`. `None` whenever
+    /// `warp` is `None`, exactly like the old per-pixel `warp.is_none()`
+    /// check.
+    sample: Option<AxisSamples>,
+    sample_revision: Option<u64>,
     /// Research revision carried by this output, independent of source frames.
     warp_revision: u64,
     warp_reported_revision: Option<u64>,
@@ -1373,6 +1379,19 @@ struct State {
     /// which construct a `State` with no live Wayland objects at all.
     compositor: Option<WlCompositor>,
     presenters: Vec<Presenter>,
+    /// Set once at startup by `negotiate_gpu`, when `renderer != Cpu` and
+    /// dmabuf feedback completed and `Gpu::new` succeeded. `None` either
+    /// because the renderer is forced to `Cpu`, or because something in
+    /// that chain failed — `gpu_error` says what, for `decide_backend`'s
+    /// fallback message.
+    ///
+    /// Declared ahead of `capture` so it is also *dropped* ahead of it:
+    /// `Gpu::drop` waits the device idle, and an asynchronous source
+    /// measurement may still be reading a capture image when the slicer
+    /// stops (on any of `run`'s error paths, not only the clean one). The
+    /// images live in `capture` and destroy themselves when dropped, so the
+    /// wait has to come first.
+    gpu: Option<gpu::Gpu>,
     capture: Capture,
     closed: bool,
     /// Counts consecutive intervals where feedback came back for nobody; see
@@ -1391,12 +1410,6 @@ struct State {
     presentation: Option<WpPresentation>,
     timing: Timing,
     stats: FrameStats,
-    /// Set once at startup by `negotiate_gpu`, when `renderer != Cpu` and
-    /// dmabuf feedback completed and `Gpu::new` succeeded. `None` either
-    /// because the renderer is forced to `Cpu`, or because something in
-    /// that chain failed — `gpu_error` says what, for `decide_backend`'s
-    /// fallback message.
-    gpu: Option<gpu::Gpu>,
     /// What the compositor's main device advertises, and the subset of it
     /// flagged for direct scanout; both empty until `negotiate_gpu` runs
     /// (or if it never does).
@@ -1437,7 +1450,19 @@ struct State {
     adaptive: Option<LiftRuntime>,
     /// Advances only on completed source captures, never on repaint ticks.
     capture_id: u64,
+    /// The most recent measurement the GPU has handed back, or the most
+    /// recent failure to obtain one. Deliberately outlives the capture it
+    /// describes: the pass that produced it was submitted some captures ago
+    /// and the controller's time constants make that irrelevant.
     capture_measurement: Option<CapturedLuminance>,
+    /// When the next measurement may be submitted, and which capture slot
+    /// one already submitted is still reading. See
+    /// [`super::adaptive::MeasurementSchedule`].
+    measurement: super::adaptive::MeasurementSchedule,
+    /// Owns the process's stdout so lifecycle events and periodic telemetry
+    /// go through a writer thread instead of this (render) thread blocking
+    /// on, or panicking from, `println!`. See `control::StdoutWriter`.
+    stdout: super::control::StdoutWriter,
 }
 
 /// Kept across transfer-mode/settings changes so a static capture can be
@@ -1447,7 +1472,10 @@ struct CapturedLuminance {
     capture_id: u64,
     result: Result<(f64, u32), String>,
     measured_at_unix_ms: u64,
-    cost_ms: f64,
+    /// Submission to collection, in milliseconds — see
+    /// [`super::gpu::LuminanceSample::latency_ms`]. Nothing waits for it, so
+    /// it is a pipeline latency rather than a cost the frame loop paid.
+    latency_ms: f64,
 }
 
 /// One controller and one uniform value for the entire wall. The measurement
@@ -1461,6 +1489,10 @@ struct LiftRuntime {
     next_tick: Option<Instant>,
     next_report: Instant,
     status: crate::model::observed::ProjectionBlackLiftStatus,
+    /// A `BlackLift` report is periodic telemetry (rate-limited to 10 Hz
+    /// below), so it goes through the coalescing side of `StdoutWriter`: a
+    /// slow reader loses only staleness, never correctness.
+    stdout: super::control::StdoutWriter,
 }
 
 impl LiftRuntime {
@@ -1489,7 +1521,7 @@ impl LiftRuntime {
             },
         );
         if let Ok(line) = serde_json::to_string(&event) {
-            println!("{line}");
+            self.stdout.telemetry(line);
             true
         } else {
             false
@@ -1507,7 +1539,9 @@ fn configure_adaptive(state: &mut State, spec: &SlicerSpec, generation: u64) {
                 super::control::ControlEventKind::BlackLift { status: None },
             );
             if let Ok(line) = serde_json::to_string(&event) {
-                println!("{line}");
+                // A one-time mode transition (adaptive turned off), not
+                // periodic telemetry: guaranteed delivery, not coalescing.
+                state.stdout.event(line);
             }
         }
         return;
@@ -1539,6 +1573,7 @@ fn configure_adaptive(state: &mut State, spec: &SlicerSpec, generation: u64) {
         canvas_size: (spec.canvas_width as u32, spec.canvas_height as u32),
         session: spec.control_session.clone(), generation, next_tick: None,
         next_report: now,
+        stdout: state.stdout.clone(),
         status: crate::model::observed::ProjectionBlackLiftStatus {
             metric: "Mean linear Rec.709 luminance after sRGB decoding; nearest cell centers on a source-canvas grid up to 256x256, including unused canvas, excluding allocation padding".into(),
             available: false, paused, stale: false, reason,
@@ -1558,43 +1593,165 @@ fn configure_adaptive(state: &mut State, spec: &SlicerSpec, generation: u64) {
     }
 }
 
+/// Unix milliseconds now, for the measurement timestamps in the status.
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Take delivery of a measurement the GPU has already finished. Never waits:
+/// an unsignalled fence simply means the answer arrives on a later capture.
+fn poll_measurement(state: &mut State) {
+    let Some(gpu) = state.gpu.as_mut() else {
+        return;
+    };
+    match gpu.poll_luminance_measurement() {
+        Ok(None) => {}
+        Ok(Some(sample)) => {
+            state.measurement.completed();
+            store_measurement(state, sample);
+        }
+        Err(error) => {
+            // The pass is unusable; nothing is in flight to wait for and the
+            // schedule's rate limit keeps the retry off the frame path.
+            state.measurement.completed();
+            let capture_id = state.capture_id;
+            store_measurement_error(state, capture_id, &error);
+        }
+    }
+}
+
+/// Record a collected sample against the capture it actually measured.
+fn store_measurement(state: &mut State, sample: super::gpu::LuminanceSample) {
+    state.capture_measurement = Some(CapturedLuminance {
+        capture_id: sample.tag,
+        result: Ok((sample.luminance, sample.sample_count)),
+        // The sample is of the frame that was captured when the pass was
+        // submitted, not of the moment its fence was noticed, so the age the
+        // status reports counts from there.
+        measured_at_unix_ms: unix_ms_now().saturating_sub(sample.latency_ms as u64),
+        latency_ms: sample.latency_ms,
+    });
+}
+
+fn store_measurement_error(state: &mut State, capture_id: u64, error: &anyhow::Error) {
+    state.capture_measurement = Some(CapturedLuminance {
+        capture_id,
+        result: Err(format!("{error:#}")),
+        measured_at_unix_ms: unix_ms_now(),
+        latency_ms: 0.0,
+    });
+}
+
+/// Ask the GPU for a measurement of the capture just completed into `slot`,
+/// if the schedule allows one. Returns without waiting for any result.
+fn submit_measurement(state: &mut State, slot: usize, canvas: (u32, u32), now: Instant) {
+    if !state
+        .measurement
+        .should_submit(now, slot, state.capture.gpu_slot)
+    {
+        return;
+    }
+    let capture_id = state.capture_id;
+    let y_invert = state.capture.y_invert;
+    let submitted = match (state.gpu.as_mut(), state.capture.gpu_images.get(slot)) {
+        (Some(gpu), Some((image, _))) => {
+            gpu.submit_luminance_measurement(image, y_invert, canvas.0, canvas.1, capture_id)
+        }
+        _ => Err(anyhow::anyhow!("Completed GPU source image unavailable")),
+    };
+    match submitted {
+        Ok(()) => state
+            .measurement
+            .submitted(super::adaptive::MeasurementFlight {
+                capture_id,
+                slot,
+                submitted_at: now,
+            }),
+        Err(error) => {
+            state.measurement.refused(now);
+            store_measurement_error(state, capture_id, &error);
+        }
+    }
+}
+
+/// Make sure no measurement is still reading `slot`'s capture image, because
+/// it is about to be handed back to the compositor (or destroyed).
+///
+/// The GPU-side read is ordered ahead of the blend of the same capture, and
+/// `blend()` waits on its own fence, so on a presenting wall this finds the
+/// pass long finished and costs one `vkGetFenceStatus`. The wait exists for
+/// the case where the gate withheld the frame and no blend ran at all: the
+/// compositor writes into these images with no fence of its own, so the
+/// alternative to waiting is sampling a frame while it is overwritten.
+fn retire_measurement_for_slot(state: &mut State, slot: usize) {
+    if !state.measurement.reads_slot(slot) {
+        return;
+    }
+    state.measurement.completed();
+    let Some(gpu) = state.gpu.as_mut() else {
+        return;
+    };
+    match gpu.finish_luminance_measurement() {
+        Ok(Some((sample, waited))) => {
+            if waited {
+                eprintln!(
+                    "slicer: waited for the source measurement of capture {} before reusing \
+                     its capture slot",
+                    sample.tag
+                );
+            }
+            store_measurement(state, sample);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let capture_id = state.capture_id;
+            store_measurement_error(state, capture_id, &error);
+        }
+    }
+}
+
+/// Retire whatever measurement is in flight, whichever slot it reads. Used
+/// where the capture stream is being restarted and neither slot's contents
+/// or identity can be relied on any longer.
+fn retire_measurement(state: &mut State) {
+    if let Some(flight) = state.measurement.flight() {
+        retire_measurement_for_slot(state, flight.slot);
+    }
+}
+
 /// Called once for each completed capture, while its slot is still owned by
 /// the slicer. No presenter or retained-capture repaint calls measurement.
+///
+/// Nothing here blocks: a measurement already finished by the GPU is taken
+/// delivery of, a new one may be queued, and the controller is advanced with
+/// whatever the most recent answer was. The value applied is therefore
+/// typically a capture or two old, which the controller's 250 ms-1 s time
+/// constants make immaterial, and the status reports which capture it came
+/// from so that staleness is visible rather than implied.
 fn measure_adaptive(state: &mut State, slot: usize) -> bool {
-    let Some(runtime) = &mut state.adaptive else {
+    let Some(runtime) = state.adaptive.as_ref() else {
         return false;
     };
     if runtime.controller.paused() || state.capture.backend != Some(Backend::Gpu) {
         return false;
     }
     let was_available = runtime.status.available;
+    let canvas_size = runtime.canvas_size;
     let now = Instant::now();
-    if state
-        .capture_measurement
-        .as_ref()
-        .is_none_or(|m| m.capture_id != state.capture_id)
-    {
-        let result = match (state.gpu.as_mut(), state.capture.gpu_images.get(slot)) {
-            (Some(gpu), Some((image, _))) => gpu.measure_luminance(
-                image,
-                state.capture.y_invert,
-                runtime.canvas_size.0,
-                runtime.canvas_size.1,
-            ),
-            _ => Err(anyhow::anyhow!("Completed GPU source image unavailable")),
-        };
-        state.capture_measurement = Some(CapturedLuminance {
-            capture_id: state.capture_id,
-            result: result.map_err(|error| format!("{error:#}")),
-            measured_at_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64,
-            cost_ms: now.elapsed().as_secs_f64() * 1000.0,
-        });
-    }
-    let measurement = state.capture_measurement.as_ref().unwrap();
-    runtime.status.measurement_ms = Some(measurement.cost_ms);
+    poll_measurement(state);
+    submit_measurement(state, slot, canvas_size, now);
+    let (Some(runtime), Some(measurement)) =
+        (state.adaptive.as_mut(), state.capture_measurement.as_ref())
+    else {
+        // Measurement was requested and nothing has come back yet: the
+        // controller stays at its configured fixed level, reported as
+        // startup, until the first pass is collected.
+        return false;
+    };
+    runtime.status.measurement_ms = Some(measurement.latency_ms);
     // A settled source has no timer. Do not apply minutes of idle time to
     // a target that arrived only with this capture's scene cut.
     if !runtime.controller.needs_tick() {
@@ -1602,20 +1759,27 @@ fn measure_adaptive(state: &mut State, slot: usize) -> bool {
     }
     match measurement.result.clone() {
         Ok((luminance, count)) => {
+            // Tagged with the capture the pass sampled, which is the one
+            // this value describes — not whichever capture was current when
+            // its fence happened to be noticed.
             runtime.controller.measure_with_capture(
                 luminance,
                 u64::from(count),
-                Some(state.capture_id),
+                Some(measurement.capture_id),
             );
             if count > 0 && luminance.is_finite() {
                 runtime.status.available = true;
                 runtime.status.stale = false;
                 runtime.status.reason = None;
-                runtime.status.capture_id = Some(state.capture_id);
+                runtime.status.capture_id = Some(measurement.capture_id);
                 runtime.status.sample_count = count;
                 runtime.status.luminance = Some(luminance);
                 runtime.status.measured_at_unix_ms = Some(measurement.measured_at_unix_ms);
-                runtime.status.sample_age_ms = Some(0);
+                // Age is derived from that timestamp wherever the status is
+                // published (`LiftRuntime::report`, `snapshot.rs`). Claiming
+                // zero here would have been honest only while the readback
+                // happened inside this call; a collected sample describes a
+                // capture that is already a frame or two old.
             } else {
                 runtime.status.available = false;
                 runtime.status.stale = true;
@@ -1717,10 +1881,10 @@ impl State {
     ///
     /// Locked (`!free_run`): every presenter must have answered for the
     /// previous commit before any of them may take a newer frame than its
-    /// neighbours — a partial commit here is exactly the race the gate
+    /// neighbors — a partial commit here is exactly the race the gate
     /// exists to close. Free-run: one ready presenter is enough, because
     /// each takes the newest frame the instant it can, without regard for
-    /// its neighbours' pace.
+    /// its neighbors' pace.
     fn gate_open(&self) -> bool {
         if self.free_run {
             let signal = self.gate_signal();
@@ -1960,10 +2124,12 @@ impl State {
             capture_intervals: ci,
             outputs,
         };
-        // Rust's stdout is line-buffered, so this flushes on the newline
-        // `println!` appends — the manager's reader thread sees it promptly
-        // without either side needing to do anything explicit.
-        println!("{}", serde_json::to_string(&stats).unwrap_or_default());
+        // Periodic telemetry, coalesced through `StdoutWriter`'s writer
+        // thread rather than blocking this (render) thread on the pipe; the
+        // writer flushes every line it writes, so the manager's reader
+        // thread still sees each one promptly.
+        self.stdout
+            .telemetry(serde_json::to_string(&stats).unwrap_or_default());
 
         self.stats = FrameStats::new();
     }
@@ -2029,6 +2195,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         adaptive: None,
         capture_id: 0,
         capture_measurement: None,
+        measurement: super::adaptive::MeasurementSchedule::default(),
+        stdout: super::control::StdoutWriter::spawn(),
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
@@ -2145,6 +2313,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             transfer: Vec::new(),
             dynamic_table: None,
             warp: None,
+            sample: None,
+            sample_revision: None,
             warp_revision: 0,
             warp_reported_revision: None,
             warp_submitted_revision: None,
@@ -2177,26 +2347,42 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     }
     // How much black each region of the canvas is receiving. Derived from
     // every slice, because how much a projector must lift depends on how many
-    // *others* light the same pixel — a four-way grid centre needs none while
-    // its two-way seams still do.
+    // *others* light the same pixel — a four-way grid center needs none while
+    // its two-way seams still do. Used only as the fallback for a hand-built
+    // spec with no configured layout at all; every canvas plan the daemon
+    // itself derives resolves both the seam weight and this lift through
+    // `layout::Evaluator` instead (`blend::SlicerSpec::layout`'s doc).
     let coverage = Coverage::new(super::warp_update::coverage_rects(spec));
+    let layout = spec
+        .layout
+        .as_ref()
+        .map(|l| super::layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
         let (width, height) = presenter.configured.unwrap();
-        // Built at the *presented* size: ramps are defined against the
-        // slice, and any mismatch shows up as identity pixels, not a panic.
-        let mut transfer = Vec::with_capacity(width as usize * height as usize);
-        for y in 0..height as i32 {
-            for x in 0..width as i32 {
-                // Coverage is a property of the canvas, so the slice-local
-                // pixel is looked up at its place in the layout.
-                let lift = coverage.lift(
-                    spec.black_lift,
-                    f64::from(slice.source.x + x) + 0.5,
-                    f64::from(slice.source.y + y) + 0.5,
-                );
-                transfer.push(pixel_transfer(&slice.ramps, spec.gamma, lift, x, y));
-            }
-        }
+        let layout = layout
+            .as_ref()
+            .map(|l| l.index(&slice.output).map(|i| (l, i)))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        // Built at the *presented* size, with no warp yet (this is the
+        // initial bootstrap table, before any control update has built one):
+        // any warp/size mismatch later shows up as identity pixels, not a
+        // panic. Single-threaded here — this runs once at startup, not per
+        // frame — through the same row evaluator `warp_update`'s ongoing
+        // rebuilds use, so there is exactly one place this math lives.
+        let mut transfer = vec![(0u16, 0u8); width as usize * height as usize];
+        super::warp_update::fill_rows(
+            spec,
+            slice,
+            None,
+            &coverage,
+            layout,
+            (width, height),
+            0,
+            &mut transfer,
+        );
         presenter.transfer = transfer;
     }
 
@@ -2246,7 +2432,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 )?;
             }
         }
-        present_pattern(&mut state, spec, pattern);
+        present_pattern(&mut state, spec, pattern)?;
         loop {
             queue.blocking_dispatch(&mut state)?;
             if state.closed {
@@ -2352,7 +2538,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 anyhow::bail!("screencopy failed {failures} times; giving up");
             }
             // Either frame may have been the one that failed, so start over
-            // with a single capture rather than guessing.
+            // with a single capture rather than guessing. Both capture
+            // slots are about to be rearmed from scratch, so anything still
+            // measuring one of them is retired first.
+            retire_measurement(&mut state);
             state.capture.failed = false;
             state.capture.ready = false;
             current = request_capture(&mut state, &screencopy, &source, &handle);
@@ -2400,8 +2589,15 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 // this call blocks on it.
                 current.destroy();
                 let filled_slot = state.capture.gpu_slot;
-                measure_adaptive(&mut state, filled_slot);
                 state.capture.gpu_slot = (filled_slot + 1) % GPU_CAPTURE_SLOTS;
+                // Flipped first so measurement knows which slot is about to
+                // be armed and never samples that one. This takes delivery
+                // of whatever the GPU has already measured and may queue a
+                // pass over the capture just completed; it waits for
+                // nothing. The pass's read of `filled_slot` is ordered
+                // ahead of the `blend()` below, which waits on its own
+                // fence — see `Gpu::submit_luminance_measurement`.
+                measure_adaptive(&mut state, filled_slot);
                 // The newest complete frame, held for the gate rather than
                 // blended here: whether it goes out now or in a moment is
                 // the gate's decision, made once at the bottom of the loop
@@ -2410,6 +2606,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 // full, and it is independent of when this frame is shown.
                 state.capture.pending_slot = Some(filled_slot);
 
+                // The arm below hands `gpu_slot` back to the compositor,
+                // which writes into it with no fence of its own. That slot
+                // carries the capture measured one iteration ago, so this
+                // is where an unobserved measurement of it has to be
+                // retired; on a presenting wall it has been signaled since
+                // that iteration's `blend()`.
+                let arming_slot = state.capture.gpu_slot;
+                retire_measurement_for_slot(&mut state, arming_slot);
                 let requesting_from = Instant::now();
                 if !arm_copy(
                     &mut state,
@@ -2539,13 +2743,16 @@ fn report_capability(
             effective_renderer,
             warp_available: available,
             reason,
-            requested_mode: if requested { "warp" } else { "simple" }.into(),
-            effective_mode: if requested && available {
-                "warp"
+            requested_mode: if requested {
+                crate::model::ProjectionMode::Warp
             } else {
-                "simple"
-            }
-            .into(),
+                crate::model::ProjectionMode::Simple
+            },
+            effective_mode: if requested && available {
+                crate::model::ProjectionMode::Warp
+            } else {
+                crate::model::ProjectionMode::Simple
+            },
         },
     );
     println!("{}", serde_json::to_string(&event).unwrap());
@@ -2597,7 +2804,7 @@ fn initialize_warp_control(
         configure_adaptive(state, spec, 0);
         return Ok(());
     }
-    let controller = super::warp_update::Controller::new(
+    let mut controller = super::warp_update::Controller::new(
         spec,
         state
             .presenters
@@ -2607,6 +2814,7 @@ fn initialize_warp_control(
         blend_workers(u32::MAX) as usize,
     )
     .map_err(anyhow::Error::msg)?;
+    controller.set_stdout(state.stdout.clone());
     controller.read_stdin()?;
     state.warp_updates = Some(controller);
     // Initial matrices and tables must exist before any submission. Later
@@ -2698,9 +2906,15 @@ fn static_pattern_rgba(
         gamma: spec.gamma,
         black_lift: 0.0,
         rect,
+        // The picture's true canvas footprint — the same fractional,
+        // possibly-scaled `source` this function resamples into below — so
+        // canvas-anchored features (the grid's tile lines, warp-alignment's
+        // percentage lines and circles) are computed at their real canvas
+        // position rather than assuming raster pixel x is canvas pixel
+        // `rect.x + x`, which only holds when Content scale is 100%.
+        source_rect: Some(source),
         pattern: Some(pattern),
         canvas_size: Some([spec.canvas_width as u32, spec.canvas_height as u32]),
-        ramps: Vec::new(),
     };
     let rgb = super::pattern::render(width, height, &fake);
     let mut rgba = vec![0; spec.canvas_width as usize * spec.canvas_height as usize * 4];
@@ -2792,6 +3006,17 @@ fn static_pattern_rgba(
 /// already waited their fence, so no SSBO reader remains in flight.
 /// Stage the complete affected set before changing any active matrix/table.
 fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
+    // Checked here because every path through the main and startup loops
+    // already calls this once per iteration regardless of backend: a broken
+    // pipe (the daemon restarted, or stopped reading) makes the stdout
+    // writer thread give up instead of blocking or panicking on the render
+    // thread (see `StdoutWriter`); noticing it here ends the child cleanly,
+    // the same way stdin EOF already does, rather than rendering into a pipe
+    // nobody drains until some other error surfaces.
+    if state.stdout.closed() {
+        state.closed = true;
+        return Ok(());
+    }
     let Some(controller) = state.warp_updates.as_mut() else {
         return Ok(());
     };
@@ -2883,11 +3108,10 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
             (
                 o.name.clone(),
                 if o.warp.is_some() {
-                    "bilinear"
+                    crate::model::SamplingMode::Bilinear
                 } else {
-                    "exact"
-                }
-                .to_string(),
+                    crate::model::SamplingMode::Exact
+                },
             )
         })
         .collect();
@@ -3070,6 +3294,13 @@ fn ensure_capture_buffer(
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
+            // Every capture image goes with this drain, including one an
+            // asynchronous measurement may still be reading, so that pass
+            // has to be retired first whichever slot it is on.
+            if let Some(gpu) = state.gpu.as_mut() {
+                let _ = gpu.finish_luminance_measurement();
+            }
+            state.measurement.completed();
             for (_, buffer) in state.capture.gpu_images.drain(..) {
                 buffer.destroy();
             }
@@ -3832,7 +4063,7 @@ fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
 /// most recently completed and the gate has been holding — falling back to
 /// `Capture.last_blended_slot` when there is no fresh capture waiting, which
 /// is the free-run case of a straggler whose readiness cleared after this
-/// cycle's frame already went out to its neighbours. Either is guaranteed
+/// cycle's frame already went out to its neighbors. Either is guaranteed
 /// not to be the image the compositor is currently writing into: that is
 /// always the *other* slot (see `Capture.gpu_slot`'s doc).
 fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
@@ -4047,7 +4278,7 @@ fn gpu_present_due(state: &mut State, handle: &QueueHandle<State>, due: &[Due]) 
 /// Locked mode is only ever called once `can_present` has confirmed every
 /// presenter is ready, so every `stale` presenter is committed together —
 /// the whole point being that no output can show a newer frame than its
-/// neighbours. Free-run commits presenter by presenter as each becomes
+/// neighbors. Free-run commits presenter by presenter as each becomes
 /// ready, which is exactly what makes a wall that cannot share a rate keep
 /// moving at all. CPU path only — see `present_frame_gpu` for the GPU path's
 /// equivalent.
@@ -4119,13 +4350,34 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         presenter.next_buffer = (slot + 1) % len;
         presenter.busy[slot] = true;
 
+        // Rebuild the axis-sample table only when the warp actually moved to
+        // a new generation, not every frame: `warp_revision` only advances in
+        // `apply_warp_updates`, so a run of frames on an unchanged warp reuses
+        // the same `AxisSamples` and never re-solves a single homography.
+        if presenter.sample_revision != Some(presenter.warp_revision) {
+            // Matches `source_x`/`source_y` below exactly: the fallback
+            // origin `Warp::clamped_canvas_at` would use if this warp had no
+            // `source_rect` (every warp built by `sampling_warp` sets one, so
+            // in practice this is never read, but it must still match the
+            // old per-pixel call's argument to stay byte-identical).
+            let origin = [
+                f64::from(presenter.source.x.max(0) as u32),
+                f64::from(presenter.source.y.max(0) as u32),
+            ];
+            presenter.sample = presenter
+                .warp
+                .as_ref()
+                .map(|w| AxisSamples::build(w, origin));
+            presenter.sample_revision = Some(presenter.warp_revision);
+        }
+
         {
             // Split-borrow again: the transfer table is read while this
             // presenter's buffer is written.
             let Presenter {
                 transfer,
                 buffers,
-                warp,
+                sample,
                 source,
                 ..
             } = presenter;
@@ -4141,7 +4393,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 source_x: source.x.max(0) as u32,
                 source_y: source.y.max(0) as u32,
                 width,
-                warp: warp.as_ref(),
+                sample: sample.as_ref(),
             };
 
             let row_bytes = width as usize * 4;
@@ -4157,7 +4409,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 blend.rows(painted, 0, height);
             } else {
                 // Rows are independent, so each worker owns a disjoint band of
-                // the destination and nothing needs synchronising. Scoped
+                // the destination and nothing needs synchronizing. Scoped
                 // threads borrow the canvas and the table directly, which is
                 // why this needs no channel and no Arc.
                 let band = height.div_ceil(workers);
@@ -4201,6 +4453,67 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
     }
 }
 
+/// Precomputed per-axis canvas sample positions for [`Blend::sample`]'s
+/// bilinear path, built once per warp generation instead of solved with a
+/// homography (matrix multiply plus divide, [`super::warp::Warp::source_at`])
+/// on every destination pixel of every frame.
+///
+/// The CPU renderer never receives a genuine corner warp: `requested_warp`
+/// rejects one before the slicer connects to the compositor (see
+/// `cpu_rejects_warp_before_connecting_and_preserves_identity_support`), and
+/// every `Warp` this struct is ever built from — the content path's
+/// `presenter.warp` and `present_pattern`'s local warp alike — is
+/// [`super::warp::Warp::identity`] plus, at most, a `source_rect` crop/scale.
+/// For that shape `Warp::canvas_at`'s mapping is `rect[axis] +
+/// local[axis]/output_dim[axis] * rect[axis+2]` with `local` equal to the
+/// output coordinate itself, and `clamped_canvas_at`'s border clamp is
+/// applied per axis too — so the whole mapping is two independent 1-D
+/// functions, not one 2-D one. A full `width * height` table would waste
+/// memory for no benefit; two 1-D tables are exact and far smaller.
+///
+/// Memory at 4K (3840x2160, the largest single output `warp_update`
+/// allows): `(3840 + 2160)` entries of `Option<f64>` (16 bytes, no niche for
+/// `f64`) is about 94 KiB per output — negligible, and roughly three orders
+/// of magnitude below a naive `3840 * 2160` per-pixel table (~66 MiB).
+struct AxisSamples {
+    x: Vec<Option<f64>>,
+    y: Vec<Option<f64>>,
+}
+
+impl AxisSamples {
+    /// Builds by calling the same `clamped_canvas_at` the per-pixel path
+    /// used to call every frame, just once per column and once per row, so
+    /// every entry is the exact value the old code computed — not an
+    /// approximation of it. `warp` must be [`super::warp::Warp::is_identity`];
+    /// see the struct docs for why that is the only shape that ever reaches
+    /// here, and the assert below for what happens if that ever stops being
+    /// true (a wrong per-axis table would otherwise fail silently). The
+    /// table size is `warp`'s own output size, not a separately passed one,
+    /// so it can never disagree with the geometry `warp` itself encodes.
+    fn build(warp: &super::warp::Warp, origin: [f64; 2]) -> Self {
+        assert!(
+            warp.is_identity(),
+            "CPU Blend only ever samples an identity warp (source-rectangle \
+             crop/scale); geometric correction is rejected before it reaches \
+             the CPU renderer, so a per-axis table is exact here"
+        );
+        let [width, height] = warp.output_size();
+        let x = (0..width)
+            .map(|i| {
+                warp.clamped_canvas_at(f64::from(i) + 0.5, 0.5, origin)
+                    .map(|p| p[0])
+            })
+            .collect();
+        let y = (0..height)
+            .map(|i| {
+                warp.clamped_canvas_at(0.5, f64::from(i) + 0.5, origin)
+                    .map(|p| p[1])
+            })
+            .collect();
+        Self { x, y }
+    }
+}
+
 /// Everything a blend worker needs that does not vary between rows.
 ///
 /// Cutting a slice out of the canvas and shading it is per-pixel independent
@@ -4220,7 +4533,7 @@ struct Blend<'a> {
     width: u32,
     /// `Some` is the common fractional crop/scale path. `None` is the
     /// exact integer-copy proof and deliberately retains its old sampling.
-    warp: Option<&'a super::warp::Warp>,
+    sample: Option<&'a AxisSamples>,
 }
 
 impl Blend<'_> {
@@ -4233,7 +4546,7 @@ impl Blend<'_> {
     }
 
     fn sample(&self, x: u32, y: u32) -> Option<[u8; 3]> {
-        if self.warp.is_none() {
+        let Some(axes) = self.sample else {
             let source_x = self.source_x.checked_add(x)?;
             let source_y = self.source_y.checked_add(y)?;
             if source_x >= self.usable_width || source_y >= self.usable_height {
@@ -4251,13 +4564,14 @@ impl Blend<'_> {
                 self.canvas[offset + self.format.green],
                 self.canvas[offset + self.format.red],
             ]);
-        }
-        let [source_x, source_y] = self.warp.unwrap().clamped_canvas_at(
-            f64::from(x) + 0.5,
-            f64::from(y) + 0.5,
-            [f64::from(self.source_x), f64::from(self.source_y)],
-        )?;
-        // Source positions are texel centres.  This check is intentionally
+        };
+        // Table lookup, not a homography solve: `axes` was built once for
+        // this warp generation (`AxisSamples::build`), so this is exactly
+        // the value `Warp::clamped_canvas_at(x+0.5, y+0.5, ...)` would have
+        // returned every frame, at the cost of two array reads.
+        let source_x = axes.x.get(x as usize).copied().flatten()?;
+        let source_y = axes.y.get(y as usize).copied().flatten()?;
+        // Source positions are texel centers.  This check is intentionally
         // before clamping to the captured image: a crop outside the canvas
         // is black, including when an old frame's buffer is being reused.
         if source_x < 0.5
@@ -4273,7 +4587,7 @@ impl Blend<'_> {
             source_y
         };
         // The exact path remains a byte-for-byte texel copy.  Fractional
-        // source rectangles use bilinear texel-centre sampling, matching the
+        // source rectangles use bilinear texel-center sampling, matching the
         // GPU's linearly filtered source mapping.
         let x0 = (source_x - 0.5).floor() as u32;
         let y0 = (source_y - 0.5).floor() as u32;
@@ -4348,38 +4662,74 @@ fn blend_workers(rows: u32) -> u32 {
 
 /// Test patterns, drawn once in canvas coordinates so they continue exactly
 /// across the seams — with the same ramps and lift content would get.
-fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::TestPattern) {
+///
+/// Builds this slice's picture in canvas space (the same picture, via the
+/// same `static_pattern_rgba`, that the GPU path uploads as a
+/// `StaticCanvas`), then samples it into the presenter's buffer through
+/// exactly the same `Blend::sample` the CPU *content* path uses — a
+/// source-rectangle-only `Warp` standing in for the real geometric
+/// correction the CPU renderer does not support. A 1:1 local copy here — as
+/// this used to be — silently assumed raster pixel x was canvas pixel
+/// `slice.source.x + x`, which only holds when Content scale is 100%; at any
+/// other scale it drew canvas-anchored features at the wrong canvas
+/// position, so a CPU-rendered wall calibrated on the pattern would not
+/// merge with a GPU-rendered one on real content.
+fn present_pattern(
+    state: &mut State,
+    spec: &SlicerSpec,
+    pattern: crate::model::TestPattern,
+) -> anyhow::Result<()> {
     for (slice, presenter) in spec.slices.iter().zip(state.presenters.iter_mut()) {
         let Some((width, height)) = presenter.configured else {
             continue;
         };
-        let fake = OverlaySpec {
-            output: slice.output.clone(),
-            gamma: spec.gamma,
-            black_lift: 0.0,
-            rect: slice.source,
-            pattern: Some(pattern),
-            canvas_size: Some([spec.canvas_width as u32, spec.canvas_height as u32]),
-            ramps: Vec::new(),
+        let canvas = static_pattern_rgba(spec, slice, pattern)?;
+        let source = slice.source_rect.unwrap_or([
+            f64::from(slice.source.x),
+            f64::from(slice.source.y),
+            f64::from(slice.source.width),
+            f64::from(slice.source.height),
+        ]);
+        let warp = super::warp::Warp::identity(width, height)
+            .with_source_rect(source)
+            .map_err(anyhow::Error::msg)?;
+        // One-shot per pattern activation, not per frame, but built through
+        // the same `AxisSamples` the content path uses so there is exactly
+        // one place this table-building logic lives.
+        let sample = AxisSamples::build(
+            &warp,
+            [
+                f64::from(slice.source.x.max(0) as u32),
+                f64::from(slice.source.y.max(0) as u32),
+            ],
+        );
+        let blend = Blend {
+            canvas: &canvas,
+            transfer: &presenter.transfer,
+            // `static_pattern_rgba`'s output is packed R,G,B,A, unlike a
+            // captured canvas' native BGRA/RGBA negotiated format.
+            format: PixelFormat {
+                bytes: 4,
+                red: 0,
+                green: 1,
+                blue: 2,
+            },
+            stride: spec.canvas_width as u32 * 4,
+            y_invert: false,
+            usable_width: spec.canvas_width as u32,
+            usable_height: spec.canvas_height as u32,
+            source_x: slice.source.x.max(0) as u32,
+            source_y: slice.source.y.max(0) as u32,
+            width,
+            sample: Some(&sample),
         };
-        let rgb = super::pattern::render(width, height, &fake);
         let (_, map) = &mut presenter.buffers[0];
-        for y in 0..height as usize {
-            for x in 0..width as usize {
-                let (a, b) = presenter
-                    .transfer
-                    .get(y * width as usize + x)
-                    .copied()
-                    .unwrap_or((256, 0));
-                let src = &rgb[(y * width as usize + x) * 3..(y * width as usize + x) * 3 + 3];
-                let out = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
-                let dst = &mut map[(y * width as usize + x) * 4..(y * width as usize + x) * 4 + 4];
-                dst[0] = out(src[2]);
-                dst[1] = out(src[1]);
-                dst[2] = out(src[0]);
-                dst[3] = 255;
-            }
+        let row_bytes = width as usize * 4;
+        // Clear first: a crop can extend beyond the canvas, same as content.
+        for pixel in map[..height as usize * row_bytes].chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 0, 0, 255]);
         }
+        blend.rows(&mut map[..height as usize * row_bytes], 0, height);
         let (buffer, _) = &presenter.buffers[0];
         presenter.surface.attach(Some(buffer), 0, 0);
         presenter
@@ -4387,6 +4737,7 @@ fn present_pattern(state: &mut State, spec: &SlicerSpec, pattern: crate::model::
             .damage_buffer(0, 0, width as i32, height as i32);
         presenter.surface.commit();
     }
+    Ok(())
 }
 
 // --- the `sync` test pattern ----------------------------------------------
@@ -4706,7 +5057,7 @@ fn sync_due(state: &mut State) -> Vec<Due> {
     due
 }
 
-/// CPU path: rasterise the rect list into each due presenter's next free shm
+/// CPU path: rasterize the rect list into each due presenter's next free shm
 /// slot and commit it exactly as `present_frame_cpu` commits a slice of the
 /// canvas — the same rotation, the same frame callback, the same
 /// presentation-feedback request.
@@ -4841,7 +5192,7 @@ fn present_sync_gpu(
             Some(gpu::BlendJob {
                 target: image,
                 output: d.index,
-                // Unused in sync mode — the shader takes its colour from the
+                // Unused in sync mode — the shader takes its color from the
                 // shape list, not from a canvas — but carried so a job is
                 // one thing whichever mode built it.
                 source_x: presenter.source.x.max(0) as u32,
@@ -4894,7 +5245,7 @@ fn sync_shape_items(groups: &[SyncGroup]) -> (u32, Vec<[u32; 4]>) {
     (groups.len() as u32, items)
 }
 
-/// Everything a `sync` rasterising worker needs that does not vary between
+/// Everything a `sync` rasterizing worker needs that does not vary between
 /// rows — [`Blend`]'s counterpart for a pattern with no canvas behind it.
 struct SyncPaint<'a> {
     transfer: &'a [(u16, u8)],
@@ -5405,13 +5756,13 @@ mod tests {
             source_x: 2,
             source_y: 1,
             width: 6,
-            warp: None,
+            sample: None,
         }
     }
 
     /// Splitting the work across workers must produce byte-identical output.
     ///
-    /// The band arithmetic is the whole risk of parallelising this: a worker
+    /// The band arithmetic is the whole risk of parallelizing this: a worker
     /// addresses its destination relative to its own chunk but the canvas and
     /// the transfer table absolutely, and getting that wrong shifts rows in a
     /// way that looks plausible on a photograph of a projector.
@@ -5449,7 +5800,7 @@ mod tests {
 
     /// A vertically flipped capture must address the canvas from the bottom.
     #[test]
-    fn y_invert_is_honoured_per_band() {
+    fn y_invert_is_honored_per_band() {
         let pixels = canvas(9, 40);
         let transfer: Vec<(u16, u8)> = vec![(256, 0); 6 * 8];
         let mut blend = blend_for(&pixels, &transfer);
@@ -5470,7 +5821,7 @@ mod tests {
     fn sampled_blend<'a>(
         canvas: &'a [u8],
         transfer: &'a [(u16, u8)],
-        warp: &'a super::super::warp::Warp,
+        sample: &'a AxisSamples,
         width: u32,
     ) -> Blend<'a> {
         Blend {
@@ -5489,7 +5840,7 @@ mod tests {
             source_x: 0,
             source_y: 0,
             width,
-            warp: Some(warp),
+            sample: Some(sample),
         }
     }
 
@@ -5503,7 +5854,8 @@ mod tests {
         let warp = super::super::warp::Warp::identity(2, 1)
             .with_source_rect([0.0, 0.0, 4.0, 1.0])
             .unwrap();
-        let blend = sampled_blend(&canvas, &transfer, &warp, 2);
+        let sample = AxisSamples::build(&warp, [0.0, 0.0]);
+        let blend = sampled_blend(&canvas, &transfer, &sample, 2);
         let mut output = vec![0u8; 8];
         blend.rows(&mut output, 0, 1);
 
@@ -5518,6 +5870,7 @@ mod tests {
         let warp = super::super::warp::Warp::identity(4, 1)
             .with_source_rect([0.0, 0.0, 2.0, 1.0])
             .unwrap();
+        let sample = AxisSamples::build(&warp, [0.0, 0.0]);
         let blend = Blend {
             canvas: &canvas,
             transfer: &transfer,
@@ -5534,7 +5887,7 @@ mod tests {
             source_x: 0,
             source_y: 0,
             width: 4,
-            warp: Some(&warp),
+            sample: Some(&sample),
         };
         let mut output = vec![0u8; 16];
         blend.rows(&mut output, 0, 1);
@@ -5550,7 +5903,7 @@ mod tests {
     }
 
     #[test]
-    fn cpu_simple_fractional_crop_honours_y_inversion() {
+    fn cpu_simple_fractional_crop_honors_y_inversion() {
         let mut canvas = vec![0u8; 4 * 3 * 4];
         for (y, row) in canvas.chunks_exact_mut(16).enumerate() {
             for pixel in row.chunks_exact_mut(4) {
@@ -5561,6 +5914,7 @@ mod tests {
         let warp = super::super::warp::Warp::identity(2, 2)
             .with_source_rect([0.5, 0.25, 2.0, 2.0])
             .unwrap();
+        let sample = AxisSamples::build(&warp, [0.0, 0.0]);
         let blend = Blend {
             canvas: &canvas,
             transfer: &transfer,
@@ -5577,7 +5931,7 @@ mod tests {
             source_x: 0,
             source_y: 0,
             width: 2,
-            warp: Some(&warp),
+            sample: Some(&sample),
         };
         let mut output = vec![0u8; 16];
         blend.rows(&mut output, 0, 2);
@@ -5613,7 +5967,8 @@ mod tests {
         let warp = super::super::warp::Warp::identity(4, 1)
             .with_source_rect([-0.25, 0.0, 4.0, 1.0])
             .unwrap();
-        let blend = sampled_blend(&canvas, &transfer, &warp, 4);
+        let sample = AxisSamples::build(&warp, [0.0, 0.0]);
+        let blend = sampled_blend(&canvas, &transfer, &sample, 4);
         let mut output = vec![0u8; 16];
         blend.rows(&mut output, 0, 1);
 
@@ -6125,6 +6480,8 @@ mod tests {
             adaptive: None,
             capture_id: 0,
             capture_measurement: None,
+            measurement: super::super::adaptive::MeasurementSchedule::default(),
+            stdout: super::super::control::StdoutWriter::spawn(),
         }
     }
 
@@ -6184,7 +6541,7 @@ mod tests {
             capture_id: 41,
             result: Ok((0.0, 65536)),
             measured_at_unix_ms: 1000,
-            cost_ms: 2.0,
+            latency_ms: 2.0,
         });
         // Keep the report window shut so this specifically exercises the
         // first-valid-sample transition, rather than an ordinary timer tick.
@@ -6206,13 +6563,131 @@ mod tests {
             capture_id: 42,
             result: Ok((0.0, 65536)),
             measured_at_unix_ms: 1001,
-            cost_ms: 2.0,
+            latency_ms: 2.0,
         });
         state.adaptive.as_mut().unwrap().next_report = Instant::now() + Duration::from_secs(1);
         assert!(!measure_adaptive(&mut state, 0));
         let report_at = state.adaptive.as_ref().unwrap().next_tick.unwrap();
         tick_adaptive_at(&mut state, report_at);
         assert!(state.adaptive.as_ref().unwrap().next_tick.is_none());
+    }
+
+    #[test]
+    fn startup_holds_the_fixed_level_until_the_first_pass_is_collected() {
+        // Nothing has been measured yet and, with measurement asynchronous,
+        // nothing can have been: the first capture queues a pass and the
+        // controller keeps reporting the configured fixed level rather than
+        // stalling the render thread to obtain a value on the spot.
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        let spec = adaptive_spec();
+        configure_adaptive(&mut state, &spec, 7);
+        state.capture_id = 2;
+        state.capture.gpu_slot = 1;
+        // The first pass is queued and its fence has not signaled yet.
+        state
+            .measurement
+            .submitted(super::super::adaptive::MeasurementFlight {
+                capture_id: 1,
+                slot: 0,
+                submitted_at: Instant::now(),
+            });
+        assert!(!measure_adaptive(&mut state, 1));
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert_eq!(runtime.controller.level(), spec.black_lift);
+        assert_eq!(
+            runtime.controller.status(),
+            super::super::adaptive::ControllerStatus::Startup
+        );
+    }
+
+    #[test]
+    fn the_slot_the_next_capture_will_fill_is_never_measured() {
+        // The compositor writes into the armed slot with no fence of its
+        // own, so a pass reading it would be sampling a frame as it is
+        // overwritten. Attempting the submission at all would be visible
+        // here as a refusal recorded against the capture.
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        configure_adaptive(&mut state, &adaptive_spec(), 7);
+        state.capture_id = 5;
+        state.capture.gpu_slot = 0;
+        measure_adaptive(&mut state, 0);
+        assert!(
+            state.capture_measurement.is_none(),
+            "no submission should have been attempted for the armed slot"
+        );
+        assert!(state.measurement.flight().is_none());
+    }
+
+    #[test]
+    fn a_measurement_in_flight_defers_the_next_submission_and_survives_the_capture() {
+        // Every completed capture runs `measure_adaptive`; only one pass may
+        // be outstanding, and the one already submitted must still be there
+        // afterwards — it is what the next capture collects, and what the
+        // arm of its slot retires.
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        configure_adaptive(&mut state, &adaptive_spec(), 7);
+        let flight = super::super::adaptive::MeasurementFlight {
+            capture_id: 5,
+            slot: 0,
+            submitted_at: Instant::now(),
+        };
+        state.measurement.submitted(flight);
+        state.capture_id = 6;
+        state.capture.gpu_slot = 0;
+        measure_adaptive(&mut state, 1);
+        assert_eq!(state.measurement.flight(), Some(flight));
+        assert!(
+            state.capture_measurement.is_none(),
+            "a second submission must not even be attempted"
+        );
+    }
+
+    #[test]
+    fn a_collected_measurement_is_applied_tagged_with_the_capture_it_sampled() {
+        // The readback is deferred, so the value that arrives describes a
+        // capture that is no longer the current one. Reporting it against
+        // the current capture id would make every sample look fresh.
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        configure_adaptive(&mut state, &adaptive_spec(), 7);
+        state.capture_id = 9;
+        state.capture.gpu_slot = 1;
+        // Inside the rate limit, so this capture collects and applies
+        // without queueing a pass of its own.
+        state.measurement.refused(Instant::now());
+        state.capture_measurement = Some(CapturedLuminance {
+            capture_id: 6,
+            result: Ok((1.0, 65536)),
+            measured_at_unix_ms: 1000,
+            latency_ms: 17.0,
+        });
+        measure_adaptive(&mut state, 0);
+        let runtime = state.adaptive.as_ref().unwrap();
+        assert_eq!(runtime.status.capture_id, Some(6));
+        assert_eq!(runtime.controller.last_capture_id(), Some(6));
+        assert_eq!(runtime.status.measurement_ms, Some(17.0));
+        assert!(runtime.status.available);
+    }
+
+    #[test]
+    fn retiring_a_measured_slot_releases_it_even_with_no_gpu_to_ask() {
+        let mut state = bare_state(vec![]);
+        state.capture.backend = Some(Backend::Gpu);
+        state
+            .measurement
+            .submitted(super::super::adaptive::MeasurementFlight {
+                capture_id: 3,
+                slot: 1,
+                submitted_at: Instant::now(),
+            });
+        // The other slot is untouched: retiring is per image, not global.
+        retire_measurement_for_slot(&mut state, 0);
+        assert!(state.measurement.reads_slot(1));
+        retire_measurement_for_slot(&mut state, 1);
+        assert!(state.measurement.flight().is_none());
     }
 
     #[test]
@@ -6225,7 +6700,7 @@ mod tests {
             capture_id: 41,
             result: Ok((1.0, 65536)),
             measured_at_unix_ms: 1000,
-            cost_ms: 2.0,
+            latency_ms: 2.0,
         });
         assert!(measure_adaptive(&mut state, 0));
         let deadline = Instant::now() + Duration::from_millis(5);
@@ -6235,7 +6710,7 @@ mod tests {
             capture_id: 42,
             result: Ok((1.0, 65536)),
             measured_at_unix_ms: 1001,
-            cost_ms: 2.0,
+            latency_ms: 2.0,
         });
         let _ = measure_adaptive(&mut state, 0);
         assert_eq!(state.adaptive.as_ref().unwrap().next_tick, Some(deadline));
@@ -6296,7 +6771,7 @@ mod tests {
             capture_id: 42,
             result: Ok((1.0, 65536)),
             measured_at_unix_ms: 1000,
-            cost_ms: 2.0,
+            latency_ms: 2.0,
         });
         let mut spec = adaptive_spec();
         configure_adaptive(&mut state, &spec, 1);
@@ -6337,7 +6812,7 @@ mod tests {
             capture_id: 1,
             result: Ok((1.0, 65536)),
             measured_at_unix_ms: 1000,
-            cost_ms: 0.0,
+            latency_ms: 0.0,
         });
         measure_adaptive(&mut state, 0);
         let next = state.adaptive.as_ref().unwrap().next_tick.unwrap();
@@ -6655,7 +7130,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cpu_rasteriser_and_the_shader_produce_the_same_bytes() {
+    fn the_cpu_rasterizer_and_the_shader_produce_the_same_bytes() {
         // The measurement is only comparable between renderers if they draw
         // the identical frame, so this checks the two halves of that claim
         // against each other with a transfer that is neither identity nor
@@ -6708,7 +7183,7 @@ mod tests {
     }
 
     #[test]
-    fn a_banded_rasterise_matches_a_single_pass_one() {
+    fn a_banded_rasterize_matches_a_single_pass_one() {
         // The CPU path splits the rows across scoped threads exactly as the
         // content blend does, so a rect that straddles a band boundary must
         // come out the same either way.
@@ -6792,9 +7267,9 @@ mod tests {
                     gamma: spec.gamma,
                     black_lift: 0.0,
                     rect: slice.source,
+                    source_rect: None,
                     pattern: Some(pattern),
                     canvas_size: None,
-                    ramps: vec![],
                 },
             );
             for y in 0..180usize {
@@ -6861,6 +7336,14 @@ mod tests {
         slice.source_rect = Some([0.5, 0.5, 480.0, 360.0]);
         for pattern in [TestPattern::Grid, TestPattern::Gamma, TestPattern::Identify] {
             let canvas = static_pattern_rgba(&spec, &slice, pattern).unwrap();
+            // Built with the same footprint `static_pattern_rgba` resolves
+            // internally (`slice.source_rect`), not the raster `rect` at
+            // 1:1: a canvas-anchored feature (the grid's tile lines) is now
+            // computed from the true canvas footprint, so a comparison
+            // picture that omitted it would show tiles at the pre-fix,
+            // wrong canvas position and this coincidence would no longer
+            // hold. Gamma and Identify's own drawing does not depend on the
+            // footprint, so this is a no-op for them.
             let picture = super::super::pattern::render(
                 240,
                 180,
@@ -6869,9 +7352,9 @@ mod tests {
                     gamma: spec.gamma,
                     black_lift: 0.0,
                     rect: slice.source,
+                    source_rect: slice.source_rect,
                     pattern: Some(pattern),
                     canvas_size: None,
-                    ramps: Vec::new(),
                 },
             );
             // At 2x density with a half-pixel source origin, these canvas
@@ -6889,10 +7372,22 @@ mod tests {
                         let midpoint = (u16::from(picture[src + c])
                             + u16::from(picture[src + 3 + c]))
                         .div_ceil(2) as u8;
-                        assert_eq!(
-                            canvas[dst + 4 + c],
-                            midpoint,
-                            "{pattern:?} midpoint {x},{y}"
+                        // +/-1: `source[3] = 360.0` over `height = 180` does
+                        // not divide back to an exactly representable f64,
+                        // so the resample's `py` lands a sub-ULP epsilon off
+                        // 104.0 rather than exactly on it, pulling in an
+                        // infinitesimal, content-dependent contribution from
+                        // the next texel row. This one-row check only
+                        // predicts the pure-1D average, so a tie can round
+                        // either way; it is pre-existing floating-point
+                        // fragility in the resample this criterion-1 rework
+                        // does not touch, made visible now only because the
+                        // grid's corrected canvas-anchored content differs
+                        // pixel-for-pixel from before at this sample point.
+                        let actual = canvas[dst + 4 + c];
+                        assert!(
+                            actual.abs_diff(midpoint) <= 1,
+                            "{pattern:?} midpoint {x},{y}: {actual} vs {midpoint}"
                         );
                     }
                 }
@@ -6937,6 +7432,237 @@ mod tests {
         }
     }
 
+    /// The September 21 review bug, directly: `warp_alignment`'s percentage
+    /// lines and `grid`'s tile fill must classify the very same canvas
+    /// position the very same way regardless of a slice's raster density
+    /// relative to its canvas footprint (what "Content scale" changes), and
+    /// regardless of the footprint's origin being fractional. Before this
+    /// fix, `static_pattern_rgba` rendered the picture as if raster pixel x
+    /// were canvas pixel `slice.source.x + x` at 1:1, so only the 1x case
+    /// below would have landed correctly.
+    #[test]
+    fn warp_alignment_and_grid_canvas_features_hold_position_across_slice_scale() {
+        let mut spec = pattern_spec();
+        spec.canvas_width = 1000;
+        spec.canvas_height = 1000;
+        // A fractional origin: exactly what `canonical_source`'s exact-
+        // integer fast path does not cover, and every Content scale other
+        // than one that happens to divide the canvas evenly produces.
+        let footprint: [f64; 4] = [120.25, 80.75, 700.0, 700.0];
+        let pixel = |canvas: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let offset = (y * 1000 + x) * 4;
+            <[u8; 4]>::try_from(&canvas[offset..offset + 4]).unwrap()
+        };
+        let mut grid_samples = Vec::new();
+        for raster in [350i32, 700, 1400] {
+            // raster/footprint = 0.5x, 1x, 2x.
+            let mut slice = spec.slices[0].clone();
+            slice.source = crate::model::Rect {
+                x: footprint[0].floor() as i32,
+                y: footprint[1].floor() as i32,
+                width: raster,
+                height: raster,
+            };
+            slice.source_rect = Some(footprint);
+
+            let alignment = static_pattern_rgba(&spec, &slice, TestPattern::WarpAlignment)
+                .unwrap_or_else(|e| panic!("raster {raster}: {e}"));
+            // The 50% line of a 1000-wide canvas sits at columns 499/500.
+            // y=650 is inside the footprint and clear of every 10% line and
+            // every alignment circle (the nearest, the 350px-radius
+            // inscribed circle, is 100px away there).
+            let on_line = (495..=505).any(|x| pixel(&alignment, x, 650)[0] > 200);
+            assert!(on_line, "raster {raster}: no lit pixel near canvas x=500");
+            // x=350 (not a multiple of 100, so not on any 10% line) and
+            // 212px from the circles' shared center, clear of all three.
+            let off = pixel(&alignment, 350, 650);
+            assert!(
+                off[0] < 100,
+                "raster {raster}: canvas (350,650) should stay background, got {off:?}"
+            );
+
+            let grid = static_pattern_rgba(&spec, &slice, TestPattern::Grid).unwrap();
+            // (220,260): 20,60 into the tile at (200,200) — clear of that
+            // tile's diagonal cross and corner triangle, and (with a raster
+            // pixel spanning at most 2 canvas px here) clear of its edges.
+            grid_samples.push(pixel(&grid, 220, 260));
+        }
+        assert!(
+            grid_samples.windows(2).all(|w| w[0] == w[1]),
+            "the same canvas tile position must classify identically at every scale: {grid_samples:?}"
+        );
+    }
+
+    /// Two outputs whose canvas footprints overlap — a real seam — must
+    /// agree, pixel for pixel, on every canvas-anchored grid feature inside
+    /// that overlap, even when the two slices have different raster
+    /// densities (as two projectors of different native resolution sharing
+    /// a wall commonly would). This is the same guarantee two aligned
+    /// projectors rely on to superimpose the pattern physically.
+    #[test]
+    fn two_overlapping_slices_agree_on_grid_features_inside_the_overlap() {
+        let mut spec = pattern_spec();
+        spec.canvas_width = 1000;
+        spec.canvas_height = 1000;
+        let mut left = spec.slices[0].clone();
+        left.output = "LEFT".into();
+        left.source = crate::model::Rect {
+            x: 100,
+            y: 100,
+            width: 300,
+            height: 300,
+        };
+        left.source_rect = Some([100.0, 100.0, 600.0, 600.0]);
+        let mut right = spec.slices[0].clone();
+        right.output = "RIGHT".into();
+        right.source = crate::model::Rect {
+            x: 400,
+            y: 100,
+            width: 1200,
+            height: 1200,
+        };
+        right.source_rect = Some([400.0, 100.0, 600.0, 600.0]);
+
+        let canvas_left = static_pattern_rgba(&spec, &left, TestPattern::Grid).unwrap();
+        let canvas_right = static_pattern_rgba(&spec, &right, TestPattern::Grid).unwrap();
+        // (570,320): inside both footprints ([100,700] and [400,1000] on x,
+        // both [100,700] on y) and 70,20 into its tile — clear of the
+        // diagonal cross and corner triangle.
+        let offset = (320 * 1000 + 570) * 4;
+        assert_eq!(
+            &canvas_left[offset..offset + 4],
+            &canvas_right[offset..offset + 4],
+            "two overlapping slices at different raster densities disagreed \
+             on a canvas-anchored grid feature inside their overlap"
+        );
+    }
+
+    /// Criterion 2: the CPU (no-GPU) `present_pattern` path, for a slice
+    /// whose raster is not 1:1 with its canvas footprint, must produce
+    /// exactly what sampling the canvas-space picture through the content
+    /// CPU blend (`Blend::sample`) would — not a 1:1 local copy, which is
+    /// what this function used to do and which only agreed with the content
+    /// path at Content scale 100%.
+    #[test]
+    fn cpu_present_pattern_matches_sampling_the_canvas_picture_through_the_content_blend() {
+        let (socket, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let connection = Connection::from_socket(socket).unwrap();
+        let backend = connection.backend().downgrade();
+
+        let mut spec = pattern_spec();
+        spec.canvas_width = 320;
+        spec.canvas_height = 240;
+        // Raster at 2x the canvas footprint's density.
+        spec.slices[0].source = crate::model::Rect {
+            x: 10,
+            y: 10,
+            width: 480,
+            height: 360,
+        };
+        spec.slices[0].source_rect = Some([10.0, 10.0, 240.0, 180.0]);
+        let slice = spec.slices[0].clone();
+
+        let transfer = vec![(200u16, 3u8); 480 * 360];
+        let mut state = bare_state(vec![]);
+        state.presenters = vec![Presenter {
+            surface: WlSurface::inert(backend.clone()),
+            layer_surface: ZwlrLayerSurfaceV1::inert(backend.clone()),
+            configured: Some((480, 360)),
+            opaque_for: None,
+            output_mode: None,
+            name: slice.output.clone(),
+            buffers: vec![(
+                WlBuffer::inert(backend.clone()),
+                memmap2::MmapMut::map_anon(480 * 360 * 4).unwrap(),
+            )],
+            gpu_buffers: vec![],
+            busy: vec![false],
+            next_buffer: 0,
+            transfer: transfer.clone(),
+            dynamic_table: None,
+            warp: None,
+            sample: None,
+            sample_revision: None,
+            warp_revision: 0,
+            warp_reported_revision: None,
+            warp_submitted_revision: None,
+            source: slice.source,
+            frame_pending: false,
+            pending_since: None,
+            feedback_pending_for: None,
+            feedback_since: None,
+            stalled: false,
+            stale: true,
+        }];
+
+        present_pattern(&mut state, &spec, TestPattern::Grid).unwrap();
+        let (_, map) = &state.presenters[0].buffers[0];
+        let actual = map[..480 * 360 * 4].to_vec();
+
+        // Independently reproduce the content CPU blend's sampling of this
+        // slice's canvas-space picture.
+        let canvas = static_pattern_rgba(&spec, &slice, TestPattern::Grid).unwrap();
+        let warp = super::super::warp::Warp::identity(480, 360)
+            .with_source_rect([10.0, 10.0, 240.0, 180.0])
+            .unwrap();
+        let sample = AxisSamples::build(&warp, [10.0, 10.0]);
+        let expected_blend = Blend {
+            canvas: &canvas,
+            transfer: &transfer,
+            format: PixelFormat {
+                bytes: 4,
+                red: 0,
+                green: 1,
+                blue: 2,
+            },
+            stride: 320 * 4,
+            y_invert: false,
+            usable_width: 320,
+            usable_height: 240,
+            source_x: 10,
+            source_y: 10,
+            width: 480,
+            sample: Some(&sample),
+        };
+        let mut expected = vec![0u8; 480 * 360 * 4];
+        expected_blend.rows(&mut expected, 0, 360);
+        assert_eq!(actual, expected);
+
+        // And this must actually differ from the old 1:1 local copy: proof
+        // the fix changes behavior for a scaled slice, not just that the
+        // new implementation is internally consistent with itself.
+        let legacy_picture = super::super::pattern::render(
+            480,
+            360,
+            &OverlaySpec {
+                output: slice.output.clone(),
+                gamma: spec.gamma,
+                black_lift: 0.0,
+                rect: slice.source,
+                source_rect: None,
+                pattern: Some(TestPattern::Grid),
+                canvas_size: Some([320, 240]),
+            },
+        );
+        let mut legacy = vec![0u8; 480 * 360 * 4];
+        for y in 0..360usize {
+            for x in 0..480usize {
+                let (a, b) = transfer[y * 480 + x];
+                let src = &legacy_picture[(y * 480 + x) * 3..(y * 480 + x) * 3 + 3];
+                let out = |v: u8| (((a as u32 * v as u32) >> 8) + b as u32).min(255) as u8;
+                let dst = &mut legacy[(y * 480 + x) * 4..(y * 480 + x) * 4 + 4];
+                dst[0] = out(src[2]);
+                dst[1] = out(src[1]);
+                dst[2] = out(src[0]);
+                dst[3] = 255;
+            }
+        }
+        assert_ne!(
+            actual, legacy,
+            "the fix must actually change output for a scaled slice"
+        );
+    }
+
     #[test]
     fn cpu_rejects_warp_before_connecting_and_preserves_identity_support() {
         let mut spec = pattern_spec();
@@ -6978,6 +7704,8 @@ mod tests {
                 transfer: vec![(256, 0); 16],
                 dynamic_table: None,
                 warp: None,
+                sample: None,
+                sample_revision: None,
                 warp_revision: 7,
                 warp_reported_revision: None,
                 warp_submitted_revision: None,

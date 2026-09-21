@@ -1,8 +1,9 @@
 //! D3 reference weights, deliberately test-only until geometry-model integration.
 //!
 //! These are shared *source coverage* polygons, never destination pins. Public
-//! pinning still selects a fixed source rectangle. See research/warp/D3.md for
-//! the supported topology, boundary convention, and comparison with current ramps.
+//! pinning still selects a fixed source rectangle. The supported topology,
+//! the boundary convention and the active-edge rule shared with production are
+//! documented on the items below and on `layout::Evaluator`.
 
 type CanvasPoint = [f64; 2];
 type SourceQuad = [CanvasPoint; 4];
@@ -97,6 +98,83 @@ fn inward_distance(poly: &[CanvasPoint], p: CanvasPoint) -> Option<f64> {
         distance = distance.min(signed.max(0.0));
     }
     Some(distance)
+}
+
+/// The projected extent `[min, max]` of `poly`'s vertices onto unit
+/// direction `dir`.
+fn project(poly: &[CanvasPoint], dir: CanvasPoint) -> (f64, f64) {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for v in poly {
+        let t = v[0] * dir[0] + v[1] * dir[1];
+        lo = lo.min(t);
+        hi = hi.max(t);
+    }
+    (lo, hi)
+}
+
+/// Whether `other` makes edge `(a, b)` active at query point `p` — the same
+/// seam rule stated on `layout::Evaluator` in production, generalized from
+/// axis-aligned rectangles to arbitrary convex quads.
+///
+/// A rectangle's left/right edge is active only when a neighbor's rectangle
+/// STRADDLES it: extends past it on the outward side and reaches past it on
+/// the inward side too (`q.x < r.x && r.x < right(q)`), and covers the
+/// point's row. Decomposed into perpendicular/parallel components against
+/// the edge's own line, that becomes: `other`'s extent along the edge's
+/// outward normal must strictly contain the edge's own line position (not
+/// merely touch it — a touching neighbor never activates an edge, matching
+/// [`shared_edge`]'s "touching is not overlapping" convention), and
+/// `other`'s extent along the edge's direction must cover `p`'s position
+/// there (closed, matching [`inward_distance`]'s closed boundary).
+fn edge_active(a: CanvasPoint, b: CanvasPoint, other: &[CanvasPoint], p: CanvasPoint) -> bool {
+    let d = sub(b, a);
+    let len = d[0].hypot(d[1]);
+    if len <= LENGTH_EPS {
+        return false;
+    }
+    let dir = [d[0] / len, d[1] / len];
+    // Any perpendicular direction works: the strict-interior test below is
+    // invariant to which of the two normals is chosen.
+    let normal = [-dir[1], dir[0]];
+    let edge_pos = a[0] * normal[0] + a[1] * normal[1];
+    let (lo_n, hi_n) = project(other, normal);
+    if !(lo_n < edge_pos - LENGTH_EPS && edge_pos + LENGTH_EPS < hi_n) {
+        return false;
+    }
+    let p_dir = p[0] * dir[0] + p[1] * dir[1];
+    let (lo_d, hi_d) = project(other, dir);
+    lo_d - LENGTH_EPS <= p_dir && p_dir <= hi_d + LENGTH_EPS
+}
+
+/// The seam rule (see `layout::Evaluator`'s doc comment, which states it
+/// once for both production and this independent oracle): minimum distance
+/// to `sources[index]`'s ACTIVE edges at `p`, falling back to the plain
+/// inward distance to all four (here, all) edges — [`inward_distance`] —
+/// when none are active. `sources` are the unclipped source quads (not the
+/// canvas-clipped `visible` set): production's `layout::Evaluator` computes
+/// activity from unclipped configured source rectangles too, so canvas
+/// clipping only decides which portion of the canvas is queried, never
+/// which edges attenuate.
+fn active_inward_distance(sources: &[Polygon], index: usize, p: CanvasPoint) -> Option<f64> {
+    let poly = &sources[index];
+    let fallback = inward_distance(poly, p)?;
+    let mut active_min = f64::INFINITY;
+    for (a, b) in edges(poly) {
+        let active = (0..sources.len()).any(|q| q != index && edge_active(a, b, &sources[q], p));
+        if !active {
+            continue;
+        }
+        let d = sub(b, a);
+        let len = d[0].hypot(d[1]);
+        let signed = (cross(d, sub(p, a)) / len).max(0.0);
+        active_min = active_min.min(signed);
+    }
+    Some(if active_min.is_finite() {
+        active_min
+    } else {
+        fallback
+    })
 }
 
 impl Oracle {
@@ -198,7 +276,9 @@ impl Oracle {
         if p[0] < 0.0 || p[1] < 0.0 || p[0] > self.canvas[0] || p[1] > self.canvas[1] {
             return Ok(result);
         }
-        let distances: Vec<_> = self.sources.iter().map(|q| inward_distance(q, p)).collect();
+        let distances: Vec<_> = (0..self.sources.len())
+            .map(|i| active_inward_distance(&self.sources, i, p))
+            .collect();
         let count = distances.iter().filter(|v| v.is_some()).count();
         let total: f64 = distances.iter().flatten().sum();
         for (weight, distance) in result.iter_mut().zip(distances) {
@@ -246,10 +326,9 @@ impl Oracle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ProjectionConfig, Rect};
-    use crate::projection::blend::{
-        canvas_plan, transfer_at, FadeTo, Participant, RampSpec, Slicing,
-    };
+    use crate::model::{CanvasRect, ProjectionConfig, Rect};
+    use crate::projection::blend::{canvas_plan, Participant, Slicing};
+    use crate::projection::layout::{Evaluator, LayoutParticipant, LayoutSpec};
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> SourceQuad {
         [[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
@@ -302,8 +381,11 @@ mod tests {
         .unwrap();
         close(&oracle.weights([925.0, 500.0]).unwrap(), &[0.75, 0.25]);
         close(&oracle.weights([900.0, 500.0]).unwrap(), &[1.0, 0.0]);
-        // All-edge distances differ from axis ramps near a common top edge.
-        close(&oracle.weights([925.0, 10.0]).unwrap(), &[0.5, 0.5]);
+        // Active-edge distances keep the same ratio up to a common top
+        // edge, unlike the old all-edges-always rule this oracle used
+        // before: neither rectangle's top edge is straddled by the other
+        // (same height, same y origin), so it never enters the minimum.
+        close(&oracle.weights([925.0, 10.0]).unwrap(), &[0.75, 0.25]);
         check_sum(&oracle);
         let unequal = Oracle::new(
             [1900.0, 1000.0],
@@ -499,35 +581,68 @@ mod tests {
     }
 
     #[test]
-    fn fixed_transfer_coefficient_error_is_bounded_separately() {
-        // A unit left-facing ramp passes w through the production transfer
-        // evaluator, so this checks the actual rounding/gamma/border contract.
-        let ramp = RampSpec {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            },
-            fade_to: FadeTo::Left,
+    fn fixed_point_gain_error_is_bounded_across_every_weight_and_gamma() {
+        // Two overlapping sources — A = [0, 2] x [0, 1], B = [-1, 1] x [0, 1]
+        // — give A's active-edge distance (only its left edge is active, via
+        // B's straddle) as exactly `x`, and B's (only its right edge, via A)
+        // as exactly `1 - x`, so `layout::Evaluator`'s own weight for A at
+        // canvas-unit x = w is exactly w. That passes w through the actual
+        // production evaluator — not a synthetic ramp — for the fixed-point
+        // rounding/gamma contract this checks. (The lift half of the
+        // fixed-point contract is exhaustively covered by
+        // `layout`'s own `footprint_maximum_is_canvas_clipped_and_does_not_follow_pins`.)
+        let spec = LayoutSpec {
+            aspect: 1.0,
+            blend: true,
+            participants: vec![
+                LayoutParticipant {
+                    output: "A".into(),
+                    source: CanvasRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 2.0,
+                        height: 1.0,
+                    },
+                    raster_footprint: CanvasRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 2.0,
+                        height: 1.0,
+                    },
+                },
+                LayoutParticipant {
+                    output: "B".into(),
+                    source: CanvasRect {
+                        x: -1.0,
+                        y: 0.0,
+                        width: 2.0,
+                        height: 1.0,
+                    },
+                    raster_footprint: CanvasRect {
+                        x: -1.0,
+                        y: 0.0,
+                        width: 2.0,
+                        height: 1.0,
+                    },
+                },
+            ],
         };
+        let evaluator = Evaluator::new(&spec, 1000, 1000).unwrap();
         for index in 0..=1000 {
             let w = index as f64 / 1000.0;
             for gamma in [1.0, 2.2, 3.0] {
-                for lift in [0.0, 0.17, 0.5, 1.0] {
-                    for edge in [0.0, 0.5, 1.0] {
-                        let r = w.powf(1.0 / gamma);
-                        let a = edge * (1.0 - lift) * r;
-                        let b = edge * lift;
-                        let (gain, offset) =
-                            transfer_at(std::slice::from_ref(&ramp), gamma, lift, w, 0.5, edge);
-                        assert!((f64::from(gain) / 256.0 - a).abs() <= 1.0 / 512.0 + 1e-15);
-                        assert!((f64::from(offset) / 255.0 - b).abs() <= 1.0 / 510.0 + 1e-15);
-                        for input in [0_u16, 1, 127, 128, 254, 255] {
-                            let actual = (((gain * input) >> 8) + u16::from(offset)).min(255);
-                            let ideal = (a * f64::from(input) + 255.0 * b).min(255.0);
-                            assert!((f64::from(actual) - ideal).abs() <= 2.0);
-                        }
+                for edge in [0.0, 0.5, 1.0] {
+                    let expected = edge * w.powf(1.0 / gamma);
+                    let (gain, offset) = evaluator.transfer(0, w * 1000.0, 500.0, gamma, 0.0, edge);
+                    assert_eq!(offset, 0, "no black lift is configured");
+                    assert!(
+                        (f64::from(gain) / 256.0 - expected).abs() <= 1.0 / 512.0 + 1e-9,
+                        "w={w} gamma={gamma} edge={edge}: gain {gain}"
+                    );
+                    for input in [0_u16, 1, 127, 128, 254, 255] {
+                        let actual = ((gain * input) >> 8).min(255);
+                        let ideal = expected * f64::from(input);
+                        assert!((f64::from(actual) - ideal).abs() <= 2.0);
                     }
                 }
             }
@@ -535,7 +650,16 @@ mod tests {
     }
 
     #[test]
-    fn distance_rule_difference_from_current_rectangular_evaluator_is_explicit() {
+    fn production_and_oracle_agree_at_a_common_top_border() {
+        // Once the deleted legacy pairwise `RampSpec` rule always looked at
+        // every edge, so an ordinary two-projector overlap's ratio would
+        // shift near the top/bottom border where a third, uninvolved edge
+        // happened to be closer — the discrepancy this oracle was built to
+        // expose (finding A5). Production now uses `layout::Evaluator`'s
+        // active-edge rule everywhere, including for this legacy integer
+        // layout (synthesized into a `LayoutSpec`), which is the same rule
+        // this oracle implements: they must agree here too, not just away
+        // from every border.
         let participants: Vec<_> = [0, 900]
             .into_iter()
             .enumerate()
@@ -556,6 +680,12 @@ mod tests {
             ..ProjectionConfig::default()
         };
         let plan = canvas_plan(&participants, Some(&config), Slicing::Always).unwrap();
+        let evaluator = super::super::layout::Evaluator::new(
+            plan.layout.as_ref().unwrap(),
+            plan.canvas_width,
+            plan.canvas_height,
+        )
+        .unwrap();
         let oracle = Oracle::new(
             [1900.0, 1000.0],
             &[
@@ -564,18 +694,11 @@ mod tests {
             ],
         )
         .unwrap();
-        // At a common top border, minimum-distance weights differ materially.
         let weights = oracle.weights([925.0, 10.0]).unwrap();
-        close(&weights, &[0.5, 0.5]);
-        let legacy = transfer_at(&plan.slices[0].ramps, 1.0, 0.0, 925.0, 10.0, 1.0);
-        assert_eq!(legacy, (192, 0));
-        assert_eq!((weights[0] * 256.0).round() as u16, 128);
-        // Record current arithmetic with nonzero lift; this is a comparison, not
-        // an old-configuration migration requirement.
-        assert_eq!(
-            transfer_at(&plan.slices[0].ramps, 1.0, 0.2, 925.0, 10.0, 1.0),
-            (154, 51)
-        );
+        close(&weights, &[0.75, 0.25]);
+        let production = evaluator.transfer(0, 925.0, 10.0, 1.0, 0.0, 1.0);
+        assert_eq!(production, (192, 0));
+        assert_eq!((weights[0] * 256.0).round() as u16, 192);
     }
 
     #[test]
@@ -654,7 +777,13 @@ mod tests {
     }
 
     #[test]
-    fn arbitrary_triple_improves_the_current_pairwise_sum() {
+    fn arbitrary_triple_matches_the_oracle_not_the_deleted_pairwise_sum() {
+        // The deleted legacy pairwise `RampSpec` rule summed each pair's
+        // ramp independently, so a three-way overlap's coefficients summed
+        // to 229/256 (about 0.895), not 1 (`seam_oracle.rs`'s own former
+        // documentation of that gap). Production now uses the same
+        // minimum-active-distance rule this oracle does, through
+        // `layout::Evaluator`, so both agree — and both actually sum to 1.
         let participants: Vec<_> = [0, 5, 8]
             .into_iter()
             .enumerate()
@@ -675,12 +804,15 @@ mod tests {
             ..ProjectionConfig::default()
         };
         let plan = canvas_plan(&participants, Some(&config), Slicing::Always).unwrap();
-        let coefficients: Vec<_> = plan
-            .slices
-            .iter()
-            .map(|s| transfer_at(&s.ramps, 1.0, 0.0, 8.5 - f64::from(s.source.x), 5.5, 1.0).0)
+        let evaluator = super::super::layout::Evaluator::new(
+            plan.layout.as_ref().unwrap(),
+            plan.canvas_width,
+            plan.canvas_height,
+        )
+        .unwrap();
+        let production: Vec<u16> = (0..3)
+            .map(|i| evaluator.transfer(i, 8.5, 5.5, 1.0, 0.0, 1.0).0)
             .collect();
-        assert_eq!(coefficients, vec![58, 166, 5]);
         let oracle = Oracle::new(
             [18.0, 10.0],
             &[
@@ -690,9 +822,180 @@ mod tests {
             ],
         )
         .unwrap();
-        close(
-            &oracle.weights([8.5, 5.5]).unwrap(),
-            &[3.0 / 11.0, 7.0 / 11.0, 1.0 / 11.0],
+        let expected = oracle.weights([8.5, 5.5]).unwrap();
+        close(&expected, &[3.0 / 11.0, 7.0 / 11.0, 1.0 / 11.0]);
+        let sum: u32 = production.iter().map(|&g| u32::from(g)).sum();
+        assert!((sum as i64 - 256).abs() <= 2, "sum was {sum}, not ~256");
+        for i in 0..3 {
+            assert!(
+                (f64::from(production[i]) / 256.0 - expected[i]).abs() <= 1.0 / 256.0 + 1e-9,
+                "index {i}: production {} oracle {}",
+                production[i],
+                expected[i]
+            );
+        }
+    }
+
+    // --- restored per-pixel production-vs-oracle comparison (finding A5) --
+    //
+    // Commit 7fccd1d replaced the original per-pixel comparison
+    // (`production_rectangles_match_independent_d3_oracle`) with a
+    // sum-to-one test that is true by construction — `weight = own / total`
+    // sums to 1 regardless of whether `own` is computed correctly, so it
+    // could not have caught a seam-rule bug. This restores the genuine
+    // comparison, now that both production (`layout::Evaluator`) and this
+    // oracle implement the identical active-edge rule stated once on
+    // `layout::Evaluator`'s doc comment.
+
+    /// Build the same layout as both a production `LayoutSpec` (pixel rects
+    /// normalized by the canvas width, per `layout::canvas_plan_with_correction`'s
+    /// convention) and an oracle `Oracle`, then check every covered canvas
+    /// pixel's weight agrees within old test's tolerance: `1/512` gain
+    /// quantization plus a small epsilon.
+    fn compare_production_and_oracle(rects: &[(f64, f64, f64, f64)], width: i32, height: i32) {
+        let aspect = f64::from(width) / f64::from(height);
+        let participants: Vec<_> = rects
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y, w, h))| {
+                let source = CanvasRect {
+                    x: x / f64::from(width),
+                    y: y / f64::from(width),
+                    width: w / f64::from(width),
+                    height: h / f64::from(width),
+                };
+                LayoutParticipant {
+                    output: i.to_string(),
+                    source,
+                    raster_footprint: source,
+                }
+            })
+            .collect();
+        let spec = LayoutSpec {
+            aspect,
+            blend: true,
+            participants,
+        };
+        let evaluator = Evaluator::new(&spec, width, height).unwrap();
+        let quads: Vec<SourceQuad> = rects.iter().map(|&(x, y, w, h)| rect(x, y, w, h)).collect();
+        let oracle = Oracle::new([f64::from(width), f64::from(height)], &quads).unwrap();
+        for gy in 0..height {
+            for gx in 0..width {
+                let (cx, cy) = (f64::from(gx) + 0.5, f64::from(gy) + 0.5);
+                let expected = oracle.weights([cx, cy]).unwrap();
+                for (i, expected) in expected.iter().enumerate() {
+                    let (gain, lift) = evaluator.transfer(i, cx, cy, 1.0, 0.0, 1.0);
+                    assert_eq!(lift, 0, "no black lift is configured");
+                    let actual = f64::from(gain) / 256.0;
+                    assert!(
+                        (actual - expected).abs() <= 1.0 / 512.0 + 1e-9,
+                        "index {i} at ({cx}, {cy}): production {actual} oracle {expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn production_matches_oracle_for_a_two_strip() {
+        compare_production_and_oracle(
+            &[(0.0, 0.0, 60.0, 100.0), (40.0, 0.0, 60.0, 100.0)],
+            100,
+            100,
         );
+    }
+
+    #[test]
+    fn production_matches_oracle_for_a_2x2_grid_with_20_percent_overlaps() {
+        let rects = [
+            (0.0, 0.0, 60.0, 60.0),
+            (40.0, 0.0, 60.0, 60.0),
+            (0.0, 40.0, 60.0, 60.0),
+            (40.0, 40.0, 60.0, 60.0),
+        ];
+        compare_production_and_oracle(&rects, 100, 100);
+
+        // The four-way corner explicitly, not just swept over by the loop
+        // above: every source carries an equal quarter there.
+        let participants: Vec<_> = rects
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y, w, h))| {
+                let source = CanvasRect {
+                    x: x / 100.0,
+                    y: y / 100.0,
+                    width: w / 100.0,
+                    height: h / 100.0,
+                };
+                LayoutParticipant {
+                    output: i.to_string(),
+                    source,
+                    raster_footprint: source,
+                }
+            })
+            .collect();
+        let spec = LayoutSpec {
+            aspect: 1.0,
+            blend: true,
+            participants,
+        };
+        let evaluator = Evaluator::new(&spec, 100, 100).unwrap();
+        let quads: Vec<SourceQuad> = rects.iter().map(|&(x, y, w, h)| rect(x, y, w, h)).collect();
+        let oracle = Oracle::new([100.0, 100.0], &quads).unwrap();
+        let corner = [50.0, 50.0];
+        close(&oracle.weights(corner).unwrap(), &[0.25; 4]);
+        for i in 0..4 {
+            let (gain, _) = evaluator.transfer(i, corner[0], corner[1], 1.0, 0.0, 1.0);
+            assert!(
+                (f64::from(gain) / 256.0 - 0.25).abs() <= 1.0 / 512.0 + 1e-9,
+                "index {i} at the corner: gain {gain}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_matches_oracle_for_unequal_heights_with_partial_overlap() {
+        compare_production_and_oracle(
+            &[(0.0, 0.0, 60.0, 100.0), (40.0, 20.0, 60.0, 60.0)],
+            100,
+            100,
+        );
+    }
+
+    #[test]
+    fn production_matches_oracle_for_a_three_way_overlap() {
+        compare_production_and_oracle(
+            &[
+                (0.0, 0.0, 10.0, 10.0),
+                (5.0, 0.0, 10.0, 10.0),
+                (8.0, 0.0, 10.0, 10.0),
+            ],
+            18,
+            10,
+        );
+    }
+
+    #[test]
+    fn production_matches_oracle_for_a_nested_layout() {
+        // B sits entirely inside A: near-total overlap (`>= 80%` of the
+        // smaller original rectangle), so both `Evaluator` and `Oracle`
+        // independently classify this an all-pairs stack — full weight for
+        // both, not a distance ratio — and must still agree pixel for pixel.
+        compare_production_and_oracle(
+            &[(0.0, 0.0, 100.0, 100.0), (20.0, 20.0, 30.0, 30.0)],
+            100,
+            100,
+        );
+    }
+
+    #[test]
+    fn production_matches_oracle_for_a_cross_shaped_overlap() {
+        let rects = [
+            (0.0, 0.0, 60.0, 60.0),
+            (30.0, 0.0, 60.0, 60.0),
+            (0.0, 30.0, 60.0, 60.0),
+            (30.0, 30.0, 60.0, 60.0),
+        ];
+        compare_production_and_oracle(&rects, 90, 90);
     }
 }

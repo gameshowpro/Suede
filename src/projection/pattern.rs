@@ -1,17 +1,20 @@
 //! Built-in test patterns, rendered on the CPU into the overlay buffer.
 //!
-//! Adapted from the operator's proven SVG bench pattern: 100 px colour tiles,
-//! a white diagonal cross with a small black centre cross per tile, a corner
+//! Adapted from the operator's proven SVG bench pattern: 100 px color tiles,
+//! a white diagonal cross with a small black center cross per tile, a corner
 //! triangle, and pixel coordinates — plus patterns specific to edge blending
 //! (white for ramps, black for lift, a gamma-measurement chart).
 //!
-//! Everything is drawn in *global* layout coordinates derived from the
-//! output's rectangle, so a feature at global x=1800 lands on the same spot
-//! of both projectors sharing a seam: when the projectors are physically
-//! aligned, the patterns superimpose exactly. That is what makes the grid an
-//! alignment tool rather than just a picture.
+//! Everything canvas-anchored is drawn in *canvas* coordinates derived from
+//! the picture's footprint (`OverlaySpec::source_rect`, or `rect` at 1:1 when
+//! there is no canvas concept), so a feature at canvas x=1800 lands on the
+//! same spot of both projectors sharing a seam: when the projectors are
+//! physically aligned, the patterns superimpose exactly. That is what makes
+//! the grid an alignment tool rather than just a picture — and it holds
+//! however a slice's raster size relates to its canvas footprint, not only
+//! when they happen to be equal (Content scale 100%).
 
-use crate::model::{Rect, TestPattern};
+use crate::model::TestPattern;
 
 use super::blend::OverlaySpec;
 
@@ -21,13 +24,13 @@ const TILE: i32 = 100;
 pub fn render(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     let mut rgb = vec![0u8; width as usize * height as usize * 3];
     match spec.pattern {
-        Some(TestPattern::Grid) => grid(&mut rgb, width, height, &spec.rect, &spec.output),
+        Some(TestPattern::Grid) => grid(&mut rgb, width, height, spec),
         Some(TestPattern::White) => rgb.fill(255),
         // Black is already black — and deliberately unmarked: any lit pixel
         // would corrupt the black-lift comparison it exists for.
         Some(TestPattern::Black) => {}
         Some(TestPattern::Gamma) => gamma_chart(&mut rgb, width, height, spec.gamma),
-        Some(TestPattern::Identify) => identify(&mut rgb, width, height, &spec.rect, &spec.output),
+        Some(TestPattern::Identify) => identify(&mut rgb, width, height, spec),
         // The animated counter belongs to the slicer, which draws it per
         // frame from `sync_rects` rather than through this function at all.
         // Reaching here means the tiled path asked for it — see
@@ -39,25 +42,61 @@ pub fn render(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     rgb
 }
 
+/// This picture's true footprint in canvas space: the configured fractional,
+/// possibly scaled source rectangle when one exists, or an implied
+/// unit-density rectangle at `rect`'s origin sized to the picture itself.
+/// The implied case is the no-canvas bench-alignment overlay, whose `rect`
+/// already *is* the global layout position at 1:1 density, so canvas-anchored
+/// features keep landing on exactly the spot they always have.
+fn footprint(spec: &OverlaySpec, width: u32, height: u32) -> [f64; 4] {
+    spec.source_rect.unwrap_or([
+        f64::from(spec.rect.x),
+        f64::from(spec.rect.y),
+        f64::from(width),
+        f64::from(height),
+    ])
+}
+
+/// The canvas coordinate a raster-local pixel *center* represents, through
+/// this picture's footprint. Mirrors `warp::Warp::canvas_at` and the
+/// resampling `slicer::static_pattern_rgba` uses to place this picture on the
+/// canvas, so a canvas-anchored feature computed here lands at the same
+/// canvas position however this picture later gets scaled into its
+/// footprint. `.floor()` the result for the integer canvas pixel index a
+/// per-pixel feature test (tile color, line hit-test) wants.
+fn to_canvas(local: i32, length: u32, origin: f64, extent: f64) -> f64 {
+    origin + (f64::from(local) + 0.5) / f64::from(length) * extent
+}
+
+/// The inverse of a plain proportional *edge* mapping (deliberately without
+/// [`to_canvas`]'s half-pixel center offset): the local raster position whose
+/// left edge sits at canvas coordinate `canvas`. Used to place a decoration
+/// at a canvas-anchored boundary (e.g. a grid tile's corner), as opposed to
+/// classifying which canvas pixel a raster pixel's center falls into.
+fn from_canvas_edge(canvas: f64, length: u32, origin: f64, extent: f64) -> f64 {
+    (canvas - origin) / extent * f64::from(length)
+}
+
 // --- output identification -----------------------------------------------
 
 /// The connector's name, as large as this output will carry.
 ///
 /// Sized for someone standing at the projector rather than sitting at the
 /// screen: the answer they need is which cable to move, and the two displays
-/// they are choosing between may be metres apart and differently lit. So the
+/// they are choosing between may be meters apart and differently lit. So the
 /// name is scaled to the output rather than set at a fixed size, and the
-/// background is keyed to the name so neighbours never look alike even when
+/// background is keyed to the name so neighbors never look alike even when
 /// the text is too far away to read.
-fn identify(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
-    let ground = name_colour(output);
+fn identify(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
+    let output = spec.output.as_str();
+    let ground = name_color(output);
     for pixel in rgb.chunks_exact_mut(3) {
         pixel.copy_from_slice(&ground);
     }
 
     // A border in the same hue but bright: it states where this output ends,
     // which is the other half of the question when two of them overlap.
-    let edge = name_colour_bright(output);
+    let edge = name_color_bright(output);
     let thickness = (width.min(height) / 60).clamp(2, 12) as i32;
     for y in 0..height as i32 {
         for x in 0..width as i32 {
@@ -86,8 +125,17 @@ fn identify(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) 
 
     // Underneath, what the daemon thinks this output is: its size and where
     // it sits on the canvas. Ordering the cables is the point, and that is
-    // the line which says whether the order came out right.
-    let detail = format!("{}X{} AT {},{}", width, height, rect.x, rect.y);
+    // the line which says whether the order came out right. The position is
+    // this output's true canvas footprint, not its raster rectangle, so it
+    // reads correctly under a scaled (Content scale != 100%) source too.
+    let source = footprint(spec, width, height);
+    let detail = format!(
+        "{}X{} AT {},{}",
+        width,
+        height,
+        source[0].round() as i64,
+        source[1].round() as i64
+    );
     let small = (scale / 4).clamp(1, 6);
     let detail_w = text_width(&detail, small);
     text(
@@ -105,12 +153,12 @@ fn identify(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) 
 ///
 /// Hashed rather than taken from a list: the names are whatever the hardware
 /// offers, and a list would eventually meet a machine whose outputs all fell
-/// off the end of it and came out the same colour.
-fn name_colour(output: &str) -> [u8; 3] {
+/// off the end of it and came out the same color.
+fn name_color(output: &str) -> [u8; 3] {
     hsl(name_hue(output), 0.55, 0.22)
 }
 
-fn name_colour_bright(output: &str) -> [u8; 3] {
+fn name_color_bright(output: &str) -> [u8; 3] {
     hsl(name_hue(output), 0.75, 0.55)
 }
 
@@ -127,11 +175,19 @@ fn name_hue(output: &str) -> f64 {
 
 // --- the tile grid --------------------------------------------------------
 
-fn grid(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
+fn grid(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
+    let output = spec.output.as_str();
+    let rect = footprint(spec, width, height);
     for y in 0..height as i32 {
+        // The canvas pixel this raster row's center falls into — not `y +
+        // rect.y`, which only holds at 1:1 (Content scale 100%). At any
+        // other scale that assumption is exactly the bug this rework fixes:
+        // it would place canvas-anchored tile boundaries at the wrong canvas
+        // position, so two projectors calibrated on the grid would not
+        // actually merge on real content sharing the same footprint.
+        let gy = to_canvas(y, height, rect[1], rect[3]).floor() as i32;
         for x in 0..width as i32 {
-            let gx = x + rect.x;
-            let gy = y + rect.y;
+            let gx = to_canvas(x, width, rect[0], rect[2]).floor() as i32;
             let u = gx.rem_euclid(TILE);
             let v = gy.rem_euclid(TILE);
 
@@ -142,7 +198,7 @@ fn grid(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
             let on_up = (v - (TILE - 1 - u)).abs() <= 1;
             if on_down || on_up {
                 pixel = [255, 255, 255];
-                // Small black centre cross on top of the white diagonals.
+                // Small black center cross on top of the white diagonals.
                 if (37..=62).contains(&u) && (37..=62).contains(&v) {
                     pixel = [0, 0, 0];
                 }
@@ -157,17 +213,22 @@ fn grid(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
         }
     }
 
-    // Tile annotations: global coordinates top corners, output name at the
-    // bottom. Text is screen truth — a photo of the projection says exactly which
-    // output and which pixels are in frame.
-    let first_tx = rect.x.div_euclid(TILE);
-    let first_ty = rect.y.div_euclid(TILE);
-    let last_tx = (rect.x + width as i32 - 1).div_euclid(TILE);
-    let last_ty = (rect.y + height as i32 - 1).div_euclid(TILE);
+    // Tile annotations: canvas coordinates at the top corners, output name at
+    // the bottom. Text is screen truth — a photo of the projection says
+    // exactly which output and which pixels are in frame. The visible tile
+    // range and each tile's local origin are found through the footprint's
+    // *edges* (not pixel centers — a boundary is not anybody's center), the
+    // exact inverse of how content later gets resampled into this footprint.
+    let first_tx = (rect[0] / f64::from(TILE)).floor() as i32;
+    let first_ty = (rect[1] / f64::from(TILE)).floor() as i32;
+    let last_tx = ((rect[0] + rect[2]) / f64::from(TILE)).ceil() as i32 - 1;
+    let last_ty = ((rect[1] + rect[3]) / f64::from(TILE)).ceil() as i32 - 1;
     for ty in first_ty..=last_ty {
         for tx in first_tx..=last_tx {
-            let origin_x = tx * TILE - rect.x;
-            let origin_y = ty * TILE - rect.y;
+            let origin_x =
+                from_canvas_edge(f64::from(tx * TILE), width, rect[0], rect[2]).round() as i32;
+            let origin_y =
+                from_canvas_edge(f64::from(ty * TILE), height, rect[1], rect[3]).round() as i32;
             let label_x = (tx * TILE).to_string();
             let label_y = (ty * TILE).to_string();
             text(rgb, width, height, origin_x + 5, origin_y + 5, 1, &label_x);
@@ -195,8 +256,8 @@ fn grid(rgb: &mut [u8], width: u32, height: u32, rect: &Rect, output: &str) {
     }
 }
 
-/// Tile colours in the spirit of the reference pattern: hue families down the
-/// rows, light-to-dark variants across the columns, a grey every tenth.
+/// Tile colors in the spirit of the reference pattern: hue families down the
+/// rows, light-to-dark variants across the columns, a gray every tenth.
 fn tile_color(tx: i64, ty: i64) -> [u8; 3] {
     let col = tx.rem_euclid(10) as usize;
     let row = ty.rem_euclid(18) as usize;
@@ -260,7 +321,7 @@ fn gamma_chart(rgb: &mut [u8], width: u32, height: u32, configured: f64) {
                 if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
                     continue;
                 }
-                // Stripes surround the solid centre on both sides, so the
+                // Stripes surround the solid center on both sides, so the
                 // comparison is local rather than across the block edge.
                 let inner = x >= x0 + BLOCK_W / 4 && x < x0 + 3 * BLOCK_W / 4;
                 let value = if inner {
@@ -312,14 +373,14 @@ pub fn text_width(message: &str, scale: i32) -> i32 {
 }
 
 /// Blit `message` in the 5×7 font, white with a black drop shadow so it
-/// survives any tile colour underneath.
+/// survives any tile color underneath.
 pub fn text(rgb: &mut [u8], width: u32, height: u32, x: i32, y: i32, scale: i32, message: &str) {
     // The shadow exists to keep small text legible over the grid's tile
-    // colours. Offsetting it by a whole scale unit is right at scale 1 and
+    // colors. Offsetting it by a whole scale unit is right at scale 1 and
     // absurd at scale 50, where it stops reading as a shadow and starts
     // reading as a second, misaligned copy of the letter.
     let shadow = (scale / 6).max(1);
-    for (offset, colour) in [(shadow, [0, 0, 0]), (0, [255, 255, 255])] {
+    for (offset, color) in [(shadow, [0, 0, 0]), (0, [255, 255, 255])] {
         let mut pen_x = x + offset;
         let pen_y = y + offset;
         for c in message.chars() {
@@ -334,7 +395,7 @@ pub fn text(rgb: &mut [u8], width: u32, height: u32, x: i32, y: i32, scale: i32,
                             let px = pen_x + col_index as i32 * scale + sx;
                             let py = pen_y + row_index as i32 * scale + sy;
                             if px >= 0 && py >= 0 && px < width as i32 && py < height as i32 {
-                                put(rgb, width, px, py, colour);
+                                put(rgb, width, px, py, color);
                             }
                         }
                     }
@@ -569,21 +630,21 @@ pub struct SyncGroup {
 /// are drawn.
 ///
 /// Pure, and the single source of both renderers' pixels — the CPU path
-/// rasterises this list into an shm buffer and the GPU path uploads it to a
+/// rasterizes this list into an shm buffer and the GPU path uploads it to a
 /// fragment shader — because the measurement this pattern exists for is only
 /// meaningful if switching renderers cannot change what the camera sees.
 ///
 /// What is drawn, and why each part is there:
 ///
 /// - **Two seven-segment digits of `frame % 100`**, 90 % of the output's
-///   height and centred. Big because the camera is looking at a projected
+///   height and centered. Big because the camera is looking at a projected
 ///   image from across a room, and seven-segment because segments are
 ///   rectangles: the same shapes the shader already tests, with no font
-///   rasterisation on either path to disagree about.
+///   rasterization on either path to disagree about.
 /// - **A sixteen-bit binary strip of `frame & 0xffff`**, most significant
 ///   bit at the top, filled for one and hollow for zero. Two consecutive
 ///   frames differ in the low bits whatever the digits are doing, so the
-///   strip still reads when a projector's colour wheel has smeared the
+///   strip still reads when a projector's color wheel has smeared the
 ///   digits across the exposure — and it disambiguates the wrap from 99 to
 ///   00.
 /// - **Four large cells along the bottom edge**, the low four bits of the
@@ -785,7 +846,7 @@ pub fn sync_rects(
 /// One seven-segment bar as a rectangle, `segment` indexed as
 /// [`DIGIT_SEGMENTS`] documents.
 fn segment_rect(segment: u32, x: i64, y: i64, w: i64, h: i64, t: i64) -> (i64, i64, i64, i64) {
-    // The middle bar straddles the digit's centre line, which is what makes
+    // The middle bar straddles the digit's center line, which is what makes
     // the two halves the same height.
     let mid0 = y + h / 2 - t / 2;
     let mid1 = mid0 + t;
@@ -993,6 +1054,7 @@ fn sync_unavailable(rgb: &mut [u8], width: u32, height: u32) {
 /// width and height (2 pixels thick) and concentric alignment circles in the
 /// center of the canvas.
 fn warp_alignment(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
+    let rect = footprint(spec, width, height);
     let (cw, ch) = match spec.canvas_size {
         Some([w, h]) if w > 0 && h > 0 => (w as f64, h as f64),
         _ => {
@@ -1046,12 +1108,16 @@ fn warp_alignment(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
     }
 
     for y in 0..height as i32 {
-        let gy = y + spec.rect.y;
+        // The canvas row this raster row's center falls into — see `grid`'s
+        // `to_canvas` for why this must go through the footprint rather than
+        // `y + spec.rect.y`, which only holds when raster and canvas pixels
+        // coincide 1:1 (Content scale 100%).
+        let gy = to_canvas(y, height, rect[1], rect[3]).floor() as i32;
         let on_horiz_line = y_ranges.iter().any(|&(y0, y1)| gy >= y0 && gy <= y1);
         let dy = (gy as f64 + 0.5) - cy;
 
         for x in 0..width as i32 {
-            let gx = x + spec.rect.x;
+            let gx = to_canvas(x, width, rect[0], rect[2]).floor() as i32;
             if on_horiz_line {
                 put(rgb, width, x, y, white);
                 continue;
@@ -1080,7 +1146,7 @@ fn warp_alignment(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::TestPattern;
+    use crate::model::{Rect, TestPattern};
 
     fn spec(pattern: TestPattern, rect: Rect) -> OverlaySpec {
         OverlaySpec {
@@ -1088,9 +1154,9 @@ mod tests {
             gamma: 2.2,
             black_lift: 0.0,
             rect,
+            source_rect: None,
             pattern: Some(pattern),
             canvas_size: None,
-            ramps: Vec::new(),
         }
     }
 
@@ -1226,7 +1292,7 @@ mod tests {
                 },
             ),
         );
-        // The 2.2 candidate is the fourth block; sample its solid centre.
+        // The 2.2 candidate is the fourth block; sample its solid center.
         let block_x = (1920 - (6 * 224 - 24)) / 2 + 3 * 224 + 100;
         let value = pixel(&rgb, 1920, block_x, 540)[0];
         let expected = (255.0 * 0.5f64.powf(1.0 / 2.2)).round() as u8;
@@ -1239,8 +1305,8 @@ mod tests {
     }
 
     #[test]
-    fn tile_colours_are_stable_and_distinct() {
-        // Neighbouring tiles must differ (the grid must be visible), and the
+    fn tile_colors_are_stable_and_distinct() {
+        // Neighboring tiles must differ (the grid must be visible), and the
         // palette must be deterministic (the fingerprint must be stable).
         assert_eq!(tile_color(0, 0), tile_color(0, 0));
         assert_ne!(tile_color(0, 0), tile_color(1, 0));
@@ -1265,9 +1331,9 @@ mod tests {
         ];
         let mut seen = std::collections::HashMap::new();
         for name in names {
-            let colour = name_colour(name);
-            if let Some(other) = seen.insert(colour, name) {
-                panic!("{name} and {other} share a ground colour {colour:?}");
+            let color = name_color(name);
+            if let Some(other) = seen.insert(color, name) {
+                panic!("{name} and {other} share a ground color {color:?}");
             }
         }
         // Adjacent numbers are the pair most likely to be confused, so they
@@ -1305,9 +1371,9 @@ mod tests {
                         width: width as i32,
                         height: height as i32,
                     },
+                    source_rect: None,
                     pattern: Some(TestPattern::Identify),
                     canvas_size: None,
-                    ramps: Vec::new(),
                 },
             );
             assert_eq!(rgb.len(), width as usize * height as usize * 3);
@@ -1402,9 +1468,9 @@ mod tests {
                         width: w as i32,
                         height: h as i32,
                     },
+                    source_rect: None,
                     pattern: Some(pattern),
                     canvas_size: None,
-                    ramps: Vec::new(),
                 },
             );
             let mut out = format!("P6 {w} {h} 255 ").into_bytes();
@@ -1512,12 +1578,12 @@ mod tests {
             let strip_x = w - inset - cell;
             let strip_y = block_y + (digit_h - pitch * 16) / 2;
             for bit in 0..16i64 {
-                // The centre of a cell is lit for a one and hollow for a
+                // The center of a cell is lit for a one and hollow for a
                 // zero — the one sample that tells filled from outlined.
-                let centre = (strip_x + cell / 2, strip_y + bit * pitch + cell / 2);
+                let center = (strip_x + cell / 2, strip_y + bit * pitch + cell / 2);
                 let set = (frame >> (15 - bit as u32)) & 1 == 1;
                 assert_eq!(
-                    lit(&groups, centre.0, centre.1),
+                    lit(&groups, center.0, center.1),
                     set,
                     "frame {frame:#06x}, strip row {bit}"
                 );
@@ -1568,7 +1634,7 @@ mod tests {
                 let groups = sync_rects(width, height, frame, "DP-1", 9_000, CLOCK);
                 for (bit, &(x0, y0, x1, y1)) in boxes.iter().enumerate() {
                     let set = (nibble >> (3 - bit as u32)) & 1 == 1;
-                    // The centre tells filled from outlined...
+                    // The center tells filled from outlined...
                     assert_eq!(
                         lit(&groups, (x0 + x1) / 2, (y0 + y1) / 2),
                         set,

@@ -1,3 +1,4 @@
+# Build output
 /target
 /site
 *.deb
@@ -8,3 +9,23 @@
 # Written by CI to carry the build identity across the cross container
 # boundary; never committed, because it describes one build.
 .build-id
+
+# Python bytecode from the research and scripts helpers
+__pycache__/
+*.pyc
+
+# Agent tooling: plans, handoff notes, worktrees and per-tool scratch state.
+# This is a public repository; none of it is published.
+/.claude/
+/.agents/
+
+# Appliance configuration dumps captured while profiling. They describe one
+# site (addresses, app URLs) and are inputs to nothing in the repository.
+/*_profile.json
+
+# Camera footage and manifests from on-wall sync sessions: gigabytes of video.
+/sync-session/
+
+# Research records and the raw evidence behind them stay local. What matters
+# from past feature work is documented under docs/.
+/research/

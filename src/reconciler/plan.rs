@@ -125,7 +125,7 @@ where
         // the observed value already matches. An observed value that Suede did
         // not set is not necessarily pinned: sway auto-arranges outputs it has
         // no explicit position for, and will silently recompute that position
-        // when a neighbouring output changes size. Applying once makes it
+        // when a neighboring output changes size. Applying once makes it
         // explicit; later passes go back to minimal diffs.
         let unmanaged = applied.is_none();
         let force = just_enabled || unmanaged;
@@ -507,7 +507,7 @@ pub fn placement_commands(
 
 /// The `output … bg` command for a background, if it asks for anything.
 ///
-/// Sway takes either a file with a scaling mode, or a solid colour. A missing
+/// Sway takes either a file with a scaling mode, or a solid color. A missing
 /// wallpaper is a divergence rather than a failure: the output keeps working,
 /// and the operator is told which id could not be found.
 fn background_command<F>(
@@ -526,7 +526,7 @@ where
                 format!("{name} refers to wallpaper {id:?}, which is not stored"),
             ));
         };
-        // Sway paints the colour wherever the image does not reach — which is
+        // Sway paints the color wherever the image does not reach — which is
         // every mode except `fill` and `stretch`, so it is always supplied.
         return Ok(Some(format!(
             "output {name} bg {path} {} #{}",
@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn a_near_refresh_rate_is_applied_as_advertised() {
         // The planner must issue the rate the display actually offers, so the
-        // next pass recognises the result as already satisfied.
+        // next pass recognizes the result as already satisfied.
         let mut display = output("HDMI-A-1", true);
         display.modes = vec![Mode {
             width: 2560,
@@ -896,7 +896,7 @@ mod tests {
     fn an_unmanaged_output_has_every_setting_applied_once() {
         // An observed position Suede did not set is not pinned: sway
         // auto-arranges such outputs and silently recomputes their position
-        // when a neighbour changes size. So the first pass must be explicit
+        // when a neighbor changes size. So the first pass must be explicit
         // even where observed already equals desired.
         let observed = vec![output("HDMI-A-1", true)];
         let mut desired = config("HDMI-A-1");
@@ -1164,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn a_colour_background_is_a_solid_colour() {
+    fn a_color_background_is_a_solid_color() {
         let observed = vec![output("HDMI-A-1", true)];
         let desired = with_background(
             "HDMI-A-1",
@@ -1200,15 +1200,15 @@ mod tests {
             tearing_capable(),
             |id| Some(format!("/state/wallpapers/{id}.png")),
         );
-        // The colour is always supplied: `fit` letterboxes, and an unstated
-        // colour would leave swaybg to choose what the bars look like.
+        // The color is always supplied: `fit` letterboxes, and an unstated
+        // color would leave swaybg to choose what the bars look like.
         assert!(plan
             .commands
             .contains(&"output HDMI-A-1 bg /state/wallpapers/lobby.png fit #000000".to_string()));
     }
 
     #[test]
-    fn an_unstated_colour_is_black_rather_than_nothing() {
+    fn an_unstated_color_is_black_rather_than_nothing() {
         let observed = vec![output("HDMI-A-1", true)];
         let desired = with_background("HDMI-A-1", Background::default());
         let plan = plan_outputs(&observed, &[desired], &HashMap::new(), tearing_capable());
@@ -1396,8 +1396,8 @@ mod tests {
     }
 
     #[test]
-    fn a_wallpaper_can_carry_a_fallback_colour() {
-        // `fit` letterboxes, so the colour decides what the bars look like.
+    fn a_wallpaper_can_carry_a_fallback_color() {
+        // `fit` letterboxes, so the color decides what the bars look like.
         let observed = vec![output("HDMI-A-1", true)];
         let desired = with_background(
             "HDMI-A-1",

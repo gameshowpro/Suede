@@ -60,6 +60,7 @@ button.header-action {
 button.header-action:hover:not(:disabled) {
   color: var(--ink); border-color: var(--muted); background: var(--sunken);
 }
+button.header-action:disabled { opacity: .5; cursor: not-allowed; }
 button.header-action:focus-visible {
   outline: 2px solid var(--accent); outline-offset: 1px;
 }
@@ -127,7 +128,7 @@ input[type=file] { padding: 6px; }
 /* On/off is a switch, not a two-item dropdown: the state is readable without
    opening anything, and it takes one click to change instead of two. Drawn
    from the checkbox itself so the control keeps its native semantics —
-   labelling, focus, keyboard, and the form value all still work. */
+   labeling, focus, keyboard, and the form value all still work. */
 input[type=checkbox].switch {
   appearance: none; -webkit-appearance: none; position: relative; cursor: pointer;
   width: 42px; height: 24px; flex: 0 0 auto; padding: 0; border-radius: 999px;
@@ -195,7 +196,7 @@ td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
 
 /* The reconnect overlay, after Blazor Server's: dim everything, say what is
    happening, and offer the one action that helps. A disconnected page cannot
-   honour a click on anything behind this, and letting it look as though it
+   honor a click on anything behind this, and letting it look as though it
    could is how an operator ends up believing a setting was saved. */
 #offline { position: fixed; inset: 0; z-index: 200; display: none;
   align-items: center; justify-content: center; padding: 20px;
@@ -318,13 +319,18 @@ window.addEventListener("error", (event) => {
   </div>
   <!-- Displays -->
   <section id="tab-displays">
+    <!-- Page-level so it is visible in both Simple and Warp: shared crop and
+         content-scale edits (editSharedContent) can fail in Simple mode too,
+         and Save stays blocked on this error regardless of which mode's
+         controls happen to be showing. -->
+    <p id="warp-error" role="alert"></p>
     <div class="panel">
       <h2>Layout</h2>
       <fieldset id="warp-canvas">
         <legend>Canvas</legend>
         <div class="fields">
-          <div><label for="canvas-aspect">Aspect (width / height)</label><input id="canvas-aspect" type="number" min="0.001" step="any"></div>
-          <div><label for="canvas-width">Render width</label><input id="canvas-width" type="number" min="1" max="32768" step="1"></div>
+          <div><label for="canvas-aspect">Aspect (width / height)</label><input id="canvas-aspect" type="number" min="0.001" step="any" data-config-field="aspect"></div>
+          <div><label for="canvas-width">Render width</label><input id="canvas-width" type="number" min="1" max="32768" step="1" data-config-field="renderWidth"></div>
           <div><label>Derived height</label><output id="canvas-height">—</output></div>
           <div><label>Recommended width</label><output id="canvas-recommendation">Calculating…</output></div>
           <div><label>Rendering scale</label><output id="canvas-rendering-scale">—</output></div>
@@ -363,7 +369,7 @@ window.addEventListener("error", (event) => {
            needs no overlaps and no canvas: it belongs to the layout, not to
            projection. It is the fastest way to answer "is this display
            working, which connector is it, and is the whole frame in view" —
-           every tile is labelled with its output name and global pixel
+           every tile is labeled with its output name and global pixel
            coordinates. -->
       <div id="pattern-row" style="margin-top:14px">
         <h3 style="margin:0 0 8px">Test pattern</h3>
@@ -391,14 +397,14 @@ window.addEventListener("error", (event) => {
         <span id="output-display" class="muted" style="font-size:14px;font-weight:400"></span></h2>
       <div class="fields">
         <div><label for="o-enable">Enabled</label>
-          <input type="checkbox" role="switch" class="switch" id="o-enable"></div>
-        <div><label for="o-mode">Mode <button class="action ghost pin-toggle" type="button" id="pin-mode" aria-pressed="false" aria-label="Pin mode" title="Pin mode"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-mode"></select>
+          <input type="checkbox" role="switch" class="switch" id="o-enable" data-config-field="enable"></div>
+        <div><label for="o-mode">Mode <button class="action ghost pin-toggle" type="button" id="pin-mode" aria-pressed="false" aria-label="Pin mode" title="Pin mode"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-mode" data-config-field="mode"></select>
           <span class="hint" id="o-mode-note" hidden></span>
           <span class="hint" id="o-mode-hint"></span></div>
-        <div><label for="o-scale">Display scale (HiDPI) <button class="action ghost pin-toggle" type="button" id="pin-output-scale" aria-pressed="false" aria-label="Pin display scale" title="Pin display scale"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><input id="o-scale" type="number" step="any" min="0.25">
+        <div><label for="o-scale">Display scale (HiDPI) <button class="action ghost pin-toggle" type="button" id="pin-output-scale" aria-pressed="false" aria-label="Pin display scale" title="Pin display scale"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><input id="o-scale" type="number" step="any" min="0.25" data-config-field="scale">
           <span class="hint" id="o-scale-hint"></span>
           <span class="hint">Compositor/OS display scaling (typically 1.0 for projectors; 2.0 for 4K). Not content scale.</span></div>
-        <div><label for="o-transform">Transform <button class="action ghost pin-toggle" type="button" id="pin-transform" aria-pressed="false" aria-label="Pin transform" title="Pin transform"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-transform">
+        <div><label for="o-transform">Transform <button class="action ghost pin-toggle" type="button" id="pin-transform" aria-pressed="false" aria-label="Pin transform" title="Pin transform"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-transform" data-config-field="transform">
           <option value="">Leave to sway</option>
           <option>normal</option><option>90</option><option>180</option><option>270</option>
           <option>flipped</option><option>flipped-90</option><option>flipped-180</option><option>flipped-270</option>
@@ -410,9 +416,9 @@ window.addEventListener("error", (event) => {
         <legend>Shared content selection</legend>
         <p class="hint">Simple and Warp use this same source crop and content scale (100% = 1:1 pixel sampling). Destination pins remain Warp calibration.</p>
         <div class="fields">
-          <div><label for="source-x">Crop X (source px)</label><input id="source-x" type="number" step="any"></div>
-          <div><label for="source-y">Crop Y (source px)</label><input id="source-y" type="number" step="any"></div>
-          <div><label for="content-scale">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any"><span class="hint" id="source-size"></span></div>
+          <div><label for="source-x">Crop X (source px)</label><input id="source-x" type="number" step="any" data-config-field="source"></div>
+          <div><label for="source-y">Crop Y (source px)</label><input id="source-y" type="number" step="any" data-config-field="source"></div>
+          <div><label for="content-scale">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="source"><span class="hint" id="source-size"></span></div>
         </div>
       </fieldset>
 
@@ -433,7 +439,6 @@ window.addEventListener("error", (event) => {
             <ellipse data-handle="6" tabindex="0" role="button" aria-label="Horizontal center left"/>
             <ellipse data-handle="7" tabindex="0" role="button" aria-label="Horizontal center right"/>
           </svg>
-          <p id="warp-error" role="alert"></p>
           <div class="fields" id="warp-numbers"></div>
           <div class="row"><button class="action ghost" id="warp-reset-centers">Reset centers</button><button class="action ghost" id="warp-reset-pins">Reset pins</button></div>
         </div>
@@ -445,7 +450,7 @@ window.addEventListener("error", (event) => {
         <p class="hint">Shown whenever no window covers this output — during a
           relaunch, or before the first app starts.</p>
         <div class="fields">
-          <div><label for="o-bg">Background</label><select id="o-bg"></select></div>
+          <div><label for="o-bg">Background</label><select id="o-bg" data-config-field="background"></select></div>
           <div class="span2" id="o-bg-summary-wrap">
             <label>&nbsp;</label>
             <div id="o-bg-summary" class="preview small"></div>
@@ -588,7 +593,7 @@ window.addEventListener("error", (event) => {
           <p class="hint">Empty searches for a browser and ignores any that is
             a snap. Name one to settle it — a bare name is looked up on
             <span class="mono">PATH</span>, a path is used as given. Naming a
-            snap is honoured; Suede then puts the profile where a confined
+            snap is honored; Suede then puts the profile where a confined
             snap can write.</p></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div id="a-gain-row"><label for="a-gain">Level (dB)</label>
@@ -630,7 +635,7 @@ window.addEventListener("error", (event) => {
       <fieldset>
         <legend>Arguments</legend>
         <div class="invocation" id="a-preview-args">—</div>
-        <p class="legend-key"><span class="preset">grey</span> from the preset,
+        <p class="legend-key"><span class="preset">gray</span> from the preset,
           <b class="app">blue</b> yours, <span class="uri">green</span> the expanded URI.</p>
         <label for="a-extra-args" style="margin-top:10px">Add your own</label>
         <textarea id="a-extra-args" rows="3" spellcheck="false"
@@ -943,8 +948,8 @@ const bytes = (n) => n > 1048576 ? `${num(n / 1048576)} MB` : `${num(n / 1024, 0
 //
 // Edits are pushed to the outputs as they are made, but nothing touches disk
 // until Save: the daemon holds them as a preview that any committed write or
-// restart discards. Cancel reverts to the snapshot taken at load/save.
-let configSnapshot = null;
+// restart discards. Cancel reverts to what the server reports after undoing
+// the working copy.
 let configGeneration = null, configEpoch = null, observedConfigEpoch = null, acceptedConfig = null;
 let previewTimer = null, previewActive = false, previewQueued = null;
 let previewFlight = null, writeTail = Promise.resolve(), lastPreviewAt = -Infinity;
@@ -1080,6 +1085,7 @@ async function finishConfigWrite(path, options) {
   if (configBusy) throw new Error("A configuration operation is already in progress.");
   configBusy = true;
   document.querySelector("main").inert = true;
+  renderDirtyStatus();
   clearTimeout(previewTimer); previewQueued = null;
   editVersion++;
   try {
@@ -1089,18 +1095,12 @@ async function finishConfigWrite(path, options) {
       acceptedConfig = null;
       return result;
     });
-  } finally { configBusy = false; document.querySelector("main").inert = false; }
+  } finally { configBusy = false; document.querySelector("main").inert = false; renderDirtyStatus(); }
 }
 async function cancelPreview() {
   clearTimeout(previewTimer);
   previewQueued = null;
-  config = await api("/config/revert", { method: "POST" });
-  configSnapshot = structuredClone(config);
-  acceptedConfig = structuredClone(config);
-  previewActive = false;
-  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
-  if (selected) selectOutput(selected);
-  renderDirtyStatus();
+  applyLoadedConfig(await api("/config/revert", { method: "POST" }));
 }
 
 function isDirty() {
@@ -1115,15 +1115,23 @@ function isDirty() {
 
 function renderDirtyStatus() {
   const dirty = isDirty();
+  // These two sit in the header, outside <main>, so main.inert during a
+  // write does not cover them — they need their own disabled state, kept in
+  // step with configBusy/configConflict here rather than relying on inert.
+  const locked = configBusy || configConflict;
   const saveBtn = $("pj-save");
   const cancelBtn = $("pj-cancel");
   if (saveBtn) {
     saveBtn.classList.toggle("dirty", dirty);
-    saveBtn.title = dirty ? "Save configuration to disk" : "Configuration is saved";
+    saveBtn.disabled = locked;
+    saveBtn.title = locked ? "A configuration operation is in progress or a conflict needs resolving first"
+      : dirty ? "Save configuration to disk" : "Configuration is saved";
   }
   if (cancelBtn) {
     cancelBtn.classList.toggle("dirty", dirty);
-    cancelBtn.title = dirty ? "Revert to saved configuration" : "Revert configuration";
+    cancelBtn.disabled = locked;
+    cancelBtn.title = locked ? "A configuration operation is in progress or a conflict needs resolving first"
+      : dirty ? "Revert to saved configuration" : "Revert configuration";
   }
 }
 
@@ -1597,7 +1605,10 @@ function renderLayout() {
             height: layoutDrag.initialSource.height,
           };
         }
-        if (layoutDrag.initialPosition || !pixels) {
+        // With a canvas present, geometry.source above is the one layout
+        // representation; legacy position is written only when there is no
+        // canvas to normalize against, so it never goes stale alongside it.
+        if (!pixels) {
           output.position = {
             x: Math.round((layoutDrag.initialPosition?.x ?? r.x) + dx / layoutDrag.scale),
             y: Math.round((layoutDrag.initialPosition?.y ?? r.y) + dy / layoutDrag.scale),
@@ -1702,7 +1713,7 @@ function renderLayoutSize() {
     .filter(({ r }) => r.width > 0 && (r.configured?.enable ?? true));
 
   // Count overlapping pairs so the operator can see the slicer will engage —
-  // and so the Projection panel can grey itself out when it will not.
+  // and so the Projection panel can gray itself out when it will not.
   let overlaps = 0;
   for (let i = 0; i < entries.length; i++) {
     for (let j = i + 1; j < entries.length; j++) {
@@ -1773,7 +1784,10 @@ window.addEventListener("keydown", (event) => {
     output.geometry.source.x += dxPx / pixels.width;
     output.geometry.source.y += dyPx / pixels.yDensity;
   }
-  if (output.position || !pixels) {
+  // As the drag handler above: legacy position is written only when there
+  // is no canvas, so geometry.source stays the one representation once one
+  // exists.
+  if (!pixels) {
     output.position = {
       x: (output.position?.x ?? r.x) + dxPx,
       y: (output.position?.y ?? r.y) + dyPx,
@@ -1821,9 +1835,7 @@ function selectOutput(name, redrawLayout = true) {
   const offered = output
     ? (output.modes.length ? output.modes : (output.currentMode ? [output.currentMode] : []))
     : COMMON_MODES.slice();
-  if (existing?.mode && !offered.some((m) =>
-      m.width === existing.mode.width && m.height === existing.mode.height &&
-      Math.round(m.refreshHz) === Math.round(existing.mode.refreshHz))) {
+  if (existing?.mode && !offered.some((m) => modeMatches(m, existing.mode))) {
     offered.unshift(existing.mode);
   }
   // "Leave to sway" is always offered, whether or not a display is attached
@@ -1954,12 +1966,26 @@ function refreshFieldHints(name) {
   renderFieldProvenance("o-scale-hint", existing?.scale, output?.scale, existing?.adopted, "scale", (v) => `${num(v, 2)}×`);
   renderFieldProvenance("o-transform-hint", existing?.transform, output?.transform, existing?.adopted, "transform", (v) => v);
 
+  // Current Warp supports scale 1 and normal transform only; the backend
+  // rejects anything else on a warp output. Lock the controls rather than
+  // let an edit round-trip into a rejected write, and say why.
+  const warpLocked = config?.projection?.mode === "warp";
+  $("o-scale").disabled = warpLocked;
+  $("o-scale").title = warpLocked ? "Warp requires scale 1×; locked while Warp mode is active." : "";
+  $("o-transform").disabled = warpLocked;
+  $("o-transform").title = warpLocked ? "Warp requires the normal transform; locked while Warp mode is active." : "";
+  if (warpLocked) {
+    $("o-scale-hint").textContent += " Locked: Warp requires scale 1×.";
+    $("o-transform-hint").textContent += " Locked: Warp requires the normal transform.";
+  }
+
   for (const [id, key] of [["pin-mode", "mode"], ["pin-output-scale", "scale"], ["pin-transform", "transform"]]) {
     const button = $(id), pinned = existing?.[key] != null;
     button.setAttribute("aria-pressed", String(pinned));
     button.setAttribute("aria-label", `${pinned ? "Unpin" : "Pin"} ${key}`);
     button.title = `${pinned ? "Unpin" : "Pin"} ${key}`;
-    button.disabled = !pinned && !pinnableFields(known, existing)[key];
+    const locked = warpLocked && key !== "mode";
+    button.disabled = locked || (!pinned && !pinnableFields(known, existing)[key]);
   }
 }
 
@@ -2058,11 +2084,18 @@ function defaultCanvasAspect() {
 function defaultCanvasWidth() {
   return config?.projection?.canvas?.renderWidth ?? recommendation?.idealWidth ?? defaultLayoutDimensions().width;
 }
+// Mirrors the backend's OutputConfig::effective_mode/effective_transform:
+// the operator's own value, else whatever Suede adopted, else — for the UI
+// only, before anything has ever settled — the display's own observed mode.
+// A rotated raster (any of the four 90/270 variants, plain or flipped) has
+// its width and height swapped, exactly as presentation_dimensions() does.
 function rasterDimensions(output) {
-  const mode = output?.mode;
+  const known = knownOutputs().find(k => k.name === output?.match?.name);
+  const mode = output?.mode ?? output?.adopted?.mode ?? known?.output?.currentMode ?? null;
   if (!mode) return null;
-  return ["90", "270"].includes(String(output.transform ?? "normal"))
-    ? { width: mode.height, height: mode.width } : mode;
+  const transform = String(output.transform ?? output.adopted?.transform ?? "normal");
+  return ["90", "270", "flipped-90", "flipped-270"].includes(transform)
+    ? { width: mode.height, height: mode.width } : { width: mode.width, height: mode.height };
 }
 function selectedGeometry() { return configEntry(selected)?.geometry ?? null; }
 function renderSharedContent() {
@@ -2210,27 +2243,34 @@ const unitPins = [[0,0],[1,0],[1,1],[0,1]];
 function identityGeometry(source) {
   return { source: structuredClone(source), corners: structuredClone(unitPins), center: [.5, .5], rasterFootprint: structuredClone(source) };
 }
+// Seed identity geometry for enabled outputs that do not have one yet, using
+// the same canvas-pixel normalization every other seeding site uses
+// (canvasPixels(): x/width by canvas width, y/height by yDensity — never
+// bounding-box width for both axes, which only agrees with it when canvas
+// aspect happens to equal the layout's). A legacy `position` is Sway's
+// logical (scale-divided) coordinate; multiplying by the output's own scale
+// brings it into the same raw-pixel space as its (scale-independent) raster
+// dimensions before the pair is normalized into canvas units. An output with
+// no configured position starts at the canvas origin, exactly like
+// addToLayout — position is never adopted from what Sway happens to be
+// showing right now.
 function ensureWarpGeometries() {
-  const dim = defaultLayoutDimensions();
-  const width = dim.width;
-  const left = dim.left ?? 0;
-  const top = dim.top ?? 0;
+  const pixels = canvasPixels();
+  if (!pixels) return;
   for (const entry of config?.outputs ?? []) {
-    if (entry.geometry) continue;
+    if (entry.geometry || entry.enable === false) continue;
+    const raster = rasterDimensions(entry);
+    if (!raster) continue;
     const known = knownOutputs().find(k => k.name === entry.match?.name);
-    const r = known ? canvasRect(known) : {
-      x: entry.position?.x ?? 0,
-      y: entry.position?.y ?? 0,
-      width: entry.mode?.width ?? 1920,
-      height: entry.mode?.height ?? 1080,
-    };
-    const source = {
-      x: (r.x - left) / width,
-      y: (r.y - top) / width,
-      width: (r.width || 1920) / width,
-      height: (r.height || 1080) / width,
-    };
-    entry.geometry = identityGeometry(source);
+    const scale = entry.scale ?? entry.adopted?.scale ?? known?.output?.scale ?? 1;
+    const x = entry.position ? entry.position.x * scale : 0;
+    const y = entry.position ? entry.position.y * scale : 0;
+    entry.geometry = identityGeometry({
+      x: x / pixels.width,
+      y: y / pixels.yDensity,
+      width: raster.width / pixels.width,
+      height: raster.height / pixels.yDensity,
+    });
   }
 }
 
@@ -2675,7 +2715,7 @@ $("a-capabilities").onclick = async () => {
 
 function paintCapabilities(r) {
   const pill = (cls, text) => `<span class="pill ${cls}">${escape(text)}</span>`;
-  // The renderer string is the headline: a software rasteriser here means
+  // The renderer string is the headline: a software rasterizer here means
   // every green cell below is running on the CPU.
   const softwareGpu = /swiftshader|llvmpipe|softpipe/i.test(r.gpuRenderer ?? "");
   const gpu = r.gpuRenderer
@@ -2754,7 +2794,13 @@ function renderProjection(force = false) {
 }
 
 function updateProjectionField(field) {
-  const projection = config?.projection ? structuredClone(config.projection) : { mode: "simple" };
+  // ProjectionConfig is #[serde(default)]: an unrelated field being edited
+  // for the first time must not fabricate `mode` into the payload. Doing so
+  // used to write mode: "simple" the moment a projection object was first
+  // created, silently discarding a requested Warp that is merely in
+  // fallback right now (the toggle showing Simple is not the same as the
+  // operator choosing it).
+  const projection = config?.projection ? structuredClone(config.projection) : {};
   const level = typeof projection.blackLift === "object" && projection.blackLift ? projection.blackLift.level : (projection.blackLift ?? 0);
   const adaptiveLift = () => ({ mode: "adaptive", level,
     darkThreshold: .02, brightThreshold: .2, riseMs: 1000, fallMs: 250, slewPerSecond: .1,
@@ -2897,14 +2943,25 @@ function drawWarp() {
     el.setAttribute("aria-disabled",String(!warpEditable()));
   });
 }
+// d = max(4, ceil(log10(2 * D))): four decimals bound corner-coordinate
+// display error to about 0.2 px at 4K; larger rasters (up to the 32K limit)
+// need up to five. D is the output's own raster axis, in pixels — width for
+// X, height for Y — so a display error bound in canvas units still applies
+// once this fraction lands on the physical output.
+function warpPinPrecision(axis) {
+  const raster = rasterDimensions(warpOutput());
+  const d = axis === 0 ? raster?.width : raster?.height;
+  if (!(d > 0)) return 4;
+  return Math.max(4, Math.ceil(Math.log10(2 * d)));
+}
 function renderWarpNumbers() {
   const g = warpOutput()?.geometry;
   if (!g) return;
   const editable = warpEditable();
   const pinIn = (i, a, label) =>
-    `<div><label for="pin-${i}-${a}">${label}</label><input id="pin-${i}-${a}" type="number" step="any" value="${editNumber(g.corners[i][a], 4)}" ${editable ? "" : "disabled"}></div>`;
+    `<div><label for="pin-${i}-${a}">${label}</label><input id="pin-${i}-${a}" type="number" step="any" data-config-field="corners" value="${editNumber(g.corners[i][a], warpPinPrecision(a))}" ${editable ? "" : "disabled"}></div>`;
   const centerIn = (a, label) =>
-    `<div><label for="center-${a}">${label}</label><input id="center-${a}" type="number" step="any" value="${editNumber(g.center[a], 4)}" ${editable ? "" : "disabled"}></div>`;
+    `<div><label for="center-${a}">${label}</label><input id="center-${a}" type="number" step="any" data-config-field="center" value="${editNumber(g.center[a], warpPinPrecision(a))}" ${editable ? "" : "disabled"}></div>`;
 
   $("warp-numbers").innerHTML = `
     <div class="warp-matrix" role="group" aria-label="Corner and center geometry numbers">
@@ -2964,7 +3021,7 @@ function renderWarpStatus() {
   let message = previewActive || config?.committed === false ? "Unsaved edits. " : "";
   if (configConflict) message += "Resolve the configuration conflict before editing.";
   else if (previewQueued || previewFlight) message += "Preview awaiting server acceptance.";
-  else if (projectionStats?.running && c?.session && c?.appliedConfigGeneration != null && String(c.appliedConfigGeneration) === String(configGeneration))
+  else if (projectionStats?.running && c?.session && c?.configGeneration?.applied != null && String(c.configGeneration.applied) === String(configGeneration))
     message += "Effective projection installed for the latest accepted settings.";
   else message += "Settings accepted; installation of this working copy is not yet confirmed.";
   const output = c?.outputs?.find(o=>o.name===warpOutput()?.match?.name);
@@ -2972,6 +3029,11 @@ function renderWarpStatus() {
     ` Selected output: presentation receipt for control generation ${output.presentedGeneration} (not optical visibility).`;
   if (c?.lastFailure) message += ` ${c.lastFailure.reason ?? c.lastFailure.message ?? "Projection update failed."}`;
   $("warp-status").textContent = message;
+  // Keeps the scale/transform lock and pin-button disabled state honest
+  // across a mode toggle or a capability change, without touching any
+  // field's value (refreshFieldHints never assigns .value), so it cannot
+  // stomp on an edit in progress.
+  if (selected) refreshFieldHints(selected);
   renderDirtyStatus();
 }
 function oneToOneStatus() {
@@ -3031,12 +3093,12 @@ function renderCanvas() {
 function setProjectionMode(mode) {
   if (!config || (mode === "warp" && !warpAvailable())) return;
   if (mode === "warp") {
-    if (!config.projection) config.projection = { mode: "warp", blend: true, gamma: 2.2, blackLift: 0.0, freeRun: false, renderer: "auto" };
+    // The daemon fills every omitted projection field from its own defaults.
+    config.projection ??= {};
     if (!config.projection.canvas) {
       config.projection.canvas = {
         aspect: defaultCanvasAspect(),
         renderWidth: defaultCanvasWidth(),
-        scale: 1.0,
       };
     }
     ensureWarpGeometries();
@@ -3050,9 +3112,15 @@ $("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
 $("warp-reset-pins").onclick = () => editGeometry(g=>g.corners=structuredClone(unitPins));
 function adoptCanvas(aspect, width, preserveAspectPixels = false) {
   if (!config) return;
-  if (!config.projection) config.projection = { mode: "simple", blend: true, gamma: 2.2, blackLift: 0.0, freeRun: false, renderer: "auto" };
-  aspect = Number(aspect) || defaultCanvasAspect();
-  width = Number(width) || defaultCanvasWidth();
+  // A shared canvas edit is valid regardless of mode (section 1 of the
+  // rework plan) and must not fabricate `mode` any more than an unrelated
+  // projection field may. `undefined` means "this axis was not edited, use
+  // the current default"; anything else — including a literal 0, "" (which
+  // Number() turns into 0) or NaN typed by the operator — is validated
+  // below instead of being silently swapped for the default.
+  if (!config.projection) config.projection = {};
+  aspect = aspect === undefined ? defaultCanvasAspect() : Number(aspect);
+  width = width === undefined ? defaultCanvasWidth() : Number(width);
   const height = Math.max(1, Math.round(width / aspect));
   if (![aspect, width].every(v => Number.isFinite(v) && v > 0) || !Number.isInteger(width) || width > 32768 || height > 32768 || width * height > 64000000)
     throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP.");
@@ -3063,13 +3131,13 @@ function adoptCanvas(aspect, width, preserveAspectPixels = false) {
     source.y = source.y * old.yDensity / (aspect * height);
     source.height = source.height * old.yDensity / (aspect * height);
   }
-  config.projection.canvas = { ...(config.projection.canvas ?? {}), aspect, renderWidth: width, scale: config.projection.canvas?.scale ?? 1.0 };
+  config.projection.canvas = { ...(config.projection.canvas ?? {}), aspect, renderWidth: width };
   ensureWarpGeometries();
   pushPreview(true); renderCanvas(); renderSharedContent();
 }
-function setCanvasWidth(width) { adoptCanvas(defaultCanvasAspect(), Number(width)); }
+function setCanvasWidth(width) { adoptCanvas(undefined, Number(width)); }
 $("canvas-width").onchange = () => { try { setCanvasWidth(Number($("canvas-width").value)); } catch (error) { setDisplayError(error.message); } };
-$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), defaultCanvasWidth(), true); } catch (error) { setDisplayError(error.message); } };
+$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), undefined, true); } catch (error) { setDisplayError(error.message); } };
 for (const event of ["focusin", "focusout"]) $("warp-canvas").addEventListener(event, () => setTimeout(renderCanvas));
 const warpSvg = $("warp-editor");
 function pointerPoint(event) {
@@ -3195,7 +3263,7 @@ for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", 
   $(id).addEventListener("input", () => {
     // Silently, not with a toast: a restored form value is not a user asking
     // for anything, and a complaint about it would be the same noise in a
-    // different colour.
+    // different color.
     if (!config) return;
     updateProjectionField(id);
     renderLayoutSize();
@@ -3713,6 +3781,27 @@ document.querySelectorAll("nav button").forEach((button) => {
   };
 });
 
+// The one place a freshly received document becomes the page's state,
+// shared by an ordinary load, Revert (which fetches the server's reverted
+// copy) and Discard (which reloads through loadConfig(true)) so the three
+// cannot drift into rendering slightly different things. Clears whatever a
+// previous document's edits left behind: the recommendation (it is a
+// function of the new document, not the old one) and any validation error
+// (it described a draft that no longer exists).
+function applyLoadedConfig(incoming) {
+  config = incoming;
+  acceptedConfig = structuredClone(config);
+  previewActive = false; configConflict = false;
+  recommendation = null;
+  setDisplayError(null);
+  $("config-conflict").hidden = true;
+  if (document.activeElement !== $("config-json")) $("config-json").value = JSON.stringify(config, null, 2);
+  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
+  invalidateRecommendation();
+  if (!selected) selected = layoutEntries()[0]?.known.name ?? null;
+  if (selected) selectOutput(selected);
+  renderDirtyStatus();
+}
 async function loadConfig(force = false) {
   const serial = ++configLoadSerial, version = editVersion, metadata = {};
   const incoming = await rawApi("/config", undefined, metadata);
@@ -3729,21 +3818,10 @@ async function loadConfig(force = false) {
     if (metadata.generation !== configGeneration || metadata.epoch !== configEpoch) flagConflict("Another client changed the working copy. Your local edits are preserved here.");
     return;
   }
-  config = incoming;
   if (configEpoch != null && configEpoch !== metadata.epoch && projectionStats) projectionStats.control = null;
   configEpoch = metadata.epoch;
   configGeneration = metadata.generation;
-  configSnapshot = structuredClone(config);
-  acceptedConfig = structuredClone(config);
-  previewActive = false; configConflict = false;
-  recommendation = null;
-  $("config-conflict").hidden = true;
-  if (document.activeElement !== $("config-json")) $("config-json").value = JSON.stringify(config, null, 2);
-  renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
-  invalidateRecommendation();
-  if (!selected) selected = layoutEntries()[0]?.known.name ?? null;
-  if (selected) selectOutput(selected);
-  renderDirtyStatus();
+  applyLoadedConfig(incoming);
 }
 $("config-discard").onclick = () => run(async () => {
   clearTimeout(previewTimer); previewQueued = null;
@@ -3814,7 +3892,7 @@ window.addEventListener("online", resync);
 
 // --- staying connected ------------------------------------------------
 //
-// Modelled on Blazor Server's reconnect overlay, which is the established
+// Modeled on Blazor Server's reconnect overlay, which is the established
 // answer to this: dim the page, say what is happening, count the attempts,
 // and offer a manual retry. Adopted rather than imported - this page carries
 // no dependencies and is tested for it, because an appliance may have no
@@ -3892,7 +3970,7 @@ function connect() {
     attempt = 0;
     hideOffline();
     $("live").textContent = "live"; $("live").className = "pill ok";
-    // Events are state-based, not replayed, so resynchronise on every connect.
+    // Events are state-based, not replayed, so resynchronize on every connect.
     loadAll().catch((error) => toast(error.message, true));
   };
   source.onerror = () => {
@@ -3930,7 +4008,12 @@ function connect() {
     if (stream !== source) return;
     projectionEventVersion++;
     projectionStats = JSON.parse(e.data);
-    renderProjectionTiming(); renderWarpStatus();
+    // warpAvailable() reads projectionStats.geometry.warpAvailable, so a
+    // capability change arriving here has to re-run renderWarpEditor (which
+    // decides warp-controls'/output-warp's hidden state), not just
+    // renderWarpStatus — otherwise recovered capability leaves the editor
+    // hidden until something unrelated happens to redraw it.
+    renderProjectionTiming(); renderWarpEditor();
   });
 }
 

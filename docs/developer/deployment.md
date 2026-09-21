@@ -9,7 +9,7 @@ A Rust release build is a single self-contained ELF binary whose only dynamic de
 | `/usr/bin/suede` | The binary, with the web UI embedded |
 | `/usr/lib/systemd/user/suede.service` | The systemd **user** unit |
 | `/usr/share/suede/provision.sh` | Root provisioning script |
-| `/usr/share/doc/suede/examples/` | Bootstrap config and a four-output example |
+| `/usr/share/doc/suede/examples/` | Bootstrap config (`suede.toml`) and four desired-state examples: a plain tiled appliance, and warp, shared-canvas, and adaptive-black-lift projection layouts |
 
 Declared dependencies are `sway`, `pipewire`, and `pipewire-pulse`, with `chromium | firefox` recommended.
 
@@ -107,12 +107,12 @@ One workflow, `ci.yml`, with `dorny/paths-filter` splitting app changes from doc
 | Job | Runs when | Does |
 |---|---|---|
 | `test` | app changes, all PRs | fmt, clippy, tests, OpenAPI generation, smoke test |
-| `build` | push to main | Release binaries and `.deb`s for amd64 and arm64 |
+| `build` | push to `main`, `research/**` or `preview/**` | Release binaries and `.deb`s for amd64 and arm64 |
 | `release` | push to main | Tags and publishes if the version is new |
 | `build-docs` | docs changes on main | Generates API assets, builds the site with `--strict` |
 | `deploy-docs` | after build-docs | Publishes to GitHub Pages |
 
-The `test` job asserts the binary is self-contained by checking `ldd` output — anything beyond libc means a native dependency crept in and cross-compilation is about to get much harder.
+The `build` job asserts the binary is self-contained by checking `ldd` output — anything beyond libc means a native dependency crept in and cross-compilation is about to get much harder.
 
 ## The documentation site
 

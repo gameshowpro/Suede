@@ -681,7 +681,7 @@ mod tests {
     async fn raw_sway_commands_run_unconditionally() {
         // The `allowRawSwayCommands` gate is gone: the endpoint always works.
         // The field survives on `Settings` only so an old saved document
-        // still deserialises — see `Settings::allow_raw_sway_commands`.
+        // still deserializes — see `Settings::allow_raw_sway_commands`.
         let harness = harness(None);
         let response = harness
             .router

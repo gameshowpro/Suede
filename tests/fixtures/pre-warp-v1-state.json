@@ -1,0 +1,236 @@
+{
+  "schemaVersion": 1,
+  "revision": 1736,
+  "committed": true,
+  "outputs": [
+    {
+      "match": {
+        "name": "DP-5"
+      },
+      "enable": true,
+      "position": {
+        "x": 350,
+        "y": 200
+      },
+      "adaptiveSync": false,
+      "allowTearing": false,
+      "adopted": {
+        "mode": {
+          "width": 1920,
+          "height": 1200,
+          "refreshHz": 59.95
+        },
+        "scale": 1.0,
+        "transform": "normal",
+        "display": {
+          "make": "Seiko Epson Corporation",
+          "model": "EPSON PJ",
+          "serial": "0x01010101"
+        },
+        "capturedAt": 1789582919
+      }
+    },
+    {
+      "match": {
+        "name": "DP-6"
+      },
+      "enable": true,
+      "position": {
+        "x": 1700,
+        "y": 200
+      },
+      "adaptiveSync": false,
+      "allowTearing": false,
+      "adopted": {
+        "mode": {
+          "width": 1920,
+          "height": 1200,
+          "refreshHz": 59.95
+        },
+        "scale": 1.0,
+        "transform": "normal",
+        "display": {
+          "make": "Seiko Epson Corporation",
+          "model": "EPSON PJ",
+          "serial": "0x01010101"
+        },
+        "capturedAt": 1789582919
+      }
+    },
+    {
+      "match": {
+        "name": "DP-8"
+      },
+      "enable": true,
+      "position": {
+        "x": 1680,
+        "y": 960
+      },
+      "adaptiveSync": false,
+      "allowTearing": false,
+      "adopted": {
+        "mode": {
+          "width": 1920,
+          "height": 1200,
+          "refreshHz": 59.95
+        },
+        "scale": 1.0,
+        "transform": "normal",
+        "display": {
+          "make": "Seiko Epson Corporation",
+          "model": "EPSON PJ",
+          "serial": "0x01010101"
+        },
+        "capturedAt": 1789582919
+      }
+    },
+    {
+      "match": {
+        "name": "DP-7"
+      },
+      "enable": true,
+      "position": {
+        "x": 350,
+        "y": 960
+      },
+      "adaptiveSync": false,
+      "allowTearing": false,
+      "adopted": {
+        "mode": {
+          "width": 1920,
+          "height": 1200,
+          "refreshHz": 59.95
+        },
+        "scale": 1.0,
+        "transform": "normal",
+        "display": {
+          "make": "Seiko Epson Corporation",
+          "model": "EPSON PJ",
+          "serial": "0x01010101"
+        },
+        "capturedAt": 1789582919
+      }
+    }
+  ],
+  "apps": [
+    {
+      "id": "test1",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "http://renderer.example:10093/renderer/index.html",
+        "showFpsCounter": false,
+        "extraArgs": []
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      },
+      "persistProfile": false
+    },
+    {
+      "id": "seascape",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "https://testpatterns.gameshow.pro/seascape/index.html",
+        "showFpsCounter": false,
+        "extraArgs": []
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      },
+      "persistProfile": false
+    },
+    {
+      "id": "arena-fx",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "http://localhost:10081/renderer/index.html",
+        "showFpsCounter": false,
+        "extraArgs": []
+      },
+      "audio": {
+        "output": "alsa_output.usb-Burr-Brown_from_TI_USB_Audio_DAC-00.analog-stereo",
+        "gainDb": 0.0
+      },
+      "readiness": {
+        "url": "http://localhost:10081/renderer/index.html",
+        "intervalSeconds": 2,
+        "timeoutSeconds": 5
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      },
+      "persistProfile": false
+    },
+    {
+      "id": "live-input-test",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "https://testpatterns.gameshow.pro/passthrough/index.html",
+        "showFpsCounter": false,
+        "extraArgs": []
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      },
+      "persistProfile": false
+    },
+    {
+      "id": "sync-test",
+      "launcher": {
+        "kind": "chromium-kiosk",
+        "uri": "https://testpatterns.gameshow.pro/sync-grid/index.html",
+        "showFpsCounter": false,
+        "extraArgs": []
+      },
+      "restart": {
+        "policy": "always",
+        "delayMs": 1000,
+        "maxDelayMs": 30000
+      },
+      "persistProfile": false
+    }
+  ],
+  "activeApp": "arena-fx",
+  "backgrounds": [
+    {
+      "id": "reddy",
+      "color": "#ff0000",
+      "mode": "fill"
+    },
+    {
+      "id": "Green",
+      "color": "#00ff2a",
+      "mode": "fill"
+    },
+    {
+      "id": "Cyan",
+      "color": "#00ffd5",
+      "mode": "fill"
+    },
+    {
+      "id": "Yellow",
+      "color": "#eeff00",
+      "mode": "fill"
+    }
+  ],
+  "projection": {
+    "blend": true,
+    "gamma": 2.2,
+    "blackLift": 0.0,
+    "freeRun": false,
+    "renderer": "auto"
+  },
+  "settings": {
+    "hideCursor": true,
+    "outputPollIntervalSeconds": 5,
+    "measureCapabilitiesOnStart": true
+  }
+}

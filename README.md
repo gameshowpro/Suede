@@ -25,6 +25,7 @@ Suede turns a Linux box running Sway into a remotely manageable display applianc
 - **Kiosk browser supervision** - one active application at a time, covering every display as a single canvas, with battle-tested kiosk arguments, per-app browser profiles, readiness gating, and crash-restart policies with backoff.
 - **Audio routing** - enumerate PipeWire sinks with stable identifiers, route each app's audio to a chosen sink, or null-route it to silence.
 - **Content watchdog** - pages can post heartbeats; a frozen page gets its browser killed and relaunched automatically.
+- **Projection and edge blending** - overlap outputs instead of tiling them and Suede slices one shared canvas into gamma-correct blended seams, with optional per-output corner/center Warp correction and adaptive black-level compensation.
 - **Environment health checks** - Suede verifies its surroundings (Sway, browsers, PipeWire, its own service) and offers one-click fixes for what it can safely repair, with documentation links for the rest.
 - **Live events** - Server-Sent Events stream every change: displays, windows, audio devices, app status, health.
 - **Single binary** - one self-contained executable with the web UI embedded; shipped as a `.deb` for x86-64 and Raspberry Pi class aarch64 devices.
@@ -130,8 +131,11 @@ curl -X POST http://media-server:9088/api/v1/apps/standby/activate
 
 Overlap the outputs instead of tiling them - `"x": 1760` rather than `1920`,
 say - and Suede switches to projection mode automatically: it renders the app
-once into a headless canvas and slices it per projector, blending the seams.
-See [projection and edge blending](https://suede.gameshow.pro/configuration/#projection-edge-blending).
+once into a shared canvas and slices it per projector, gamma-correct blending
+the seams. Add per-output corner-pin and center-line calibration
+(`"projection": {"mode": "warp", ...}`) to fit the picture to a curved,
+tilted, or imperfectly rigged surface. See [projection and edge
+blending](https://suede.gameshow.pro/configuration/#projection-edge-blending).
 
 The configuration is persisted immediately: reboot the machine and it comes back exactly like this, no operator required. Watch it happen live:
 
@@ -177,6 +181,6 @@ allow, which is more permissive than people usually expect.
 Contributions are welcome and are asked for under a grant that allows both
 licenses — see [CONTRIBUTING.md](CONTRIBUTING.md) for why.
 
-Copyright © 2026 Barjonas LLC. Commercial enquiries:
+Copyright © 2026 Barjonas LLC. Commercial inquiries:
 <https://barjonas.com/#contact>
 

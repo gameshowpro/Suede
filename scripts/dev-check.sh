@@ -52,6 +52,7 @@ if [[ "$STAGE" == "fix" ]]; then
 fi
 
 if [[ "$STAGE" == "all" || "$STAGE" == "lint" ]]; then
+  run_stage "en-US spelling" scripts/check-en-us.sh
   run_stage "cargo fmt" cargo fmt --all -- --check
   run_stage "cargo clippy" cargo clippy --all-targets -- -D warnings
 fi

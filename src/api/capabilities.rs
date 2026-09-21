@@ -589,7 +589,7 @@ fn api_root(api_base: &str) -> &str {
 }
 
 /// Whether a report is the shape a settling-race false-negative takes: a real
-/// GPU that nonetheless decoded nothing in hardware. A software rasteriser
+/// GPU that nonetheless decoded nothing in hardware. A software rasterizer
 /// (`llvmpipe`) or a platform with no browser decode path (VideoCore) reports
 /// no hardware too, but stably — re-measuring those only wastes a launch, so
 /// they are not treated as suspicious.

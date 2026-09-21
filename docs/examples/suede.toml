@@ -51,13 +51,20 @@ docs_base_url = "https://suede.gameshow.pro/"
 
 # Whether outputs may overlap in canvas space.
 #
-# Left false, sway tiles the layout itself and a write whose output rectangles
-# intersect is rejected; the compositor must run with
+# Left false (the default, shown here commented out for a plain tiling
+# appliance), sway tiles the layout itself and a write whose output
+# rectangles intersect is rejected; the compositor must run with
 # WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 or a spanned window mirrors on some
 # drivers. Set true, every layout of two or more outputs goes through the
 # slicer instead — each display scans out its own buffer, so that variable
 # must *not* be set. `provision.sh --allow-overlaps` configures both halves.
 # See configuration.md#direct-scanout.
+#
+# Uncomment `allow_overlaps = true` if you are using one of the overlapping
+# example configs (four-output-warp.json, four-output-shared-canvas.json, or
+# four-output-adaptive.json) — those examples validate against the schema
+# either way, but the daemon itself rejects an overlapping layout at write
+# time while this stays false.
 # allow_overlaps = false
 
 # Whether the compositor may flip the slicer's buffers straight to the display

@@ -4,7 +4,7 @@
 //! splitting. The control reader and build completion wake the Wayland poll;
 //! neither reads files nor waits on stdin in the render thread.
 use super::{
-    blend::{dynamic_transfer_at, transfer_at, Coverage, SliceSpec, SlicerSpec},
+    blend::{pack_dynamic_shape, pixel_transfer, Coverage, SliceSpec, SlicerSpec},
     control::{ControlEvent, ControlEventKind, ControlUpdate, CONTROL_VERSION},
     warp::Warp,
 };
@@ -91,6 +91,12 @@ pub struct Controller {
     workers: usize,
     closed_reported: bool,
     restart_required: bool,
+    /// `None` writes lifecycle lines directly with `println!`, which every
+    /// existing unit test still relies on (this is off the render thread in
+    /// tests, so blocking/panicking there is not the hazard `StdoutWriter`
+    /// exists for). Production sets this once, right after `new`, from
+    /// `state.stdout` — see `initialize_warp_control`.
+    stdout: Option<super::control::StdoutWriter>,
 }
 
 fn signal(stream: &UnixStream) {
@@ -123,6 +129,7 @@ impl Controller {
             workers: workers.clamp(1, 8),
             closed_reported: false,
             restart_required: false,
+            stdout: None,
         };
         // Initial data is built off the render thread, like every later edit.
         controller.start_build();
@@ -208,6 +215,14 @@ impl Controller {
         &self.spec.control_session
     }
 
+    /// Route this controller's lifecycle lines through a writer thread
+    /// instead of `println!`ing them directly on whichever thread calls
+    /// `event`/`poll` — the render thread in production. Additive: leaving
+    /// this unset keeps the direct `println!` every existing test exercises.
+    pub fn set_stdout(&mut self, stdout: super::control::StdoutWriter) {
+        self.stdout = Some(stdout);
+    }
+
     pub fn event(&self, generation: u64, kind: ControlEventKind) {
         let event = ControlEvent {
             version: CONTROL_VERSION,
@@ -216,7 +231,14 @@ impl Controller {
             kind,
         };
         if let Ok(line) = serde_json::to_string(&event) {
-            println!("{line}");
+            // Lifecycle events (`Accepted`, `Built`, `Applied`, `Rejected`,
+            // `Closed`, `Submitted`, `Capability`) must not be dropped, so
+            // this is the ordered, guaranteed-delivery side of
+            // `StdoutWriter`, not the coalescing one.
+            match &self.stdout {
+                Some(stdout) => stdout.event(line),
+                None => println!("{line}"),
+            }
         }
     }
 
@@ -479,17 +501,6 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
                 return Err("configured output raster differs from presenter dimensions".into());
             }
             sampling_warp(spec, &slice, (w, h))?;
-            if slice.ramps.len() > 64 {
-                return Err("at most 64 ramps per output are supported".into());
-            }
-            if slice.ramps.iter().any(|r| {
-                r.rect.width <= 0
-                    || r.rect.height <= 0
-                    || r.rect.x.checked_add(r.rect.width).is_none()
-                    || r.rect.y.checked_add(r.rect.height).is_none()
-            }) {
-                return Err("invalid ramp rectangle".into());
-            }
             Ok(Key {
                 layout: layout
                     .as_ref()
@@ -565,23 +576,37 @@ pub(crate) fn sampling_warp(
     ))
 }
 
-/// Shared row evaluator for scoped builds and the measured pool candidate.
+/// Shared row evaluator for scoped builds and the measured pool candidate,
+/// and the one place the inverse map, bounds clamp and canvas-bounds test
+/// live: [`fill_rows`] and [`fill_dynamic_rows`] were near-duplicates of this
+/// same walk, differing only in the empty sentinel and the final per-pixel
+/// expression, which is exactly the shape that lets fixed and adaptive modes
+/// quietly disagree at a border if one copy is edited and the other is not.
+///
+/// `layout` is `Some` for every canvas plan the daemon derives, legacy
+/// integer layouts included (see `blend::SlicerSpec::layout`'s doc): it is
+/// the sole source of blend weight, through [`super::layout::Evaluator`],
+/// which also resolves black-lift coverage from the same configured
+/// footprints. `None` is only a hand-built spec with no configured layout at
+/// all; it still gets `coverage`'s black-lift (physical rectangle coverage
+/// alone has no seam-weight rule to fall back to, so every covering source
+/// there gets full weight — see [`pixel_transfer`]).
 #[allow(clippy::too_many_arguments)]
-fn fill_rows(
+fn fill_generic<T: Copy>(
     spec: &SlicerSpec,
     slice: &SliceSpec,
     warp: Option<&Warp>,
-    coverage: &Coverage,
-    layout: Option<(&super::layout::Evaluator, usize)>,
     size: (u32, u32),
     first_row: usize,
-    dest: &mut [(u16, u8)],
+    dest: &mut [T],
+    empty: T,
+    mut value_of: impl FnMut(f64, f64, f64) -> T,
 ) {
     let width = size.0;
     for (offset, value) in dest.iter_mut().enumerate() {
         let x = (offset % width as usize) as u32;
         let y = (first_row + offset / width as usize) as u32;
-        *value = (0, 0);
+        *value = empty;
         let edge = warp.map_or(1.0, |w| w.coverage(x, y));
         if edge == 0.0 {
             continue;
@@ -601,8 +626,6 @@ fn fill_rows(
         ) else {
             continue;
         };
-        let sx = cx - slice.source.x as f64;
-        let sy = cy - slice.source.y as f64;
         // Match the shader's canvas texel-center bounds, including fractional
         // source rectangles. Sync colors use this same transfer table.
         if cx < 0.5
@@ -612,23 +635,41 @@ fn fill_rows(
         {
             continue;
         }
-        if let Some((layout, index)) = layout {
-            *value = layout.transfer(index, cx, cy, spec.gamma, spec.black_lift, edge);
-            continue;
-        }
-        *value = transfer_at(
-            &slice.ramps,
-            spec.gamma,
-            coverage.lift(spec.black_lift, cx, cy),
-            sx,
-            sy,
-            edge,
-        );
+        *value = value_of(cx, cy, edge);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn fill_dynamic_rows(
+pub(crate) fn fill_rows(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    warp: Option<&Warp>,
+    coverage: &Coverage,
+    layout: Option<(&super::layout::Evaluator, usize)>,
+    size: (u32, u32),
+    first_row: usize,
+    dest: &mut [(u16, u8)],
+) {
+    fill_generic(
+        spec,
+        slice,
+        warp,
+        size,
+        first_row,
+        dest,
+        (0, 0),
+        |cx, cy, edge| {
+            if let Some((layout, index)) = layout {
+                layout.transfer(index, cx, cy, spec.gamma, spec.black_lift, edge)
+            } else {
+                pixel_transfer(coverage.lift(spec.black_lift, cx, cy), edge)
+            }
+        },
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fill_dynamic_rows(
     spec: &SlicerSpec,
     slice: &SliceSpec,
     warp: Option<&Warp>,
@@ -638,45 +679,22 @@ fn fill_dynamic_rows(
     first_row: usize,
     dest: &mut [u32],
 ) {
-    let width = size.0;
-    for (offset, value) in dest.iter_mut().enumerate() {
-        let x = (offset % width as usize) as u32;
-        let y = (first_row + offset / width as usize) as u32;
-        *value = 0;
-        let edge = warp.map_or(1.0, |w| w.coverage(x, y));
-        if edge == 0.0 {
-            continue;
-        }
-        let Some([cx, cy]) = warp.map_or(
-            Some([
-                slice.source.x as f64 + x as f64 + 0.5,
-                slice.source.y as f64 + y as f64 + 0.5,
-            ]),
-            |w| {
-                w.clamped_canvas_at(
-                    x as f64 + 0.5,
-                    y as f64 + 0.5,
-                    [slice.source.x as f64, slice.source.y as f64],
-                )
-            },
-        ) else {
-            continue;
-        };
-        let sx = cx - slice.source.x as f64;
-        let sy = cy - slice.source.y as f64;
-        if cx < 0.5
-            || cy < 0.5
-            || cx > spec.canvas_width as f64 - 0.5
-            || cy > spec.canvas_height as f64 - 0.5
-        {
-            continue;
-        }
-        *value = if let Some((layout, index)) = layout {
-            layout.dynamic_shape(index, cx, cy, spec.gamma, edge)
-        } else {
-            dynamic_transfer_at(&slice.ramps, spec.gamma, sx, sy, edge, coverage.at(cx, cy))
-        };
-    }
+    fill_generic(
+        spec,
+        slice,
+        warp,
+        size,
+        first_row,
+        dest,
+        0,
+        |cx, cy, edge| {
+            if let Some((layout, index)) = layout {
+                layout.dynamic_shape(index, cx, cy, spec.gamma, edge)
+            } else {
+                pack_dynamic_shape(1.0, edge, coverage.at(cx, cy))
+            }
+        },
+    );
 }
 
 fn build(
@@ -782,10 +800,7 @@ mod tests {
     use super::*;
     use crate::{
         model::{AdaptiveBlackLift, Rect, Renderer},
-        projection::{
-            blend::{FadeTo, RampSpec},
-            warp::Geometry,
-        },
+        projection::warp::Geometry,
     };
     use std::time::Duration;
 
@@ -816,7 +831,6 @@ mod tests {
                         height: 8,
                     },
                     geometry: None,
-                    ramps: vec![],
                 })
                 .collect(),
         }
@@ -863,7 +877,6 @@ mod tests {
                 },
                 source_rect: Some([i as f64 * 4.0, 0.0, 6.0, 8.0]),
                 geometry: None,
-                ramps: Vec::new(),
             })
             .collect();
         spec.layout = Some(super::super::layout::LayoutSpec {
@@ -1103,14 +1116,14 @@ mod tests {
         let all = complete(&mut c);
         assert_eq!(all.outputs.len(), 2);
         c.installed(&all);
-        shared.slices[0].ramps.push(RampSpec {
-            rect: Rect {
-                x: 4,
-                y: 0,
-                width: 4,
-                height: 8,
-            },
-            fade_to: FadeTo::Right,
+        // A per-slice-only, live-updatable field: `same_topology` never
+        // compares `geometry` (a destination pin edit is exactly the "live
+        // GPU edit" case, never a restart), so this changes slice 0's own
+        // key in place without touching slice 1's `SliceSpec` or forcing a
+        // restart.
+        shared.slices[0].geometry = Some(Geometry {
+            corners: [[1.0, 1.0], [7.0, 0.0], [8.0, 7.0], [0.0, 8.0]],
+            center: [0.5, 0.5],
         });
         send(&mut c, 3, shared);
         let local = complete(&mut c);
@@ -1235,20 +1248,6 @@ mod tests {
             .collect();
         assert!(Controller::new(&spec, vec![(8, 8); 9], 4).is_err());
         let mut spec = fixture();
-        spec.slices[0].ramps = vec![
-            RampSpec {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 8,
-                    height: 8
-                },
-                fade_to: FadeTo::Right,
-            };
-            65
-        ];
-        assert!(Controller::new(&spec, vec![(8, 8); 2], 4).is_err());
-        spec.slices[0].ramps.clear();
         spec.slices[0].source.x = i32::MAX;
         assert!(Controller::new(&spec, vec![(8, 8); 2], 4).is_err());
     }
@@ -1320,15 +1319,6 @@ mod tests {
                     width: 1920,
                     height: 1080,
                 };
-                slice.ramps = vec![RampSpec {
-                    rect: Rect {
-                        x: 1760,
-                        y: 0,
-                        width: 160,
-                        height: 1080,
-                    },
-                    fade_to: FadeTo::Right,
-                }];
                 slice
             })
             .collect();

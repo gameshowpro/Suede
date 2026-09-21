@@ -5,13 +5,14 @@
 //! needing to reconstruct a delta chain.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
-use std::sync::{Arc, Condvar, Mutex};
+use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::blend::SlicerSpec;
-use crate::model::Renderer;
+use crate::model::{ProjectionMode, Renderer, SamplingMode};
 
 /// The only protocol version understood by this release.
 pub const CONTROL_VERSION: u32 = 1;
@@ -72,8 +73,8 @@ pub enum ControlEventKind {
         warp_available: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
-        requested_mode: String,
-        effective_mode: String,
+        requested_mode: ProjectionMode,
+        effective_mode: ProjectionMode,
     },
     Accepted,
     Built {
@@ -89,10 +90,9 @@ pub enum ControlEventKind {
         build_ms: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         upload_ms: Option<f64>,
-        /// Effective sampler selected for each affected output, for example
-        /// `"exact"` or `"bilinear"`.
+        /// Effective sampler selected for each affected output.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-        sampling_modes: BTreeMap<String, String>,
+        sampling_modes: BTreeMap<String, SamplingMode>,
     },
     Submitted {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -260,6 +260,112 @@ impl<T> NewestMailbox<T> {
 impl<T> Default for NewestMailbox<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Owns the render thread's stdout so it never blocks on — or panics from —
+/// writing it directly. `println!` calls `.unwrap()` internally, so a reader
+/// that stops draining the pipe (the daemon restarting, a broken pipe) would
+/// otherwise either stall the render thread on a full OS pipe buffer or crash
+/// it outright; both used to happen from inside the per-frame/per-generation
+/// path itself (`LiftRuntime::report`, the stats publisher,
+/// `warp_update::Controller::event`).
+///
+/// Two channels feed one pair of writer threads, matched to how each message
+/// kind tolerates loss:
+/// - `lifecycle` is a bounded, ordered queue for messages that must not be
+///   dropped — one send per control-generation transition (`Accepted`,
+///   `Built`, `Applied`, ...), never per frame, so the 4096-deep bound is
+///   enormous headroom and an occasional blocking send here is not a
+///   per-frame cost.
+/// - `telemetry` is [`NewestMailbox`]: periodic status (adaptive black-lift,
+///   frame stats) where only the newest value matters and a slow reader
+///   must never make memory grow.
+///
+/// Cheap to clone: every field is itself a cheap-to-clone handle to shared
+/// state, so each owner (a `Controller`, a `LiftRuntime`, `State` itself)
+/// keeps its own handle to the same two writer threads.
+#[derive(Clone)]
+pub struct StdoutWriter {
+    lifecycle: mpsc::SyncSender<String>,
+    telemetry: NewestMailbox<String>,
+    closed: Arc<AtomicBool>,
+}
+
+/// Write one line to stdout and flush it, returning `false` on any I/O
+/// error — most commonly `BrokenPipe`, when the reader has stopped — instead
+/// of panicking the way `println!`'s internal `.unwrap()` does.
+fn write_line(line: &str) -> bool {
+    let mut stdout = io::stdout().lock();
+    stdout
+        .write_all(line.as_bytes())
+        .and_then(|()| stdout.write_all(b"\n"))
+        .and_then(|()| stdout.flush())
+        .is_ok()
+}
+
+impl StdoutWriter {
+    pub fn spawn() -> Self {
+        let (lifecycle_tx, lifecycle_rx) = mpsc::sync_channel::<String>(4096);
+        let telemetry = NewestMailbox::<String>::new();
+        let closed = Arc::new(AtomicBool::new(false));
+
+        let lifecycle_closed = closed.clone();
+        // Ordered, one line per `send`: nothing here coalesces, so a burst
+        // of lifecycle events is never collapsed into just the last one.
+        let _ = std::thread::Builder::new()
+            .name("slicer-stdout-lifecycle".into())
+            .spawn(move || {
+                while let Ok(line) = lifecycle_rx.recv() {
+                    if !write_line(&line) {
+                        lifecycle_closed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+
+        let telemetry_reader = telemetry.clone();
+        let telemetry_closed = closed.clone();
+        // Blocks on the mailbox's own condvar between values, so an idle
+        // period costs nothing and a burst only ever sends the newest one.
+        let _ = std::thread::Builder::new()
+            .name("slicer-stdout-telemetry".into())
+            .spawn(move || {
+                while let Some(line) = telemetry_reader.take() {
+                    if !write_line(&line) {
+                        telemetry_closed.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            });
+
+        Self {
+            lifecycle: lifecycle_tx,
+            telemetry,
+            closed,
+        }
+    }
+
+    /// Enqueue a line that must reach the reader, in order. Only ever called
+    /// once per control-generation transition, not per frame, so blocking on
+    /// a full queue (which the 4096 bound makes practically unreachable) is
+    /// not the per-frame stall this type exists to avoid.
+    pub fn event(&self, line: String) {
+        let _ = self.lifecycle.send(line);
+    }
+
+    /// Publish a periodic status line. Calls between writer-thread wakeups
+    /// collapse into one: only the newest line is ever written.
+    pub fn telemetry(&self, line: String) {
+        let _ = self.telemetry.push(line);
+    }
+
+    /// Whether a writer thread hit a broken pipe (or another write failure)
+    /// and gave up. The render loop polls this to end the child cleanly —
+    /// the way stdin EOF already does — instead of a write panicking on the
+    /// render thread.
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
     }
 }
 

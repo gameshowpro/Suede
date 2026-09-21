@@ -3,7 +3,7 @@
 //! table cost, not physical footprint calibration or arbitrary polygon seams.
 
 use super::{
-    blend::{transfer_at, Coverage, SlicerSpec},
+    blend::{pixel_transfer, Coverage, SlicerSpec},
     warp::Warp,
 };
 use serde::Deserialize;
@@ -304,7 +304,7 @@ fn build_selected(
                             continue;
                         }
                         let lift = coverage.lift(spec.black_lift, cx, cy);
-                        *value = transfer_at(&slice.ramps, spec.gamma, lift, sx, sy, edge);
+                        *value = pixel_transfer(lift, edge);
                     }
                 });
             }
@@ -376,10 +376,7 @@ pub fn benchmark(spec: &SlicerSpec) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        model::Rect,
-        projection::blend::{pixel_transfer, SliceSpec},
-    };
+    use crate::{model::Rect, projection::blend::SliceSpec};
     fn spec() -> SlicerSpec {
         SlicerSpec {
             layout: None,
@@ -404,7 +401,6 @@ mod tests {
                     width: 8,
                     height: 8,
                 },
-                ramps: vec![],
             }],
         }
     }
@@ -418,7 +414,7 @@ mod tests {
                 for x in 0..8 {
                     assert_eq!(
                         b.outputs[0].table[(y * 8 + x) as usize],
-                        pixel_transfer(&[], s.gamma, 0.0, x, y)
+                        crate::projection::blend::pixel_transfer(0.0, 1.0)
                     );
                 }
             }

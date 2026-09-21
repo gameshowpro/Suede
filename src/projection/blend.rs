@@ -1,15 +1,21 @@
-//! Pure edge-blend math: seams from layout, gamma-shaped ramps from seams.
+//! Canvas planning and the physical black-lift coverage count.
 //!
 //! Everything here is deterministic geometry and arithmetic, deliberately free
 //! of Wayland, processes, and IO, for the same reason the output planner is
-//! pure: the correctness rules — ramps exactly spanning the shared region,
-//! luminance summing to one across a seam — are testable on any machine.
-//! The future warp client (corner pinning) reuses this module unchanged; a
-//! homography changes where a ramp is *drawn*, not what its values are.
+//! pure: the correctness rules — luminance summing to one across a seam —
+//! are testable on any machine. The seam blend weight itself lives in
+//! exactly one place, [`super::layout::Evaluator`]: every [`CanvasPlan`] this
+//! module produces carries a [`super::layout::LayoutSpec`], including the
+//! legacy integer-position layouts synthesized by
+//! [`canvas_plan_with_warp_activation`] below, so warp geometry (corner
+//! pinning) reuses the same weights unchanged — a homography changes where a
+//! seam is *sampled*, not what its blend ratio is.
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{ProjectionConfig, Rect, Renderer, TestPattern};
+use crate::model::{CanvasRect, ProjectionConfig, Rect, Renderer, TestPattern};
+
+use super::layout::{LayoutParticipant, LayoutSpec};
 
 /// An output taking part in seam derivation: its place in the global layout.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,43 +25,30 @@ pub struct Participant {
     /// Whether a display is currently attached to this output.
     ///
     /// Absent outputs still take full part in the plan: they shape the
-    /// canvas and every ramp, because the *configuration* describes the
+    /// canvas and every seam, because the *configuration* describes the
     /// installation and a dark projector does not change where the light
-    /// from its neighbours lands. Only presentation is skipped — the region
+    /// from its neighbors lands. Only presentation is skipped — the region
     /// simply goes unshown. So unplugging one projector never alters what
     /// the others display, and plugging it back in needs no re-authoring.
     pub connected: bool,
 }
 
-/// The side of a ramp at which attenuation reaches zero — the side where the
-/// neighbouring projector has fully taken over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum FadeTo {
-    Left,
-    Right,
-    Top,
-    Bottom,
-}
-
-/// One gradient this output must draw, in output-local coordinates.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RampSpec {
-    pub rect: Rect,
-    pub fade_to: FadeTo,
-}
-
 /// Everything one overlay process needs. Serialized to the `suede blend`
 /// subcommand verbatim — this struct *is* the daemon↔overlay contract.
+///
+/// This overlay path runs only where nothing in the configured layout
+/// overlaps — the reconciler never builds a canvas for it otherwise — so it
+/// never needs a seam blend; it exists to show a test pattern (or nothing
+/// at all) over content that sway already composites directly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlaySpec {
     pub output: String,
-    /// Shapes the ramps' fall-off; see [`crate::model::ProjectionConfig`].
+    /// Shapes the test pattern's own gradients; see
+    /// [`crate::model::ProjectionConfig`].
     pub gamma: f64,
     /// The configured black-level compensation, carried so a change to it
-    /// repaints the overlay. It is not *applied* here: these overlays run
+    /// repaints the overlay. It is not *applied* here: this overlay runs
     /// only where nothing overlaps, so there is no raised black floor to
     /// match. The canvas path resolves it per pixel through [`Coverage`].
     #[serde(default)]
@@ -64,13 +57,23 @@ pub struct OverlaySpec {
     /// global coordinates and continue exactly across a seam.
     #[serde(default)]
     pub rect: Rect,
+    /// This picture's true, possibly fractional and scaled, footprint in
+    /// canvas space — the same value `SliceSpec::source_rect` carries for
+    /// content. `None` means there is no canvas concept to place this
+    /// picture in (the no-canvas bench-alignment overlay), so `rect` itself
+    /// is the unit-density footprint. Canvas-anchored features (the grid's
+    /// tile lines, warp-alignment's percentage lines and circles) are
+    /// computed through this rectangle rather than through `rect` at 1:1, so
+    /// they land on the same canvas position regardless of a slice's
+    /// raster/canvas scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rect: Option<[f64; 4]>,
     /// Test pattern to draw instead of showing the content through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pattern: Option<TestPattern>,
     /// Global canvas dimensions (width, height), for canvas-relative patterns.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub canvas_size: Option<[u32; 2]>,
-    pub ramps: Vec<RampSpec>,
 }
 
 fn intersect(a: &Rect, b: &Rect) -> Option<Rect> {
@@ -86,13 +89,11 @@ fn intersect(a: &Rect, b: &Rect) -> Option<Rect> {
     })
 }
 
-fn area(rect: &Rect) -> i64 {
-    rect.width as i64 * rect.height as i64
-}
-
-/// One projector's slice of the canvas: which region it shows, and how its
-/// seam edges fade. `source` is in canvas coordinates; `ramps` are in
-/// slice-local coordinates.
+/// One projector's slice of the canvas: which region it shows. Its seam
+/// blend weight is not carried here — it is derived from `SlicerSpec.layout`
+/// (this output's entry in the shared [`super::layout::LayoutSpec`]) through
+/// [`super::layout::Evaluator`], the one place that rule lives. `source` is
+/// in canvas coordinates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SliceSpec {
@@ -104,7 +105,6 @@ pub struct SliceSpec {
     pub source_rect: Option<[f64; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<super::warp::Geometry>,
-    pub ramps: Vec<RampSpec>,
 }
 
 /// Everything the slicer process needs: capture this, cut it up like that.
@@ -134,7 +134,12 @@ pub struct SlicerSpec {
     /// Which pipeline to blend with; see [`crate::model::Renderer`].
     #[serde(default)]
     pub renderer: Renderer,
-    /// Full configured roster, independently of which outputs can present.
+    /// Full configured roster, independently of which outputs can present —
+    /// the sole source of blend-weight truth (via
+    /// [`super::layout::Evaluator`]) for every canvas plan this daemon
+    /// builds, `canvas_plan_with_warp_activation`'s legacy integer layouts
+    /// included. `None` only for a hand-built spec with no seam blending at
+    /// all (every covered pixel full weight, no black lift).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<super::layout::LayoutSpec>,
     /// Configured simple-mode coverage, including unattached outputs.
@@ -170,7 +175,7 @@ pub enum Slicing {
     WhenOverlapping,
     /// Every layout of two or more outputs, overlapping or not.
     ///
-    /// A tiled layout then yields slices with no seams and so no ramps. What
+    /// A tiled layout then yields slices with no seams and so no blend. What
     /// it buys is that each display scans out one private, output-sized
     /// buffer instead of sharing one window across the lot — the case direct
     /// scanout was built for, and the case a driver cannot mirror by mistake.
@@ -182,13 +187,14 @@ pub enum Slicing {
 /// **The layout is the projection configuration.** Each participant's
 /// rectangle is where its beam lands in canvas space; wherever two
 /// rectangles intersect, both projectors show that region of the canvas, and
-/// with `blend` on each fades its own copy toward the neighbour. Every seam
+/// with `blend` on each fades its own copy toward the neighbor. Every seam
 /// carries its own width because every seam *is* its own intersection —
 /// a top row may overlap differently from a bottom row, grids included.
 ///
 /// The plan is a function of the *configuration alone*. Whether a display is
 /// currently attached decides only which slices get presented — never the
-/// canvas size and never a ramp. That is what keeps a failure local: pull the
+/// canvas size and never a seam's weight. That is what keeps a failure
+/// local: pull the
 /// cable on one projector and the others carry on showing exactly the pixels
 /// they showed a moment earlier, with the dead projector's region simply
 /// unlit. Deriving any of the geometry from what happens to be plugged in
@@ -237,7 +243,7 @@ pub fn canvas_plan_with_warp_activation(
         }
     }
 
-    // Normalise so the canvas starts at 0,0 wherever the user drew it.
+    // Normalize so the canvas starts at 0,0 wherever the user drew it.
     let min_x = participants.iter().map(|p| p.rect.x).min().unwrap_or(0);
     let min_y = participants.iter().map(|p| p.rect.y).min().unwrap_or(0);
     let rects: Vec<(String, Rect)> = participants
@@ -258,80 +264,67 @@ pub fn canvas_plan_with_warp_activation(
     let canvas_width = rects.iter().map(|(_, r)| r.x + r.width).max().unwrap_or(0);
     let canvas_height = rects.iter().map(|(_, r)| r.y + r.height).max().unwrap_or(0);
 
-    // Ramps from pairwise intersections, when blending is on.
-    let blend = config.is_some_and(|p| p.blend);
-    let mut ramps: Vec<Vec<RampSpec>> = vec![Vec::new(); rects.len()];
-    if blend {
-        for i in 0..rects.len() {
-            for j in (i + 1)..rects.len() {
-                let (a, b) = (&rects[i].1, &rects[j].1);
-                let Some(seam) = intersect(a, b) else {
-                    continue;
+    // Legacy integer layouts have no separate canvas-unit configuration: the
+    // integer positions/sizes above (already normalized to start at 0,0)
+    // *are* the whole layout. Synthesize the same `LayoutSpec` a warp canvas
+    // would carry, normalizing by the bounding box's own width — canvas
+    // units are isotropic (`crate::model::geometry`'s module doc), so one
+    // divisor serves both axes. `layout::Evaluator` then derives seams,
+    // stacking and black-lift coverage exactly as it does for a configured
+    // warp canvas: this is the one blend-weight rule production has.
+    let aspect = f64::from(canvas_width) / f64::from(canvas_height);
+    let layout = LayoutSpec {
+        aspect,
+        blend: config.is_some_and(|p| p.blend),
+        participants: rects
+            .iter()
+            .map(|(name, rect)| {
+                let source = CanvasRect {
+                    x: f64::from(rect.x) / f64::from(canvas_width),
+                    y: f64::from(rect.y) / f64::from(canvas_width),
+                    width: f64::from(rect.width) / f64::from(canvas_width),
+                    height: f64::from(rect.height) / f64::from(canvas_width),
                 };
-                // A near-total overlap is a deliberate duplicate (stacked
-                // projectors, a mirror) — both show it at full strength.
-                if area(&seam) * 5 >= area(a).min(area(b)) * 4 {
-                    continue;
+                LayoutParticipant {
+                    output: name.clone(),
+                    source,
+                    // A legacy layout has no separate physical-footprint
+                    // concept: the configured rectangle is both the crop and
+                    // the coverage a black-lift shortfall is computed from.
+                    raster_footprint: source,
                 }
-                // Edge adjacency: the seam spans (most of) the shorter
-                // output along the axis perpendicular to the fade. In a
-                // grid, a corner already receives the product of each
-                // output's horizontal and vertical ramps, which sums to
-                // constant luminance by construction — a diagonal pair must
-                // not add a third.
-                let horizontal = seam.height * 2 >= a.height.min(b.height);
-                let vertical = seam.width * 2 >= a.width.min(b.width);
-                let center_dx = (a.x * 2 + a.width) - (b.x * 2 + b.width);
-                let center_dy = (a.y * 2 + a.height) - (b.y * 2 + b.height);
-                let axis = match (horizontal, vertical) {
-                    (true, false) => Axis::X,
-                    (false, true) => Axis::Y,
-                    (true, true) => {
-                        if center_dx.abs() >= center_dy.abs() {
-                            Axis::X
-                        } else {
-                            Axis::Y
-                        }
-                    }
-                    (false, false) => continue,
-                };
-                let (fade_a, fade_b) = match axis {
-                    Axis::X if center_dx <= 0 => (FadeTo::Right, FadeTo::Left),
-                    Axis::X => (FadeTo::Left, FadeTo::Right),
-                    Axis::Y if center_dy <= 0 => (FadeTo::Bottom, FadeTo::Top),
-                    Axis::Y => (FadeTo::Top, FadeTo::Bottom),
-                };
-                for (index, fade_to) in [(i, fade_a), (j, fade_b)] {
-                    let origin = &rects[index].1;
-                    ramps[index].push(RampSpec {
-                        rect: Rect {
-                            x: seam.x - origin.x,
-                            y: seam.y - origin.y,
-                            width: seam.width,
-                            height: seam.height,
-                        },
-                        fade_to,
-                    });
-                }
-            }
-        }
+            })
+            .collect(),
+    };
+    // Validates the topology a legacy layout still requires — nonempty,
+    // non-mixed stacking, in-bounds — but not that every source is reachable
+    // from every other (`layout::Evaluator::new` no longer requires that; see
+    // its own doc): a legacy layout that fails this is not a layout
+    // `layout::Evaluator` — and so nothing downstream — can give one seam
+    // rule to, so there is no canvas plan for it. That is rarer now, so it
+    // is worth a line explaining why, rather than a silent `None` that looks
+    // identical to "nothing overlaps" or "one output".
+    if let Err(reason) = super::layout::Evaluator::new(&layout, canvas_width, canvas_height) {
+        eprintln!(
+            "blend: rejecting the synthesized layout for {} participant(s): {reason}",
+            participants.len()
+        );
+        return None;
     }
 
     // Only connected outputs can be presented on. Everything above — the
-    // canvas size and every ramp — was computed from the full configured
-    // layout, so a disconnected output leaves its region unshown without
-    // altering a single pixel of its neighbours'.
+    // canvas size and the synthesized layout — was computed from the full
+    // configured roster, so a disconnected output leaves its region unshown
+    // without altering a single pixel of its neighbors'.
     let slices: Vec<SliceSpec> = rects
         .iter()
-        .zip(ramps)
         .zip(participants)
-        .filter(|((_, _), participant)| participant.connected)
-        .map(|(((name, rect), ramps), _)| SliceSpec {
+        .filter(|(_, participant)| participant.connected)
+        .map(|((name, rect), _)| SliceSpec {
             source_rect: None,
             geometry: None,
             output: name.clone(),
             source: *rect,
-            ramps,
         })
         .collect();
 
@@ -349,7 +342,7 @@ pub fn canvas_plan_with_warp_activation(
     }
 
     Some(CanvasPlan {
-        layout: None,
+        layout: Some(layout),
         adaptive_lift: config.and_then(|p| p.black_lift.adaptive_settings()),
         coverage_rects: rects.iter().map(|(_, rect)| *rect).collect(),
         canvas_width,
@@ -419,23 +412,6 @@ pub fn dynamic_shade(value: u32, input: u8, level: f64, maximum: u32) -> u8 {
         .clamp(0.0, 255.0) as u8
 }
 
-/// Build one dynamic shape entry from ramps and output-pixel coverage.
-pub fn dynamic_transfer_at(
-    ramps: &[RampSpec],
-    gamma: f64,
-    x: f64,
-    y: f64,
-    edge: f64,
-    coverage: u32,
-) -> u32 {
-    if coverage == 0 || edge <= 0.0 {
-        return pack_dynamic_shape(0.0, 0.0, 0);
-    }
-    let transmitted =
-        ramps_attenuation(ramps, x, y).map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
-    pack_dynamic_shape(transmitted, edge, coverage)
-}
-
 fn covering(rects: &[Rect], x: f64, y: f64) -> u32 {
     rects
         .iter()
@@ -456,7 +432,7 @@ impl Coverage {
             .filter(|r| r.width > 0 && r.height > 0)
             .collect();
         // Coverage only changes where a rectangle begins or ends, so the
-        // true maximum is found by sampling the centre of every cell of the
+        // true maximum is found by sampling the center of every cell of the
         // grid those edges induce — a few dozen probes, not megapixels.
         let mut xs: Vec<i32> = rects.iter().flat_map(|r| [r.x, r.x + r.width]).collect();
         let mut ys: Vec<i32> = rects.iter().flat_map(|r| [r.y, r.y + r.height]).collect();
@@ -501,61 +477,36 @@ impl Coverage {
     }
 }
 
-/// The signal transfer for one pixel of a slice, as fixed-point `(a, b)`
-/// where `out = min(((a * input) >> 8) + b, 255)` for an 8-bit channel.
+/// The signal transfer for one pixel with no seam weighting — full own-source
+/// signal (weight 1) — as fixed-point `(a, b)` where
+/// `out = min(((a * input) >> 8) + b, 255)` for an 8-bit channel. Combines
+/// output-pixel picture coverage `edge` with the black-level rescale `lift`
+/// — [`Coverage::lift`], not the configured `blackLift` directly — so the
+/// slicer applies one table in one pass.
 ///
-/// Combines the gamma-shaped ramps (inside seams, multiplied where they
-/// overlap at grid corners) with the black-level rescale, so the slicer
-/// applies one table in one pass.
-///
-/// `lift` is the lift *resolved for this pixel* — [`Coverage::lift`] — not
-/// the configured `blackLift`. The two effects are independent: in a grid, a
-/// two-projector seam is both inside a ramp and short of the four-projector
-/// centre's black, so it needs a ramp *and* a lift. Only in the plain
-/// two-projector case do they never coincide.
-pub fn pixel_transfer(ramps: &[RampSpec], gamma: f64, lift: f64, x: i32, y: i32) -> (u16, u8) {
-    transfer_at(ramps, gamma, lift, x as f64 + 0.5, y as f64 + 0.5, 1.0)
-}
-
-/// Fixed transfer at continuous slice-local source pixel boundaries `(x, y)`.
-/// The caller supplies finite coordinates, positive finite gamma, finite
-/// resolved lift, and output-pixel picture coverage `edge` in `[0, 1]`.
-/// This function adds no half pixel and performs no source or canvas clamping.
-///
-/// With gamma-shaped ramp `r`, stores `a=round(edge*(1-lift)*r*256)` in
-/// `0..=256` and `b=round(edge*lift*255)` in `0..=255`. Lift is clamped to
-/// `[0, 1]`; positive ties round upward. Border coverage attenuates both
-/// coefficients before rounding. Never quantize `r` separately: at `edge=1`
-/// the integer wrapper must preserve the legacy multiplication/rounding order.
-/// GPU storage packs this pair as `(u32::from(a) << 8) | u32::from(b)`:
-/// bits 0..7 are b, bits 8..16 are a, and bits 17..31 are zero.
-pub fn transfer_at(
-    ramps: &[RampSpec],
-    gamma: f64,
-    lift: f64,
-    x: f64,
-    y: f64,
-    edge: f64,
-) -> (u16, u8) {
-    let transmitted =
-        ramps_attenuation(ramps, x, y).map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
+/// This is what every seam-weighted transfer collapses to once a source has
+/// no neighbor to blend against — the degenerate case of
+/// [`super::layout::Evaluator::transfer`]'s own formula with weight fixed at
+/// one. It exists as its own function for the "no configured layout at all"
+/// fallback (see `SlicerSpec::layout`'s doc) where there is no seam rule to
+/// evaluate in the first place. Lift is clamped to `[0, 1]`; positive ties
+/// round upward. GPU storage packs this pair as
+/// `(u32::from(a) << 8) | u32::from(b)`: bits 0..7 are `b`, bits 8..16 are
+/// `a`, and bits 17..31 are zero.
+pub fn pixel_transfer(lift: f64, edge: f64) -> (u16, u8) {
     let lift = lift.clamp(0.0, 1.0);
     (
-        (edge * (1.0 - lift) * transmitted * 256.0).round() as u16,
+        (edge * (1.0 - lift) * 256.0).round() as u16,
         (edge * lift * 255.0).round() as u8,
     )
 }
 
-enum Axis {
-    X,
-    Y,
-}
-
 /// One pattern overlay per output, for bench alignment when no canvas runs.
 ///
-/// Ramps live in the slicer now — the canvas is where seams exist. These
-/// overlays only carry test patterns, drawn in layout coordinates so two
-/// physically-aligned projectors superimpose them.
+/// This path only ever runs where nothing in the layout overlaps — the
+/// canvas is where seams exist — so these overlays carry only test
+/// patterns, drawn in layout coordinates so two physically-aligned
+/// projectors superimpose them.
 pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) -> Vec<OverlaySpec> {
     if config.test_pattern.is_none() {
         return Vec::new();
@@ -568,112 +519,34 @@ pub fn overlay_specs(participants: &[Participant], config: &ProjectionConfig) ->
             gamma: config.gamma,
             black_lift: config.black_lift.level(),
             rect: participant.rect,
+            source_rect: None,
             pattern: config.test_pattern,
             canvas_size: None,
-            ramps: Vec::new(),
         })
         .collect();
     specs.sort_by(|a, b| a.output.cmp(&b.output));
     specs
 }
 
-/// Combined light attenuation of every ramp covering the pixel centre
-/// `(x, y)`, or `None` when no ramp covers it at all.
-///
-/// The distinction matters: a covered pixel with attenuation 1.0 is *inside*
-/// a seam (no lift there — the doubled projector black is the lift), while an
-/// uncovered pixel is outside every seam and receives the black-lift.
-fn attenuation_at(spec: &OverlaySpec, x: f64, y: f64) -> Option<f64> {
-    ramps_attenuation(&spec.ramps, x, y)
-}
-
-fn ramps_attenuation(ramps: &[RampSpec], x: f64, y: f64) -> Option<f64> {
-    let mut covered = false;
-    let mut transmitted = 1.0;
-    for ramp in ramps {
-        let inside = x >= ramp.rect.x as f64
-            && x < (ramp.rect.x + ramp.rect.width) as f64
-            && y >= ramp.rect.y as f64
-            && y < (ramp.rect.y + ramp.rect.height) as f64;
-        if !inside {
-            continue;
-        }
-        covered = true;
-        let along = match ramp.fade_to {
-            FadeTo::Right => 1.0 - (x - ramp.rect.x as f64) / ramp.rect.width as f64,
-            FadeTo::Left => (x - ramp.rect.x as f64) / ramp.rect.width as f64,
-            FadeTo::Bottom => 1.0 - (y - ramp.rect.y as f64) / ramp.rect.height as f64,
-            FadeTo::Top => (y - ramp.rect.y as f64) / ramp.rect.height as f64,
-        };
-        // Where ramps overlap (grid corners), attenuations multiply in
-        // light, which is what makes a 2×2 corner sum to constant luminance.
-        transmitted *= along.clamp(0.0, 1.0);
-    }
-    covered.then_some(transmitted)
-}
-
-/// The ramp alpha for a covered pixel.
-///
-/// The overlay is black; compositing `content·(1−α)` happens in signal space,
-/// and the display then raises the signal to `gamma`. To attenuate *light* by
-/// `t`, the alpha must therefore be `1 − t^(1/gamma)` — the mathematically
-/// required shaping that a naive signal-space gradient gets wrong.
-fn ramp_alpha(transmitted: f64, gamma: f64) -> u8 {
-    let alpha = 1.0 - transmitted.powf(1.0 / gamma);
-    (alpha * 255.0).round().clamp(0.0, 255.0) as u8
-}
-
-/// Ramp alpha per pixel, row-major; 0 outside every seam. The seam math in
-/// isolation, kept for tests and for the future warp shader.
-pub fn alpha_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
-    let mut map = vec![0u8; width as usize * height as usize];
-    for y in 0..height {
-        for x in 0..width {
-            if let Some(t) = attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
-                map[(y * width + x) as usize] = ramp_alpha(t, spec.gamma);
-            }
-        }
-    }
-    map
-}
-
 /// The complete overlay image: premultiplied BGRA bytes, row-major.
 ///
-/// Seam pixels are black at the ramp alpha; everything else is transparent.
-///
-/// These overlays are the *no-canvas* path, which the reconciler runs only
-/// when nothing in the layout overlaps. Every pixel is therefore lit by
-/// exactly one projector, no region sits at a doubled black floor, and the
-/// black-level lift is zero by construction — see [`Coverage`], which is
-/// what resolves it wherever seams do exist.
+/// This is the *no-canvas* path, which the reconciler runs only when
+/// nothing in the layout overlaps: every pixel is lit by exactly one
+/// projector, so there is no seam to shape and no black-lift shortfall —
+/// see [`Coverage`], which resolves that wherever seams do exist instead.
 pub fn pixel_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     match spec.pattern {
-        None => transparent_map(width, height, spec),
+        None => transparent_map(width, height),
         Some(_) => pattern_map(width, height, spec),
     }
 }
 
-/// The normal overlay: content shows through except in the seams.
-fn transparent_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
-    let mut pixels = vec![0u8; width as usize * height as usize * 4];
-    for y in 0..height {
-        for x in 0..width {
-            let offset = ((y * width + x) * 4) as usize;
-            // Black at the ramp alpha inside a seam; fully transparent
-            // outside, where there is nothing to compensate for.
-            if let Some(t) = attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
-                pixels[offset + 3] = ramp_alpha(t, spec.gamma);
-            }
-        }
-    }
-    pixels
+/// The normal overlay: fully transparent, content shows through everywhere.
+fn transparent_map(width: u32, height: u32) -> Vec<u8> {
+    vec![0u8; width as usize * height as usize * 4]
 }
 
-/// A test pattern: fully opaque, with the ramps applied to the pattern itself
-/// exactly as they would be to real content — so what the operator aligns
-/// with is what content will experience. As above, this path has no seams and
-/// so no lift; the canvas path patterns through [`pixel_transfer`] instead,
-/// which carries both.
+/// A test pattern: fully opaque, unshaped — this path has no seams to fade.
 fn pattern_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
     let rgb = super::pattern::render(width, height, spec);
     let mut pixels = vec![0u8; width as usize * height as usize * 4];
@@ -681,20 +554,11 @@ fn pattern_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
         for x in 0..width {
             let index = (y * width + x) as usize;
             let source = [rgb[index * 3], rgb[index * 3 + 1], rgb[index * 3 + 2]];
-            // In a seam: scale the signal so the *light* is attenuated by t,
-            // exactly as the alpha ramp does to content.
-            let shaped: [f64; 3] = match attenuation_at(spec, x as f64 + 0.5, y as f64 + 0.5) {
-                Some(t) => {
-                    let scale = t.powf(1.0 / spec.gamma);
-                    [0, 1, 2].map(|c| source[c] as f64 * scale)
-                }
-                None => [0, 1, 2].map(|c| source[c] as f64),
-            };
             let offset = index * 4;
-            // Opaque and premultiplied: BGRA from the shaped RGB.
-            pixels[offset] = shaped[2].round().clamp(0.0, 255.0) as u8;
-            pixels[offset + 1] = shaped[1].round().clamp(0.0, 255.0) as u8;
-            pixels[offset + 2] = shaped[0].round().clamp(0.0, 255.0) as u8;
+            // Opaque and premultiplied: BGRA from RGB, straight through.
+            pixels[offset] = source[2];
+            pixels[offset + 1] = source[1];
+            pixels[offset + 2] = source[0];
             pixels[offset + 3] = 255;
         }
     }
@@ -704,6 +568,7 @@ fn pattern_map(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::projection::layout::Evaluator;
 
     fn participant(name: &str, x: i32, y: i32, width: i32, height: i32) -> Participant {
         Participant {
@@ -730,6 +595,18 @@ mod tests {
         ProjectionConfig::default()
     }
 
+    /// The `layout::Evaluator` a synthesized `CanvasPlan` carries — the one
+    /// blend-weight rule every test below checks behavior through, rather
+    /// than a deleted ramps abstraction.
+    fn evaluator_for(plan: &CanvasPlan) -> Evaluator {
+        Evaluator::new(
+            plan.layout.as_ref().expect("legacy layouts synthesize one"),
+            plan.canvas_width,
+            plan.canvas_height,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn nonidentity_activation_slices_one_output_without_enabling_blend() {
         let config = ProjectionConfig {
@@ -745,10 +622,15 @@ mod tests {
             Slicing::WhenOverlapping,
             true,
         )
-        .expect("a nonidentity output needs a slicer even without ramps");
+        .expect("a nonidentity output needs a slicer even without blend");
         assert_eq!((plan.canvas_width, plan.canvas_height), (1920, 1080));
         assert_eq!(plan.slices.len(), 1);
-        assert!(plan.slices[0].ramps.is_empty());
+        let layout = plan
+            .layout
+            .as_ref()
+            .expect("a layout is always synthesized");
+        assert_eq!(layout.participants.len(), 1);
+        assert!(!layout.blend);
         assert_eq!(
             plan.slices[0].source,
             Rect {
@@ -763,7 +645,7 @@ mod tests {
     // --- the canvas plan: the layout IS the configuration -----------------
 
     #[test]
-    fn an_overlapping_pair_becomes_a_canvas_with_mirrored_ramps() {
+    fn an_overlapping_pair_becomes_a_canvas_with_a_synthesized_layout() {
         let plan = canvas_plan(
             &[
                 participant("DP-3", 0, 0, 1920, 1080),
@@ -792,22 +674,27 @@ mod tests {
                 height: 1080
             }
         );
-        assert_eq!(left.ramps.len(), 1);
-        assert_eq!(left.ramps[0].fade_to, FadeTo::Right);
-        assert_eq!(
-            left.ramps[0].rect,
-            Rect {
-                x: 1760,
-                y: 0,
-                width: 160,
-                height: 1080
-            }
-        );
-
         let right = &plan.slices[1];
         assert_eq!(right.source.x, 1760);
-        assert_eq!(right.ramps[0].fade_to, FadeTo::Left);
-        assert_eq!(right.ramps[0].rect.width, 160);
+
+        // The synthesized layout carries both participants, normalized by
+        // the canvas bounding-box width, and every downstream weight comes
+        // from `layout::Evaluator` — the one blend-weight rule.
+        let layout = plan.layout.as_ref().unwrap();
+        assert_eq!(layout.participants.len(), 2);
+        assert!(layout.blend);
+        let evaluator = evaluator_for(&plan);
+        // At the seam's midpoint (x = 1840, the middle of the 160px overlap
+        // 1760..1920), both sides split evenly.
+        assert_eq!(evaluator.transfer(0, 1840.0, 500.0, 1.0, 0.0, 1.0).0, 128);
+        assert_eq!(evaluator.transfer(1, 1840.0, 500.0, 1.0, 0.0, 1.0).0, 128);
+        // A quarter of the way in from DP-3's side (x = 1800), DP-3 keeps
+        // three quarters of the light and DP-1 a quarter — matching the
+        // ordinary strip ratio `layout::Evaluator`'s own tests check.
+        assert_eq!(evaluator.transfer(0, 1800.0, 500.0, 1.0, 0.0, 1.0).0, 192);
+        assert_eq!(evaluator.transfer(1, 1800.0, 500.0, 1.0, 0.0, 1.0).0, 64);
+        // Outside the seam: full weight, unattenuated.
+        assert_eq!(evaluator.transfer(0, 800.0, 500.0, 1.0, 0.0, 1.0).0, 256);
     }
 
     #[test]
@@ -838,9 +725,11 @@ mod tests {
             (degraded.canvas_width, degraded.canvas_height),
             (5440, 1080)
         );
+        // The roster the layout is derived from is unchanged too — a
+        // disconnected output still shapes its neighbors' seams.
+        assert_eq!(whole.layout, degraded.layout);
 
-        // The survivors keep their source rectangles and their ramps — the
-        // seam toward the dark projector still fades, so nothing brightens.
+        // The survivors keep their source rectangles.
         for name in ["DP-3", "DP-2"] {
             let before = whole.slices.iter().find(|s| s.output == name).unwrap();
             let after = degraded.slices.iter().find(|s| s.output == name).unwrap();
@@ -855,7 +744,7 @@ mod tests {
     fn an_output_that_was_never_plugged_in_still_shapes_the_canvas() {
         // Configuring a rig from the desk before the projectors arrive: the
         // canvas is the full installation, and the one display present shows
-        // its own region of it, already blended for the neighbour to come.
+        // its own region of it, already blended for the neighbor to come.
         let plan = canvas_plan(
             &[
                 participant("DP-3", 0, 0, 1920, 1080),
@@ -869,9 +758,13 @@ mod tests {
         assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
         assert_eq!(plan.slices.len(), 1);
         assert_eq!(plan.slices[0].output, "DP-3");
-        assert_eq!(plan.slices[0].ramps.len(), 1);
-        assert_eq!(plan.slices[0].ramps[0].fade_to, FadeTo::Right);
         assert_eq!(plan.sway_positions, vec![("DP-3".into(), 0, 0)]);
+        // The absent DP-1 still takes part in the synthesized layout, and
+        // still shapes DP-3's seam — the same ratio as the connected case.
+        let layout = plan.layout.as_ref().unwrap();
+        assert_eq!(layout.participants.len(), 2);
+        let evaluator = evaluator_for(&plan);
+        assert_eq!(evaluator.transfer(0, 1800.0, 500.0, 1.0, 0.0, 1.0).0, 192);
     }
 
     #[test]
@@ -894,7 +787,8 @@ mod tests {
     #[test]
     fn every_seam_carries_its_own_overlap() {
         // A row of three where the rigger got 160 px on one seam and 100 on
-        // the other. No single number can describe this; the layout can.
+        // the other. No single ramp width can describe this; the layout's
+        // geometry can — each seam's own rectangles imply its own overlap.
         let plan = canvas_plan(
             &[
                 participant("A", 0, 0, 1920, 1080),
@@ -907,17 +801,23 @@ mod tests {
         .unwrap();
 
         assert_eq!(plan.canvas_width, 5500);
-        let middle = &plan.slices[1];
-        assert_eq!(middle.ramps.len(), 2);
-        let widths: Vec<i32> = middle.ramps.iter().map(|r| r.rect.width).collect();
-        assert!(widths.contains(&160) && widths.contains(&100), "{widths:?}");
+        let evaluator = evaluator_for(&plan);
+        // 40px into the 160px A-B seam (25%) and 40px into the 100px B-C
+        // seam (40%) give different ratios, proving each seam is evaluated
+        // by its own geometry rather than one shared width.
+        let (ab, _) = evaluator.transfer(1, 1800.0, 500.0, 1.0, 0.0, 1.0);
+        let (bc, _) = evaluator.transfer(1, 3620.0, 500.0, 1.0, 0.0, 1.0);
+        assert_ne!(ab, bc, "the two seams must not share one ratio");
+        assert_eq!(ab, 64); // B is 40/160 = 25% of the way in from A's side.
+        assert_eq!(bc, 154); // B is 1 - 40/100 = 60% of the way in from C's side.
     }
 
     #[test]
     fn rows_can_overlap_differently_from_columns() {
         // The 2x2 the redesign asked for: the top pair overlaps 160 in x,
-        // the rows overlap 90 in y. Corners come out as the product of the
-        // horizontal and vertical ramps; no diagonal ramp is generated.
+        // the rows overlap 90 in y. The synthesized layout carries all four
+        // rectangles, so `layout::Evaluator` derives each seam from them —
+        // no diagonal cross-term, since the rule is per-edge distance.
         let plan = canvas_plan(
             &[
                 participant("A", 0, 0, 1920, 1080),
@@ -931,23 +831,16 @@ mod tests {
         .unwrap();
 
         assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 2070));
-        for slice in &plan.slices {
-            assert_eq!(
-                slice.ramps.len(),
-                2,
-                "{} should fade on exactly two edges",
-                slice.output
-            );
-        }
-        let a = &plan.slices[0];
-        let horizontal = a.ramps.iter().find(|r| r.fade_to == FadeTo::Right).unwrap();
-        let vertical = a
-            .ramps
-            .iter()
-            .find(|r| r.fade_to == FadeTo::Bottom)
-            .unwrap();
-        assert_eq!(horizontal.rect.width, 160);
-        assert_eq!(vertical.rect.height, 90);
+        assert_eq!(plan.layout.as_ref().unwrap().participants.len(), 4);
+        let evaluator = evaluator_for(&plan);
+        // At the symmetric four-way corner (midpoint of both seams), every
+        // participant carries an equal quarter of the light.
+        let (mid, _) = evaluator.transfer(0, 1840.0, 1035.0, 2.0, 0.0, 1.0);
+        let expected = (0.25f64).powf(0.5);
+        assert!(
+            ((mid as f64 / 256.0) - expected).abs() < 0.02,
+            "corner multiplier was {mid}"
+        );
     }
 
     #[test]
@@ -987,9 +880,6 @@ mod tests {
 
         assert_eq!((plan.canvas_width, plan.canvas_height), (3840, 1080));
         assert_eq!(plan.slices.len(), 2);
-        // Nothing intersects, so nothing fades: blending is still on, it
-        // simply has no seam to shape.
-        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
         assert_eq!(
             plan.slices[0].source,
             Rect {
@@ -1008,6 +898,11 @@ mod tests {
                 height: 1080
             }
         );
+        // Nothing overlaps (the two only touch), so nothing fades: blending
+        // is still on, it simply has no seam to shape either side of.
+        let evaluator = evaluator_for(&plan);
+        assert_eq!(evaluator.transfer(0, 500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
+        assert_eq!(evaluator.transfer(1, 3500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
     }
 
     #[test]
@@ -1036,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn the_canvas_normalises_wherever_the_layout_was_drawn() {
+    fn the_canvas_normalizes_wherever_the_layout_was_drawn() {
         // An operator who drew the layout starting at 500,300 still gets a
         // canvas anchored at zero.
         let plan = canvas_plan(
@@ -1054,9 +949,11 @@ mod tests {
     }
 
     #[test]
-    fn a_full_mirror_is_duplicated_but_never_ramped() {
+    fn a_full_mirror_is_duplicated_but_never_blended() {
         // Two projectors stacked for brightness, or a confidence monitor:
-        // both show the region at full strength.
+        // both show the region at full strength — the synthesized layout's
+        // near-total overlap is classified a stack by
+        // `crate::model::geometry::validate_sources`, same as a warp canvas.
         let plan = canvas_plan(
             &[
                 participant("MAIN", 0, 0, 1920, 1080),
@@ -1066,8 +963,10 @@ mod tests {
             Slicing::WhenOverlapping,
         )
         .unwrap();
-        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
         assert_eq!(plan.slices[0].source, plan.slices[1].source);
+        let evaluator = evaluator_for(&plan);
+        assert_eq!(evaluator.transfer(0, 500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
+        assert_eq!(evaluator.transfer(1, 500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
     }
 
     #[test]
@@ -1085,7 +984,11 @@ mod tests {
             Slicing::WhenOverlapping,
         )
         .unwrap();
-        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
+        assert!(!plan.layout.as_ref().unwrap().blend);
+        let evaluator = evaluator_for(&plan);
+        // Every covered point gets full weight, seam or not.
+        assert_eq!(evaluator.transfer(0, 1840.0, 500.0, 1.0, 0.0, 1.0).0, 256);
+        assert_eq!(evaluator.transfer(1, 1840.0, 500.0, 1.0, 0.0, 1.0).0, 256);
 
         // And with no projection section at all, the same.
         let plan = canvas_plan(
@@ -1097,13 +1000,82 @@ mod tests {
             Slicing::WhenOverlapping,
         )
         .unwrap();
-        assert!(plan.slices.iter().all(|slice| slice.ramps.is_empty()));
+        assert!(!plan.layout.as_ref().unwrap().blend);
     }
 
-    // --- the per-pixel transfer -------------------------------------------
+    // --- disconnected legacy layouts (P3, review A8/`layout.rs:177`) ------
 
     #[test]
-    fn seam_light_sums_to_one_through_the_transfer() {
+    fn two_outputs_with_a_gap_still_get_a_canvas_plan() {
+        // Before `layout::Evaluator` became the sole blend-weight rule, two
+        // outputs with a deliberate gap between them (no overlap, no shared
+        // edge) got a canvas plan with no seam to compute. `Slicing::Always`
+        // is what a caller building a plan for direct scanout — not only
+        // for overlap — uses; `WhenOverlapping` would already reject this
+        // pair before reaching `Evaluator::new` (see the "must overlap"
+        // check above), so it would not exercise the fix here.
+        let plan = canvas_plan_with_warp_activation(
+            &[
+                participant("L", 0, 0, 1920, 1080),
+                // A 100px gap: L ends at x=1920, R starts at x=2020.
+                participant("R", 2020, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+            Slicing::Always,
+            false,
+        )
+        .expect("a gap must not cost the pair its canvas plan");
+        assert_eq!(plan.slices.len(), 2);
+        let layout = plan
+            .layout
+            .as_ref()
+            .expect("a layout is always synthesized");
+        assert_eq!(layout.participants.len(), 2);
+        let evaluator = evaluator_for(&plan);
+        // Disconnected groups simply never blend with each other: each
+        // source's own region is untouched, full weight, no seam.
+        assert_eq!(evaluator.transfer(0, 900.0, 500.0, 1.0, 0.0, 1.0).0, 256);
+        assert_eq!(evaluator.transfer(1, 2900.0, 500.0, 1.0, 0.0, 1.0).0, 256);
+        // The gap itself belongs to neither source.
+        assert_eq!(evaluator.transfer(0, 1960.0, 500.0, 1.0, 0.0, 1.0).0, 0);
+    }
+
+    #[test]
+    fn three_outputs_where_only_two_overlap_keep_their_shared_canvas_plan() {
+        // A and B overlap (and so are connected to each other); C sits in a
+        // separate, disconnected group of its own — a realistic "two walls,
+        // one daemon" installation, not merely two isolated pairs.
+        let plan = canvas_plan_with_warp_activation(
+            &[
+                participant("A", 0, 0, 1920, 1080),
+                participant("B", 1760, 0, 1920, 1080),
+                participant("C", 5000, 0, 1920, 1080),
+            ],
+            Some(&blending()),
+            Slicing::Always,
+            false,
+        )
+        .expect("one disconnected group must not cost the others their plan");
+        assert_eq!(plan.slices.len(), 3);
+        let layout = plan
+            .layout
+            .as_ref()
+            .expect("a layout is always synthesized");
+        assert_eq!(layout.participants.len(), 3);
+        let evaluator = evaluator_for(&plan);
+        // A and B still share their seam exactly as the connected-pair test
+        // above checks (same geometry, same expected split).
+        assert_eq!(evaluator.transfer(0, 1840.0, 500.0, 1.0, 0.0, 1.0).0, 128);
+        assert_eq!(evaluator.transfer(1, 1840.0, 500.0, 1.0, 0.0, 1.0).0, 128);
+        // C, disconnected from both, keeps full weight throughout its own
+        // region — nothing about A/B's seam reaches across the gap.
+        assert_eq!(evaluator.transfer(2, 5900.0, 500.0, 1.0, 0.0, 1.0).0, 256);
+    }
+
+    // --- the per-pixel transfer through the synthesized layout ------------
+
+    #[test]
+    fn seam_light_sums_to_one_through_the_layout() {
         let plan = canvas_plan(
             &[
                 participant("L", 0, 0, 1920, 1080),
@@ -1114,11 +1086,11 @@ mod tests {
         )
         .unwrap();
         let gamma = 2.2;
-        let left = &plan.slices[0];
-        let right = &plan.slices[1];
+        let evaluator = evaluator_for(&plan);
         for offset in 0..160 {
-            let (a_left, _) = pixel_transfer(&left.ramps, gamma, 0.0, 1760 + offset, 500);
-            let (a_right, _) = pixel_transfer(&right.ramps, gamma, 0.0, offset, 500);
+            let x = 1760.0 + offset as f64;
+            let (a_left, _) = evaluator.transfer(0, x, 500.0, gamma, 0.0, 1.0);
+            let (a_right, _) = evaluator.transfer(1, x, 500.0, gamma, 0.0, 1.0);
             let light = (a_left as f64 / 256.0).powf(gamma) + (a_right as f64 / 256.0).powf(gamma);
             assert!(
                 (light - 1.0).abs() < 0.03,
@@ -1126,28 +1098,19 @@ mod tests {
             );
         }
         // Outside the seam: identity.
-        assert_eq!(pixel_transfer(&left.ramps, gamma, 0.0, 800, 500), (256, 0));
-    }
-
-    /// The lift a slice applies at a global canvas point, as the slicer
-    /// resolves it: coverage over the whole layout, then the local pixel.
-    fn lift_at(plan: &CanvasPlan, slice: &SliceSpec, black_lift: f64, gx: i32, gy: i32) -> u8 {
-        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
-        let lift = coverage.lift(black_lift, f64::from(gx) + 0.5, f64::from(gy) + 0.5);
-        pixel_transfer(
-            &slice.ramps,
-            2.2,
-            lift,
-            gx - slice.source.x,
-            gy - slice.source.y,
-        )
-        .1
+        assert_eq!(
+            evaluator.transfer(0, 800.0, 500.0, gamma, 0.0, 1.0),
+            (256, 0)
+        );
     }
 
     #[test]
     fn black_lift_applies_outside_seams_only() {
-        // Two projectors: coverage is 1 or 2, so the general rule collapses
-        // to the original one — full lift outside, none inside.
+        // Two projectors: physical coverage is 1 or 2, so the general rule
+        // collapses to the original one — full lift outside, none inside —
+        // and `layout::Evaluator` resolves both the seam and the lift from
+        // the same synthesized layout (legacy layouts get real black-lift
+        // coverage counting too, not just a warp canvas).
         let plan = canvas_plan(
             &[
                 participant("L", 0, 0, 1920, 1080),
@@ -1157,23 +1120,21 @@ mod tests {
             Slicing::WhenOverlapping,
         )
         .unwrap();
-        let left = &plan.slices[0];
-        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
-        assert_eq!(coverage.max(), 2);
+        let evaluator = evaluator_for(&plan);
+        assert_eq!(evaluator.maximum(), 2);
 
         // Outside: out = lift + (1-lift)*in.
-        let lift = coverage.lift(0.1, 800.5, 500.5);
-        let (a, b) = pixel_transfer(&left.ramps, 2.2, lift, 800, 500);
+        let (a, b) = evaluator.transfer(0, 800.5, 500.5, 2.2, 0.1, 1.0);
         assert_eq!(b, 26, "lift offset should be 0.1*255");
         assert_eq!(a, 230, "multiplier should be (1-0.1)*256");
         // Inside the seam: no lift, the doubled projector black is the lift.
-        assert_eq!(lift_at(&plan, left, 0.1, 1840, 500), 0);
+        assert_eq!(evaluator.transfer(0, 1840.5, 500.5, 2.2, 0.1, 1.0).1, 0);
     }
 
     #[test]
     fn a_grid_lifts_every_region_by_its_own_shortfall() {
         // A 2×2 with 160px overlaps both ways. Three black floors exist —
-        // one, two and four projectors — and only the four-way centre is
+        // one, two and four projectors — and only the four-way center is
         // already at the worst of them.
         let plan = canvas_plan(
             &[
@@ -1186,84 +1147,26 @@ mod tests {
             Slicing::WhenOverlapping,
         )
         .unwrap();
-        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
-        assert_eq!(coverage.max(), 4, "the centre is lit by all four");
-        assert_eq!(coverage.at(500.5, 500.5), 1);
-        assert_eq!(coverage.at(1840.5, 500.5), 2);
-        assert_eq!(coverage.at(1840.5, 1000.5), 4);
+        let evaluator = evaluator_for(&plan);
+        assert_eq!(evaluator.maximum(), 4, "the center is lit by all four");
 
-        // L·(N−n)/n with L = 0.05: a lone projector makes up three floors on
-        // its own, each of a seam's pair makes up one, the centre none.
-        assert!((coverage.lift(0.05, 500.5, 500.5) - 0.15).abs() < 1e-9);
-        assert!((coverage.lift(0.05, 1840.5, 500.5) - 0.05).abs() < 1e-9);
-        assert_eq!(coverage.lift(0.05, 1840.5, 1000.5), 0.0);
-
-        // And the centre is the one region the old binary rule got wrong: it
-        // sits inside ramps, so it must still receive no lift while the
-        // two-way seams around it — also inside ramps — now do.
-        let tl = &plan.slices[0];
-        assert_eq!(lift_at(&plan, tl, 0.05, 1840, 1000), 0, "four-way centre");
-        assert_eq!(lift_at(&plan, tl, 0.05, 1840, 500), 13, "two-way seam");
-        assert_eq!(lift_at(&plan, tl, 0.05, 500, 500), 38, "single projector");
-    }
-
-    #[test]
-    fn total_black_is_even_across_a_grid() {
-        // The point of the exercise: every region emits the same black.
-        // In units of one projector's black, a point lit by n projectors
-        // emits n, and each of them adds its lift on top.
-        let plan = canvas_plan(
-            &[
-                participant("TL", 0, 0, 1920, 1080),
-                participant("TR", 1760, 0, 1920, 1080),
-                participant("BL", 0, 920, 1920, 1080),
-                participant("BR", 1760, 920, 1920, 1080),
-            ],
-            Some(&blending()),
-            Slicing::WhenOverlapping,
-        )
-        .unwrap();
-        let coverage = Coverage::new(plan.slices.iter().map(|s| s.source));
-        let emitted = |x: f64, y: f64| {
-            let n = f64::from(coverage.at(x, y));
-            // Each projector emits its own black plus the lift it applies.
-            n * (1.0 + coverage.lift(0.05, x, y) / 0.05)
-        };
-        let centre = emitted(1840.5, 1000.5);
-        for (x, y, label) in [
-            (500.5, 500.5, "single"),
-            (1840.5, 500.5, "vertical seam"),
-            (500.5, 1000.5, "horizontal seam"),
-        ] {
-            let here = emitted(x, y);
-            assert!(
-                (here - centre).abs() < 1e-9,
-                "{label} emits {here}, centre emits {centre}"
-            );
-        }
-    }
-
-    #[test]
-    fn corner_regions_multiply_their_ramps() {
-        let plan = canvas_plan(
-            &[
-                participant("A", 0, 0, 1920, 1080),
-                participant("B", 1760, 0, 1920, 1080),
-                participant("C", 0, 990, 1920, 1080),
-                participant("D", 1760, 990, 1920, 1080),
-            ],
-            Some(&blending()),
-            Slicing::WhenOverlapping,
-        )
-        .unwrap();
-        // Slice A, mid-corner: both ramps at half strength -> product 0.25
-        // of the light, signal multiplier 0.25^(1/gamma).
-        let a = &plan.slices[0];
-        let (mid, _) = pixel_transfer(&a.ramps, 2.0, 0.0, 1840, 1035);
-        let expected = (0.25f64).powf(0.5);
-        assert!(
-            ((mid as f64 / 256.0) - expected).abs() < 0.02,
-            "corner multiplier was {mid}"
+        // And the center is the one region the old binary rule got wrong: it
+        // sits inside the blend, so it must still receive no lift while the
+        // two-way seams around it — also inside the blend — now do.
+        assert_eq!(
+            evaluator.transfer(0, 1840.0, 1000.0, 1.0, 0.05, 1.0).1,
+            0,
+            "four-way center"
+        );
+        assert_eq!(
+            evaluator.transfer(0, 1840.0, 500.0, 1.0, 0.05, 1.0).1,
+            13,
+            "two-way seam"
+        );
+        assert_eq!(
+            evaluator.transfer(0, 500.0, 500.0, 1.0, 0.05, 1.0).1,
+            38,
+            "single projector"
         );
     }
 
@@ -1284,38 +1187,29 @@ mod tests {
             },
         );
         assert_eq!(specs.len(), 2);
-        assert!(specs.iter().all(|spec| spec.ramps.is_empty()));
     }
 
-    // --- the overlay pixel paths (unchanged math, kept honest) -------------
-
-    fn ramp_only_spec(gamma: f64, width: i32) -> OverlaySpec {
-        OverlaySpec {
-            output: "DP-1".into(),
-            gamma,
-            black_lift: 0.0,
-            rect: Rect::default(),
-            pattern: None,
-            canvas_size: None,
-            ramps: vec![RampSpec {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width,
-                    height: 1,
-                },
-                fade_to: FadeTo::Right,
-            }],
-        }
-    }
+    // --- the overlay pixel paths (no seams: the no-canvas path never has
+    //     one) ---------------------------------------------------------
 
     #[test]
-    fn gamma_shapes_the_alpha() {
-        let map = alpha_map(100, 1, &ramp_only_spec(2.2, 100));
-        let mid = map[50] as f64 / 255.0;
-        assert!((mid - 0.27).abs() < 0.02, "alpha at midpoint was {mid}");
-        assert!(map[0] <= 1);
-        assert!(map[99] >= 220);
+    fn a_plain_overlay_is_fully_transparent() {
+        let spec = OverlaySpec {
+            output: "DP-1".into(),
+            gamma: 2.2,
+            black_lift: 0.0,
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 1,
+            },
+            source_rect: None,
+            pattern: None,
+            canvas_size: None,
+        };
+        let pixels = pixel_map(100, 1, &spec);
+        assert!(pixels.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1330,19 +1224,44 @@ mod tests {
                 width: 100,
                 height: 1,
             },
+            source_rect: None,
             pattern: Some(TestPattern::White),
             canvas_size: None,
-            ramps: Vec::new(),
         };
         let pixels = pixel_map(100, 1, &spec);
         assert!((0..100).all(|x| pixels[x * 4 + 3] == 255));
     }
 
     #[test]
-    fn the_slicer_spec_serialises_stably() {
+    fn the_slicer_spec_serializes_stably() {
         // The spec crosses a process boundary as JSON; field names are ABI.
         let spec = SlicerSpec {
-            layout: None,
+            // Round binary fractions, deliberately not derived from the
+            // canvas dimensions below: serde_json's default (non-
+            // `float_roundtrip`) float parser is not guaranteed exact to the
+            // last bit for an arbitrary repeating decimal, so this ABI
+            // stability check picks values with an exact `f64` JSON
+            // round-trip rather than fighting that unrelated precision
+            // question.
+            layout: Some(LayoutSpec {
+                aspect: 2.0,
+                blend: true,
+                participants: vec![LayoutParticipant {
+                    output: "DP-3".into(),
+                    source: CanvasRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.5,
+                        height: 0.25,
+                    },
+                    raster_footprint: CanvasRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 0.5,
+                        height: 0.25,
+                    },
+                }],
+            }),
             coverage_rects: Vec::new(),
             control_session: String::new(),
             source: "HEADLESS-1".into(),
@@ -1364,35 +1283,15 @@ mod tests {
                     width: 1920,
                     height: 1080,
                 },
-                ramps: vec![RampSpec {
-                    rect: Rect {
-                        x: 1760,
-                        y: 0,
-                        width: 160,
-                        height: 1080,
-                    },
-                    fade_to: FadeTo::Right,
-                }],
             }],
         };
         let json = serde_json::to_string(&spec).unwrap();
         assert!(json.contains(r#""canvasWidth":3680"#), "{json}");
-        assert!(json.contains(r#""fadeTo":"right""#), "{json}");
         assert!(json.contains(r#""renderer":"auto""#), "{json}");
+        assert!(json.contains(r#""layout":{"#), "{json}");
+        assert!(json.contains(r#""participants":["#), "{json}");
         let back: SlicerSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
-    }
-
-    // Frozen pre-warp arithmetic from dbdd174. Keep independent of the new
-    // continuous evaluator so two new paths agreeing cannot conceal drift.
-    fn legacy_transfer(ramps: &[RampSpec], gamma: f64, lift: f64, x: i32, y: i32) -> (u16, u8) {
-        let transmitted = ramps_attenuation(ramps, x as f64 + 0.5, y as f64 + 0.5)
-            .map_or(1.0, |t| t.clamp(0.0, 1.0).powf(1.0 / gamma));
-        let lift = lift.clamp(0.0, 1.0);
-        (
-            ((1.0 - lift) * transmitted * 256.0).round() as u16,
-            (lift * 255.0).round() as u8,
-        )
     }
 
     fn channel((a, b): (u16, u8), input: u32) -> u8 {
@@ -1400,76 +1299,7 @@ mod tests {
     }
 
     #[test]
-    fn continuous_identity_retains_legacy_coefficients_and_every_input_byte() {
-        let rect = Rect {
-            x: 2,
-            y: 1,
-            width: 7,
-            height: 5,
-        };
-        let all: Vec<_> = [FadeTo::Left, FadeTo::Right, FadeTo::Top, FadeTo::Bottom]
-            .into_iter()
-            .map(|fade_to| RampSpec { rect, fade_to })
-            .collect();
-        // All ramp directions, multiplied corners, and points outside seams.
-        for ramps in [
-            vec![],
-            vec![all[0].clone()],
-            vec![all[1].clone()],
-            vec![all[2].clone()],
-            vec![all[3].clone()],
-            vec![all[1].clone(), all[3].clone()],
-        ] {
-            for gamma in [1.0, 1.8, 2.2, 2.4, 4.0] {
-                // Include clamp limits, rounding ties, and saturated lift.
-                for lift in [-0.1, 0.0, 0.05, 0.1, 0.5, 0.75, 1.0, 1.1] {
-                    for y in 0..8 {
-                        for x in 0..11 {
-                            let expected = legacy_transfer(&ramps, gamma, lift, x, y);
-                            let actual = transfer_at(
-                                &ramps,
-                                gamma,
-                                lift,
-                                x as f64 + 0.5,
-                                y as f64 + 0.5,
-                                1.0,
-                            );
-                            assert_eq!(actual, expected, "x={x} y={y} gamma={gamma} lift={lift}");
-                            assert_eq!(pixel_transfer(&ramps, gamma, lift, x, y), expected);
-                            for input in 0..=255 {
-                                assert_eq!(channel(actual, input), channel(expected, input));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn continuous_ramps_use_the_fractional_source_point_without_an_added_half_pixel() {
-        let rect = Rect {
-            x: 2,
-            y: 3,
-            width: 4,
-            height: 2,
-        };
-        for (fade_to, expected) in [
-            (FadeTo::Left, 80),
-            (FadeTo::Right, 176),
-            (FadeTo::Top, 32),
-            (FadeTo::Bottom, 224),
-        ] {
-            let ramp = RampSpec { rect, fade_to };
-            assert_eq!(
-                transfer_at(&[ramp], 1.0, 0.0, 3.25, 3.25, 1.0),
-                (expected, 0)
-            );
-        }
-    }
-
-    #[test]
-    fn border_coverage_attenuates_both_terms_before_fixed_point_rounding() {
+    fn plain_transfer_matches_the_fixed_point_contract_at_every_lift_and_edge() {
         for (edge, lift, expected) in [
             (0.0, 0.0, (0, 0)),
             (0.0, 0.5, (0, 0)),
@@ -1484,8 +1314,8 @@ mod tests {
             (1.0, 0.1, (230, 26)),
             (1.0, 1.0, (0, 255)),
         ] {
-            let actual = transfer_at(&[], 2.2, lift, 0.5, 0.5, edge);
-            assert_eq!(actual, expected);
+            let actual = pixel_transfer(lift, edge);
+            assert_eq!(actual, expected, "edge={edge} lift={lift}");
             // D2's ideal white level survives lift changes within the legacy
             // coefficient rounding plus the channel's integer truncation.
             assert!((f64::from(channel(actual, 255)) - 255.0 * edge).abs() <= 1.5);
@@ -1495,6 +1325,9 @@ mod tests {
                 }
             }
         }
+        // Lift outside [0, 1] clamps rather than under/overflowing.
+        assert_eq!(pixel_transfer(-0.1, 1.0), (256, 0));
+        assert_eq!(pixel_transfer(1.1, 1.0), (0, 255));
     }
 
     #[test]
@@ -1518,7 +1351,7 @@ mod tests {
         }
         let saturated = coverage.lift(0.5, 1.5, 1.5);
         assert_eq!(saturated, 1.0); // k=3, L*k=1.5
-        assert_eq!(transfer_at(&[], 2.2, saturated, 1.5, 1.5, 0.5), (0, 128));
+        assert_eq!(pixel_transfer(saturated, 0.5), (0, 128));
     }
 
     #[test]

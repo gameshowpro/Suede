@@ -37,7 +37,7 @@ impl MockAudio {
         }
     }
 
-    /// Two HDMI sinks, one audio input and one video input, modelled on a
+    /// Two HDMI sinks, one audio input and one video input, modeled on a
     /// Magewell USB capture device, so `--mock` and the smoke test exercise
     /// all three lists.
     pub fn with_devices() -> Self {

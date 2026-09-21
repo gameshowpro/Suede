@@ -90,7 +90,7 @@ PLAYWRIGHT_BROWSERS_PATH=/tmp/suede-ui-tests/browsers \
 node tests/ui/warp-source.cjs
 ```
 
-The retained [`packet7_private.py`](../../research/warp/packet7_private.py)
+The retained `packet7_private.py` (internal research record, not published)
 starts a temporary production daemon, managed Chromium source, and separate
 headless Sway on brain. Stage it, the selected candidate as `suede`, and the
 source fixture as `warp-source.html` in a fresh `/tmp/suede-packet7-*` directory,
@@ -104,6 +104,10 @@ Suede's real child supervision and window placement.
 
 Forward the private daemon and CDP ports to the controller machine, then run:
 (Replace the run ID and SHA-256 placeholders with the verified session values.)
+
+The `research/warp/` harness scripts named below are local research tooling and
+are not part of this repository; this section records how the live session was
+driven, for whoever holds them.
 
 ```sh
 NODE_PATH=/tmp/suede-ui-tests/node_modules \
@@ -128,5 +132,5 @@ exit can mean the requested target scope was not measured. Read its JSON.
 Private headless receipts and local fixture passes do not close physical-rig,
 touch, optical, or manual gates. Keep operator identity, date, workload,
 candidate hash, observation, and raw evidence for each manual item in the
-[Packet 7 record](../../research/warp/PACKET7.md). Pi testing remains on hold
+Packet 7 record (internal research record, not published). Pi testing remains on hold
 until all required brain acceptance, including manual checks, is complete.

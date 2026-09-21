@@ -290,8 +290,7 @@
     "mode": "warp",
     "canvas": {
       "aspect": 7.111111111111111,
-      "renderWidth": 7680,
-      "scale": 1.0
+      "renderWidth": 7680
     },
     "blend": true,
     "gamma": 2.2,

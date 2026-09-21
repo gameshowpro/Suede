@@ -30,7 +30,7 @@ WatchdogSec=45s
 # Abort rather than terminate when the watchdog fires, so the stuck process
 # leaves a core behind. A restart that discards the evidence buys uptime at
 # the cost of never learning why - and this took a debugger on a live
-# appliance to characterise the first time.
+# appliance to characterize the first time.
 WatchdogSignal=SIGABRT
 # Suede waits for the sway socket itself, so a restart loop is not a busy loop.
 Restart=always

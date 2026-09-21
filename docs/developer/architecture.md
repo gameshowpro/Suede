@@ -14,7 +14,9 @@ src/
 ├── config.rs         Bootstrap configuration: file + SUEDE_* overrides
 ├── model/
 │   ├── observed.rs   What sway and PipeWire report
-│   └── desired.rs    The document clients write, and its validation
+│   ├── desired.rs    The document clients write, and its validation
+│   ├── geometry.rs   Canvas/output geometry: source rects, corner pins, center remap
+│   └── black_lift.rs Fixed and adaptive black-lift configuration
 ├── sway/
 │   ├── protocol.rs   IPC framing
 │   ├── raw.rs        Sway's JSON shapes, and the mapping into the model
@@ -23,8 +25,25 @@ src/
 ├── audio/
 │   ├── pw.rs         PipeWire via pw-dump / pw-cli
 │   └── mock.rs       In-memory monitor
-├── state.rs          Atomic persistence with a .bak fallback
+├── state.rs          Atomic persistence with a .bak fallback; repairs an old or invalid document instead of refusing to boot
 ├── snapshot.rs       Shared live view of outputs, windows, and status
+├── projection_policy.rs  Warp capability gating: when Warp is allowed to be effective
+├── projection/        Canvas slicing, edge blending, and Warp geometry (feature `projection`)
+│   ├── mod.rs          Module overview and the capture→blend→present pipeline
+│   ├── manager.rs      `BlendManager`: owns the slicer child process (spawn, control, restart) and per-output blend-overlay processes
+│   ├── slicer.rs       The `suede slice` child binary: capture, blend, present loop
+│   ├── control.rs      Versioned stdin/stdout control protocol to the slicer child
+│   ├── layout.rs       `Evaluator`: seam distance and blend-weight computation
+│   ├── warp.rs         Per-output homography and center remap math
+│   ├── warp_update.rs  Output-local transfer/geometry table builds
+│   ├── blend.rs        Canvas planning and blend-weight activation
+│   ├── seam_oracle.rs  Independent test-only cross-check for blend weights
+│   ├── gpu.rs          Vulkan capture/blend path, queue priority negotiation
+│   ├── gpu_readback.rs `#[cfg(test)]` GPU readback harness, not production
+│   ├── adaptive.rs     Adaptive black-lift measurement and control
+│   ├── pattern.rs      Built-in test patterns (grid, warp-alignment, sync, …)
+│   ├── overlay.rs      The `suede blend` child binary: a per-output layer-shell overlay for test-pattern-only bench alignment when no canvas is running — actual seam blending lives in the slicer now
+│   └── dmabuf.rs       dmabuf plumbing shared between the Wayland side (`slicer.rs`) and the Vulkan side (`gpu.rs`)
 ├── reconciler/
 │   ├── plan.rs       Pure diff: (observed, desired) → commands
 │   └── mod.rs        The pass, the task loop, event forwarding
@@ -34,6 +53,7 @@ src/
 ├── checks/           Environment health checks and remediations
 ├── events.rs         SSE fan-out
 └── api/              axum routers, handlers, OpenAPI, embedded web UI
+    └── projection.rs   `/projection/recommendation` handlers and the layout-recommendation engine
 ```
 
 ## Boundaries that matter
@@ -59,14 +79,16 @@ The executor in `reconciler/mod.rs` runs the plan. Splitting them is what makes 
 ## The reconciliation pass
 
 1. Re-query outputs.
-2. Diff against desired state; issue only the commands for fields that differ.
-3. If any output was enabled or disabled, wait for the layout to settle, then re-query.
-4. Resolve each app to its target output and workspace.
-5. Start, stop, or restart applications accordingly.
-6. Ensure the null audio sink exists, if any app routes to silence.
-7. Hide and park the cursor.
-8. Re-query windows, place any that are newly mapped, run the watchdog.
-9. Publish status.
+2. Plan the canvas: decide Warp capability (`projection_policy::status`), validate warp geometry, and compute the canvas/slicing plan. The configured layout lives in canvas space and may overlap; sway must only ever be handed a plain tiling, so this happens before the output plan.
+3. Diff the resulting (non-overlapping) output layout against desired state; issue only the commands for fields that differ, in one batched Sway IPC message.
+4. If any output was enabled or disabled, wait for the layout to settle, then re-query. A plain move is also re-observed before anything downstream derives geometry from it.
+5. Run the projection pass: size the headless canvas and start, update, or stop the slicer child now that observed output geometry is settled. This decides which output (if any) the active app renders into.
+6. Resolve exactly one app — `desired.activeApp` — to its target output and workspace; it always covers the whole canvas. Per-app placement fields no longer exist; there is nothing to resolve per display.
+7. Start, stop, or restart that application accordingly.
+8. Ensure the null audio sink exists, if the app routes to silence.
+9. Hide and park the cursor.
+10. Re-query windows, place any that are newly mapped, run the watchdog.
+11. Publish status.
 
 A failed command is logged, recorded as a divergence, and retried next pass. A pass never aborts the daemon and never discards desired state.
 
@@ -85,8 +107,33 @@ There is one subtlety worth knowing: enabling an output resets everything Sway k
 | Sway event pump | Reconnects with backoff, forwards events to the trigger |
 | PipeWire monitor | `pw-dump --monitor` as a change trigger, debounced |
 | Health checks | Re-evaluated every 60 seconds |
+| Boot capability probe | `api::capabilities::boot_measure`, spawned once at startup to establish initial GPU/warp capability before the first pass needs it |
+| systemd liveness watchdog | `watchdog::feed`, feeds `sd_notify(WATCHDOG=1)` for as long as the daemon's async runtime is still turning — separate from the per-app content watchdog, which lives in the supervisor |
+| Slicer control writer (`projection/manager.rs`) | A dedicated blocking thread owning the slicer child's stdin pipe, so a slow write never blocks reconciliation |
+| Slicer stats reader (`projection/manager.rs`) | A dedicated thread reading the slicer child's stdout for capability events and stats, independent of the control writer |
 
 Triggers are coalesced: a burst of events produces one pass. The trigger channel has capacity one, and a full channel means a pass is already pending, so requesting is never blocking.
+
+### The state store's two locks
+
+`StateStore` (`state.rs`) splits "what is live" from "what is on disk" into
+two locks taken in a fixed order, never nested. `documents`, a `RwLock`,
+holds the current and (if one is live) preview document; a `prepare` closure
+runs under it to read anything a validator needs — capability status, the
+bootstrap overlap policy — before the transition, so nothing that touches
+disk, a capability probe, or another lock is ever reached while `documents`
+is held. `writer`, a separate `Mutex`, owns everything about the file on
+disk and is taken only after `documents` is released: `flush` copies the
+newest document out under a brief read guard, drops it, and only then
+persists. Saves are serialized by `writer` and ordered by revision, so a
+flush that finds a newer revision already on disk does nothing — an earlier
+revision can never overwrite a later one no matter how the executor
+schedules the flushes. Handlers run persistence through `spawn_blocking`
+(the fsync of even a 4 kB file is still a blocking syscall), so a slow disk
+never stalls the async executor or an `effective()` reader. If a save fails,
+memory wins: the write stays live and the reconciler keeps driving toward
+it, and `StateStore::persist_failure` reports a `state_not_persisted`
+divergence until a later save reaches disk.
 
 ## Testing
 
@@ -100,7 +147,11 @@ CI has no compositor, so the architecture is built around that constraint rather
 | API | `tower::ServiceExt::oneshot` against the router, with mock backends |
 | Persistence | Temp directories; corruption and migration paths included |
 | OpenAPI | Snapshot test, so every endpoint change is a reviewable diff |
+| Documentation links | `tests/docs_links.rs` resolves every `"page/#anchor"` string literal named in `src/checks/mod.rs` and `src/model/observed.rs` against the actual docs tree |
+| GPU-gated | `#[ignore]`d by default; `SUEDE_GPU_TEST=1 cargo test -- --ignored` runs them against whatever Vulkan device the machine actually has |
+| Web UI (Warp editor) | `tests/ui/*.cjs`, driven by Playwright against a real browser — not run by CI; a manual step documented in `tests/ui/README.md` |
 | End to end | `scripts/smoke-test.sh` drives a running daemon over HTTP |
+| Spelling | `scripts/check-en-us.sh` fails on en-GB spelling in a tracked text file; runs in CI and in `scripts/dev-check.sh` |
 
 The smoke test is the one that catches what unit tests structurally cannot: it starts the real binary, kills a supervised process to prove it relaunches, restarts the daemon to prove configuration survives, and diffs `suede openapi` against the served document.
 
@@ -119,9 +170,9 @@ Two dependencies named in the original specification were replaced during implem
 
 **The web UI is build-step free.** The specification called for TypeScript compiled to static assets. It is instead one self-contained HTML file embedded with `include_str!`. A reference client's job is to be readable and to exercise every endpoint; requiring an npm toolchain in CI to ship it would be a poor trade.
 
-## Future architecture plans
+## Design records and future architecture plans
 
-For in-depth design RFCs and upcoming architectural evolutions, see the [Engineering Plans](../plans/index.md) section:
+See the [Engineering Plans](../plans/index.md) section:
 
-- [Black Offset Architecture Plan](../plans/black-offset.md): Multi-projector optical black floor compensation, non-linear dynamic roll-off, and scene-adaptive temporal contrast masking.
-- [Direct-to-Display Presentation via VK_KHR_display](../plans/VK_KHR_display.md): Bypassing the Wayland compositor to present directly to display hardware via Vulkan display extensions.
+- [Black lift](../plans/black-offset.md): a design record of the shipped `projection.blackLift` spatial-distribution and adaptive-control math, plus one related idea that was drafted but never built.
+- [Direct-to-Display Presentation via VK_KHR_display](../plans/VK_KHR_display.md): a proposed plan, not yet implemented, for bypassing the Wayland compositor to present directly to display hardware via Vulkan display extensions.

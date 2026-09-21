@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn only_outputs_carry_a_default() {
         // AudioSource and VideoSource have no `is_default` field at all;
-        // assert that by serialising and checking the key is absent, rather
+        // assert that by serializing and checking the key is absent, rather
         // than by a field access that the compiler would just refuse.
         let devices = parse_devices(DUMP_FIXTURE).unwrap();
         let json = serde_json::to_value(&devices).unwrap();

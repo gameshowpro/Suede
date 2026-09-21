@@ -234,6 +234,7 @@ daemon restart from making a reset generation counter look current.
 | `enable` | bool | `true` | `false` actively disables the output |
 | `mode` | object \| null | null | `{width, height, refreshHz}`; null leaves Sway's preferred mode, which Suede then pins — see [Adopted values](#adopted-values). A requested `refreshHz` is resolved to the nearest advertised rate within 1 Hz — see [Refresh rates](#refresh-rates) |
 | `position` | object \| null | null | `{x, y}` in the global layout |
+| `geometry` | object \| null | null | Shared canvas source crop plus retained Warp correction; see [Canvas and warp geometry](#projection-geometry) |
 | `scale` | number \| null | null | Output scale factor |
 | `transform` | string \| null | null | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`… |
 | `adaptiveSync` | bool | `false` | Variable refresh rate |
@@ -528,7 +529,7 @@ launched the app has run.
     [projection](#projection-edge-blending).
 
 !!! info "Unknown fields are refused"
-    A write naming a field Suede does not recognise is rejected outright
+    A write naming a field Suede does not recognize is rejected outright
     rather than partly applied. A typo in a key is otherwise invisible: the
     write succeeds, the setting is silently dropped, and the appliance
     quietly does something other than what was asked.
@@ -578,7 +579,7 @@ entirely yours.
 
 !!! tip "Give the outputs matching heights"
     A spanned window covers the *bounding box* of every output. Where an output
-    is shorter than its neighbours, the content below it falls outside any
+    is shorter than its neighbors, the content below it falls outside any
     display and is simply not visible.
 
 #### Launchers
@@ -624,7 +625,7 @@ entirely yours.
     ```
 
     Skipping a snap is about not choosing one by accident. Choosing one on
-    purpose is a decision, and it is honoured — `launcher.program` overrides
+    purpose is a decision, and it is honored — `launcher.program` overrides
     the search entirely:
 
     ```json
@@ -756,7 +757,7 @@ environment variables rather than command-line flags:
     measurement, the check runs once automatically — during boot, when its
     brief window is lost in the noise — and the `decode-measured` health
     check judges the result: a GPU that is software-decoding everything is a
-    warning (the silent fallback), a software rasteriser is a warning, and a
+    warning (the silent fallback), a software rasterizer is a warning, and a
     platform with no browser decode path (VideoCore) passes with the facts
     stated. With nothing changed, nothing is launched: the stored
     measurement stands. `measureCapabilitiesOnStart` in settings turns the
@@ -765,7 +766,7 @@ environment variables rather than command-line flags:
     Independent confirmation, if you want it: watch `nvidia-smi dmon -s u`
     and look at the `dec` column while a video plays.
 
-    Rasterisation, compositing, WebGL and CSS animation are a separate path and
+    Rasterization, compositing, WebGL and CSS animation are a separate path and
     generally work without any of this — check the WebGL renderer string is
     your GPU rather than `llvmpipe` or `SwiftShader`.
 
@@ -916,9 +917,9 @@ It also answers cross-origin requests from any origin, including Chromium's priv
 
 ### Projection and edge blending {: #projection-edge-blending }
 
-For two to four projectors whose beams physically overlap, **the
+For up to eight projectors whose beams physically overlap, **the
 layout is the projection configuration**. Position each output in canvas
-space exactly as its beam lands on the surface — overlapping the neighbours by
+space exactly as its beam lands on the surface — overlapping the neighbors by
 however much the rigging actually overlaps, each seam its own amount, rows
 and grids included. The canvas is the layout's bounding box, and the Displays
 tab reports it live.
@@ -980,7 +981,7 @@ Warp adds retained corner and center correction to the same content selection:
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number or object | `0.0` | Fixed compensation or optional adaptive compensation, with level 0-0.5; see below |
-| `testPattern` | string or null | null | `grid`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
+| `testPattern` | string or null | null | `grid`, `warp-alignment`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
 
@@ -1008,15 +1009,24 @@ Rise and fall time constants are 1-3,600,000 milliseconds. Slew must be
 positive and at most 10 lift units per second. All values must be finite.
 These defaults are provisional and need tuning for the installation.
 See the [complete adaptive example](examples/four-output-adaptive.json).
-For detailed mathematical derivations, forced "off" topology rules, and multi-dimensional roll-off curves, see the [Black Offset Plan](plans/black-offset.md).
+For the spatial shortfall-sharing formula, the exact adaptive target/smoothing arithmetic, and a design record of related ideas that were not built, see [Black lift](plans/black-offset.md).
 
 The statistic is mean linear luminance after sRGB decoding with Rec.709 RGB
 weights (0.2126, 0.7152, 0.0722). A regular grid of at most 256 by 256 source
 texels selects the center of each grid cell before ramps, picture borders,
 or lift. Black content and unused canvas count; allocation padding does not.
-Each completed source capture is measured once, regardless of overlapping
-outputs or their presentation rates. This sampled estimate can alias periodic
-thin lines and checkerboards; it is not the mean of every source pixel.
+This sampled estimate can alias periodic thin lines and checkerboards; it is
+not the mean of every source pixel.
+
+Measurement is asynchronous and rate-limited to roughly 8 Hz (submitted no
+more than once every 125 ms), independent of the capture and presentation
+rate and of how many outputs overlap. It never blocks the render thread: the
+GPU pass runs in its own command buffer and fence, and is collected only
+once that fence has signaled — a capture that arrives before the rate limit
+allows the next submission, or before the previous one has finished, is
+simply not the one measured. `measurementMs` in `control.blackLift` is that
+pass's submit-to-collection latency, not render-thread stall time, and
+`captureId` names the exact capture the reported sample was taken from.
 
 The target is `level * clamp((brightThreshold - luminance) /
 (brightThreshold - darkThreshold), 0, 1)`. The shared controller uses monotonic
@@ -1057,10 +1067,9 @@ Shared canvas rendering has explicit canvas and per-output geometry:
 |---|---|---|
 | `canvas.aspect` | positive number | Canvas width divided by height in isotropic canvas units |
 | `canvas.renderWidth` | integer | Chosen canvas width. It is authoritative; height is `round(renderWidth / aspect)`, at least one pixel |
-| `canvas.scale` | number | Deprecated metadata, default `1.0`; it does not control rendering or the displayed rendering percentage |
 | `geometry.source` | rectangle | The content rectangle in canvas units (`x`, `y`, `width`, `height`) |
 | `geometry.corners` | four pairs | Destination pins in output-local normalized coordinates, ordered TL, TR, BR, BL. Identity is `[[0,0],[1,0],[1,1],[0,1]]` |
-| `geometry.center` | pair | Horizontal and vertical center fractions, normally `[0.5,0.5]` |
+| `geometry.center` | pair | Horizontal and vertical center fractions, normally `[0.5,0.5]`, each constrained to `0.01..=0.99` |
 | `geometry.rasterFootprint` | rectangle | The calibrated light footprint in canvas units, independent of source placement and pin edits |
 
 Source rectangles and destination pins answer different questions. The source
@@ -1071,8 +1080,8 @@ the browser or change a neighbor's source coverage.
 
 Canvas coordinates use `[0,1] × [0,1/aspect]`. If `renderWidth` is `W`, the
 canvas height is `H = max(1, round(W/aspect))`, with positive half-way values
-rounded up; `renderWidth` remains the
-chosen allocation and `scale` is deprecated descriptive metadata. A source rectangle's
+rounded up; `renderWidth` is the chosen allocation, with no separate scale
+field. A source rectangle's
 continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`.
 Corners are normalized to the output raster and are ordered top-left,
 top-right, bottom-right, bottom-left. A shared canvas requires each enabled
@@ -1093,16 +1102,34 @@ stack. Stacks are accepted only when every pair is a stack; mixed stack/seam
 layouts are rejected. `rasterFootprint` is separate physical calibration and
 is initially copied from `source` by conversion.
 
-`POST /api/v1/projection/convert` is a read-only simple-to-warp conversion.
-Send the complete enabled participant roster in `{ "outputs": [...] }`, with
-an explicit `mode` and `position` for every enabled output, including outputs
-that are currently disconnected. Negative positions are valid. The response
-returns the bounding canvas, normalized source rectangles, identity pins,
-neutral centers, and an explicit initial footprint. Disabled outputs are
-retained in configuration but do not make a conversion incomplete. A missing
-mode or position is rejected; the candidate is never saved or applied.
+#### Retaining and clearing calibration {: #retaining-calibration }
 
-`GET /api/v1/projection/recommendation` is also read-only. It uses the
+Calibration — `canvas` and each output's `geometry` — is precious: it is the
+result of a physical alignment pass, not something a routine edit should be
+able to erase by accident. So while `projection.mode` is `simple` (including
+when there is no `projection` section at all), a `PUT` that omits `canvas`
+or an output's `geometry` **keeps the previous value** rather than clearing
+it — whether the write is a full-document `PUT /api/v1/config`, a section
+`PUT /api/v1/config/projection` or `PUT /api/v1/config/outputs`, or a
+single-output `PUT /api/v1/config/outputs/{key}`. This is what lets a Simple
+client that only ever edits, say, `blend` or `gamma` do so without knowing
+or restating the retained Warp calibration, and what lets switching from
+Warp back to Simple and back again come back to the same pins. In `warp`
+mode a `PUT` is literal: an omitted `geometry` is cleared, the same as any
+other field a `PUT` does not mention.
+
+To clear calibration explicitly regardless of mode, use the dedicated
+routes instead of a `PUT`:
+
+- `DELETE /api/v1/config/outputs/{key}/geometry` clears one output's
+  `geometry` (source crop, pins, center, and raster footprint).
+- `DELETE /api/v1/config/projection/canvas` clears the shared `canvas`.
+
+Both take the same preconditions as any other write, return the persisted
+document, and are idempotent — clearing an already-clear field still
+succeeds.
+
+`GET /api/v1/projection/recommendation` is read-only. It uses the
 effective working copy and reports its persisted `revision` and working-copy
 `generation`, a requested aspect, ideal and admissible dimensions, and
 `0.25`, `0.5`, `0.75`, and `1.0` scale presets. The ideal width samples the largest
@@ -1136,6 +1163,16 @@ frame and lifecycle statistics. It includes requested and effective mode,
 requested renderer, warp availability, a limitation reason when present, and
 whether warp settings are retained. An effective simple mode therefore does
 not imply that saved warp geometry was discarded.
+
+`geometry.effectiveMode` is the one authoritative answer to "which mode is
+actually running": it accounts for feature gating, `allowOverlaps`, and
+capability-probe hysteresis. `control.effectiveMode` looks similar but is
+only the running slicer child's own self-report of what it negotiated, with
+none of that policy layered on — read `geometry.effectiveMode` unless the
+question is specifically about the child process. Every mode field
+(`geometry.requestedMode`, `geometry.effectiveMode`, `control.requestedMode`,
+`control.effectiveMode`) and `control.outputs[].samplingMode` use the same
+lowercase strings as `projection.mode` in configuration.
 
 Complete schema examples are available for a [simple appliance](examples/four-output-appliance.json)
 and a [warp appliance](examples/four-output-warp.json). The warp example
@@ -1189,7 +1226,7 @@ reports `headless_unavailable` and tiles the layout unsliced.
 
 #### Sorting the cables out {: #identify }
 
-`identify` puts the connector's name across the whole output, on a colour
+`identify` puts the connector's name across the whole output, on a color
 derived from that name, with its size and canvas position underneath.
 
 It exists for the moment when the logical order and the physical order
@@ -1201,7 +1238,7 @@ to know which socket is lighting which projector while standing at the rack.
 The `grid` pattern names each output too, but in five-pixel text in the
 corner of every tile: legible in a photograph, useless from across a room.
 Here the name is scaled to the display, so it can be read at a glance, and
-the background colour means two projectors are never confused even when the
+the background color means two projectors are never confused even when the
 text is too far away to make out.
 
 #### Backgrounds in canvas mode {: #canvas-backgrounds }
@@ -1237,20 +1274,46 @@ use it to speak:
 - `POST /api/v1/config/revert` discards the working copy, re-applies the
   saved document, and returns it.
 
-Any committed write (including the section endpoints, which always commit)
-supersedes a live working copy. The web UI uses this grammar for the layout
-and projection editors: every edit is pushed uncommitted as it is made - the
-picture follows the numbers as you type - Save sends the same document with the
-flag set, and Cancel calls revert.
+The web UI uses this grammar for the layout and projection editors: every
+edit is pushed uncommitted as it is made - the picture follows the numbers as
+you type - Save sends the same document with the flag set, and Revert calls
+revert.
 
-`GET /api/v1/config`, `PUT /api/v1/config`, and `POST /api/v1/config/revert`
-return the exact accepted revision in `ETag` and effective working-copy identity
-in `X-Config-Generation`, plus the store instance in `X-Config-Epoch`. Send all
-three values as `If-Match`, `If-Config-Generation`, and `If-Config-Epoch` on the
-next transition. The comparison and transition are one atomic operation,
-including when another client uses a section endpoint: a late preview, Save, or
-Cancel receives `409` instead of replacing newer work or reviving a preview from
-before a daemon restart.
+`GET /api/v1/config`, every write (including the section endpoints, which
+always commit), and `POST /api/v1/config/revert` return the exact accepted
+revision in `ETag` and effective working-copy identity in
+`X-Config-Generation`, plus the store instance in `X-Config-Epoch`.
+
+**While no working copy is live**, an unconditional write — no `If-Match`,
+`If-Config-Generation`, or `If-Config-Epoch` at all — still works, so a
+script or a `curl` one-liner needs no preamble.
+
+**Once a working copy is live**, any write, preview, or revert must send
+`If-Config-Generation` naming the exact working copy it replaces (it may
+also send `If-Match` and `If-Config-Epoch`); one without it is refused with
+`409`, rather than silently discarding another client's unsaved edit. A
+write that does name it commits on that one working copy alone — never a
+hybrid of it and the last saved document — so two operators editing at once
+resolve predictably: whichever of them last read the current working copy
+can build on it and save; the other gets `409` and reloads to see what
+happened. This is one atomic check-and-transition, including when the
+write comes through a section endpoint, so a late Save or Revert can never
+replace newer work or revive a preview from before a daemon restart (the
+store's epoch changes on restart, so `If-Config-Epoch` catches that case
+too).
+
+```bash
+# A plain read establishes the working-copy identity to build on.
+curl -sD - http://appliance:9088/api/v1/config/settings -o /dev/null \
+  | grep -i x-config-generation
+# x-config-generation: 4
+
+# The next write must repeat it, or a live working copy refuses the write.
+curl -X PUT http://appliance:9088/api/v1/config/settings \
+  -H 'Content-Type: application/json' \
+  -H 'If-Config-Generation: 4' \
+  -d '{"hideCursor": false, "outputPollIntervalSeconds": 5}'
+```
 
 #### Editing geometry in the web UI {: #geometry-editor }
 
@@ -1269,12 +1332,15 @@ preserve those rectangles, pins, and physical footprints, avoiding drift on
 repeated resolution changes. Aspect edits keep crop pixel origins and content
 scale anchored, exposing unused or out-of-bounds areas for adjustment.
 
-**Arrange automatically** accepts positive integer rows/columns and overlap
-as a percentage of adjacent tile extents. It places enabled configured outputs
-in table order, including disconnected outputs with known modes, and uniformly
-fits their composition inside the chosen canvas. Disabled outputs and existing
-calibration stay unchanged. Unused canvas is visible; mixed-size grids that
-fail source topology validation are rejected. Arrangement is one unsaved edit.
+**Arrange automatically** accepts positive integer rows/columns, a Content
+scale percentage (100% is 1:1 pixel sampling), and overlap as a percentage of
+adjacent tile extents. Content scale and overlap are linked: changing either
+one recalculates the other so the arrangement fills the canvas. It places
+enabled configured outputs in table order, including disconnected outputs
+with known modes, and uniformly fits their composition inside the chosen
+canvas. Disabled outputs and existing calibration stay unchanged. Unused
+canvas is visible; mixed-size grids that fail source topology validation are
+rejected. Arrangement is one unsaved edit.
 
 Drag the four corner handles to place the picture inside the output raster.
 The four center-line handles control two shared fractions: moving either end
@@ -1285,7 +1351,7 @@ centers** and **Reset pins** are also unsaved edits. Source placement and the
 physical raster footprint have separate controls; destination pin movement
 does not change the selected browser content or its dimensions.
 
-One **Save** persists the entire Displays page; **Cancel** restores its committed
+One **Save** persists the entire Displays page; **Revert** restores its committed
 state, including canvas dimensions. Previews are serialized with both operations.
 Switching output rows retains drafts, and invalid fields block Save. If another client or a
 daemon restart changes the working copy, the editor keeps your local edits
@@ -1302,7 +1368,7 @@ Focus render width to expose 25%, 50%, 75%, and 100% buttons; keyboard or touch
 activation fills that field. Width/aspect edits preview directly and can resize
 and reflow the source browser. Rendering scale is chosen width / ideal width,
 so 50% width corresponds to approximately 25% of the pixels at fixed aspect.
-It can exceed 100% within allocation limits. Cancel restores the previous size.
+It can exceed 100% within allocation limits. Revert restores the previous size.
 
 Pin toggles promote the exact resolved mode, output scale, or transform to an
 explicit setting; unpinning returns to automatic adoption. Provenance labels
@@ -1312,30 +1378,40 @@ canonical precision: focus/blur, selection, unrelated edits, and Save do not
 round calibration. Raw config retains exact stored numbers.
 
 The editor distinguishes server acceptance from slicer installation using
-`control.appliedConfigGeneration` and the current child session. Numeric
-working-copy generations are scoped to `X-Config-Epoch`; they are not slicer
-control generations. Presentation receipt is reported per output and does not
-measure when the light became visible. Pattern changes and a Save that removes
-a diagnostic pattern preserve the stored geometry and mode.
+`control.configGeneration.applied` (the working-copy generation the current
+slicer session has actually installed) against `control.configGeneration.requested`
+and the current child session. Numeric working-copy generations are scoped to
+`X-Config-Epoch`; they are never comparable with `control.childGeneration`,
+which is the child's own protocol sequence and resets on every slicer
+restart. Presentation receipt is reported per output, in
+`control.outputs[].presentedGeneration`, and does not measure when the light
+became visible. Pattern changes and a Save that removes a diagnostic pattern
+preserve the stored geometry and mode.
 
 #### Test patterns {: #projection-test-patterns }
 
-Built into the blending component, sized automatically to each output, and
-drawn in **global** coordinates so features continue exactly across a seam:
-two aligned projectors superimpose the pattern pixel for pixel. Ramps and
-black lift apply to the pattern exactly as they would to content, so what you
-align with is what content will experience. Patterns work regardless of
-`blend`, because alignment comes first — and, being drawn globally, they are
-unaffected by the overlapping-output limitation above, which makes them the
-right tool for checking a rig before committing to a layout.
+Built into the blending component and drawn in **canvas** coordinates, so a
+canvas-anchored feature lands at the same canvas position regardless of an
+output's Content scale or source crop: two aligned projectors superimpose
+the pattern pixel for pixel. A pattern is sampled through exactly the same
+source-rectangle, warp, and blend path real content is — on both the GPU and
+CPU rendering paths, and at any Content scale, not only 100% — so what you
+align with a pattern is what content will actually experience; calibration
+done on a pattern holds once you switch back to content. Ramps and black
+lift apply to the pattern the same way. Patterns work regardless of `blend`,
+because alignment comes first — and, being canvas-anchored rather than
+per-output, they are unaffected by the overlapping-output limitation above,
+which makes them the right tool for checking a rig before committing to a
+layout.
 
 | Pattern | For |
 |---|---|
-| `grid` | Geometry, focus, and seam alignment: 100 px color tiles with crosses, each labelled with its global pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
+| `grid` | Geometry, focus, and seam alignment: 100 px color tiles with crosses, each labeled with its canvas pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
+| `warp-alignment` | Corner and center-pin calibration: 10% grid lines and a center alignment circle on dark gray, drawn in canvas space so the same lines line up across outputs regardless of each one's source crop. |
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |
-| `sync` | Measuring output-to-output presentation sync with a camera. Every output shows the *same* two-digit counter, drawn by the blending component itself and advanced once per present cycle, with a 16-bit binary strip of the same counter beside it, four large cells along the bottom edge carrying the counter's low four bits (most significant at the left, filled for one and hollow for zero), the output's name top left, and the stats snapshot id with a UTC `HH:MM:SS.mmm` clock bottom left. Photograph two or more outputs in one exposure at **1/1000 s or faster**; on DLP projectors take **two consecutive frames**, because the colour wheel can leave a single exposure showing part of two refreshes. Report, per output, the number showing — or "two numbers visible" when an output straddles a refresh. Needs `allowOverlaps = true`. |
+| `sync` | Measuring output-to-output presentation sync with a camera. Every output shows the *same* two-digit counter, drawn by the blending component itself and advanced once per present cycle, with a 16-bit binary strip of the same counter beside it, four large cells along the bottom edge carrying the counter's low four bits (most significant at the left, filled for one and hollow for zero), the output's name top left, and the stats snapshot id with a UTC `HH:MM:SS.mmm` clock bottom left. Photograph two or more outputs in one exposure at **1/1000 s or faster**; on DLP projectors take **two consecutive frames**, because the color wheel can leave a single exposure showing part of two refreshes. Report, per output, the number showing — or "two numbers visible" when an output straddles a refresh. Needs `allowOverlaps = true`. |
 
 The gamma chart assumes the output runs at scale 1 (its stripes are
 single-pixel rows); the other patterns have no such constraint.
@@ -1395,6 +1471,42 @@ retired) was worse than not having one.
 
 ## Where state is stored
 
-`$XDG_STATE_HOME/suede/state.json`, written atomically: a temp file is written and fsynced, then renamed over the target, and the previous version is kept as `state.json.bak`. A corrupt primary falls back to the backup, and a corrupt backup falls back to an empty document — an appliance must still boot.
+`$XDG_STATE_HOME/suede/state.json`, written atomically: a temp file is written and fsynced, then renamed over the target, and the previous version is kept as `state.json.bak`. A primary that is not valid JSON falls back to the backup, and a backup that is not valid JSON either falls back to an empty document — an appliance must still boot.
 
 Package upgrades never touch this directory, so configuration survives them by construction.
+
+### An old or invalid document never stops the daemon
+
+Suede does not migrate documents between schema versions, and refusing to
+boot on one is never the right answer. An old-schema document loads;
+settings this build no longer understands, or values that fail validation,
+are repaired field by field back to their defaults — a single bad field is
+dropped, a section that cannot be read at all falls back to its default —
+and the daemon starts from whatever is left rather than from nothing. Every
+repair is logged and reported as a `state_document_repaired` divergence in
+`GET /api/v1/status`; see [The saved file needed repair at
+startup](troubleshooting.md#state-document-repaired) for what to do about
+one. Nothing is silently rewritten: before a repaired document is saved
+over the original, the file as found is copied to `state.json.rejected`, so
+the exact bytes Suede would not load are still on disk to inspect or
+recover fields from by hand.
+
+The one document this does not apply to is one written by a *newer* Suede.
+That is not a file to repair — this build cannot know what a field from the
+future means — so it is refused outright, with a message naming the schema
+found and the schema this build understands, rather than quietly discarding
+a working configuration by starting from defaults.
+
+### A write is memory-first
+
+A write is accepted and takes effect — the reconciler drives toward it and
+the response reports it as accepted — as soon as it validates, before it is
+known to be on disk. Saving to `state.json` happens afterward, off the
+request path. If that save fails (a full or read-only state directory,
+commonly), the change stays live rather than being rolled back: memory and
+the API response are never behind what the outputs are actually doing, only
+disk can lag, and Suede keeps reporting a `state_not_persisted` divergence
+in `GET /api/v1/status` until a later save reaches disk. See [A change is
+live but was not saved](troubleshooting.md#state-not-persisted). Saves are
+ordered by revision, so a slow save can never overwrite a newer one that
+finished first.

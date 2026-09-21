@@ -597,7 +597,7 @@ exec /opt/google/chrome/chrome \"$@\"
     }
 
     #[test]
-    fn naming_a_snap_explicitly_is_honoured() {
+    fn naming_a_snap_explicitly_is_honored() {
         // Skipping snaps is about not choosing one by accident. Choosing one
         // on purpose is a decision, and the profile placement makes it work.
         let candidates = vec!["/snap/bin/chromium".to_string()];

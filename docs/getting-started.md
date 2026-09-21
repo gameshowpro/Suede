@@ -116,6 +116,18 @@ Then:
 
 That last step is the point of the whole exercise; do it once before you leave the site.
 
+## Calibrate an overlapping or warped layout {: #calibration }
+
+Skip this section for a tiled installation with no overlapping projectors.
+
+1. Re-run provisioning with overlap support: `sudo /usr/share/suede/provision.sh --allow-overlaps` (add `--no-direct-scanout` to have Sway composite the slices instead of flipping them). See [Overlapping layouts and direct scanout](configuration.md#direct-scanout).
+2. In **Displays → Layout**, position each output so its beam overlaps its neighbors by the amount the rigging actually overlaps — the layout *is* the projection configuration. See [Projection and edge blending](configuration.md#projection-edge-blending).
+3. Set a canvas render width and aspect ratio, or use **Arrange automatically** to fit a grid of outputs to the canvas.
+4. Select the `grid` or `warp-alignment` test pattern and check that seam features line up before switching to real content. See [Test patterns](configuration.md#projection-test-patterns).
+5. If the surface is not flat, or the projectors cannot be racked perfectly square, switch the mode to **Warp** and drag each output's corner and center-line handles until its picture is square on the physical surface. See [Editing geometry in the web UI](configuration.md#geometry-editor).
+6. Switch to the `black` pattern and raise `blackLift` until the doubled-black seams match the rest of the image; use `white` to check for brightness mismatch between projectors. See [Adaptive black lift](configuration.md#adaptive-black-lift).
+7. Save. The picture follows your edits live as you make them — **Save** persists the layout, **Revert** discards unsaved changes and restores the last saved document.
+
 ## Sway configuration {: #sway-configuration }
 
 Suede owns a marker-delimited block in `~/.config/sway/config`:

@@ -22,6 +22,10 @@ You describe the state you want — which displays are on, at what mode and posi
 
     Pages post heartbeats. A frozen page gets its browser killed and relaunched — process liveness alone would never notice.
 
+-   :material-projector-screen:{ .lg .middle } **Projection and edge blending**
+
+    Overlap outputs instead of tiling them and Suede slices one shared canvas into gamma-correct blended seams, with optional per-output corner and center Warp correction for curved or misaligned surfaces.
+
 </div>
 
 ## The idea

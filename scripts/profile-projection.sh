@@ -3,8 +3,7 @@
 # identity, the committed layout, and three measurement passes (grid test
 # pattern, content, GPU-saturating page), each read from
 # GET /api/v1/projection/stats with concurrent slicer/sway CPU and GPU
-# utilisation sampling over the same window. See design-notes/test-log.md
-# ("Reproducing a run") for the measurement recipe this follows.
+# utilization sampling over the same window.
 #
 # Usage: scripts/profile-projection.sh [host]   (default: brain)
 #
@@ -83,7 +82,7 @@ echo "(no output above means every check passes)"
 # Helpers for the measurement passes
 # ---------------------------------------------------------------------------
 sample_window() {
-  # Samples slicer + sway %cpu (every 2s) and GPU utilisation (every 2s) for
+  # Samples slicer + sway %cpu (every 2s) and GPU utilization (every 2s) for
   # ~$2 seconds, then prints the GET /api/v1/projection/stats snapshot taken
   # right after - the slicer's own ten-second report covers the same window.
   local label="$1" dur="${2:-10}"
@@ -114,7 +113,7 @@ sample_window() {
   done
 
   wait "$gpu_bg" 2>/dev/null
-  echo "gpu utilisation samples (nvidia-smi utilization.gpu, %):"
+  echo "gpu utilization samples (nvidia-smi utilization.gpu, %):"
   sed 's/^/  /' "$gpu_log"
   rm -f "$gpu_log"
 

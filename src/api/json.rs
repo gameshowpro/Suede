@@ -5,7 +5,7 @@
 //! from this API uses, and which a client parsing JSON sees as nothing at
 //! all. That was tolerable while the only way to fail was malformed syntax.
 //! It stopped being tolerable when the desired-state types began refusing
-//! fields they do not recognise: the whole value of that strictness is
+//! fields they do not recognize: the whole value of that strictness is
 //! telling somebody *which* field, and a 422 with an empty body tells them
 //! less than silently accepting it did.
 //!

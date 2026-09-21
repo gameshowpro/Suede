@@ -41,23 +41,54 @@ impl VersionedConfig {
 impl IntoResponse for VersionedConfig {
     fn into_response(self) -> Response {
         let mut response = Json(self.document).into_response();
-        response.headers_mut().insert(
-            header::ETAG,
-            HeaderValue::from_str(&format!("\"{}\"", self.version.revision))
-                .expect("u64 revision is a valid ETag"),
-        );
-        response.headers_mut().insert(
-            CONFIG_GENERATION_HEADER,
-            HeaderValue::from_str(&self.version.generation.to_string())
-                .expect("u64 generation is a valid header value"),
-        );
-        response.headers_mut().insert(
-            CONFIG_EPOCH_HEADER,
-            HeaderValue::from_str(&self.version.epoch)
-                .expect("state epoch is a valid header value"),
-        );
+        attach_version(&mut response, &self.version);
         response
     }
+}
+
+/// One section of the document, paired with the same state identity.
+///
+/// Subresource GETs answer from the *effective* document, exactly like
+/// `GET /api/v1/config`: a `GET /config/outputs` that described the saved
+/// document while `GET /config` described the working copy would be two
+/// answers to the same question. They carry the same three headers too,
+/// because every write made while a working copy is live has to name the
+/// document it replaces, and a client that only ever reads one section would
+/// otherwise have nowhere to read those values from.
+pub struct VersionedSection<T> {
+    body: T,
+    version: StateVersion,
+}
+
+impl<T> VersionedSection<T> {
+    fn new(body: T, version: StateVersion) -> Self {
+        Self { body, version }
+    }
+}
+
+impl<T: serde::Serialize> IntoResponse for VersionedSection<T> {
+    fn into_response(self) -> Response {
+        let mut response = Json(self.body).into_response();
+        attach_version(&mut response, &self.version);
+        response
+    }
+}
+
+fn attach_version(response: &mut Response, version: &StateVersion) {
+    response.headers_mut().insert(
+        header::ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", version.revision))
+            .expect("u64 revision is a valid ETag"),
+    );
+    response.headers_mut().insert(
+        CONFIG_GENERATION_HEADER,
+        HeaderValue::from_str(&version.generation.to_string())
+            .expect("u64 generation is a valid header value"),
+    );
+    response.headers_mut().insert(
+        CONFIG_EPOCH_HEADER,
+        HeaderValue::from_str(&version.epoch).expect("state epoch is a valid header value"),
+    );
 }
 
 /// Optional blocking behavior for writes.
@@ -169,10 +200,20 @@ pub async fn put_config(
 
 #[utoipa::path(
     get, path = "/api/v1/config/outputs", tag = "config",
-    responses((status = 200, description = "Configured outputs", body = Vec<OutputConfig>))
+    responses((
+        status = 200,
+        description = "Configured outputs, from the effective document",
+        body = Vec<OutputConfig>,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+    ))
 )]
-pub async fn get_outputs(State(state): State<ApiState>) -> Json<Vec<OutputConfig>> {
-    Json(state.store.get().outputs)
+pub async fn get_outputs(State(state): State<ApiState>) -> VersionedSection<Vec<OutputConfig>> {
+    let (document, version) = state.store.effective_with_version();
+    VersionedSection::new(document.outputs, version)
 }
 
 #[utoipa::path(
@@ -201,21 +242,27 @@ pub async fn put_outputs(
     get, path = "/api/v1/config/outputs/{key}", tag = "config",
     params(("key" = String, Path, description = "Match key, e.g. HDMI-A-1")),
     responses(
-        (status = 200, description = "The output configuration", body = OutputConfig),
+        (status = 200, description = "The output configuration, from the effective document",
+            body = OutputConfig,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+        ),
         (status = 404, description = "No such entry"),
     )
 )]
 pub async fn get_output(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> ApiResult<Json<OutputConfig>> {
-    state
-        .store
-        .get()
+) -> ApiResult<VersionedSection<OutputConfig>> {
+    let (document, version) = state.store.effective_with_version();
+    document
         .outputs
         .into_iter()
         .find(|output| output.r#match.key() == key)
-        .map(Json)
+        .map(|output| VersionedSection::new(output, version))
         .ok_or_else(|| ApiError::NotFound(format!("no output configuration for {key}")))
 }
 
@@ -223,7 +270,17 @@ pub async fn get_output(
     put, path = "/api/v1/config/outputs/{key}", tag = "config",
     params(("key" = String, Path, description = "Match key"), WaitQuery),
     request_body = OutputConfig,
-    responses((status = 200, description = "The persisted document", body = DesiredState))
+    responses((status = 200,
+        description = "The persisted document. Retention note: while the \
+                       effective projection mode is Simple, omitting \
+                       `geometry` here (or leaving it out of a full PUT \
+                       /config) keeps the previously saved geometry rather \
+                       than clearing it, so a Simple-mode save cannot \
+                       accidentally discard retained Warp calibration. PUT \
+                       is otherwise literal. To actually clear one output's \
+                       geometry, use DELETE on this same path with an \
+                       additional /geometry segment.",
+        body = DesiredState))
 )]
 pub async fn put_output(
     State(state): State<ApiState>,
@@ -286,12 +343,63 @@ pub async fn delete_output(
         .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
+/// Explicit calibration clear. A full-document or section PUT cannot do
+/// this while the effective mode is Simple: `preserve_retained` treats an
+/// omitted `geometry` as "leave it", precisely so an ordinary Simple-mode
+/// save cannot discard retained Warp correction by accident (see
+/// [`crate::projection_policy::preserve_retained`]). This route bypasses
+/// that retention deliberately and is the only way to clear one output's
+/// geometry. Idempotent: a second call on an output that already has no
+/// geometry still succeeds, since the end state (no geometry) is what was
+/// asked for either way.
+#[utoipa::path(
+    delete, path = "/api/v1/config/outputs/{key}/geometry", tag = "config",
+    params(("key" = String, Path, description = "Match key"), WaitQuery),
+    responses(
+        (status = 200, description = "The persisted document, with this output's geometry cleared", body = DesiredState),
+        (status = 404, description = "No such output"),
+    )
+)]
+pub async fn delete_output_geometry(
+    State(state): State<ApiState>,
+    Path(key): Path<String>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_literal_if(expected, "outputs", query.wait, move |current| {
+            let mut next = current.clone();
+            let output = next
+                .outputs
+                .iter_mut()
+                .find(|output| output.r#match.key() == key)
+                .ok_or_else(|| ApiError::NotFound(format!("no output configuration for {key}")))?;
+            output.geometry = None;
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
+}
+
 #[utoipa::path(
     get, path = "/api/v1/config/backgrounds", tag = "config",
-    responses((status = 200, description = "Defined background presets", body = Vec<BackgroundPreset>))
+    responses((
+        status = 200,
+        description = "Defined background presets, from the effective document",
+        body = Vec<BackgroundPreset>,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+    ))
 )]
-pub async fn get_backgrounds(State(state): State<ApiState>) -> Json<Vec<BackgroundPreset>> {
-    Json(state.store.get().backgrounds)
+pub async fn get_backgrounds(
+    State(state): State<ApiState>,
+) -> VersionedSection<Vec<BackgroundPreset>> {
+    let (document, version) = state.store.effective_with_version();
+    VersionedSection::new(document.backgrounds, version)
 }
 
 #[utoipa::path(
@@ -402,10 +510,20 @@ pub async fn delete_background(
 
 #[utoipa::path(
     get, path = "/api/v1/config/apps", tag = "config",
-    responses((status = 200, description = "Configured apps", body = Vec<AppConfig>))
+    responses((
+        status = 200,
+        description = "Configured apps, from the effective document",
+        body = Vec<AppConfig>,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+    ))
 )]
-pub async fn get_apps(State(state): State<ApiState>) -> Json<Vec<AppConfig>> {
-    Json(state.store.get().apps)
+pub async fn get_apps(State(state): State<ApiState>) -> VersionedSection<Vec<AppConfig>> {
+    let (document, version) = state.store.effective_with_version();
+    VersionedSection::new(document.apps, version)
 }
 
 #[utoipa::path(
@@ -434,21 +552,27 @@ pub async fn put_apps(
     get, path = "/api/v1/config/apps/{id}", tag = "config",
     params(("id" = String, Path, description = "App identifier")),
     responses(
-        (status = 200, description = "The app configuration", body = AppConfig),
+        (status = 200, description = "The app configuration, from the effective document",
+            body = AppConfig,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+        ),
         (status = 404, description = "No such app"),
     )
 )]
 pub async fn get_app(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> ApiResult<Json<AppConfig>> {
-    state
-        .store
-        .get()
+) -> ApiResult<VersionedSection<AppConfig>> {
+    let (document, version) = state.store.effective_with_version();
+    document
         .apps
         .into_iter()
         .find(|app| app.id == id)
-        .map(Json)
+        .map(|app| VersionedSection::new(app, version))
         .ok_or_else(|| ApiError::NotFound(format!("no app configuration for {id}")))
 }
 
@@ -511,10 +635,20 @@ pub async fn delete_app(
 
 #[utoipa::path(
     get, path = "/api/v1/config/settings", tag = "config",
-    responses((status = 200, description = "Daemon settings", body = Settings))
+    responses((
+        status = 200,
+        description = "Daemon settings, from the effective document",
+        body = Settings,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+    ))
 )]
-pub async fn get_settings(State(state): State<ApiState>) -> Json<Settings> {
-    Json(state.store.get().settings)
+pub async fn get_settings(State(state): State<ApiState>) -> VersionedSection<Settings> {
+    let (document, version) = state.store.effective_with_version();
+    VersionedSection::new(document.settings, version)
 }
 
 #[utoipa::path(
@@ -543,19 +677,38 @@ pub async fn put_settings(
     get, path = "/api/v1/config/projection", tag = "config",
     responses((
         status = 200,
-        description = "The projection configuration; null when none is set",
+        description = "The projection configuration from the effective document; \
+                       null when none is set",
         body = Option<ProjectionConfig>,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
     ))
 )]
-pub async fn get_projection(State(state): State<ApiState>) -> Json<Option<ProjectionConfig>> {
-    Json(state.store.get().projection)
+pub async fn get_projection(
+    State(state): State<ApiState>,
+) -> VersionedSection<Option<ProjectionConfig>> {
+    let (document, version) = state.store.effective_with_version();
+    VersionedSection::new(document.projection, version)
 }
 
 #[utoipa::path(
     put, path = "/api/v1/config/projection", tag = "config",
     params(WaitQuery), request_body = Option<ProjectionConfig>,
     responses(
-        (status = 200, description = "The persisted document", body = DesiredState),
+        (status = 200,
+        description = "The persisted document. `null` removes the whole \
+                       projection section. Retention note: while the \
+                       effective mode is Simple, an otherwise-present \
+                       projection body that omits `canvas` keeps the \
+                       previously saved canvas rather than clearing it, so \
+                       a Simple-mode save cannot accidentally discard a \
+                       retained Warp canvas. PUT is otherwise literal. To \
+                       actually clear the shared canvas, use DELETE \
+                       /config/projection/canvas.",
+        body = DesiredState),
         (status = 422, description = "Validation failed"),
     )
 )]
@@ -571,6 +724,35 @@ pub async fn put_projection(
         .commit_if(expected, "projection", query.wait, move |current| {
             let mut next = current.clone();
             next.projection = body;
+            Ok(next)
+        })
+        .await
+        .map(|(document, version)| VersionedConfig::new(document, version))
+}
+
+/// Explicit canvas clear, for the same reason `DELETE
+/// /config/outputs/{key}/geometry` exists: `preserve_retained` deliberately
+/// refills an omitted `canvas` while the effective mode is Simple, so
+/// ordinary section and full-document PUTs cannot clear it. A document with
+/// no `projection` section at all, or one whose canvas is already absent,
+/// is left as it is — clearing an already-clear canvas is still success.
+#[utoipa::path(
+    delete, path = "/api/v1/config/projection/canvas", tag = "config",
+    params(WaitQuery),
+    responses((status = 200, description = "The persisted document, with the shared canvas cleared", body = DesiredState))
+)]
+pub async fn delete_projection_canvas(
+    State(state): State<ApiState>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    state
+        .commit_literal_if(expected, "projection", query.wait, move |current| {
+            let mut next = current.clone();
+            if let Some(projection) = next.projection.as_mut() {
+                projection.canvas = None;
+            }
             Ok(next)
         })
         .await
@@ -603,12 +785,6 @@ pub async fn revert_config(
     state
         .revert_if(precondition(&headers)?)
         .map(|(document, version)| VersionedConfig::new(document, version))
-}
-
-/// Shared by handlers that need to report an unexpected state error.
-#[allow(dead_code)]
-fn internal(error: impl std::fmt::Display) -> ApiError {
-    ApiError::Internal(error.to_string())
 }
 
 /// Re-exported for the OpenAPI document.
@@ -986,6 +1162,149 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
+    const OUTPUT_WITH_GEOMETRY: &str = r#"{"match":{"name":"HDMI-A-1"},"enable":true,
+        "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":0,"y":0},
+        "geometry":{"source":{"x":0,"y":0,"width":1,"height":1},
+            "corners":[[0,0],[1,0],[1,1],[0,1]],
+            "rasterFootprint":{"x":0,"y":0,"width":1,"height":1}}}"#;
+
+    /// A11: `preserve_retained` refills an omitted `geometry` while the
+    /// document stays Simple, so PUT alone can never clear retained
+    /// calibration — this is the explicit route that can, and a PUT that
+    /// follows it must not resurrect what it cleared.
+    #[tokio::test]
+    async fn deleting_output_geometry_really_clears_it_and_a_later_put_does_not_resurrect_it() {
+        let harness = harness(None);
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(OUTPUT_WITH_GEOMETRY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = call(&harness, "GET", "/api/v1/config/outputs/HDMI-A-1", None).await;
+        assert!(!body["geometry"].is_null(), "{body}");
+
+        let (status, body) = call(
+            &harness,
+            "DELETE",
+            "/api/v1/config/outputs/HDMI-A-1/geometry",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(&harness, "GET", "/api/v1/config/outputs/HDMI-A-1", None).await;
+        assert!(
+            body["geometry"].is_null(),
+            "DELETE must really clear it: {body}"
+        );
+
+        // A plain Simple-mode PUT that omits geometry entirely — the
+        // ordinary shape a client sends when it never touched calibration —
+        // must not bring the deleted geometry back from the basis document.
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(OUTPUT),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = call(&harness, "GET", "/api/v1/config/outputs/HDMI-A-1", None).await;
+        assert!(
+            body["geometry"].is_null(),
+            "a later PUT without geometry must not resurrect cleared calibration: {body}"
+        );
+
+        // Deleting an output's geometry twice (or an output whose geometry
+        // is already absent) is idempotent success, not a 404 — the DELETE
+        // asks for an end state, not that something specific be removed.
+        let (status, _) = call(
+            &harness,
+            "DELETE",
+            "/api/v1/config/outputs/HDMI-A-1/geometry",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // The output itself not existing is still a 404, exactly like the
+        // parent DELETE route.
+        let (status, _) = call(
+            &harness,
+            "DELETE",
+            "/api/v1/config/outputs/ghost/geometry",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// A11: the same clearing/no-resurrection contract, for the shared
+    /// canvas.
+    #[tokio::test]
+    async fn deleting_projection_canvas_really_clears_it_and_a_later_put_does_not_resurrect_it() {
+        let mut harness = harness(None);
+        // A shared canvas requires allow_overlaps and at least one enabled
+        // output with a complete geometry; set both up first so the PUTs
+        // below are validated on the canvas field alone. The router was
+        // built against the original bootstrap, so it is rebuilt from the
+        // mutated state rather than relying on the one `harness()` returned.
+        std::sync::Arc::make_mut(&mut harness.state.bootstrap).allow_overlaps = true;
+        harness.router = crate::api::router(harness.state.clone());
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/outputs/HDMI-A-1",
+            Some(OUTPUT_WITH_GEOMETRY),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            // Aspect 1.0 to match OUTPUT_WITH_GEOMETRY's unit-square source.
+            Some(r#"{"canvas":{"aspect":1.0,"renderWidth":1600}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(&harness, "GET", "/api/v1/config/projection", None).await;
+        assert!(!body["canvas"].is_null(), "{body}");
+
+        let (status, body) =
+            call(&harness, "DELETE", "/api/v1/config/projection/canvas", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, body) = call(&harness, "GET", "/api/v1/config/projection", None).await;
+        assert!(
+            body["canvas"].is_null(),
+            "DELETE must really clear it: {body}"
+        );
+
+        // An ordinary Simple-mode projection edit that never mentions canvas
+        // must not bring the deleted one back.
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"gamma":2.4}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, body) = call(&harness, "GET", "/api/v1/config/projection", None).await;
+        assert!(
+            body["canvas"].is_null(),
+            "a later PUT without canvas must not resurrect a cleared one: {body}"
+        );
+
+        // No projection section at all, or one whose canvas is already
+        // clear: still success, not an error.
+        let (status, _) = call(&harness, "DELETE", "/api/v1/config/projection/canvas", None).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn putting_the_same_output_twice_updates_rather_than_duplicates() {
         let harness = harness(None);
@@ -1320,12 +1639,40 @@ mod tests {
         assert_eq!(body["projection"]["blackLift"], 0.0);
     }
 
+    /// The preconditions a client that has just read the state would send.
+    fn conditions(harness: &Harness) -> Vec<(String, String)> {
+        let (_, version) = harness.state.store.effective_with_version();
+        vec![
+            ("if-match".into(), version.revision.to_string()),
+            (
+                "if-config-generation".into(),
+                version.generation.to_string(),
+            ),
+            ("if-config-epoch".into(), version.epoch),
+        ]
+    }
+
+    async fn call_conditionally(
+        harness: &Harness,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let owned = conditions(harness);
+        let headers: Vec<(&str, &str)> = owned
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let (status, _, body) = call_with_headers(harness, method, uri, body, &headers).await;
+        (status, body)
+    }
+
     #[tokio::test]
     async fn an_uncommitted_write_reaches_the_outputs_but_never_the_disk() {
         let harness = harness(None);
         let mut working = harness.state.store.get();
         // Any settings bool would do here; `hideCursor` is used because,
-        // unlike `allowRawSwayCommands`, it still serialises — the retired
+        // unlike `allowRawSwayCommands`, it still serializes — the retired
         // field's `skip_serializing` would make this write silently omit it
         // and the test would stop proving anything.
         working.settings.hide_cursor = false;
@@ -1347,8 +1694,11 @@ mod tests {
         assert!(harness.state.store.get().committed);
 
         // Revert discards the working copy and returns the saved document.
-        let (status, body) = call(&harness, "POST", "/api/v1/config/revert", None).await;
-        assert_eq!(status, StatusCode::OK);
+        // It names the working copy it is discarding, because by now there is
+        // one and it might be somebody else's.
+        let (status, body) =
+            call_conditionally(&harness, "POST", "/api/v1/config/revert", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["committed"], true);
         assert!(!harness.state.store.has_preview());
     }
@@ -1367,9 +1717,10 @@ mod tests {
         )
         .await;
 
-        // Save: the same document with the flag set.
+        // Save: the same document with the flag set, naming the working copy
+        // it is committing.
         document.committed = true;
-        let (status, body) = call(
+        let (status, body) = call_conditionally(
             &harness,
             "PUT",
             "/api/v1/config",
@@ -1399,8 +1750,14 @@ mod tests {
         assert!(!harness.state.store.has_preview());
     }
 
+    /// Replaces `a_committed_section_write_discards_the_working_copy`, which
+    /// asserted the behavior the September 21 review lists as A10: a section
+    /// PUT with no preconditions silently discarded another client's live
+    /// preview. Two operators editing at once is a real scenario, so the
+    /// unconditional write is now refused and the conditional one commits on
+    /// the working copy rather than on a hybrid of it and the saved document.
     #[tokio::test]
-    async fn a_committed_section_write_discards_the_working_copy() {
+    async fn a_section_write_cannot_discard_a_working_copy_unless_it_names_it() {
         let harness = harness(None);
         let mut working = harness.state.store.get();
         working.settings.hide_cursor = false;
@@ -1414,12 +1771,177 @@ mod tests {
         .await;
         assert!(harness.state.store.has_preview());
 
-        let (status, _) = call(&harness, "PUT", "/api/v1/config/backgrounds", Some("[]")).await;
-        assert_eq!(status, StatusCode::OK);
-        assert!(
-            !harness.state.store.has_preview(),
-            "saving must supersede the working copy"
+        let (status, body) = call(&harness, "PUT", "/api/v1/config/backgrounds", Some("[]")).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "an unconditional save must not discard an unsaved edit: {body}"
         );
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("If-Config-Generation"),
+            "the client is told how to retry: {body}"
+        );
+        assert!(
+            harness.state.store.has_preview(),
+            "and the working copy is still there"
+        );
+
+        let (status, body) =
+            call_conditionally(&harness, "PUT", "/api/v1/config/backgrounds", Some("[]")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!harness.state.store.has_preview());
+        assert!(
+            !harness.state.store.get().settings.hide_cursor,
+            "one basis: the section write commits the working copy it named"
+        );
+    }
+
+    /// A10's interleaving: two browsers, one appliance.
+    #[tokio::test]
+    async fn one_operators_save_cannot_erase_another_operators_preview() {
+        let harness = harness(None);
+
+        // A is mid-edit: a working copy on the outputs, not saved.
+        let mut previewed = harness.state.store.get();
+        previewed.settings.hide_cursor = false;
+        previewed.committed = false;
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let a_generation = harness.state.store.generation();
+
+        // B saves a section, from a page loaded before A started.
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/settings",
+            Some(r#"{"hideCursor":true,"outputPollIntervalSeconds":11}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness.state.store.generation(),
+            a_generation,
+            "the refused write left the working copy exactly as it was"
+        );
+        assert!(!harness.state.store.effective().settings.hide_cursor);
+        assert_eq!(
+            harness
+                .state
+                .store
+                .effective()
+                .settings
+                .output_poll_interval_seconds,
+            5,
+            "and B's edit went nowhere"
+        );
+
+        // B's revert is refused for the same reason: it would discard A's work.
+        let (status, _) = call(&harness, "POST", "/api/v1/config/revert", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(harness.state.store.has_preview());
+
+        // B reloads, sees A's working copy, and now may either commit it...
+        let (status, body) = call_conditionally(
+            &harness,
+            "PUT",
+            "/api/v1/config/settings",
+            Some(r#"{"hideCursor":false,"outputPollIntervalSeconds":11}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["settings"]["outputPollIntervalSeconds"], 11);
+        assert!(
+            !body["settings"]["hideCursor"].as_bool().unwrap(),
+            "A's unsaved change was committed with B's, not silently dropped: {body}"
+        );
+        assert!(!harness.state.store.has_preview());
+    }
+
+    #[tokio::test]
+    async fn a_stale_revert_cannot_discard_a_newer_working_copy() {
+        let harness = harness(None);
+        let mut previewed = harness.state.store.get();
+        previewed.settings.hide_cursor = false;
+        previewed.committed = false;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        let stale = conditions(&harness);
+
+        // A second edit moves the working copy on.
+        previewed.settings.output_poll_interval_seconds = 7;
+        let (status, _) = call_conditionally(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let headers: Vec<(&str, &str)> = stale
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let (status, _, _) =
+            call_with_headers(&harness, "POST", "/api/v1/config/revert", None, &headers).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            harness
+                .state
+                .store
+                .effective()
+                .settings
+                .output_poll_interval_seconds,
+            7,
+            "the newer working copy survived the late Cancel"
+        );
+    }
+
+    /// A10 acceptance 5: one answer to "what is the configuration", whichever
+    /// route asks.
+    #[tokio::test]
+    async fn subresource_reads_answer_from_the_effective_document() {
+        let harness = harness(None);
+        let mut previewed = harness.state.store.get();
+        previewed.settings.hide_cursor = false;
+        previewed.committed = false;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+
+        let (status, headers, body) =
+            call_with_headers(&harness, "GET", "/api/v1/config/settings", None, &[]).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["hideCursor"], false,
+            "the working copy is what is on the outputs, so it is what a read describes"
+        );
+        // And the identity a write now has to quote comes back with it.
+        let (_, version) = harness.state.store.effective_with_version();
+        assert_eq!(
+            headers[CONFIG_GENERATION_HEADER],
+            version.generation.to_string()
+        );
+        assert_eq!(headers[CONFIG_EPOCH_HEADER], version.epoch);
+        assert_eq!(headers[axum::http::header::ETAG], "\"0\"");
     }
 
     #[tokio::test]

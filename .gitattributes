@@ -1,4 +1,4 @@
-# Line endings are normalised to LF in the repository and, crucially, in the
+# Line endings are normalized to LF in the repository and, crucially, in the
 # working tree too.
 #
 # Without this, a checkout on Windows with core.autocrlf=true rewrites every

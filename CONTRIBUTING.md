@@ -59,6 +59,8 @@ Notes on the code:
   exercise.
 - Anything that changes what an operator sees — a divergence, a health check,
   a UI string — needs the documentation changed in the same commit.
+- Write en-US spelling; `scripts/check-en-us.sh` enforces it in CI and in
+  `scripts/dev-check.sh`.
 
 ## Reporting a problem
 

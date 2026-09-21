@@ -13,7 +13,7 @@ cannot claim to be.
   Suede, or is built on Suede — as a statement of fact, in ordinary type,
   without implying that it is endorsed by or affiliated with us.
 - Use the name in documentation, articles, talks, tutorials, comparisons and
-  reviews, favourable or not.
+  reviews, favorable or not.
 - Keep the name in an unmodified copy you redistribute under the license.
 - Use it in the name of a plugin, integration or tool, where the name makes
   clear that yours is the product and Suede is what it works with —

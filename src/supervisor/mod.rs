@@ -52,7 +52,7 @@ struct ManagedApp {
     /// relaunch by about one tick, while an unhealthy one is exactly what
     /// should hold the launch.
     dependency_ready: bool,
-    /// When the last readiness probe ran, to honour the configured interval.
+    /// When the last readiness probe ran, to honor the configured interval.
     last_probe: Option<Instant>,
     /// When Suede first started waiting, for the give-up timer.
     waiting_since: Option<Instant>,
@@ -257,7 +257,7 @@ impl Supervisor {
         divergences
     }
 
-    /// Reap exits, run the watchdog, place new windows, and honour restart timers.
+    /// Reap exits, run the watchdog, place new windows, and honor restart timers.
     pub async fn tick(&self, windows: &[Window]) {
         // Readiness probes talk to the network, so they run before the lock is
         // taken. Holding it across a probe would stall every API request behind
@@ -1272,7 +1272,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_explicit_expected_status_is_honoured() {
+    async fn an_explicit_expected_status_is_honored() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, _) = supervisor(dir.path());
         let url = serve("503 Service Unavailable").await;

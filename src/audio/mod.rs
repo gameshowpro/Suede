@@ -56,7 +56,7 @@ pub fn linear_from_db(db: f64) -> f64 {
     }
 }
 
-/// Quantise a level for reporting and comparison.
+/// Quantize a level for reporting and comparison.
 ///
 /// A tenth of a decibel is already an order of magnitude finer than anyone can
 /// hear, and it is what a mixer shows. Reporting the raw conversion instead
@@ -64,7 +64,7 @@ pub fn linear_from_db(db: f64) -> f64 {
 /// believe in a precision the whole signal path does not have.
 ///
 /// It also settles comparisons: a level that has been through amplitude and
-/// back is never bit-identical to the one that was asked for, so quantising
+/// back is never bit-identical to the one that was asked for, so quantizing
 /// both sides is what stops the reconciler rewriting an unchanged value on
 /// every pass.
 pub fn round_db(db: f64) -> f64 {
@@ -99,7 +99,7 @@ mod gain_tests {
     }
 
     #[test]
-    fn reported_levels_are_quantised_to_a_tenth() {
+    fn reported_levels_are_quantized_to_a_tenth() {
         assert_eq!(round_db(-23.876400520322257), -23.9);
         assert_eq!(round_db(0.0), 0.0);
         assert_eq!(round_db(-18.04), -18.0);

@@ -85,6 +85,7 @@
 //! contended queue. `describe()` reports whichever tier was actually
 //! granted.
 
+use std::borrow::Cow;
 use std::ffi::{c_char, CStr};
 use std::io::Cursor;
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -230,10 +231,10 @@ impl QueuePriority {
     }
 }
 
-/// Where a draw's colour comes from: the captured canvas, or the `sync`
+/// Where a draw's color comes from: the captured canvas, or the `sync`
 /// test pattern's own shape list.
 ///
-/// One code path records both because everything around the colour — the
+/// One code path records both because everything around the color — the
 /// per-output transfer, the viewport, the target's queue-family acquire and
 /// release, the fence — must be identical, or the pattern would stop
 /// measuring the path content actually takes.
@@ -562,8 +563,45 @@ impl MeasurePushConstants {
     }
 }
 
-/// Short-lived, bounded private resources for one source measurement. The
-/// canvas itself remains foreign-owned; only this 256x256 target is local.
+/// A source measurement whose commands are queued and whose fence has not
+/// yet been observed. Held by `Gpu` between submission and collection.
+#[derive(Clone, Copy)]
+struct PendingMeasurement {
+    /// Caller-supplied identity of the capture this pass sampled.
+    tag: u64,
+    /// Sample grid, so the collection reduces exactly what was drawn rather
+    /// than whatever the retained 256x256 target still held from last time.
+    grid: [u32; 2],
+    submitted_at: Instant,
+}
+
+/// One completed source measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LuminanceSample {
+    /// Whatever identity the submission was given — the capture id, in the
+    /// slicer's case. The value describes *that* capture, not the one
+    /// current when the fence was observed.
+    pub tag: u64,
+    /// Mean linear-light Rec.709 luminance over the sample grid.
+    pub luminance: f64,
+    /// Grid points reduced.
+    pub sample_count: u32,
+    /// Submission to first observation that the fence had signaled. This is
+    /// a latency, not a stall: nothing waited for it, so it is bounded
+    /// below by the GPU's own cost and above by how soon the caller next
+    /// asked.
+    pub latency_ms: f64,
+}
+
+/// Bounded private resources for source measurement. The canvas itself
+/// remains foreign-owned; only this 256x256 target is local.
+///
+/// The command buffer and fence are the pass's own, not the ones `blend()`
+/// re-records every frame: that is what lets a measurement be submitted and
+/// collected some later frame instead of being waited out on the spot. Both
+/// are exclusively owned by whichever submission is in flight, so nothing
+/// here may be reset or re-recorded while [`Gpu::measurement_flight`] is
+/// `Some` — see [`Gpu::submit_luminance_measurement`].
 struct MeasurementPass {
     image: vk::Image,
     memory: vk::DeviceMemory,
@@ -574,6 +612,8 @@ struct MeasurementPass {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     descriptor_set: vk::DescriptorSet,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
     initialized: bool,
 }
 
@@ -591,6 +631,12 @@ struct MeasurementCleanup<'a> {
     pipeline_layout: vk::PipelineLayout,
     fragment: vk::ShaderModule,
     pipeline: vk::Pipeline,
+    /// The pool the command buffer below was allocated from, so a failure
+    /// partway through creation returns it rather than leaking it until the
+    /// pool itself is destroyed.
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
 }
 
 impl MeasurementCleanup<'_> {
@@ -605,6 +651,8 @@ impl MeasurementCleanup<'_> {
             pipeline_layout: self.pipeline_layout,
             pipeline: self.pipeline,
             descriptor_set,
+            command_buffer: self.command_buffer,
+            fence: self.fence,
             initialized: false,
         };
         self.image = vk::Image::null();
@@ -614,6 +662,8 @@ impl MeasurementCleanup<'_> {
         self.descriptor_pool = vk::DescriptorPool::null();
         self.pipeline_layout = vk::PipelineLayout::null();
         self.pipeline = vk::Pipeline::null();
+        self.command_buffer = vk::CommandBuffer::null();
+        self.fence = vk::Fence::null();
         pass
     }
 }
@@ -621,6 +671,13 @@ impl MeasurementCleanup<'_> {
 impl Drop for MeasurementCleanup<'_> {
     fn drop(&mut self) {
         unsafe {
+            if self.fence != vk::Fence::null() {
+                self.device.destroy_fence(self.fence, None);
+            }
+            if self.command_buffer != vk::CommandBuffer::null() {
+                self.device
+                    .free_command_buffers(self.command_pool, &[self.command_buffer]);
+            }
             if self.pipeline != vk::Pipeline::null() {
                 self.device.destroy_pipeline(self.pipeline, None);
             }
@@ -656,11 +713,13 @@ impl Drop for MeasurementCleanup<'_> {
 }
 
 impl MeasurementPass {
-    fn destroy(self, device: &ash::Device) {
+    fn destroy(self, device: &ash::Device, command_pool: vk::CommandPool) {
         // Safety: called only after the measurement fence has completed (or
         // before any command references these resources on construction
         // failure); all handles are owned by this pass.
         unsafe {
+            device.destroy_fence(self.fence, None);
+            device.free_command_buffers(command_pool, &[self.command_buffer]);
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
@@ -711,9 +770,15 @@ pub struct Gpu {
     dynamic_lift: f32,
     dynamic_maximum: u32,
     /// Lazily allocated bounded source-measurement target, descriptor set,
-    /// readback buffer, and pipeline. Optional adaptive measurement never
-    /// participates in `Gpu::new`, so its absence cannot disable blending.
+    /// readback buffer, command buffer, fence and pipeline. Optional
+    /// adaptive measurement never participates in `Gpu::new`, so its absence
+    /// cannot disable blending.
     measurement: Option<MeasurementPass>,
+    /// The measurement submitted and not yet observed complete, if any.
+    /// While this is `Some`, the pass's command buffer, fence, descriptor
+    /// set and readback buffer all belong to the GPU, so no second
+    /// measurement may be recorded — see [`Gpu::submit_luminance_measurement`].
+    measurement_flight: Option<PendingMeasurement>,
     /// Deterministic post-stage failure used only by the hardware readback
     /// transaction test. `Some(n)` fails just before staging item `n`, after
     /// the preceding inactive tables have proved their cleanup path.
@@ -1042,6 +1107,7 @@ impl Gpu {
             dynamic_lift: 0.0,
             dynamic_maximum: 0,
             measurement: None,
+            measurement_flight: None,
             #[cfg(test)]
             transfer_stage_fail_after: None,
         })
@@ -1706,7 +1772,7 @@ impl Gpu {
             Ok(())
         })();
         // Safety: `fence` is done being useful either way — waited on above
-        // when submission succeeded, never signalled (so nothing could be
+        // when submission succeeded, never signaled (so nothing could be
         // waiting on it) when it did not.
         unsafe { device.destroy_fence(fence, None) };
         result
@@ -1777,6 +1843,36 @@ impl Gpu {
                     update.height
                 );
             }
+            // Compare against the table already active for this output
+            // before packing or allocating: a no-op re-apply (an unrelated
+            // field changed elsewhere in the generation) is common, and the
+            // whole point of comparing first is not to pay for a ~33 MB pack
+            // and copy at 4K only to throw it away. `output.mapped` only
+            // ever holds bytes this same validation already accepted, so an
+            // exact match needs no revalidation.
+            let unchanged = self
+                .outputs
+                .get(update.index)
+                .and_then(Option::as_ref)
+                .filter(|output| {
+                    output.size == [update.width, update.height]
+                        && output.capacity
+                            == (entries * std::mem::size_of::<u32>()) as vk::DeviceSize
+                })
+                .is_some_and(|output| {
+                    // Safety: `output.mapped` covers the active table's
+                    // complete capacity and remains mapped for its life.
+                    let mapped =
+                        unsafe { std::slice::from_raw_parts(output.mapped.cast::<u32>(), entries) };
+                    update
+                        .table
+                        .iter()
+                        .zip(mapped)
+                        .all(|(&(a, b), &packed)| pack_transfer(a, b) == packed)
+                });
+            if unchanged {
+                continue;
+            }
             if update.table.iter().any(|&(a, _)| a > 256) {
                 bail!(
                     "replace_transfers: output {} has a gain outside 0..=256",
@@ -1788,27 +1884,12 @@ impl Gpu {
                 .iter()
                 .map(|&(a, b)| pack_transfer(a, b))
                 .collect();
-            let unchanged = self
-                .outputs
-                .get(update.index)
-                .and_then(Option::as_ref)
-                .is_some_and(|output| {
-                    output.size == [update.width, update.height]
-                        && output.capacity
-                            == (packed.len() * std::mem::size_of::<u32>()) as vk::DeviceSize
-                        // Safety: `output.mapped` covers the active table's
-                        // complete capacity and remains mapped for its life.
-                        && unsafe {
-                            std::slice::from_raw_parts(
-                                output.mapped.cast::<u32>(),
-                                packed.len(),
-                            ) == packed.as_slice()
-                        }
-                });
-            if unchanged {
-                continue;
-            }
-            prepared.push((update.index, update.width, update.height, packed));
+            prepared.push((
+                update.index,
+                update.width,
+                update.height,
+                Cow::Owned(packed),
+            ));
         }
 
         self.replace_prepared_transfers(prepared)
@@ -1868,26 +1949,62 @@ impl Gpu {
             if update.table.len() != entries {
                 bail!("replace_packed_transfers: output {} has {} entries, expected {}x{} = {entries}", update.index, update.table.len(), update.width, update.height);
             }
-            for &entry in update.table {
-                validate_packed_transfer(entry)?;
-            }
-            let packed = update.table.to_vec();
-            let unchanged = self.outputs.get(update.index).and_then(Option::as_ref).is_some_and(|output| {
-                output.size == [update.width, update.height]
-                    && output.capacity == (packed.len() * std::mem::size_of::<u32>()) as vk::DeviceSize
+            // Compare the borrowed table directly against the active bytes
+            // before allocating or copying anything: a no-op re-apply is
+            // common (a full generation rebuild reuses every unchanged
+            // output's table), and at 4K this table is ~33 MB — not worth
+            // cloning or walking a per-entry validator just to discard it.
+            // The active bytes only ever hold entries this same check (or a
+            // debug build's assertion below, the first time they were
+            // uploaded) already accepted, so an exact match needs no
+            // revalidation.
+            let unchanged = self
+                .outputs
+                .get(update.index)
+                .and_then(Option::as_ref)
+                .filter(|output| {
+                    output.size == [update.width, update.height]
+                        && output.capacity
+                            == (entries * std::mem::size_of::<u32>()) as vk::DeviceSize
+                })
+                .is_some_and(|output| {
                     // Safety: the active persistently-mapped table covers its capacity.
-                    && unsafe { std::slice::from_raw_parts(output.mapped.cast::<u32>(), packed.len()) == packed.as_slice() }
-            });
-            if !unchanged {
-                prepared.push((update.index, update.width, update.height, packed));
+                    let mapped =
+                        unsafe { std::slice::from_raw_parts(output.mapped.cast::<u32>(), entries) };
+                    update.table == mapped
+                });
+            if unchanged {
+                continue;
             }
+            // Full range-checking here would re-walk every entry of a table
+            // that is, in every production caller, already correct by
+            // construction: `pack_dynamic_shape` (blend.rs) and
+            // `pack_transfer` (this file) can only emit values
+            // `validate_packed_transfer` accepts. Debug builds still walk
+            // it, as a tripwire for a future caller that bypasses both.
+            #[cfg(debug_assertions)]
+            for &entry in update.table {
+                if let Err(error) = validate_packed_transfer(entry) {
+                    bail!("replace_packed_transfers: output {}: {error}", update.index);
+                }
+            }
+            // Borrowed, not copied: `update.table` already is the packed
+            // representation, so nothing here needs its own allocation
+            // until `replace_prepared_transfers` copies it straight into
+            // the newly allocated host-visible buffer.
+            prepared.push((
+                update.index,
+                update.width,
+                update.height,
+                Cow::Borrowed(update.table),
+            ));
         }
         self.replace_prepared_transfers(prepared)
     }
 
     fn replace_prepared_transfers(
         &mut self,
-        prepared: Vec<(usize, u32, u32, Vec<u32>)>,
+        prepared: Vec<(usize, u32, u32, Cow<'_, [u32]>)>,
     ) -> anyhow::Result<()> {
         if prepared.is_empty() {
             return Ok(());
@@ -2396,7 +2513,24 @@ impl Gpu {
             pipeline_layout: vk::PipelineLayout::null(),
             fragment: vk::ShaderModule::null(),
             pipeline: vk::Pipeline::null(),
+            command_pool: self.command_pool,
+            command_buffer: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
         };
+        // Its own command buffer and fence, from the pool `blend()` already
+        // uses (created with `RESET_COMMAND_BUFFER`, so this buffer can be
+        // re-recorded per measurement independently of that one).
+        cleanup.command_buffer = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(self.command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .context("vkAllocateCommandBuffers source measurement")?[0];
+        cleanup.fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .context("vkCreateFence source measurement")?;
         let immutable = [self.sampler];
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
@@ -2608,25 +2742,100 @@ impl Gpu {
         Ok(())
     }
 
-    /// Measure mean pre-transfer linear Rec.709 luminance from a nearest-texel
-    /// source grid. The grid is at most 256×256 and covers the supplied
-    /// logical domain once; `width` and `height` deliberately exclude any
-    /// allocation padding in `canvas`. Failure is non-destructive: callers
-    /// can retain the fixed-lift renderer and surface this error as the
-    /// adaptive-mode unavailable reason.
-    pub fn measure_luminance(
+    /// Ask the GPU for mean pre-transfer linear Rec.709 luminance over a
+    /// nearest-texel source grid, and return as soon as the work is queued.
+    ///
+    /// The grid is at most 256×256 and covers the supplied logical domain
+    /// once; `width` and `height` deliberately exclude any allocation
+    /// padding in `canvas`. `tag` is handed back with the result, so the
+    /// caller can say which capture the value describes — with the readback
+    /// deferred, that is never "the current one". Failure is
+    /// non-destructive: callers can retain the fixed-lift renderer and
+    /// surface the error as the adaptive-mode unavailable reason.
+    ///
+    /// ## Why this does not wait, and what keeps the capture image alive
+    ///
+    /// The pass reads `canvas`, which on the capture path is one of the two
+    /// alternating capture images the compositor writes into with no fence
+    /// of its own (see `slicer.rs`'s module doc). Two things keep that
+    /// sound while the *host* readback is deferred by a frame or more:
+    ///
+    /// * The GPU-side read is ordered ahead of the blend the caller submits
+    ///   for the same capture. A fence signal operation defined by
+    ///   `vkQueueSubmit` includes in its first synchronization scope, beside
+    ///   its own batches, "all commands that occur earlier in submission
+    ///   order" on that queue (Vulkan 1.3, "Fence Signaling") — and this
+    ///   submission goes out before `blend()`'s, on the one queue. `blend()`
+    ///   waits on its own fence before it returns — that wait is what makes
+    ///   it safe to hand the compositor a buffer at all — so by the time
+    ///   the caller commits, this pass has finished reading the capture
+    ///   image too. Nothing extra is waited for; the ordering was already
+    ///   being paid for.
+    /// * A capture slot is re-armed one full capture later, and the caller
+    ///   calls [`Gpu::finish_luminance_measurement`] before it re-arms the
+    ///   slot a pass is reading. That covers the case where the gate
+    ///   withheld the frame and no `blend()` ran at all. It polls first and
+    ///   in practice never waits: a 256x256 sample pass has had a whole
+    ///   capture period to retire.
+    ///
+    /// Everything else the pass touches — the target image, the descriptor
+    /// set, the command buffer, the fence and the readback buffer — is
+    /// private to [`MeasurementPass`] and is not reused until the fence has
+    /// been observed, so no `wait_for_pending_work()` is needed here. That
+    /// call used to be required only because the measurement re-recorded
+    /// the command buffer `blend()` submits and reset the fence `blend()`
+    /// waits on.
+    pub fn submit_luminance_measurement(
         &mut self,
         canvas: &DmabufImage,
         y_invert: bool,
         width: u32,
         height: u32,
-    ) -> anyhow::Result<(f64, u32)> {
+        tag: u64,
+    ) -> anyhow::Result<()> {
         if width == 0 || height == 0 || width > canvas.width || height > canvas.height {
             bail!("source measurement domain must be nonzero and fit the capture canvas");
         }
-        self.measure_luminance_inner(canvas.image, canvas.view, true, y_invert, width, height)
+        self.submit_measurement_inner(
+            canvas.image,
+            canvas.view,
+            true,
+            y_invert,
+            width,
+            height,
+            tag,
+        )
     }
 
+    /// Whether a measurement has been submitted and not yet collected.
+    pub fn measurement_pending(&self) -> bool {
+        self.measurement_flight.is_some()
+    }
+
+    /// Collect a submitted measurement if its fence has already signaled.
+    /// Never waits, and returns `None` both when nothing is in flight and
+    /// when the GPU has not finished — the caller simply asks again next
+    /// capture.
+    pub fn poll_luminance_measurement(&mut self) -> anyhow::Result<Option<LuminanceSample>> {
+        Ok(self.collect_measurement(false)?.map(|(sample, _)| sample))
+    }
+
+    /// Collect a submitted measurement, waiting for the fence if it has not
+    /// signaled yet. The second element says whether that wait was real —
+    /// it is what a caller reports when the render thread genuinely had to
+    /// stop for measurement, which should never happen in a healthy run.
+    ///
+    /// Reserved for the two places where waiting is the only correct
+    /// answer: handing a measured capture slot back to the compositor, and
+    /// destroying the images a pass is reading.
+    pub fn finish_luminance_measurement(
+        &mut self,
+    ) -> anyhow::Result<Option<(LuminanceSample, bool)>> {
+        self.collect_measurement(true)
+    }
+
+    /// Test-only synchronous measurement: submit, wait, reduce. Production
+    /// uses [`Gpu::submit_luminance_measurement`] and collects later.
     #[cfg(test)]
     fn measure_static_luminance(
         &mut self,
@@ -2640,6 +2849,7 @@ impl Gpu {
         self.measure_luminance_inner(canvas.image, canvas.view, false, false, width, height)
     }
 
+    #[cfg(test)]
     fn measure_luminance_inner(
         &mut self,
         source_image: vk::Image,
@@ -2649,7 +2859,38 @@ impl Gpu {
         width: u32,
         height: u32,
     ) -> anyhow::Result<(f64, u32)> {
-        self.wait_for_pending_work()?;
+        self.submit_measurement_inner(
+            source_image,
+            source_view,
+            foreign_source,
+            y_invert,
+            width,
+            height,
+            0,
+        )?;
+        let (sample, _) = self
+            .finish_luminance_measurement()?
+            .expect("a submitted measurement always collects");
+        Ok((sample.luminance, sample.sample_count))
+    }
+
+    /// Record and submit one measurement pass. Nothing is waited for; the
+    /// result is picked up by [`Gpu::collect_measurement`].
+    #[allow(clippy::too_many_arguments)]
+    fn submit_measurement_inner(
+        &mut self,
+        source_image: vk::Image,
+        source_view: vk::ImageView,
+        foreign_source: bool,
+        y_invert: bool,
+        width: u32,
+        height: u32,
+        tag: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.measurement_flight.is_none(),
+            "a source measurement is already in flight"
+        );
         let grid = [width.min(256), height.min(256)];
         if self.measurement.is_none() {
             self.measurement = Some(self.create_measurement_pass()?);
@@ -2661,9 +2902,9 @@ impl Gpu {
             measurement_set,
             measurement_layout,
             measurement_pipeline,
-            measurement_memory,
-            measurement_coherent,
             measurement_initialized,
+            command_buffer,
+            fence,
         ) = {
             let pass = self
                 .measurement
@@ -2676,18 +2917,12 @@ impl Gpu {
                 pass.descriptor_set,
                 pass.pipeline_layout,
                 pass.pipeline,
-                pass.readback.memory,
-                pass.readback.coherent,
                 pass.initialized,
+                pass.command_buffer,
+                pass.fence,
             )
         };
-        let measurement_mapped = self
-            .measurement
-            .as_ref()
-            .expect("measurement just initialized")
-            .readback
-            .mapped;
-        let result = (|| -> anyhow::Result<(f64, u32)> {
+        let result = (|| -> anyhow::Result<()> {
             let device = &self.device.device;
             let queue_family = self.device.queue_family;
             let color_range = color_subresource_range();
@@ -2703,13 +2938,12 @@ impl Gpu {
             // source ownership is transferred in the command below.
             unsafe { device.update_descriptor_sets(&write, &[]) };
             unsafe {
-                device
-                    .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
+                device.reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
             }
             .context("vkResetCommandBuffer for source measurement")?;
             let begin = vk::CommandBufferBeginInfo::default()
                 .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-            unsafe { device.begin_command_buffer(self.command_buffer, &begin) }
+            unsafe { device.begin_command_buffer(command_buffer, &begin) }
                 .context("vkBeginCommandBuffer for source measurement")?;
 
             let acquire_canvas = vk::ImageMemoryBarrier::default()
@@ -2748,7 +2982,7 @@ impl Gpu {
                 .subresource_range(color_range);
             unsafe {
                 device.cmd_pipeline_barrier(
-                    self.command_buffer,
+                    command_buffer,
                     if foreign_source {
                         vk::PipelineStageFlags::TOP_OF_PIPE
                     } else {
@@ -2778,15 +3012,15 @@ impl Gpu {
                 })
                 .layer_count(1)
                 .color_attachments(&attachment);
-            unsafe { device.cmd_begin_rendering(self.command_buffer, &rendering) };
+            unsafe { device.cmd_begin_rendering(command_buffer, &rendering) };
             unsafe {
                 device.cmd_bind_pipeline(
-                    self.command_buffer,
+                    command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     measurement_pipeline,
                 );
                 device.cmd_set_viewport(
-                    self.command_buffer,
+                    command_buffer,
                     0,
                     &[vk::Viewport {
                         x: 0.0,
@@ -2798,7 +3032,7 @@ impl Gpu {
                     }],
                 );
                 device.cmd_set_scissor(
-                    self.command_buffer,
+                    command_buffer,
                     0,
                     &[vk::Rect2D {
                         offset: vk::Offset2D { x: 0, y: 0 },
@@ -2809,7 +3043,7 @@ impl Gpu {
                     }],
                 );
                 device.cmd_bind_descriptor_sets(
-                    self.command_buffer,
+                    command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     measurement_layout,
                     0,
@@ -2824,14 +3058,14 @@ impl Gpu {
                     y_invert: u32::from(y_invert),
                 };
                 device.cmd_push_constants(
-                    self.command_buffer,
+                    command_buffer,
                     measurement_layout,
                     vk::ShaderStageFlags::FRAGMENT,
                     0,
                     constants.as_bytes(),
                 );
-                device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
-                device.cmd_end_rendering(self.command_buffer);
+                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                device.cmd_end_rendering(command_buffer);
             }
             let readable_target = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
@@ -2844,7 +3078,7 @@ impl Gpu {
                 .subresource_range(color_range);
             unsafe {
                 device.cmd_pipeline_barrier(
-                    self.command_buffer,
+                    command_buffer,
                     vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::DependencyFlags::empty(),
@@ -2867,7 +3101,7 @@ impl Gpu {
                 });
             unsafe {
                 device.cmd_copy_image_to_buffer(
-                    self.command_buffer,
+                    command_buffer,
                     measurement_image,
                     vk::ImageLayout::GENERAL,
                     measurement_readback,
@@ -2901,7 +3135,7 @@ impl Gpu {
                 .subresource_range(color_range);
             unsafe {
                 device.cmd_pipeline_barrier(
-                    self.command_buffer,
+                    command_buffer,
                     vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                     vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                     vk::DependencyFlags::empty(),
@@ -2910,40 +3144,102 @@ impl Gpu {
                     &[release_canvas],
                 )
             };
-            unsafe { device.end_command_buffer(self.command_buffer) }
+            unsafe { device.end_command_buffer(command_buffer) }
                 .context("vkEndCommandBuffer for source measurement")?;
-            unsafe { device.reset_fences(&[self.fence]) }
+            // Safety: this fence is the measurement's own, and nothing is in
+            // flight on it — `measurement_flight` was checked to be `None`
+            // above and is set only by a submission that reached the line
+            // below.
+            unsafe { device.reset_fences(&[fence]) }
                 .context("vkResetFences for source measurement")?;
-            let cbs = [self.command_buffer];
+            let cbs = [command_buffer];
             let submit = vk::SubmitInfo::default().command_buffers(&cbs);
-            unsafe { device.queue_submit(self.device.queue, &[submit], self.fence) }
+            // Deliberately not followed by a wait: see this method's
+            // caller-facing doc on `submit_luminance_measurement`. The
+            // submission going out *here*, before the caller's `blend()`,
+            // is what orders the GPU read of the capture image ahead of the
+            // fence `blend()` already waits on.
+            unsafe { device.queue_submit(self.device.queue, &[submit], fence) }
                 .context("vkQueueSubmit source measurement")?;
-            self.fence_in_flight = true;
-            unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-                .context("vkWaitForFences source measurement")?;
-            self.fence_in_flight = false;
-            // Readback allocation may fall back to noncoherent host-visible
-            // memory, which must be invalidated after the GPU write.
-            if !measurement_coherent {
-                let range = [vk::MappedMemoryRange::default()
-                    .memory(measurement_memory)
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE)];
-                unsafe { device.invalidate_mapped_memory_ranges(&range) }
-                    .context("vkInvalidateMappedMemoryRanges source measurement")?;
-            }
-            let count = grid[0] * grid[1];
-            let bytes =
-                unsafe { std::slice::from_raw_parts(measurement_mapped, count as usize * 4) };
-            Ok((mean_linear_luminance_rgba(bytes), count))
+            Ok(())
         })();
         if result.is_ok() {
+            // The layout transition to GENERAL is part of the submission, so
+            // the next pass can load the target rather than discard it from
+            // the moment this one is queued.
             self.measurement
                 .as_mut()
                 .expect("measurement remains retained")
                 .initialized = true;
+            self.measurement_flight = Some(PendingMeasurement {
+                tag,
+                grid,
+                submitted_at: Instant::now(),
+            });
         }
         result
+    }
+
+    /// Reduce a completed measurement, optionally waiting for its fence.
+    ///
+    /// The readback buffer is written only by the pass whose fence is being
+    /// observed here, so once that fence has signaled the bytes are stable
+    /// and nothing else can touch them before they are summed.
+    fn collect_measurement(
+        &mut self,
+        block: bool,
+    ) -> anyhow::Result<Option<(LuminanceSample, bool)>> {
+        let Some(flight) = self.measurement_flight else {
+            return Ok(None);
+        };
+        let pass = self
+            .measurement
+            .as_ref()
+            .expect("a measurement in flight implies its pass is retained");
+        let device = &self.device.device;
+        // Safety: the fence belongs to this device and to this pass alone.
+        let signaled = unsafe { device.get_fence_status(pass.fence) }
+            .context("vkGetFenceStatus source measurement")?;
+        let waited = if signaled {
+            false
+        } else {
+            if !block {
+                return Ok(None);
+            }
+            // Safety: same fence; waiting on an unsignalled fence whose
+            // submission was accepted above cannot deadlock against this
+            // thread, which submits nothing else until it returns.
+            unsafe { device.wait_for_fences(&[pass.fence], true, u64::MAX) }
+                .context("vkWaitForFences source measurement")?;
+            true
+        };
+        self.measurement_flight = None;
+        // Readback allocation may fall back to noncoherent host-visible
+        // memory, which must be invalidated after the GPU write.
+        if !pass.readback.coherent {
+            let range = [vk::MappedMemoryRange::default()
+                .memory(pass.readback.memory)
+                .offset(0)
+                .size(vk::WHOLE_SIZE)];
+            // Safety: the range covers exactly this buffer's own allocation.
+            unsafe { device.invalidate_mapped_memory_ranges(&range) }
+                .context("vkInvalidateMappedMemoryRanges source measurement")?;
+        }
+        let sample_count = flight.grid[0] * flight.grid[1];
+        // Safety: the mapping is at least 256*256*4 bytes and the pass wrote
+        // `grid[0] * grid[1]` RGBA texels into its start; the fence above
+        // orders that write before this read.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(pass.readback.mapped, sample_count as usize * 4) };
+        Ok(Some((
+            LuminanceSample {
+                tag: flight.tag,
+                luminance: mean_linear_luminance_rgba(bytes),
+                sample_count,
+                latency_ms: flight.submitted_at.elapsed().as_secs_f64() * 1000.0,
+            },
+            waited,
+        )))
     }
 
     fn wait_for_pending_work(&mut self) -> anyhow::Result<()> {
@@ -3270,7 +3566,7 @@ impl Gpu {
         unsafe { device.end_command_buffer(self.command_buffer) }.context("vkEndCommandBuffer")?;
 
         // Safety: `self.fence` was last waited on by the previous `blend()`
-        // call (or has never been signalled, on the first call), so
+        // call (or has never been signaled, on the first call), so
         // resetting it here cannot race an in-flight wait.
         unsafe { device.reset_fences(&[self.fence]) }.context("vkResetFences")?;
         let command_buffers = [self.command_buffer];
@@ -3330,7 +3626,10 @@ impl Drop for Gpu {
                 device.free_memory(placeholder.memory, None);
             }
             if let Some(measurement) = self.measurement.take() {
-                measurement.destroy(device);
+                // `device_wait_idle` above has already retired any pass that
+                // was still in flight, so its command buffer and fence are
+                // free to be destroyed with the rest.
+                measurement.destroy(device, self.command_pool);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -3948,7 +4247,9 @@ mod tests {
         assert_eq!(packed & 0xff, 7);
 
         // The identity transfer (`a = 256, b = 0`, from `pixel_transfer` in
-        // blend.rs when nothing is ramped or lifted) must round-trip too.
+        // blend.rs at full edge weight and zero black-lift — a source with
+        // no seam to blend against and nothing raising its black level)
+        // must round-trip too.
         let identity = pack_transfer(256, 0);
         assert_eq!(identity >> 8, 256);
         assert_eq!(identity & 0xff, 0);

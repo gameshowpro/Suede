@@ -355,6 +355,10 @@ impl Divergence {
         "warp_geometry_invalid",
         "blend_overlay_failed",
         "headless_unavailable",
+        "canvas_plan_failed",
+        "state_document_repaired",
+        "state_not_persisted",
+        "adopted_value_invalid",
     ];
 
     /// Documentation page for a divergence kind, relative to the docs root.
@@ -380,6 +384,10 @@ impl Divergence {
                 "configuration/#projection-edge-blending"
             }
             "warp_unavailable" | "warp_geometry_invalid" => "configuration/#projection-geometry",
+            "canvas_plan_failed" => "troubleshooting/#canvas-plan-failed",
+            "state_document_repaired" => "troubleshooting/#state-document-repaired",
+            "state_not_persisted" => "troubleshooting/#state-not-persisted",
+            "adopted_value_invalid" => "troubleshooting/#adopted-value-invalid",
             _ => return None,
         })
     }
@@ -422,7 +430,7 @@ pub struct Status {
     ///
     /// Divergences and checks are different axes: a machine can apply its
     /// configuration perfectly while its browser is missing hardware video
-    /// decode. Summarised here so the common question takes one call; the
+    /// decode. Summarized here so the common question takes one call; the
     /// detail stays at `GET /system/checks`.
     ///
     /// `None` rather than an all-zero [`CheckSummary`] wherever the counts
@@ -598,7 +606,7 @@ pub enum CheckStatus {
 pub struct CapabilityReport {
     pub user_agent: String,
     /// From `WEBGL_debug_renderer_info`. `null` when WebGL is unavailable or
-    /// the browser masks it — itself a finding, since a software rasteriser
+    /// the browser masks it — itself a finding, since a software rasterizer
     /// usually announces itself here (`SwiftShader`, `llvmpipe`).
     #[serde(default)]
     pub gpu_vendor: Option<String>,
@@ -750,44 +758,25 @@ pub struct ProjectionControlStatus {
     /// can provide one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warp_reason: Option<String>,
-    /// Requested operator mode and the mode the negotiated pipeline runs.
+    /// Requested operator mode and the mode the negotiated pipeline runs, as
+    /// reported by the child's own `Capability` event. This is the child's
+    /// self-report, not the public policy answer: see
+    /// [`ProjectionGeometryStatus::effective_mode`] for the one authoritative
+    /// effective mode a client should read, which also accounts for feature
+    /// gating, `allowOverlaps`, and capability-probe hysteresis this field
+    /// knows nothing about.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_mode: Option<String>,
+    pub requested_mode: Option<crate::model::ProjectionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub effective_mode: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_generation: Option<u64>,
-    /// Working-copy generation whose effective projection snapshot the
-    /// manager most recently asked this slicer session to realize. This is
-    /// deliberately separate from `requested_generation`: the latter is a
-    /// child-local control sequence, while this identifies the configuration
-    /// response the editor received.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub requested_config_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Highest accepted generation reported by this child.
-    pub accepted_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Highest generation built for any affected output.
-    pub built_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Highest generation installed as a complete render revision.
-    pub applied_generation: Option<u64>,
-    /// Working-copy generation whose projection snapshot the slicer has
-    /// installed. It advances only on an `applied` event from the current
-    /// slicer session, or when an unchanged effective snapshot is already
-    /// known to have been installed. It must never be compared with the
-    /// child-local control generations.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub applied_config_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Highest generation submitted by any output. This does not mean all
-    /// outputs have submitted it.
-    pub submitted_generation: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    /// Highest generation presented by any output. Independent heads need
-    /// not physically present a generation at the same instant.
-    pub presented_generation: Option<u64>,
+    pub effective_mode: Option<crate::model::ProjectionMode>,
+    /// Control-protocol generation counters, local to the current child
+    /// session's own sequence.
+    #[serde(default, skip_serializing_if = "ProjectionChildGenerations::is_empty")]
+    pub child_generation: ProjectionChildGenerations,
+    /// Desired-state document generations this slicer session has
+    /// processed.
+    #[serde(default, skip_serializing_if = "ProjectionConfigGenerations::is_empty")]
+    pub config_generation: ProjectionConfigGenerations,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub build_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -798,6 +787,64 @@ pub struct ProjectionControlStatus {
     /// implying an atomic wall-wide flip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub outputs: Vec<ProjectionControlOutputStatus>,
+}
+
+/// Control-protocol generation counters, local to the current child
+/// session's own sequence. These reset to zero whenever the slicer process
+/// restarts and must never be compared against a desired-state document
+/// generation — see [`ProjectionConfigGenerations`] for those.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionChildGenerations {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<u64>,
+    /// Highest accepted generation reported by this child.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<u64>,
+    /// Highest generation built for any affected output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub built: Option<u64>,
+    /// Highest generation installed as a complete render revision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<u64>,
+    /// Highest generation submitted by any output. This does not mean all
+    /// outputs have submitted it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted: Option<u64>,
+    /// Highest generation presented by any output. Independent heads need
+    /// not physically present a generation at the same instant.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presented: Option<u64>,
+}
+
+impl ProjectionChildGenerations {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// Desired-state document generations this slicer session has processed.
+/// Never comparable with [`ProjectionChildGenerations`]'s child-local
+/// control sequence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionConfigGenerations {
+    /// Working-copy generation whose effective projection snapshot the
+    /// manager most recently asked this slicer session to realize.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested: Option<u64>,
+    /// Working-copy generation whose projection snapshot the slicer has
+    /// installed. It advances only on an `applied` event from the current
+    /// slicer session, or when an unchanged effective snapshot is already
+    /// known to have been installed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied: Option<u64>,
+}
+
+impl ProjectionConfigGenerations {
+    fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Adaptive lift telemetry. Capture IDs count measurements, while logical
@@ -822,7 +869,10 @@ pub struct ProjectionBlackLiftStatus {
     pub target: f64,
     pub applied: f64,
     pub logical_generation: u64,
-    /// Duration of the most recent sampling pass and host readback.
+    /// Submission to collection of the most recent sampling pass. The
+    /// measurement is asynchronous, so this is pipeline latency and not time
+    /// the render thread spent waiting: it is bounded below by the pass and
+    /// its readback and above by how soon the next capture collected it.
     pub measurement_ms: Option<f64>,
 }
 
@@ -841,7 +891,7 @@ pub struct ProjectionControlOutputStatus {
     pub presented_generation: Option<u64>,
     /// Filled when the slicer reports its effective sampling path.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub sampling_mode: Option<String>,
+    pub sampling_mode: Option<crate::model::SamplingMode>,
 }
 
 impl ProjectionControlStatus {
@@ -1222,7 +1272,7 @@ mod tests {
     }
 
     #[test]
-    fn status_serialises_the_new_fields_in_camel_case() {
+    fn status_serializes_the_new_fields_in_camel_case() {
         let status = Status {
             state: SyncState::Synced,
             divergences: vec![],
@@ -1252,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn status_serialises_active_app_as_null_when_absent() {
+    fn status_serializes_active_app_as_null_when_absent() {
         let status = Status::default();
         let value = serde_json::to_value(&status).unwrap();
         assert!(

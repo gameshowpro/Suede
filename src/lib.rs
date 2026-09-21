@@ -1,6 +1,6 @@
 //! Suede — remote management daemon for Sway-based display appliances.
 //!
-//! The daemon is organised around one idea: clients write *desired state*, and a
+//! The daemon is organized around one idea: clients write *desired state*, and a
 //! reconciler continuously drives the live Sway session toward it. Observed
 //! state is always re-derived from the compositor and never persisted.
 
@@ -55,7 +55,7 @@ pub const VERSION_STRING: &str = env!("SUEDE_VERSION_STRING");
 ///
 /// This has to be a separate, longer value because greppability is not
 /// guaranteed for what the code actually uses: a release's id collapses to
-/// six bytes, short enough for the optimiser to materialise as
+/// six bytes, short enough for the optimizer to materialize as
 /// store-immediates instead of data, and CI's identity check spent an evening
 /// failing against correct binaries that way.
 ///

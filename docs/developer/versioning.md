@@ -63,7 +63,7 @@ the table is about documents and behavior, not about how much code moved.
 ### While the major is 0
 
 !!! warning "The breaking slot is the minor, not the major"
-    Suede is `0.1.0`. By semver convention nothing below `1.0.0` promises
+    Suede is still `0.x`. By semver convention nothing below `1.0.0` promises
     stability, so a breaking change goes `0.1.x` → `0.2.0`, and patch carries
     everything else. Read "breaking" in the table above as **minor** for now,
     and "minor" as patch.

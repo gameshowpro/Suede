@@ -1,14 +1,16 @@
 # Engineering Plans
 
-This section contains architectural specifications, design RFCs, and implementation plans for upcoming display presentation, projection calibration, and performance enhancements in Suede.
+This section contains design records of shipped projection features and proposed plans for upcoming display-presentation work in Suede.
 
 ---
 
-## Active & Proposed Plans
+## Shipped, documented here as a design record
 
-### [Black Offset (Luminance Lift / Floor Compensation)](black-offset.md)
-* **Status**: Phase 1 Implemented & Validated; Phases 2 & 3 Proposed.
-* **Focus**: Optical black floor compensation across multi-projector overlapping seams. Eliminates distracting bright bands in dark scenes by lifting less-overlapped regions to match the maximum overlap floor, with planned evolutions for dynamic non-linear roll-off and scene-adaptive temporal contrast masking.
+### [Black lift](black-offset.md)
+* **Status**: Shipped as `projection.blackLift` (fixed and adaptive). See the [Configuration reference](../configuration.md#adaptive-black-lift) for the schema.
+* **Focus**: Optical black floor compensation across multi-projector overlapping seams, including content-luminance-adaptive control. The page also records one related idea that was drafted but never built.
+
+## Active & Proposed Plans
 
 ### [Direct-to-Display Presentation via VK_KHR_display](VK_KHR_display.md)
 * **Status**: Proposed Architectural Plan (Gate 0 research spike blocking).

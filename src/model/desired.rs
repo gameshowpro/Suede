@@ -138,7 +138,7 @@ impl Default for ProjectionConfig {
 /// it straight into each output's own dmabuf, and no pixel ever crosses to
 /// system memory — falling back to the CPU path (shared-memory screencopy,
 /// blended on the CPU) whenever the compositor does not offer dmabuf capture
-/// or Vulkan fails to initialise. `Cpu` forces the fallback path even on
+/// or Vulkan fails to initialize. `Cpu` forces the fallback path even on
 /// hardware that could do better. `Gpu` forces the GPU path and is a startup
 /// error if the machine cannot actually provide it — the slicer exits and
 /// the daemon respawns it on its next reconcile, rather than silently
@@ -169,7 +169,7 @@ pub enum TestPattern {
     /// averages to half light. The patch that matches from a distance names
     /// the projector's gamma; the configured value is marked.
     Gamma,
-    /// The connector's name, as large as the output will carry, on a colour
+    /// The connector's name, as large as the output will carry, on a color
     /// unique to that name.
     ///
     /// For deciding which cable to move. The grid carries the name too, but
@@ -219,7 +219,22 @@ impl DesiredState {
     /// choose — see [`crate::config::BootstrapConfig::allow_overlaps`].
     pub fn validate(&self, allow_overlaps: bool) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
+        self.validate_outputs_basic(&mut errors);
+        self.validate_layout_topology(allow_overlaps, &mut errors);
+        self.validate_backgrounds(&mut errors);
+        self.validate_projection(allow_overlaps, &mut errors);
+        self.validate_apps(&mut errors);
+        self.validate_settings(&mut errors);
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
 
+    /// Per-output match, mode, scale and background checks that do not
+    /// depend on any other output or on the layout as a whole.
+    fn validate_outputs_basic(&self, errors: &mut Vec<String>) {
         let mut seen_outputs = std::collections::HashSet::new();
         for (index, output) in self.outputs.iter().enumerate() {
             let prefix = format!("outputs[{index}]");
@@ -265,26 +280,32 @@ impl DesiredState {
                 None => {}
             }
         }
+    }
 
-        // The layout must be one contiguous surface: every output chained
-        // back to the first through any run of overlaps or shared edges. A
-        // gap in the chain means part of the canvas maps to no projector at
-        // all — content silently lost — and there is no use case for it.
-        // Only entries whose rectangle the document actually pins down
-        // (enabled, with both mode and position) can be checked; the rest
-        // take their geometry from whatever is observed at reconcile time.
-        //
-        // Flood fill over pairwise touch tests. At the design maximum of
-        // four outputs that is at most a dozen integer comparisons —
-        // asymptotically cleverer schemes (sweep lines) only pay for
-        // themselves at hundreds of rectangles.
+    /// The layout must be one contiguous surface: every output chained back
+    /// to the first through any run of overlaps or shared edges. A gap in
+    /// the chain means part of the canvas maps to no projector at all —
+    /// content silently lost — and there is no use case for it. Only
+    /// entries whose rectangle the document actually pins down (enabled,
+    /// with both mode and position) can be checked; the rest take their
+    /// geometry from whatever is observed at reconcile time.
+    ///
+    /// Flood fill over pairwise touch tests. At the design maximum of four
+    /// outputs that is at most a dozen integer comparisons —
+    /// asymptotically cleverer schemes (sweep lines) only pay for
+    /// themselves at hundreds of rectangles.
+    fn validate_layout_topology(&self, allow_overlaps: bool, errors: &mut Vec<String>) {
         let rects: Vec<(String, i64, i64, i64, i64)> = self
             .outputs
             .iter()
             .filter(|output| output.enable)
-            // Shared crops supersede legacy integer positions. Validating both
-            // would reject good crops because of stale compositor coordinates.
-            .filter(|_| self.projection.as_ref().is_none_or(|p| p.canvas.is_none()))
+            // A shared crop supersedes an output's legacy integer position,
+            // so validating both would reject a good crop over stale
+            // compositor coordinates — but that only excuses the outputs
+            // that actually carry a source rectangle. A canvas being
+            // configured elsewhere in the document must not exempt an
+            // output with no geometry of its own from this check.
+            .filter(|output| output.geometry.is_none())
             .filter_map(|output| {
                 // The adopted mode counts too: once a value has been pinned,
                 // it is as settled a fact as one the operator typed in, and
@@ -362,7 +383,9 @@ impl DesiredState {
                 ));
             }
         }
+    }
 
+    fn validate_backgrounds(&self, errors: &mut Vec<String>) {
         let mut seen_backgrounds = std::collections::HashSet::new();
         for (index, preset) in self.backgrounds.iter().enumerate() {
             let prefix = format!("backgrounds[{index}]");
@@ -374,139 +397,169 @@ impl DesiredState {
             }
             errors.extend(preset.background.problems(&prefix));
         }
+    }
 
-        if self.projection.is_none() {
+    /// Validate one output's retained geometry exactly once: against the
+    /// raster it will actually be sampled onto when a canvas and an
+    /// effective mode are both known, otherwise against the canvas (or
+    /// canvas-less numeric bounds) alone. Callers must not also call
+    /// [`OutputGeometry::validate_for_output`] or
+    /// [`OutputGeometry::validate_numbers`] themselves for the same output —
+    /// that was the duplicate-error bug this exists to close.
+    fn validate_output_geometry_once(
+        geometry: &OutputGeometry,
+        canvas: Option<&CanvasConfig>,
+        mode: Option<Mode>,
+        prefix: &str,
+        errors: &mut Vec<String>,
+    ) {
+        let result = match (canvas, mode) {
+            (Some(canvas), Some(mode)) if mode.width > 0 && mode.height > 0 => {
+                geometry.validate_for_output(canvas, mode.width as u32, mode.height as u32)
+            }
+            _ => geometry.validate_numbers(canvas),
+        };
+        if let Err(error) = result {
+            errors.push(format!("{prefix}.geometry {error}"));
+        }
+    }
+
+    /// Projection configuration: canvas, gamma, black lift, and (for a
+    /// shared canvas, in either pipeline) each participating output's
+    /// geometry and presentation dimensions.
+    fn validate_projection(&self, allow_overlaps: bool, errors: &mut Vec<String>) {
+        let Some(projection) = &self.projection else {
             // Retained warp entries remain part of the document even when no
             // projection pipeline is requested, so malformed numbers cannot
             // hide behind the absent pipeline.
             for (index, output) in self.outputs.iter().enumerate() {
                 if let Some(geometry) = &output.geometry {
-                    if let Err(error) = geometry.validate_numbers(None) {
-                        errors.push(format!("outputs[{index}].geometry {error}"));
-                    }
-                }
-            }
-        }
-
-        if let Some(projection) = &self.projection {
-            if let Some(canvas) = projection.canvas.as_ref() {
-                if let Err(error) = canvas.dimensions() {
-                    errors.push(format!("projection.canvas {error}"));
-                }
-            }
-            // 1.0 disables the correction; beyond 4.0 is no known display and
-            // almost certainly a typo'd measurement (22 for 2.2).
-            if !(projection.gamma.is_finite() && (1.0..=4.0).contains(&projection.gamma)) {
-                errors.push(format!(
-                    "projection.gamma must be between 1.0 and 4.0, not {}",
-                    projection.gamma
-                ));
-            }
-            // Above 0.5 the "compensation" is brighter than mid-grey, which
-            // is no black level anyone measured.
-            if let Err(error) = projection.black_lift.validate() {
-                errors.push(format!("projection.{error}"));
-            }
-
-            // A shared canvas has one complete configured roster in either
-            // pipeline, including disconnected enabled outputs.
-            let shared = projection.canvas.is_some() || projection.mode == ProjectionMode::Warp;
-            let mut warp_sources = Vec::new();
-            let enabled_count = self.outputs.iter().filter(|output| output.enable).count();
-            for (index, output) in self.outputs.iter().enumerate() {
-                let prefix = format!("outputs[{index}]");
-                if let Some(geometry) = &output.geometry {
-                    if let Err(error) = geometry.validate_numbers(projection.canvas.as_ref()) {
-                        errors.push(format!("{prefix}.geometry {error}"));
-                    } else if let (Some(canvas), Some(mode)) =
-                        (projection.canvas.as_ref(), output.effective_mode())
-                    {
-                        if mode.width > 0 && mode.height > 0 {
-                            if let Err(error) = geometry.validate_for_output(
-                                canvas,
-                                mode.width as u32,
-                                mode.height as u32,
-                            ) {
-                                errors.push(format!("{prefix}.geometry {error}"));
-                            }
-                        }
-                    }
-                }
-                if shared && output.enable {
-                    let Some(canvas) = projection.canvas.as_ref() else {
-                        errors.push("projection.canvas is required in warp mode".into());
-                        continue;
-                    };
-                    let Some(mode) = output.effective_mode() else {
-                        errors.push(format!("{prefix}.mode is required for a shared canvas"));
-                        continue;
-                    };
-                    if projection.mode == ProjectionMode::Warp
-                        && output.effective_scale().is_some_and(|scale| scale != 1.0)
-                    {
-                        errors.push(format!(
-                            "{prefix}.scale must be 1.0 in warp mode until raster scaling is supported"
-                        ));
-                    }
-                    if projection.mode == ProjectionMode::Warp
-                        && output
-                            .effective_transform()
-                            .is_some_and(|transform| transform != Transform::Normal)
-                    {
-                        errors.push(format!(
-                            "{prefix}.transform must be normal in warp mode until transformed rasters are supported"
-                        ));
-                    }
-                    if mode.width <= 0 || mode.height <= 0 {
-                        errors.push(format!("{prefix}.mode dimensions must be positive"));
-                        continue;
-                    }
-                    if mode.width > 32_768 || mode.height > 32_768 {
-                        errors.push(format!(
-                            "{prefix}.mode dimensions must be at most 32768 pixels per axis"
-                        ));
-                    }
-                    if (mode.width as u64) * (mode.height as u64) > 32_000_000 {
-                        errors.push(format!("{prefix}.mode allocation exceeds the 32MP limit"));
-                    }
-                    let (width, height) = (mode.width as u32, mode.height as u32);
-                    if let Err(error) = output
-                        .presentation_dimensions(mode, projection.mode == ProjectionMode::Warp)
-                    {
-                        errors.push(format!("{prefix} {error}"));
-                    }
-                    match &output.geometry {
-                        Some(geometry) => {
-                            if let Err(error) = geometry.validate_for_output(canvas, width, height)
-                            {
-                                errors.push(format!("{prefix}.geometry {error}"));
-                            }
-                            warp_sources.push(geometry.source);
-                        }
-                        None => errors
-                            .push(format!("{prefix}.geometry is required for a shared canvas")),
-                    }
-                }
-            }
-            if shared {
-                if !allow_overlaps {
-                    errors.push("shared canvas rendering requires allow_overlaps = true".into());
-                }
-                if enabled_count == 0 {
-                    errors.push(
-                        "shared canvas rendering requires at least one enabled output".into(),
+                    Self::validate_output_geometry_once(
+                        geometry,
+                        None,
+                        None,
+                        &format!("outputs[{index}]"),
+                        errors,
                     );
                 }
-                if let Some(canvas) = projection.canvas.as_ref() {
-                    if warp_sources.len() == enabled_count && !warp_sources.is_empty() {
-                        if let Err(error) = validate_sources(canvas, &warp_sources) {
-                            errors.push(format!("projection sources {error}"));
-                        }
+            }
+            return;
+        };
+
+        if let Some(canvas) = projection.canvas.as_ref() {
+            if let Err(error) = canvas.dimensions() {
+                errors.push(format!("projection.canvas {error}"));
+            }
+        }
+        // 1.0 disables the correction; beyond 4.0 is no known display and
+        // almost certainly a typo'd measurement (22 for 2.2).
+        if !(projection.gamma.is_finite() && (1.0..=4.0).contains(&projection.gamma)) {
+            errors.push(format!(
+                "projection.gamma must be between 1.0 and 4.0, not {}",
+                projection.gamma
+            ));
+        }
+        // Above 0.5 the "compensation" is brighter than mid-gray, which
+        // is no black level anyone measured.
+        if let Err(error) = projection.black_lift.validate() {
+            errors.push(format!("projection.{error}"));
+        }
+
+        // A shared canvas has one complete configured roster in either
+        // pipeline, including disconnected enabled outputs.
+        let shared = projection.canvas.is_some() || projection.mode == ProjectionMode::Warp;
+        // One fact about the whole document, not one per output: emitted
+        // here instead of inside the per-output loop below, which used to
+        // repeat it once for every enabled output.
+        if shared && projection.canvas.is_none() {
+            errors.push("projection.canvas is required in warp mode".into());
+        }
+        let mut warp_sources = Vec::new();
+        let enabled_count = self.outputs.iter().filter(|output| output.enable).count();
+        for (index, output) in self.outputs.iter().enumerate() {
+            let prefix = format!("outputs[{index}]");
+            // Exactly one geometry validation per output, regardless of
+            // whether it also takes part in the shared-canvas checks below.
+            if let Some(geometry) = &output.geometry {
+                Self::validate_output_geometry_once(
+                    geometry,
+                    projection.canvas.as_ref(),
+                    output.effective_mode(),
+                    &prefix,
+                    errors,
+                );
+            }
+            if !(shared && output.enable) {
+                continue;
+            }
+            if projection.canvas.is_none() {
+                // Already reported once above, for the document as a whole.
+                continue;
+            }
+            let Some(mode) = output.effective_mode() else {
+                errors.push(format!("{prefix}.mode is required for a shared canvas"));
+                continue;
+            };
+            if projection.mode == ProjectionMode::Warp
+                && output.effective_scale().is_some_and(|scale| scale != 1.0)
+            {
+                errors.push(format!(
+                    "{prefix}.scale must be 1.0 in warp mode until raster scaling is supported"
+                ));
+            }
+            if projection.mode == ProjectionMode::Warp
+                && output
+                    .effective_transform()
+                    .is_some_and(|transform| transform != Transform::Normal)
+            {
+                errors.push(format!(
+                    "{prefix}.transform must be normal in warp mode until transformed rasters are supported"
+                ));
+            }
+            if mode.width <= 0 || mode.height <= 0 {
+                errors.push(format!("{prefix}.mode dimensions must be positive"));
+                continue;
+            }
+            if mode.width > super::limits::MAX_DIMENSION as i32
+                || mode.height > super::limits::MAX_DIMENSION as i32
+            {
+                errors.push(format!(
+                    "{prefix}.mode dimensions must be at most 32768 pixels per axis"
+                ));
+            }
+            if (mode.width as u64) * (mode.height as u64) > super::limits::MAX_OUTPUT_PIXELS {
+                errors.push(format!("{prefix}.mode allocation exceeds the 32MP limit"));
+            }
+            if let Err(error) =
+                output.presentation_dimensions(mode, projection.mode == ProjectionMode::Warp)
+            {
+                errors.push(format!("{prefix} {error}"));
+            }
+            match &output.geometry {
+                // Already validated once above (against this same canvas
+                // and mode); only the source needs collecting here.
+                Some(geometry) => warp_sources.push(geometry.source),
+                None => errors.push(format!("{prefix}.geometry is required for a shared canvas")),
+            }
+        }
+        if shared {
+            if !allow_overlaps {
+                errors.push("shared canvas rendering requires allow_overlaps = true".into());
+            }
+            if enabled_count == 0 {
+                errors.push("shared canvas rendering requires at least one enabled output".into());
+            }
+            if let Some(canvas) = projection.canvas.as_ref() {
+                if warp_sources.len() == enabled_count && !warp_sources.is_empty() {
+                    if let Err(error) = validate_sources(canvas, &warp_sources) {
+                        errors.push(format!("projection sources {error}"));
                     }
                 }
             }
         }
+    }
 
+    fn validate_apps(&self, errors: &mut Vec<String>) {
         if let Some(active) = &self.active_app {
             if !self.apps.iter().any(|app| &app.id == active) {
                 errors.push(format!("activeApp {active:?} does not name a listed app"));
@@ -601,15 +654,11 @@ impl DesiredState {
                 }
             }
         }
+    }
 
+    fn validate_settings(&self, errors: &mut Vec<String>) {
         if self.settings.output_poll_interval_seconds == 0 {
             errors.push("settings.outputPollIntervalSeconds must be greater than zero".into());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
         }
     }
 
@@ -885,7 +934,7 @@ pub enum BackgroundMode {
     Fit,
     /// Scale to the output exactly, ignoring aspect ratio.
     Stretch,
-    /// Original size, centred.
+    /// Original size, centered.
     Center,
     /// Original size, repeated.
     Tile,
@@ -1138,10 +1187,11 @@ impl OutputConfig {
         };
         let width = (f64::from(width) / scale).round();
         let height = (f64::from(height) / scale).round();
-        if !(1.0..=32768.0).contains(&width) || !(1.0..=32768.0).contains(&height) {
+        let max_dimension = f64::from(super::limits::MAX_DIMENSION);
+        if !(1.0..=max_dimension).contains(&width) || !(1.0..=max_dimension).contains(&height) {
             return Err("presentation dimensions must be in 1..=32768 pixels per axis".into());
         }
-        if width * height > 32_000_000.0 {
+        if width * height > super::limits::MAX_OUTPUT_PIXELS as f64 {
             return Err("presentation allocation exceeds the 32MP limit".into());
         }
         Ok((width as i32, height as i32))
@@ -1435,6 +1485,7 @@ fn default_heartbeat_grace() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CanvasRect;
 
     #[test]
     fn complete_simple_and_warp_examples_validate_against_the_current_schema() {
@@ -1528,6 +1579,84 @@ mod tests {
         assert!(policy.should_restart(None));
     }
 
+    /// A15-adjacent: `validate_projection` used to push "projection.canvas
+    /// is required in warp mode" once per enabled output sharing the
+    /// canvas, rather than once for the document.
+    #[test]
+    fn missing_canvas_in_warp_mode_is_reported_once_not_per_output() {
+        let mut state = DesiredState::new();
+        state.projection = Some(ProjectionConfig {
+            mode: ProjectionMode::Warp,
+            ..Default::default()
+        });
+        for name in ["A", "B", "C"] {
+            let mut output = OutputConfig::new(OutputMatch::by_name(name));
+            output.mode = Some(Mode {
+                width: 100,
+                height: 100,
+                refresh_hz: 60.0,
+            });
+            output.position = Some(Position { x: 0, y: 0 });
+            state.outputs.push(output);
+        }
+        let errors = state.validate(true).unwrap_err();
+        let canvas_required = errors
+            .iter()
+            .filter(|e| e.contains("is required in warp mode"))
+            .count();
+        assert_eq!(
+            canvas_required, 1,
+            "one fact about the document, not one per output: {errors:?}"
+        );
+    }
+
+    /// The general per-output geometry check and the shared-canvas check
+    /// used to both call `OutputGeometry::validate_for_output` against the
+    /// same canvas and mode for a shared+enabled output, doubling every
+    /// geometry error.
+    #[test]
+    fn invalid_shared_geometry_is_reported_once_not_twice() {
+        let mut state = DesiredState::new();
+        state.projection = Some(ProjectionConfig {
+            mode: ProjectionMode::Warp,
+            canvas: Some(CanvasConfig {
+                aspect: 1.0,
+                render_width: 100,
+            }),
+            ..Default::default()
+        });
+        let mut output = OutputConfig::new(OutputMatch::by_name("A"));
+        output.mode = Some(Mode {
+            width: 100,
+            height: 100,
+            refresh_hz: 60.0,
+        });
+        output.position = Some(Position { x: 0, y: 0 });
+        output.geometry = Some(OutputGeometry {
+            // Not finite-positive: fails validate_numbers, which both the
+            // general check and the (now removed) duplicate shared-canvas
+            // check used to run independently.
+            source: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: -1.0,
+                height: 1.0,
+            },
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        });
+        state.outputs.push(output);
+        let errors = state.validate(true).unwrap_err();
+        let geometry_errors: Vec<_> = errors.iter().filter(|e| e.contains(".geometry")).collect();
+        assert_eq!(geometry_errors.len(), 1, "{errors:?}");
+    }
+
     #[test]
     fn validation_catches_duplicate_app_ids() {
         let app = AppConfig {
@@ -1616,7 +1745,7 @@ mod tests {
 
     #[test]
     fn a_corner_touch_is_not_a_chain() {
-        // Diagonal neighbours meet in a single point: no pixel row or column
+        // Diagonal neighbors meet in a single point: no pixel row or column
         // crosses between them, so the canvas is still split in two.
         let errors = layout(vec![
             placed("A", 0, 0, 1920, 1080),
@@ -1677,6 +1806,47 @@ mod tests {
         ])
         .validate(true)
         .expect("an overlap is the projection configuration on such a machine");
+    }
+
+    /// A configured canvas used to exempt every output from the plain
+    /// integer-position overlap check, not just the ones that actually
+    /// carry their own source rectangle.
+    #[test]
+    fn a_canvas_only_exempts_outputs_that_carry_their_own_geometry_from_the_overlap_check() {
+        let mut a = placed("A", 0, 0, 1920, 1080);
+        a.geometry = Some(OutputGeometry {
+            source: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+        });
+        // B overlaps A by integer position and carries no geometry of its
+        // own.
+        let mut state = layout(vec![a, placed("B", 1760, 0, 1920, 1080)]);
+        state.projection = Some(ProjectionConfig {
+            mode: ProjectionMode::Simple,
+            canvas: Some(CanvasConfig {
+                aspect: 1.0,
+                render_width: 100,
+            }),
+            ..Default::default()
+        });
+        let errors = state.validate(false).unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("overlap")),
+            "B has no source rectangle of its own and must still be checked \
+             even though a canvas is configured elsewhere: {errors:?}"
+        );
     }
 
     #[test]
@@ -1873,12 +2043,12 @@ mod tests {
     }
 
     #[test]
-    fn preset_ids_must_be_unique_and_their_colours_valid() {
+    fn preset_ids_must_be_unique_and_their_colors_valid() {
         let mut state = DesiredState::new();
         state.backgrounds.push(BackgroundPreset {
             id: "one".into(),
             background: Background {
-                color: Some("not-a-colour".into()),
+                color: Some("not-a-color".into()),
                 ..Default::default()
             },
         });
@@ -1896,7 +2066,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unset_colour_resolves_to_black() {
+    fn an_unset_color_resolves_to_black() {
         assert_eq!(Background::default().sway_color(), "000000");
         assert_eq!(
             Background {

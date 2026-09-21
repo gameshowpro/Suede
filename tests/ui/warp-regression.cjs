@@ -39,7 +39,6 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
       return respond(body,status,{'x-config-generation':String(generation),'x-config-epoch':epoch,etag:`"${current.revision}"`});
     }
     if(path==='/projection/stats') return respond({running:true,geometry:{warpAvailable:true,requestedMode:current.projection.mode,effectiveMode:current.projection.mode,retainedWarp:true},control:{session:'test-session'}});
-    if(path==='/projection/convert') return respond({canvas:fixture.projection.canvas,outputs:fixture.outputs.map(o=>({key:o.match.name,geometry:o.geometry})),warnings:[]});
     if(path==='/projection/recommendation') {
       const result={revision:current.revision,generation,requestedAspect:current.projection.canvas.aspect,idealWidth:8000,idealHeight:1125,admissibleWidth:8000,admissibleHeight:1125,presets:[.25,.5,.75,1].map(scale=>({width:8000*scale,height:Math.round(8000*scale/current.projection.canvas.aspect),scale,available:true})),knownLimits:{maxDimension:32768,maxCanvasPixels:64000000},unknownLimits:['Device allocation'],warnings:['Approximate sampled estimate']};
       await sleep(recommendationDelay); return respond(result);
@@ -154,9 +153,9 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   assert(await second.locator('#config-conflict').isVisible());assert.equal(current.outputs[0].geometry.corners[0][0],.05);
   await second.evaluate(()=>loadAll());assert.equal((await second.evaluate(()=>config.outputs[0].geometry.corners[0][0])),.07);
   await second.locator('#config-discard').click();await second.waitForFunction(()=>!configConflict);assert.equal(await second.evaluate(()=>config.outputs[0].geometry.corners[0][0]),.05);mark('two clients conflict; reconnect preserves local edits; explicit reload resolves');
-  await page.evaluate(()=>{projectionStats.control={session:'new-session',appliedConfigGeneration:Number(configGeneration)-1};renderWarpStatus();});
+  await page.evaluate(()=>{projectionStats.control={session:'new-session',configGeneration:{applied:Number(configGeneration)-1}};renderWarpStatus();});
   assert.doesNotMatch(await page.locator('#warp-status').textContent(),/Effective projection installed/);
-  await page.evaluate(()=>{projectionStats.control.appliedConfigGeneration=Number(configGeneration);renderWarpStatus();});
+  await page.evaluate(()=>{projectionStats.control.configGeneration.applied=Number(configGeneration);renderWarpStatus();});
   assert.match(await page.locator('#warp-status').textContent(),/Effective projection installed/);mark('installation status uses working-copy correlation, not acceptance alone');
   await page.evaluate(()=>{
     window.fixtureSources=[];
@@ -170,7 +169,7 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   epoch="restarted-fixture";
   await page.evaluate(()=>loadAll());assert(await page.locator('#config-conflict').isVisible());
   assert(await page.evaluate(()=>fixtureSources[0].closed));
-  await page.evaluate(()=>fixtureSources[0].listeners.projection_stats_changed({data:JSON.stringify({running:true,control:{session:'stale',appliedConfigGeneration:Number(configGeneration)}})}));
+  await page.evaluate(()=>fixtureSources[0].listeners.projection_stats_changed({data:JSON.stringify({running:true,control:{session:'stale',configGeneration:{applied:Number(configGeneration)}}})}));
   assert.notEqual(await page.evaluate(()=>projectionStats?.control?.session),'stale');
   await page.locator('#config-discard').click();await page.waitForFunction(()=>!configConflict);
   assert.equal(await page.evaluate(()=>configEpoch),'restarted-fixture');mark('daemon restart epoch prevents repeated-generation ABA conflicts');

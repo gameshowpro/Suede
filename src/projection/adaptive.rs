@@ -5,12 +5,26 @@
 //! dimensions and row stride are supplied separately, so allocation padding
 //! is never mistaken for picture content.
 
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use crate::model::AdaptiveBlackLift;
 
 /// Maximum number of source samples along either grid axis.
 pub const MAX_GRID_AXIS: usize = 256;
+/// How often a source measurement may be submitted to the GPU.
+///
+/// The controller's own time constants are `rise_ms`/`fall_ms`, configured
+/// between 250 ms and 1 s, and the slew limit bounds how far one tick can
+/// move the level regardless of how fresh the target is. Measuring every
+/// capture therefore buys nothing at all: at 60 Hz it submits roughly seven
+/// passes inside a single time constant, each of which moves the target by
+/// an amount the slew limit was going to take several hundred milliseconds
+/// to follow anyway. 125 ms (8 Hz) is two full samples inside the shortest
+/// configurable time constant — enough for the follower to see a scene cut
+/// promptly, few enough that the pass and its readback are noise against
+/// the frame budget.
+pub const MEASUREMENT_INTERVAL: Duration = Duration::from_millis(125);
 /// Differences below this level are treated as settled.
 pub const SETTLE_EPSILON: f64 = 1.0e-5;
 /// Suggested repaint cadence while the controller is moving.
@@ -59,14 +73,32 @@ impl SampleGrid {
     }
 }
 
-/// Decode one sRGB byte to linear signal.
-pub fn srgb_to_linear(byte: u8) -> f64 {
+/// The IEC 61966-2-1 electro-optical transfer function, evaluated exactly.
+///
+/// Only [`SRGB_TO_LINEAR`] calls this: the domain of the function is 256
+/// values wide and one reduction decodes up to 3 x 65 536 of them, so
+/// evaluating `powf` per channel per sample was pure waste on the render
+/// thread. Kept separate so the table can be checked against the closed
+/// form rather than against itself.
+fn srgb_to_linear_exact(byte: u8) -> f64 {
     let value = f64::from(byte) / 255.0;
     if value <= 0.04045 {
         value / 12.92
     } else {
         ((value + 0.055) / 1.055).powf(2.4)
     }
+}
+
+/// Every decoded sRGB byte, built once on first use.
+static SRGB_TO_LINEAR: LazyLock<[f64; 256]> =
+    LazyLock::new(|| std::array::from_fn(|byte| srgb_to_linear_exact(byte as u8)));
+
+/// Decode one sRGB byte to linear signal.
+///
+/// Bit-identical to [`srgb_to_linear_exact`] — the table holds exactly what
+/// that function returns — so no measurement changes value by being fast.
+pub fn srgb_to_linear(byte: u8) -> f64 {
+    SRGB_TO_LINEAR[usize::from(byte)]
 }
 
 /// Compute Rec. 709 luminance from an sRGB byte triplet.
@@ -124,6 +156,84 @@ pub fn target_for_luminance(config: AdaptiveBlackLift, luminance: f64) -> f64 {
         / (config.bright_threshold - config.dark_threshold))
         .clamp(0.0, 1.0);
     (config.level * ratio).clamp(0.0, config.level)
+}
+
+/// One source measurement the GPU has been asked for and has not yet been
+/// observed to finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeasurementFlight {
+    /// The completed capture this pass sampled. The result is tagged with
+    /// it, so a value that arrives two captures later is never mistaken for
+    /// a measurement of whichever capture happens to be current when it is
+    /// read back.
+    pub capture_id: u64,
+    /// The capture slot whose image the pass reads. The compositor must not
+    /// be handed this slot again until that read is known to be complete —
+    /// see `slicer.rs`'s `retire_measurement_for_slot`.
+    pub slot: usize,
+    pub submitted_at: Instant,
+}
+
+/// When a source measurement may be submitted, and which capture image one
+/// in flight is still reading.
+///
+/// This is the whole policy half of asynchronous measurement, deliberately
+/// free of Vulkan so it can be exercised without a GPU: `gpu.rs` owns the
+/// command buffer, the fence and the readback, and does exactly what this
+/// says. Three rules, in the order they are checked:
+///
+/// 1. One measurement at a time. A second submission would have to either
+///    rewrite the descriptor set of a pass still executing or allocate a
+///    second one; neither earns its cost at 8 Hz.
+/// 2. No more often than [`MEASUREMENT_INTERVAL`].
+/// 3. Never the slot that is about to be armed for the next capture. The
+///    compositor writes into that image with no fence of its own, so a pass
+///    reading it would be sampling a frame being overwritten underneath it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MeasurementSchedule {
+    flight: Option<MeasurementFlight>,
+    last_submission: Option<Instant>,
+}
+
+impl MeasurementSchedule {
+    /// The measurement currently in flight, if any.
+    pub fn flight(&self) -> Option<MeasurementFlight> {
+        self.flight
+    }
+
+    /// Whether an in-flight pass is still reading `slot`'s capture image.
+    pub fn reads_slot(&self, slot: usize) -> bool {
+        self.flight.is_some_and(|flight| flight.slot == slot)
+    }
+
+    /// Whether the capture just completed into `slot` should be measured.
+    /// `armed_slot` is the slot the next capture will be written into.
+    pub fn should_submit(&self, now: Instant, slot: usize, armed_slot: usize) -> bool {
+        self.flight.is_none()
+            && slot != armed_slot
+            && self
+                .last_submission
+                .is_none_or(|at| now.saturating_duration_since(at) >= MEASUREMENT_INTERVAL)
+    }
+
+    /// Record a submission the GPU accepted.
+    pub fn submitted(&mut self, flight: MeasurementFlight) {
+        self.last_submission = Some(flight.submitted_at);
+        self.flight = Some(flight);
+    }
+
+    /// Record a submission the GPU refused. Nothing is in flight, but the
+    /// rate limit still applies: a device that cannot measure must not be
+    /// asked again at capture rate.
+    pub fn refused(&mut self, now: Instant) {
+        self.last_submission = Some(now);
+        self.flight = None;
+    }
+
+    /// Clear the flight, whether its result was consumed or discarded.
+    pub fn completed(&mut self) -> Option<MeasurementFlight> {
+        self.flight.take()
+    }
 }
 
 /// Why the current controller value is being used.
@@ -366,6 +476,87 @@ mod tests {
         }
         let aliased = measure_rgb8(&high_res_line, 512, 512, 512 * 3).unwrap();
         assert_eq!(aliased.mean, 0.0);
+    }
+
+    #[test]
+    fn the_srgb_table_holds_exactly_what_the_transfer_function_returns() {
+        for byte in 0..=255_u8 {
+            assert_eq!(
+                srgb_to_linear(byte),
+                srgb_to_linear_exact(byte),
+                "table entry {byte} diverged from the closed form"
+            );
+        }
+    }
+
+    #[test]
+    fn measurement_is_one_at_a_time_rate_limited_and_never_on_the_armed_slot() {
+        let start = Instant::now();
+        let mut schedule = MeasurementSchedule::default();
+        // Nothing has been measured yet, so the first completed capture is
+        // measured at once rather than one interval from now.
+        assert!(schedule.should_submit(start, 0, 1));
+        // ... but never the image the next capture is about to be written
+        // into, whichever way round the slots happen to be.
+        assert!(!schedule.should_submit(start, 1, 1));
+
+        schedule.submitted(MeasurementFlight {
+            capture_id: 7,
+            slot: 0,
+            submitted_at: start,
+        });
+        assert!(schedule.reads_slot(0));
+        assert!(!schedule.reads_slot(1));
+        // A second pass is refused while the first is unobserved, however
+        // long ago it went out.
+        assert!(!schedule.should_submit(start + Duration::from_secs(10), 1, 0));
+
+        // Observing the fence frees the pass but not the rate limit.
+        assert_eq!(schedule.completed().unwrap().capture_id, 7);
+        assert!(!schedule.reads_slot(0));
+        assert!(!schedule.should_submit(start + Duration::from_millis(124), 1, 0));
+        assert!(schedule.should_submit(start + MEASUREMENT_INTERVAL, 1, 0));
+    }
+
+    #[test]
+    fn a_refused_submission_is_rate_limited_and_leaves_nothing_in_flight() {
+        let start = Instant::now();
+        let mut schedule = MeasurementSchedule::default();
+        schedule.refused(start);
+        assert!(schedule.flight().is_none());
+        assert!(!schedule.reads_slot(0));
+        assert!(!schedule.should_submit(start + Duration::from_millis(10), 0, 1));
+        assert!(schedule.should_submit(start + MEASUREMENT_INTERVAL, 0, 1));
+    }
+
+    #[test]
+    fn eight_hertz_is_what_a_sixty_hertz_capture_stream_produces() {
+        // The scheduler is driven once per completed capture; at 60 Hz that
+        // is a submission every eighth one, not every one.
+        let start = Instant::now();
+        let mut schedule = MeasurementSchedule::default();
+        let mut submissions = 0;
+        for capture in 0..60_u64 {
+            let now = start + Duration::from_micros(capture * 16_667);
+            // Alternating slots, the way `run`'s loop flips them.
+            let slot = (capture % 2) as usize;
+            let armed = ((capture + 1) % 2) as usize;
+            if schedule.should_submit(now, slot, armed) {
+                schedule.submitted(MeasurementFlight {
+                    capture_id: capture,
+                    slot,
+                    submitted_at: now,
+                });
+                submissions += 1;
+            }
+            // The fence is observed on the next capture, one slot before the
+            // compositor is handed that image back.
+            schedule.completed();
+        }
+        assert_eq!(
+            submissions, 8,
+            "one second of 60 Hz captures should measure about eight times"
+        );
     }
 
     #[test]

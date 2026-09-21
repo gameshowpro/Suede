@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, research/warp, 'research/**', 'preview/**']
+    branches: [main, 'research/**', 'preview/**']
   pull_request:
-    branches: [main, research/warp]
+    branches: [main]
   workflow_dispatch:
     inputs:
       docs_only:
@@ -100,6 +100,9 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
 
+      - name: Spelling (en-US)
+        run: scripts/check-en-us.sh
+
       - name: Format
         run: cargo fmt --all -- --check
 
@@ -124,8 +127,8 @@ jobs:
   build:
     needs: [changes, test]
     if: |
-      (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request') &&
-      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/research/warp' || startsWith(github.ref, 'refs/heads/research/') || startsWith(github.ref, 'refs/heads/preview/')) &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/research/') || startsWith(github.ref, 'refs/heads/preview/')) &&
       needs.changes.outputs.app == 'true'
     # Pinned, unlike the jobs above, because this one produces artifacts.
     # cargo-deb derives `Depends: libc6 (>= X)` from whatever glibc the build
@@ -165,10 +168,10 @@ jobs:
           echo "version=$version" >> $GITHUB_OUTPUT
           echo "tag=v$version" >> $GITHUB_OUTPUT
 
-          # A release build cannot recognise itself by its tag, because the
+          # A release build cannot recognize itself by its tag, because the
           # tag does not exist yet: the release job creates it after this one
           # finishes. Testing for it here always failed, so the first release
-          # through this path labelled itself a development build sixteen
+          # through this path labeled itself a development build sixteen
           # commits past the PREVIOUS release, which is the one thing the
           # revision exists to stop.
           #
@@ -283,7 +286,7 @@ jobs:
               ;;
           esac
           # The stamp, not the bare id: a release id is six bytes, and the
-          # optimiser materialises strings that short as store-immediates, so
+          # optimizer materializes strings that short as store-immediates, so
           # they never appear contiguously in the file. The grep failed
           # against correct binaries for a whole evening that way. The stamp
           # is long enough to live in rodata and kept there by #[used].
@@ -331,7 +334,7 @@ jobs:
       # Kept before packaging, because packaging strips it. A daemon that
       # deadlocks reports every frame of every thread as `??` without this,
       # and one did: the cause could only be guessed at from the shape of the
-      # stacks until a symbolised build was put on the machine by hand. Same
+      # stacks until a symbolized build was put on the machine by hand. Same
       # compilation as the shipped binary, so a backtrace from the appliance
       # resolves against it:
       #
@@ -452,7 +455,7 @@ jobs:
 
       # `--strict` checks links and navigation. It does not check that the
       # markdown still means anything, and it happily published a site where
-      # a dependency upgrade had stopped ``` fences being recognised: every
+      # a dependency upgrade had stopped ``` fences being recognized: every
       # code block rendered as prose, and shell comments became headings.
       # Nothing failed, because nothing was looking.
       - name: Check the markdown actually rendered

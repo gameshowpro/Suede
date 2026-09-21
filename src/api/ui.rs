@@ -209,6 +209,41 @@ mod tests {
     }
 
     #[test]
+    fn geometry_fields_are_wired_to_real_controls() {
+        // `the_page_covers_every_configurable_field` above deliberately
+        // checks a raw field name anywhere in the file — necessary because it
+        // is generated from the whole schema and most of those names (mode,
+        // scale, source, width...) are common English/CSS words that appear
+        // constantly outside any form control, so a whole-file substring
+        // match there proves nothing beyond "this word exists somewhere".
+        //
+        // For the fields this round's geometry/canvas fixes actually touch,
+        // check something a decorative comment or an unrelated JS variable
+        // cannot satisfy: a `data-config-field="<name>"` attribute on a real
+        // input/select in the Displays editor. A field could be removed from
+        // its control while staying mentioned elsewhere in the page, and the
+        // old substring check would not catch it; this one does.
+        for field in [
+            "enable",
+            "mode",
+            "scale",
+            "transform",
+            "background",
+            "source",
+            "corners",
+            "center",
+            "aspect",
+            "renderWidth",
+        ] {
+            let needle = format!("data-config-field=\"{field}\"");
+            assert!(
+                INDEX.contains(&needle),
+                "no control carries {needle:?} — the {field} field is not demonstrably wired to an editable control"
+            );
+        }
+    }
+
+    #[test]
     fn an_uploaded_image_can_be_put_on_a_display() {
         // The first version of this tab could upload wallpapers and nothing
         // else, leaving no way to reach a screen with one.

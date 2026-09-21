@@ -58,7 +58,7 @@ pub async fn feed(mut shutdown: tokio::sync::watch::Receiver<bool>) {
 /// How often to ping: half the deadline systemd is enforcing.
 fn watchdog_interval() -> Option<Duration> {
     // Set only for the process systemd is actually watching. It also sets
-    // WATCHDOG_PID when a service forks; honouring it keeps a child from
+    // WATCHDOG_PID when a service forks; honoring it keeps a child from
     // reporting on its parent's behalf.
     if let Ok(pid) = std::env::var("WATCHDOG_PID") {
         if pid.parse::<u32>() != Ok(std::process::id()) {
@@ -123,7 +123,7 @@ mod tests {
         unsafe { std::env::set_var("WATCHDOG_USEC", "not a number") };
         assert_eq!(watchdog_interval(), None, "nonsense means disabled");
 
-        // A value meant for a different process must not be honoured.
+        // A value meant for a different process must not be honored.
         unsafe {
             std::env::set_var("WATCHDOG_USEC", "30000000");
             std::env::set_var("WATCHDOG_PID", "1");

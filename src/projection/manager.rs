@@ -228,23 +228,20 @@ impl BlendManager {
     ) {
         if self.snapshot.update_projection_control(|status| {
             status.session = Some(session.to_string());
-            highest_generation(&mut status.requested_generation, generation);
-            status.requested_config_generation = Some(config_generation);
+            highest_generation(&mut status.child_generation.requested, generation);
+            status.config_generation.requested = Some(config_generation);
             // If the same complete control snapshot was already installed,
             // a later StateStore generation that resolves to it is applied
             // too. This is the only no-control-message fast path; an
             // in-flight newer control generation cannot satisfy it.
-            if status.applied_generation == status.requested_generation {
-                status.applied_config_generation = Some(config_generation);
+            if status.child_generation.applied == status.child_generation.requested {
+                status.config_generation.applied = Some(config_generation);
             }
-            status.requested_mode = Some(
-                if spec_requests_warp(spec) {
-                    "warp"
-                } else {
-                    "simple"
-                }
-                .to_string(),
-            );
+            status.requested_mode = Some(if spec_requests_warp(spec) {
+                crate::model::ProjectionMode::Warp
+            } else {
+                crate::model::ProjectionMode::Simple
+            });
         }) {
             self.publish_projection_report();
         }
@@ -381,12 +378,7 @@ impl BlendManager {
                 .expect("planned spawns come from specs");
             match spawn_overlay(spec) {
                 Ok(child) => {
-                    tracing::info!(
-                        output,
-                        ramps = spec.ramps.len(),
-                        gamma = spec.gamma,
-                        "started blend overlay"
-                    );
+                    tracing::info!(output, gamma = spec.gamma, "started blend overlay");
                     self.overlays.insert(
                         output.clone(),
                         RunningOverlay {
@@ -468,7 +460,8 @@ impl BlendManager {
                 restart_for_auto_cpu_update = self
                     .snapshot
                     .projection_control()
-                    .requested_generation
+                    .child_generation
+                    .requested
                     .is_some_and(|generation| generation > 0);
                 running.live_control = false;
                 running.fingerprint = slicer_fingerprint(&running.desired, false);
@@ -528,7 +521,8 @@ impl BlendManager {
                     let control_generation = self
                         .snapshot
                         .projection_control()
-                        .requested_generation
+                        .child_generation
+                        .requested
                         .unwrap_or(0);
                     if let Some(running) = self.slicer.as_ref() {
                         // This generation may still be building. Associate
@@ -699,7 +693,8 @@ fn update_control_status_for_config(
         match event.kind {
             ControlEventKind::BlackLift { status: lift } => {
                 if status
-                    .applied_generation
+                    .child_generation
+                    .applied
                     .is_none_or(|g| event.generation >= g)
                 {
                     status.black_lift = lift;
@@ -717,15 +712,20 @@ fn update_control_status_for_config(
                 status.effective_renderer = Some(effective_renderer);
                 status.warp_available = Some(warp_available);
                 status.warp_reason = reason;
+                // The child's own report is the one authoritative source for
+                // these two fields: nothing downstream re-derives them from
+                // sampling results or anything else (that duplicate
+                // computation used to live in the `Applied` arm below, and
+                // could disagree with what the child had just reported here).
                 status.requested_mode = Some(requested_mode);
                 status.effective_mode = Some(effective_mode);
             }
             ControlEventKind::Accepted => {
-                highest_generation(&mut status.accepted_generation, event.generation);
+                highest_generation(&mut status.child_generation.accepted, event.generation);
                 clear_failure_through(&mut status.last_failure, event.generation);
             }
             ControlEventKind::Built { outputs, build_ms } => {
-                highest_generation(&mut status.built_generation, event.generation);
+                highest_generation(&mut status.child_generation.built, event.generation);
                 set_output_generation(
                     &mut status.outputs,
                     &outputs,
@@ -741,15 +741,16 @@ fn update_control_status_for_config(
                 sampling_modes,
             } => {
                 let advances_applied = status
-                    .applied_generation
+                    .child_generation
+                    .applied
                     .is_none_or(|previous| event.generation >= previous);
-                highest_generation(&mut status.applied_generation, event.generation);
+                highest_generation(&mut status.child_generation.applied, event.generation);
                 if advances_applied {
                     // A pruned translation is intentionally reported as
                     // unknown rather than leaving an older correlation in
                     // place: the new render revision may differ from that
                     // older snapshot.
-                    status.applied_config_generation = config_generation;
+                    status.config_generation.applied = config_generation;
                 }
                 set_output_generation(
                     &mut status.outputs,
@@ -758,24 +759,12 @@ fn update_control_status_for_config(
                     OutputStage::Applied,
                 );
                 set_output_sampling(&mut status.outputs, sampling_modes);
-                if status.requested_mode.as_deref() == Some("warp")
-                    && status.warp_available == Some(true)
-                {
-                    status.effective_mode = Some("warp".to_string());
-                } else if status.outputs.iter().all(|output| {
-                    matches!(
-                        output.sampling_mode.as_deref(),
-                        Some("exact") | Some("bilinear")
-                    )
-                }) {
-                    status.effective_mode = Some("simple".to_string());
-                }
                 status.build_ms = build_ms.or(status.build_ms);
                 status.upload_ms = upload_ms.or(status.upload_ms);
                 clear_failure_through(&mut status.last_failure, event.generation);
             }
             ControlEventKind::Submitted { outputs } => {
-                highest_generation(&mut status.submitted_generation, event.generation);
+                highest_generation(&mut status.child_generation.submitted, event.generation);
                 set_output_generation(
                     &mut status.outputs,
                     &outputs,
@@ -784,7 +773,7 @@ fn update_control_status_for_config(
                 );
             }
             ControlEventKind::Presented { outputs } => {
-                highest_generation(&mut status.presented_generation, event.generation);
+                highest_generation(&mut status.child_generation.presented, event.generation);
                 set_output_generation(
                     &mut status.outputs,
                     &outputs,
@@ -898,7 +887,7 @@ fn set_output_generation(
 
 fn set_output_sampling(
     statuses: &mut Vec<ProjectionControlOutputStatus>,
-    sampling_modes: std::collections::BTreeMap<String, String>,
+    sampling_modes: std::collections::BTreeMap<String, crate::model::SamplingMode>,
 ) {
     for (name, sampling_mode) in sampling_modes {
         let index = match statuses.iter().position(|status| status.name == name) {
@@ -976,9 +965,22 @@ fn spawn_slicer_stdout_reader(
                 let line = match read_bounded_line(&mut reader, MAX_CONTROL_LINE_BYTES) {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
-                    Err(error) => {
-                        tracing::debug!(%error, "slicer stdout reader stopped");
+                    // An oversize line is recoverable: `read_bounded_line`
+                    // already drained it up to the next newline, so the
+                    // stream is realigned and the next line can be read
+                    // normally. Any other error means the pipe itself is in
+                    // a state this reader cannot recover from (closed,
+                    // reset, or similar) — looping on it here spun the
+                    // thread at 100% CPU instead of ending it; the child
+                    // side of this same protocol (`warp_update.rs`) already
+                    // treats only `InvalidData` as non-terminal.
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        tracing::debug!(%error, "slicer stdout reader recovered from a malformed line");
                         continue;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "slicer stdout reader stopped");
+                        break;
                     }
                 };
                 if let Ok(event) = serde_json::from_slice::<ControlEvent>(&line) {
@@ -1083,7 +1085,7 @@ fn fingerprint_slicer_json(spec: &SlicerSpec) -> u64 {
 
 /// Hash only child-lifetime inputs on a controlled GPU path. Gamma is an
 /// exception for the Gamma pattern because its canvas source is rebuilt from
-/// that value; lift, ramps, and geometry remain live snapshots.
+/// that value; lift and geometry remain live snapshots.
 fn slicer_topology_fingerprint(spec: &SlicerSpec) -> u64 {
     let mut hasher = DefaultHasher::new();
     spec.source.hash(&mut hasher);
@@ -1167,24 +1169,15 @@ mod tests {
 
     #[test]
     fn fingerprints_track_the_spec_content() {
-        use super::super::blend::{FadeTo, RampSpec};
         use crate::model::Rect;
         let mut spec = OverlaySpec {
             output: "DP-1".into(),
             gamma: 2.2,
             black_lift: 0.0,
             rect: Rect::default(),
+            source_rect: None,
             pattern: None,
             canvas_size: None,
-            ramps: vec![RampSpec {
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    width: 160,
-                    height: 1080,
-                },
-                fade_to: FadeTo::Left,
-            }],
         };
         let original = fingerprint(&spec);
         assert_eq!(original, fingerprint(&spec), "stable for equal specs");
@@ -1275,7 +1268,7 @@ mod tests {
 
     #[test]
     fn live_gpu_edits_keep_the_child_but_cpu_edits_restart_it() {
-        use super::super::blend::{FadeTo, RampSpec, SliceSpec};
+        use super::super::blend::SliceSpec;
         use crate::model::Rect;
 
         let mut gpu = minimal_slicer_spec();
@@ -1290,21 +1283,10 @@ mod tests {
                 height: 100,
             },
             geometry: None,
-            ramps: Vec::new(),
         });
         let gpu_fingerprint = slicer_fingerprint(&gpu, true);
         gpu.gamma = 2.4;
         gpu.black_lift = 0.1;
-        assert_eq!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
-        gpu.slices[0].ramps.push(RampSpec {
-            rect: Rect {
-                x: 0,
-                y: 0,
-                width: 10,
-                height: 100,
-            },
-            fade_to: FadeTo::Left,
-        });
         assert_eq!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
         gpu.slices[0].geometry = Some(crate::projection::warp::Geometry {
             corners: [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]],
@@ -1432,7 +1414,7 @@ mod tests {
             ),
         );
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.applied_generation, Some(4));
+        assert_eq!(status.child_generation.applied, Some(4));
         assert!(status.last_failure.is_none());
     }
 
@@ -1448,8 +1430,8 @@ mod tests {
             Some(41),
         );
         let pending = manager.snapshot.projection_control();
-        assert_eq!(pending.requested_config_generation, Some(41));
-        assert_eq!(pending.applied_config_generation, None);
+        assert_eq!(pending.config_generation.requested, Some(41));
+        assert_eq!(pending.config_generation.applied, None);
 
         update_control_status_for_config(
             &manager.snapshot,
@@ -1469,7 +1451,8 @@ mod tests {
             manager
                 .snapshot
                 .projection_control()
-                .applied_config_generation,
+                .config_generation
+                .applied,
             Some(41)
         );
 
@@ -1478,8 +1461,8 @@ mod tests {
         // working-copy number is a slicer control number.
         manager.mark_control_requested("current", 7, 42, &spec);
         let unchanged = manager.snapshot.projection_control();
-        assert_eq!(unchanged.requested_config_generation, Some(42));
-        assert_eq!(unchanged.applied_config_generation, Some(42));
+        assert_eq!(unchanged.config_generation.requested, Some(42));
+        assert_eq!(unchanged.config_generation.applied, Some(42));
     }
 
     #[test]
@@ -1487,7 +1470,7 @@ mod tests {
         let manager = manager_for_test();
         manager.snapshot.update_projection_control(|status| {
             status.session = Some("current".into());
-            status.requested_config_generation = Some(12);
+            status.config_generation.requested = Some(12);
         });
         let old = ControlEvent::new(
             "old".into(),
@@ -1503,8 +1486,8 @@ mod tests {
             update_control_status_for_config(&manager.snapshot, old, Some(99));
         }
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.requested_config_generation, Some(12));
-        assert_eq!(status.applied_config_generation, None);
+        assert_eq!(status.config_generation.requested, Some(12));
+        assert_eq!(status.config_generation.applied, None);
     }
 
     #[test]
@@ -1542,8 +1525,8 @@ mod tests {
             Some(70),
         );
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.requested_config_generation, Some(90));
-        assert_eq!(status.applied_config_generation, Some(80));
+        assert_eq!(status.config_generation.requested, Some(90));
+        assert_eq!(status.config_generation.applied, Some(80));
     }
 
     #[test]
@@ -1571,8 +1554,8 @@ mod tests {
                     reason: Some(
                         "dmabuf linear filtering is unavailable; install the driver update".into(),
                     ),
-                    requested_mode: "warp".into(),
-                    effective_mode: "simple".into(),
+                    requested_mode: crate::model::ProjectionMode::Warp,
+                    effective_mode: crate::model::ProjectionMode::Simple,
                 },
             ),
         );
@@ -1584,8 +1567,14 @@ mod tests {
         );
         assert_eq!(status.effective_renderer, Some(crate::model::Renderer::Cpu));
         assert_eq!(status.warp_available, Some(false));
-        assert_eq!(status.requested_mode.as_deref(), Some("warp"));
-        assert_eq!(status.effective_mode.as_deref(), Some("simple"));
+        assert_eq!(
+            status.requested_mode,
+            Some(crate::model::ProjectionMode::Warp)
+        );
+        assert_eq!(
+            status.effective_mode,
+            Some(crate::model::ProjectionMode::Simple)
+        );
         assert!(status
             .warp_reason
             .as_deref()
@@ -1620,8 +1609,8 @@ mod tests {
                     effective_renderer: crate::model::Renderer::Gpu,
                     warp_available: true,
                     reason: Some("filtering verified".into()),
-                    requested_mode: "simple".into(),
-                    effective_mode: "simple".into(),
+                    requested_mode: crate::model::ProjectionMode::Simple,
+                    effective_mode: crate::model::ProjectionMode::Simple,
                 },
             ),
         );
@@ -1636,13 +1625,16 @@ mod tests {
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::from([(
                         "DP-1".into(),
-                        "bilinear".into(),
+                        crate::model::SamplingMode::Bilinear,
                     )]),
                 },
             ),
         );
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.effective_mode.as_deref(), Some("simple"));
+        assert_eq!(
+            status.effective_mode,
+            Some(crate::model::ProjectionMode::Simple)
+        );
         assert_eq!(status.warp_reason.as_deref(), Some("filtering verified"));
     }
 
@@ -1664,7 +1656,6 @@ mod tests {
             },
             source_rect: Some([0.0, 0.0, 100.0, 100.0]),
             geometry: None,
-            ramps: Vec::new(),
         });
         let source = crate::model::CanvasRect {
             x: 0.0,
@@ -1688,12 +1679,8 @@ mod tests {
         );
         manager.mark_control_requested("public-layout", 0, 0, &spec);
         assert_eq!(
-            manager
-                .snapshot
-                .projection_control()
-                .requested_mode
-                .as_deref(),
-            Some("simple")
+            manager.snapshot.projection_control().requested_mode,
+            Some(crate::model::ProjectionMode::Simple)
         );
         update_control_status(
             &manager.snapshot,
@@ -1705,8 +1692,8 @@ mod tests {
                     effective_renderer: crate::model::Renderer::Gpu,
                     warp_available: true,
                     reason: None,
-                    requested_mode: "simple".into(),
-                    effective_mode: "simple".into(),
+                    requested_mode: crate::model::ProjectionMode::Simple,
+                    effective_mode: crate::model::ProjectionMode::Simple,
                 },
             ),
         );
@@ -1721,16 +1708,25 @@ mod tests {
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::from([(
                         "DP-1".into(),
-                        "exact".into(),
+                        crate::model::SamplingMode::Exact,
                     )]),
                 },
             ),
         );
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.effective_mode.as_deref(), Some("simple"));
-        assert_eq!(status.requested_mode.as_deref(), Some("simple"));
+        assert_eq!(
+            status.effective_mode,
+            Some(crate::model::ProjectionMode::Simple)
+        );
+        assert_eq!(
+            status.requested_mode,
+            Some(crate::model::ProjectionMode::Simple)
+        );
         assert_eq!(status.warp_available, Some(true));
-        assert_eq!(status.outputs[0].sampling_mode.as_deref(), Some("exact"));
+        assert_eq!(
+            status.outputs[0].sampling_mode,
+            Some(crate::model::SamplingMode::Exact)
+        );
     }
 
     #[cfg(unix)]
@@ -1761,13 +1757,17 @@ mod tests {
         });
         manager.snapshot.update_projection_control(|status| {
             status.session = Some(spec.control_session.clone());
-            status.requested_generation = Some(0);
+            status.child_generation.requested = Some(0);
         });
         spec.gamma = 2.4;
         assert!(manager.sync_slicer(Some(&spec), 1).is_empty());
         assert_eq!(manager.slicer_pid(), Some(pid));
         assert_eq!(
-            manager.snapshot.projection_control().requested_generation,
+            manager
+                .snapshot
+                .projection_control()
+                .child_generation
+                .requested,
             Some(1)
         );
         manager.snapshot.update_projection_control(|status| {
@@ -1783,7 +1783,11 @@ mod tests {
         );
         assert_eq!(replacement.fingerprint, slicer_fingerprint(&spec, true));
         assert_eq!(
-            manager.snapshot.projection_control().requested_generation,
+            manager
+                .snapshot
+                .projection_control()
+                .child_generation
+                .requested,
             Some(0)
         );
     }
@@ -1803,7 +1807,7 @@ mod tests {
                 upload_ms: Some(1.0),
                 sampling_modes: std::collections::BTreeMap::from([(
                     "DP-1".to_string(),
-                    "exact".to_string(),
+                    crate::model::SamplingMode::Exact,
                 )]),
             },
             ControlEventKind::Submitted {
@@ -1819,12 +1823,15 @@ mod tests {
             );
         }
         let status = manager.snapshot.projection_control();
-        assert_eq!(status.accepted_generation, Some(7));
-        assert_eq!(status.built_generation, Some(7));
-        assert_eq!(status.applied_generation, Some(7));
-        assert_eq!(status.submitted_generation, Some(7));
-        assert_eq!(status.presented_generation, Some(7));
-        assert_eq!(status.outputs[0].sampling_mode.as_deref(), Some("exact"));
+        assert_eq!(status.child_generation.accepted, Some(7));
+        assert_eq!(status.child_generation.built, Some(7));
+        assert_eq!(status.child_generation.applied, Some(7));
+        assert_eq!(status.child_generation.submitted, Some(7));
+        assert_eq!(status.child_generation.presented, Some(7));
+        assert_eq!(
+            status.outputs[0].sampling_mode,
+            Some(crate::model::SamplingMode::Exact)
+        );
     }
 
     #[test]
@@ -1838,7 +1845,8 @@ mod tests {
         assert!(manager
             .snapshot
             .projection_control()
-            .accepted_generation
+            .child_generation
+            .accepted
             .is_none());
     }
 
@@ -1861,6 +1869,6 @@ mod tests {
             .set_projection_control(ProjectionControlStatus::default());
         let reset = manager.snapshot.projection_control();
         assert!(reset.outputs.is_empty());
-        assert!(reset.presented_generation.is_none());
+        assert!(reset.child_generation.presented.is_none());
     }
 }

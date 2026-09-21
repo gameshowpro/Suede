@@ -81,7 +81,7 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   await page.locator('#arrange-rows').fill('2'); await page.locator('#arrange-columns').fill('2');
   // High overlap warning when setting scale 50
   await page.locator('#arrange-scale').fill('50'); await page.locator('#arrange-scale').dispatchEvent('change');
-  assert((await page.locator('#arrange-preview').textContent()).includes('Very high overlap') || (await page.locator('#arrange-preview').textContent()).includes('Overlap'));
+  assert((await page.locator('#arrange-preview').textContent()).includes('Overlap is very high'));
   // Scale too small (< minScale for 100% overlap) disables Apply
   await page.locator('#arrange-scale').fill('20'); await page.locator('#arrange-scale').dispatchEvent('change');
   assert.equal(await page.locator('#arrange-apply').isDisabled(), true);
@@ -99,9 +99,12 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   assert.equal((await read()).projection.mode, 'warp');
   await page.locator('#pj-save').click(); await page.waitForFunction(() => !configBusy && !previewActive);
   assert.equal(current.committed, true);
+  const savedSourceX = (await read()).outputs[1].geometry.source.x;
   await page.locator('#source-x').fill('5'); await page.locator('#source-x').press('Tab'); await settle();
   await page.locator('#pj-cancel').click(); await page.waitForFunction(() => !configBusy && !previewActive);
-  assert.notEqual((await read()).outputs[1].geometry.source.x, 5 / (await read()).projection.canvas.renderWidth);
+  // Cancel must restore the exact saved value, not merely land on something
+  // other than the discarded edit.
+  assert.equal((await read()).outputs[1].geometry.source.x, savedSourceX);
   assert.deepEqual(failures, []);
   if (process.env.UI_EVIDENCE) {
     fs.mkdirSync(process.env.UI_EVIDENCE, { recursive: true });

@@ -28,7 +28,7 @@ struct FileConfig {
     docs_base_url: Option<String>,
     /// Raw strings rather than `Vec<PowerVerb>`: a bad entry needs to become a
     /// [`ConfigError::PowerVerb`] naming the value and the accepted ones, not
-    /// whatever wording `toml`'s own enum deserialisation happens to produce,
+    /// whatever wording `toml`'s own enum deserialization happens to produce,
     /// and the same parse has to serve the `SUEDE_POWER` override too.
     power: Option<Vec<String>>,
     /// `Option`, not a bare `Vec`, so a present-but-empty list (permit
@@ -191,8 +191,8 @@ pub enum ConfigError {
     )]
     PowerVerb { value: String },
     /// Only the slicer's layout can be scanned out safely, so asking for
-    /// scanout on a tiling appliance is a request that cannot be honoured —
-    /// and honouring it anyway would re-open the mirroring bug on the very
+    /// scanout on a tiling appliance is a request that cannot be honored —
+    /// and honoring it anyway would re-open the mirroring bug on the very
     /// machines the default protects. Refused rather than ignored: an
     /// operator who wrote the key meant something by it.
     #[error(
@@ -406,7 +406,7 @@ fn parse_power(values: Vec<String>) -> Result<Vec<PowerVerb>, ConfigError> {
 mod tests {
     use super::*;
 
-    /// Serialises every test that reads or writes a `SUEDE_*` variable.
+    /// Serializes every test that reads or writes a `SUEDE_*` variable.
     ///
     /// `BootstrapConfig::load` reads *all* of them, so it is not enough for
     /// each test to own the one variable it sets. The power test deliberately
@@ -417,7 +417,7 @@ mod tests {
     static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Take the environment lock, ignoring poisoning: a panicking test has
-    /// already failed the run, and turning its neighbours into confusing
+    /// already failed the run, and turning its neighbors into confusing
     /// secondary failures helps nobody find it.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
