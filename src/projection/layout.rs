@@ -62,18 +62,16 @@ fn distance(index: usize, sources: &[CanvasRect], x: f64, y: f64) -> Option<f64>
         .iter()
         .enumerate()
         .any(|(j, q)| j != index && q.x < r.x && r.x < right(q) && q.y <= y && y <= bottom(q));
-    let has_right = sources
-        .iter()
-        .enumerate()
-        .any(|(j, q)| j != index && q.x < right(r) && right(r) < right(q) && q.y <= y && y <= bottom(q));
+    let has_right = sources.iter().enumerate().any(|(j, q)| {
+        j != index && q.x < right(r) && right(r) < right(q) && q.y <= y && y <= bottom(q)
+    });
     let has_top = sources
         .iter()
         .enumerate()
         .any(|(j, q)| j != index && q.y < r.y && r.y < bottom(q) && q.x <= x && x <= right(q));
-    let has_bottom = sources
-        .iter()
-        .enumerate()
-        .any(|(j, q)| j != index && q.y < bottom(r) && bottom(r) < bottom(q) && q.x <= x && x <= right(q));
+    let has_bottom = sources.iter().enumerate().any(|(j, q)| {
+        j != index && q.y < bottom(r) && bottom(r) < bottom(q) && q.x <= x && x <= right(q)
+    });
 
     let mut min_d = f64::INFINITY;
     if has_left {
