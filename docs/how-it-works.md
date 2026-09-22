@@ -43,7 +43,7 @@ region, measured on hardware). Instead:
 Superimposed on the surface, every point's covering copies sum to constant
 luminance, whether one seam covers it twice or a corner covers it three or
 four times (measured: worst deviation 0.008 across a 160 px two-way seam).
-One rule computes every source's share — see [Normalized Minimum-Distance
+One rule computes every source's share — see [Depth-Normalized
 Edge Blending](#normalized-minimum-distance-edge-blending) — and the
 [`blend`, `gamma` and `blackLift`](configuration.md#projection-edge-blending)
 fields shape those ramps; [Where the blend runs](#where-the-blend-runs) is
@@ -551,7 +551,7 @@ Suede provides two distinct projection display modes: **Simple mode** and **Warp
 |---|---|---|
 | **Primary Use Case** | Flat screens, LED walls, planar multi-display arrays, zero-distortion setups | Projectors on curved, tilted, or angled physical surfaces; multi-projector blended arrays |
 | **Mapping Geometry** | Pure rectangular crop and scale | Non-linear 4-corner destination pinning and 2-fraction optical center remap |
-| **Edge Blending & Seams** | Normalized minimum-distance smooth blending ramps with gamma-shaped falloff, same as Warp (`blend: true` by default; `blend: false` still duplicates overlapping regions without ramps) | Normalized minimum-distance smooth blending ramps with gamma-shaped falloff |
+| **Edge Blending & Seams** | Depth-normalized blending ramps per seam with gamma-shaped falloff, same as Warp (`blend: true` by default; `blend: false` still duplicates overlapping regions without ramps) | Depth-normalized blending ramps per seam with gamma-shaped falloff |
 | **Border Anti-Aliasing** | Not applicable (aligned to raster) | Continuous sub-pixel border coverage attenuating gain and black lift |
 | **Black Level Compensation** | Fixed or adaptive black lift (see [Adaptive black lift](configuration.md#adaptive-black-lift)) | Fixed or adaptive black lift, same as Simple |
 | **Pipeline Overhead** | Minimal (direct hardware scanning or rectangular blit) | Low GPU fragment shader pass with inverse homography and precomputed transfer tables |
@@ -594,7 +594,7 @@ The configured source roster contains one to eight enabled participants, includi
 - Each source rectangle is finite, positive, visible after clipping to the canvas, and bounded within $\pm 16$ times the larger canvas span.
 - The clipped graph must connect through positive-area overlap or a shared edge segment (isolated point contacts and gaps are rejected).
 - Sources that overlap by at least 80% of the smaller area form a pure multi-projector stack only when every pair meets that threshold; mixed stack/seam layouts are invalid.
-- These source rules drive normalized minimum-distance seam weights; destination pin edits do not alter the topological seam weights.
+- These source rules drive the depth-normalized seam weights; destination pin edits do not alter the topological seam weights.
 
 #### 3. Two-Fraction Center Remap
 In addition to corner pins, each output supports a horizontal and vertical center fraction (`geometry.center`, default `[0.5, 0.5]`):
@@ -602,10 +602,12 @@ In addition to corner pins, each output supports a horizontal and vertical cente
 - Compensates for non-linear optical distortion or off-axis lens shift where a single planar homography would bend straight lines across the center.
 - The two segments meet exactly at the center fraction, so the remap stays continuous there.
 
-#### 4. Normalized Minimum-Distance Edge Blending {: #normalized-minimum-distance-edge-blending }
-In overlapping projection areas, Suede automatically computes smooth blend ramps, with one rule for the whole wall, legacy tiled layouts included:
-- Each covering source's raw weight at a point is its distance to its own *active* seam edges — the edges another source's rectangle actually straddles there — or, where none of its edges are active (a source nested inside a neighbor, say), its plain inward distance to its own boundary. That plain-distance fallback is never a fixed constant: an earlier build used `1.0` there, which set an arbitrary blend ratio with no physical basis for nested layouts.
-- A point's normalized weight for each covering source is its raw weight divided by the sum of every covering source's raw weight there, so any number of overlapping projectors — two at a seam, three or four at a corner — sum to exactly one.
+#### 4. Depth-Normalized Edge Blending {: #normalized-minimum-distance-edge-blending }
+In overlapping projection areas, Suede computes smooth blend ramps with one rule for the whole wall, legacy tiled layouts included:
+- An edge of a source is *active* at a row or column when another source's rectangle straddles it there. Its *depth* is how far the deepest straddling neighbor reaches past that edge at that row or column.
+- Each active edge contributes a ramp: the point's distance to that edge divided by the depth, clamped to the range 0 to 1. A source's raw weight is the product of its active-edge ramps, or 1 where none of its edges is active.
+- A point's normalized weight for each covering source is its raw weight divided by the sum of every covering source's raw weight there, so any number of overlapping projectors sum to exactly one.
+- Two strips, or a grid of rows and columns, come out exact: each seam is a straight ramp across its own overlap and does not depend on the position along the seam. Rows that merely touch, or overlap by a fraction of a pixel, contribute nothing to the seams that cross them. An earlier build measured a source by its minimum distance to any active edge, which let a touching row bend a column seam into a wedge at the wall center.
 - Applies gamma-shaped falloff ramps (using configured `projection.gamma`, default 2.2) to equalize light output across seams, eliminating bright bands.
 - The gate that gives a source a plain (unramped) weight of `1` is `!blend || stacked`: `blend: false`, or that source being one side of a near-total (≥80%) overlap stack — not merely having identity pins.
 
