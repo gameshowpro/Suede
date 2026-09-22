@@ -50,6 +50,9 @@ jobs:
               # so a commit changing only build.rs skipped every job and the
               # run reported success having compiled nothing.
               - 'build.rs'
+              # The workflow itself: a change to how the binary is built or
+              # released must build and release, not report success idle.
+              - '.github/workflows/ci.yml'
               - 'Cross.toml'
               # A change to how the application is built and packaged has to
               # run that build, or the only way to test a workflow edit is to
@@ -380,7 +383,10 @@ jobs:
 
   release:
     needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # A manual dispatch on main may release too: a docs-only push that lands
+    # while a release run is in progress cancels that run, and its own run
+    # builds nothing, so the release has to be finished by hand.
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
