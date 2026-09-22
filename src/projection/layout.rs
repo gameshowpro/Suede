@@ -35,55 +35,91 @@ pub(crate) struct LocalKey {
 
 /// **The seam rule**, stated once here and implemented identically in
 /// production ([`Evaluator::raw_weight`] below) and in the independent test
-/// oracle (`seam_oracle::Oracle`, generalized to arbitrary convex quads):
+/// oracle (`seam_oracle::Oracle`, which applies it to the bounding box of
+/// the intersection polygon so that it can also take arbitrary convex
+/// quads; the two are required to agree on rectangles):
 ///
-/// For a source `r` and each of its four edges, that edge is ACTIVE at the
-/// queried row (for the left and right edges) or column (for the top and
-/// bottom edges) when some other source `q` STRADDLES it there: `q` reaches
-/// past the edge on both sides — `q.y < r.y && r.y < bottom(q)` for `r`'s
-/// top edge — while covering the queried column (for a top/bottom edge) or
-/// row (for a left/right edge). "Straddles" is strict on the axis across the
-/// edge, so a neighbor that merely touches the edge never activates it, and
-/// closed on the axis along the edge.
+/// **A seam blends across itself and nothing else.** A horizontal seam
+/// fades vertically, a vertical seam fades horizontally, and no overlap
+/// with one neighbor may bend the gradient of a seam with another.
 ///
-/// An active edge carries an overlap DEPTH: the largest distance that any
-/// straddling neighbor extends inward past that edge at that row or column,
-/// clamped to the source's own extent across the edge. For `r`'s top edge
-/// that is `max over straddling q of (bottom(q) - r.y)`, capped at
-/// `r.height`. Each active edge contributes the ramp
-/// `clamp(distance_from_the_point_to_that_edge / depth, 0, 1)`, and the
-/// source's RAW weight is the PRODUCT of its active edges' ramps — exactly
-/// `1` when no edge of it is active at that point.
+/// The rule is therefore stated per ORDERED PAIR of sources `(r, q)` whose
+/// source rectangles intersect in positive area. Let `I` be that
+/// intersection.
+///
+/// 1. **Seam axis.** `x` when `I.width < I.height`, otherwise `y`: the
+///    axis the overlap is thinnest across is the one the seam runs
+///    perpendicular to. At a grid corner, where a column overlap and a row
+///    overlap meet, this picks the smaller of the two, which coincides with
+///    one of the two straight seams meeting there; a square corner may pick
+///    either and the two answers agree in a full grid.
+/// 2. **The ramp `q` imposes on `r`**, a function of the coordinate along
+///    the seam axis only:
+///    - if exactly one of `r`'s two edges across that axis lies STRICTLY
+///      inside `q`'s extent along it, `r` ramps from that edge:
+///      `clamp(distance from the point to that edge / I's extent along the
+///      axis, 0, 1)`;
+///    - if `q` spans `r` along the axis (BOTH of `r`'s edges are strictly
+///      inside `q`'s extent), `r` is the inner slice of the pair: it ramps
+///      from both of its edges over HALF its own extent, so its ramp peaks
+///      at 1 at its center and falls to 0 at each of its own edges. That is
+///      what lets a slice nested inside a larger one fade in and out
+///      instead of appearing with a hard edge;
+///    - otherwise (`r` spans `q`, or the edges only touch) the pair imposes
+///      no ramp on `r` at all: 1.
+/// 3. **Cross-range.** The pair's ramp applies only where `q` really covers
+///    that row or column, i.e. within `I`'s extent along the OTHER axis
+///    (closed, matching [`contains`]); outside it the pair contributes 1.
+/// 4. **Combining.** `r`'s RAW weight is `(min over its x-axis pairs'
+///    ramps) * (min over its y-axis pairs' ramps)`, each min defaulting to
+///    1 when `r` has no pair on that axis. Taking the MINIMUM per axis —
+///    not the product — is what stops a diagonal grid neighbor, whose seam
+///    axis is the same as an adjacent neighbor's, from squaring a ramp that
+///    is already being applied: it repeats it instead.
 ///
 /// The final weight of a covering source is its raw weight divided by the
 /// sum of the raw weights of every source covering the point. `!blend`, or a
 /// detected all-pairs stack, gives every covering source weight 1 instead.
 ///
-/// Normalizing each edge by its own overlap depth, and multiplying the ramps
-/// instead of taking the minimum distance, is what makes the rule separable.
-/// Two strips overlapping by 20% already sum to exactly 1 before
-/// normalization, and so does a grid overlapping in both axes, where every
-/// source's raw weight is the product of the same two independent 1-D ramps.
-/// The previous "minimum distance to an active edge" rule was not separable,
-/// and that cost a real four-projector wall: its two rows touched with a
-/// 0.07-pixel overlap, which made the bottom row's top edge active with a
-/// distance that dominated the minimum for the first 112 rows below the row
-/// boundary. The horizontal seam froze at 50/50 there instead of following
-/// its gamma ramp, painting a visible bright triangle at the center of the
-/// wall. Raising a threshold would not have fixed it: with a genuine
-/// vertical overlap band the same minimum still compressed the horizontal
-/// gradient inside the band, giving a left share of 1/3 where the geometry
-/// asks for 1/4. Dividing by the depth instead makes a sub-pixel sliver
-/// produce a ramp that is already clamped to 1 at every sampled pixel
+/// Two strips overlapping by 20% and a grid overlapping in both axes are
+/// exact: their raw weights already sum to 1 before normalization, so
+/// normalization is the identity and every seam carries precisely its 1-D
+/// ramp.
+///
+/// **Why pairwise.** The previous rule was per EDGE: each edge a neighbor
+/// straddled carried a ramp across that straddle's depth. On a regular grid
+/// that is the same answer, but it reads a neighbor's offset in the wrong
+/// axis as a seam. A wall whose right column sat 1% of the canvas width
+/// lower than its left column had its top-left slice's bottom edge
+/// straddled by the top-RIGHT slice over nearly the slices' whole height,
+/// so a "seam" ramp ran down the full height of a column seam: at 25% into
+/// the column overlap the split ran 253/3 at the top of the wall to 98/158
+/// at the bottom where the geometry asks for a constant 192/64, and the row
+/// seam ran 249/7 to 90/166 along its length. Pairing the intersection with
+/// its own axis confines each neighbor's influence to the seam it actually
+/// forms. The round-2 fix this replaces — dividing each edge's ramp by that
+/// overlap's own depth, rather than taking the minimum distance to any
+/// active edge — is retained in spirit: a sub-pixel sliver where two rows
+/// merely touch still produces a ramp clamped to 1 at every sampled pixel
 /// center, so it changes nothing at all.
 ///
-/// A source with no active edge at the point is not attenuated: its raw
+/// A source no pair attenuates at the point is not attenuated: its raw
 /// weight is 1, which is the physical answer — nothing overlaps it there, so
 /// it has nothing to give away. This is not the old `Some(1.0)` sentinel of
 /// review finding A7, which stood in for a *distance* and so invented blend
-/// ratios for nested layouts; under this rule a nested source still gets a
-/// real ramp, because a neighbor that contains it straddles all four of its
-/// edges and supplies four real depths.
+/// ratios for nested layouts; under this rule a nested source gets the
+/// inner-slice ramp of point 2 instead.
+///
+/// **What this rule does NOT smooth.** Where a slice's own crop ends
+/// against the middle of a neighbor — a short slice's top edge inside a
+/// tall neighbor, on a pair whose seam axis is the other one — its weight
+/// stops at whatever its seam ramp is there rather than fading to zero. The
+/// composite stays continuous (the covering weights always sum to 1), but
+/// the SPLIT steps at that line, and so does that projector's own image.
+/// That is a property of the installation, not of the rule: a projector
+/// whose image ends in the middle of another's has a hard edge there
+/// whatever weight it is given. The tests assert those steps explicitly
+/// rather than hiding them.
 ///
 /// **Boundary convention.** Both [`Evaluator::raw_weight`] (which decides
 /// whether a point is covered at all, and evaluates the active-edge ramps)
@@ -108,15 +144,19 @@ pub(crate) struct Evaluator {
     vertical_density: f64,
     rows: usize,
     cols: usize,
-    /// Per-row overlap depth for every source's left and right edge, indexed
-    /// `row * sources.len() + source`. `0.0` means the edge is not active on
-    /// that row; an active edge always has a strictly positive depth, because
-    /// straddling is strict. Precomputed once per [`Evaluator`] so
+    /// Per-row ramp denominator for every source's left and right edge,
+    /// indexed `row * sources.len() + source`: the largest denominator any
+    /// x-axis pair whose cross-range covers that row asks for from that
+    /// edge, or `0.0` for no ramp. The minimum of several ramps measured
+    /// from the SAME edge is the ramp over the largest of their
+    /// denominators, so one number per edge per row is the exact minimum
+    /// over that row's pairs — see [`Evaluator`]'s rule, point 4.
+    /// Precomputed once per [`Evaluator`] from [`seam_pairs`] so
     /// `raw_weight` is a table lookup, never a scan over every other source.
     row_left: Vec<f64>,
     row_right: Vec<f64>,
-    /// Per-column depths for the top and bottom edges, symmetric to the rows
-    /// above and indexed `col * sources.len() + source`.
+    /// Per-column denominators for the top and bottom edges, symmetric to
+    /// the rows above and indexed `col * sources.len() + source`.
     col_top: Vec<f64>,
     col_bottom: Vec<f64>,
 }
@@ -137,74 +177,126 @@ fn contains(r: &CanvasRect, x: f64, y: f64) -> bool {
     x >= r.x && x <= right(r) && y >= r.y && y <= bottom(r)
 }
 
-/// Precompute, once per row and once per column, each source's active-edge
-/// overlap DEPTH for its left/right (per row) and top/bottom (per column)
-/// edges — see the seam-rule doc comment on [`Evaluator`]. `0.0` records an
-/// inactive edge. Left/right depths depend only on the row because the
-/// straddle test's "along the edge" axis is Y for a vertical edge;
-/// top/bottom depends only on the column for the symmetric reason.
-///
-/// Every depth is capped at the source's own extent across that edge, so a
-/// neighbor reaching clear through the source cannot make its ramp shallower
-/// than the source itself.
-fn build_edge_depths(
-    sources: &[CanvasRect],
+/// One ordered pair of overlapping sources `(r, q)`, reduced to the single
+/// ramp `q` imposes on `r` — points 1 to 3 of the rule on [`Evaluator`].
+/// Built once per [`Evaluator`] by [`seam_pairs`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SeamPair {
+    /// The attenuated source `r`.
+    source: usize,
+    /// The seam axis: x (the intersection is narrower than it is tall) or y.
+    axis_x: bool,
+    /// The intersection's closed extent along the OTHER axis — the rows (for
+    /// an x-axis pair) or columns (for a y-axis pair) where `q` actually
+    /// covers `r`. The ramp applies only there.
+    cross: (f64, f64),
+    /// Ramp denominator measured from `r`'s LOW edge across the seam axis
+    /// (left for x, top for y) and from its HIGH edge (right, bottom).
+    /// `0.0` means this pair asks for no ramp from that edge.
+    low: f64,
+    high: f64,
+}
+
+/// Every ordered pair whose sources overlap in positive area, with the ramp
+/// each one imposes — see the seam-rule doc comment on [`Evaluator`]. Pairs
+/// that impose nothing (`r` spans `q` along the seam axis) are omitted.
+fn seam_pairs(sources: &[CanvasRect]) -> Vec<SeamPair> {
+    let mut pairs = Vec::new();
+    for (i, r) in sources.iter().enumerate() {
+        for (j, q) in sources.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let (x0, x1) = (r.x.max(q.x), right(r).min(right(q)));
+            let (y0, y1) = (r.y.max(q.y), bottom(r).min(bottom(q)));
+            // Positive area only: rectangles that merely touch — brain's
+            // two rows, before the 0.07-pixel sliver — form no seam at all.
+            if !(x1 > x0 && y1 > y0) {
+                continue;
+            }
+            let axis_x = x1 - x0 < y1 - y0;
+            let (extent, cross) = if axis_x {
+                (x1 - x0, (y0, y1))
+            } else {
+                (y1 - y0, (x0, x1))
+            };
+            let (r_low, r_high, q_low, q_high) = if axis_x {
+                (r.x, right(r), q.x, right(q))
+            } else {
+                (r.y, bottom(r), q.y, bottom(q))
+            };
+            // Strictly inside: an edge a neighbor merely reaches is not a
+            // seam, matching the positive-area test above.
+            let inside_low = q_low < r_low && r_low < q_high;
+            let inside_high = q_low < r_high && r_high < q_high;
+            let (low, high) = match (inside_low, inside_high) {
+                // `q` spans `r`: `r` is the pair's inner slice, and `extent`
+                // is then `r`'s own extent along the axis, so half of it is
+                // the "half its own extent" the rule asks for.
+                (true, true) => (extent * 0.5, extent * 0.5),
+                (true, false) => (extent, 0.0),
+                (false, true) => (0.0, extent),
+                (false, false) => continue,
+            };
+            pairs.push(SeamPair {
+                source: i,
+                axis_x,
+                cross,
+                low,
+                high,
+            });
+        }
+    }
+    pairs
+}
+
+/// Collapse [`seam_pairs`] into one ramp denominator per source, per edge,
+/// per row (for the x-axis pairs) or column (for the y-axis pairs), taking
+/// the largest denominator asked of each edge — which is exactly the minimum
+/// of those pairs' ramps, since they all measure their distance from the
+/// same edge. `0.0` records an edge with no ramp.
+fn build_edge_tables(
+    pairs: &[SeamPair],
+    count: usize,
     cols: usize,
     rows: usize,
     width: f64,
     vertical_density: f64,
 ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let count = sources.len();
-    let mut row_left = vec![0.0; rows * count];
-    let mut row_right = vec![0.0; rows * count];
-    let mut col_top = vec![0.0; cols * count];
-    let mut col_bottom = vec![0.0; cols * count];
+    let mut row_left = vec![0.0_f64; rows * count];
+    let mut row_right = vec![0.0_f64; rows * count];
+    let mut col_top = vec![0.0_f64; cols * count];
+    let mut col_bottom = vec![0.0_f64; cols * count];
     for row in 0..rows {
         let y = (row as f64 + 0.5) / vertical_density;
-        for (i, r) in sources.iter().enumerate() {
-            let (mut left, mut right_depth) = (0.0_f64, 0.0_f64);
-            for (j, q) in sources.iter().enumerate() {
-                if i == j || !(q.y <= y && y <= bottom(q)) {
-                    continue;
-                }
-                if q.x < r.x && r.x < right(q) {
-                    left = left.max((right(q) - r.x).min(r.width));
-                }
-                if q.x < right(r) && right(r) < right(q) {
-                    right_depth = right_depth.max((right(r) - q.x).min(r.width));
-                }
+        for pair in pairs.iter().filter(|p| p.axis_x) {
+            if y < pair.cross.0 || y > pair.cross.1 {
+                continue;
             }
-            row_left[row * count + i] = left;
-            row_right[row * count + i] = right_depth;
+            let index = row * count + pair.source;
+            row_left[index] = row_left[index].max(pair.low);
+            row_right[index] = row_right[index].max(pair.high);
         }
     }
     for col in 0..cols {
         let x = (col as f64 + 0.5) / width;
-        for (i, r) in sources.iter().enumerate() {
-            let (mut top, mut bottom_depth) = (0.0_f64, 0.0_f64);
-            for (j, q) in sources.iter().enumerate() {
-                if i == j || !(q.x <= x && x <= right(q)) {
-                    continue;
-                }
-                if q.y < r.y && r.y < bottom(q) {
-                    top = top.max((bottom(q) - r.y).min(r.height));
-                }
-                if q.y < bottom(r) && bottom(r) < bottom(q) {
-                    bottom_depth = bottom_depth.max((bottom(r) - q.y).min(r.height));
-                }
+        for pair in pairs.iter().filter(|p| !p.axis_x) {
+            if x < pair.cross.0 || x > pair.cross.1 {
+                continue;
             }
-            col_top[col * count + i] = top;
-            col_bottom[col * count + i] = bottom_depth;
+            let index = col * count + pair.source;
+            col_top[index] = col_top[index].max(pair.low);
+            col_bottom[index] = col_bottom[index].max(pair.high);
         }
     }
     (row_left, row_right, col_top, col_bottom)
 }
 
-/// One edge's contribution to a raw weight: `clamp(distance / depth, 0, 1)`,
-/// or `1` when the edge is not active (`depth == 0.0`).
-fn edge_ramp(distance: f64, depth: f64) -> f64 {
-    if depth > 0.0 {
-        (distance / depth).clamp(0.0, 1.0)
+/// One edge's contribution to a raw weight: `clamp(distance / denominator,
+/// 0, 1)`, or `1` when no pair ramps from that edge (`denominator == 0.0`).
+fn edge_ramp(distance: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 {
+        (distance / denominator).clamp(0.0, 1.0)
     } else {
         1.0
     }
@@ -290,8 +382,15 @@ impl Evaluator {
         }
         let (cols, rows) = (width as usize, height as usize);
         let vertical_density = height as f64 * spec.aspect;
-        let (row_left, row_right, col_top, col_bottom) =
-            build_edge_depths(&sources, cols, rows, width as f64, vertical_density);
+        let pairs = seam_pairs(&sources);
+        let (row_left, row_right, col_top, col_bottom) = build_edge_tables(
+            &pairs,
+            sources.len(),
+            cols,
+            rows,
+            width as f64,
+            vertical_density,
+        );
         Ok(Self {
             spec: spec.clone(),
             sources,
@@ -308,12 +407,13 @@ impl Evaluator {
         })
     }
 
-    /// The seam rule (see the doc comment on [`Evaluator`]): the product of
-    /// `index`'s active-edge ramps at canvas-unit point `(x, y)`, or `1` when
-    /// no edge of it is active there; `None` outside `index`'s own source
-    /// rectangle. `row`/`col` are the precomputed-table indices for this
-    /// query point — callers derive them once and reuse them across every
-    /// source index.
+    /// The seam rule (see the doc comment on [`Evaluator`]): `index`'s
+    /// smallest x-axis pair ramp times its smallest y-axis pair ramp at
+    /// canvas-unit point `(x, y)`, or `1` when no pair attenuates it there;
+    /// `None` outside `index`'s own source rectangle. `row`/`col` are the
+    /// precomputed-table indices for this query point — callers derive them
+    /// once and reuse them across every source index, which is what keeps
+    /// the per-pixel cost proportional to the number of sources.
     fn raw_weight(&self, index: usize, x: f64, y: f64, row: usize, col: usize) -> Option<f64> {
         let r = &self.sources[index];
         if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
@@ -321,12 +421,11 @@ impl Evaluator {
         }
         let count = self.sources.len();
         let (row_base, col_base) = (row * count + index, col * count + index);
-        Some(
-            edge_ramp(x - r.x, self.row_left[row_base])
-                * edge_ramp(right(r) - x, self.row_right[row_base])
-                * edge_ramp(y - r.y, self.col_top[col_base])
-                * edge_ramp(bottom(r) - y, self.col_bottom[col_base]),
-        )
+        let across = edge_ramp(x - r.x, self.row_left[row_base])
+            .min(edge_ramp(right(r) - x, self.row_right[row_base]));
+        let down = edge_ramp(y - r.y, self.col_top[col_base])
+            .min(edge_ramp(bottom(r) - y, self.col_bottom[col_base]));
+        Some(across * down)
     }
 
     /// Row/column table indices for a canvas-pixel point, clamped into the
@@ -463,44 +562,35 @@ impl Evaluator {
 
 #[cfg(test)]
 /// A deliberately naive, unoptimized reference for [`Evaluator::raw_weight`]:
-/// scans every other source per edge, exactly as an unprecomputed
-/// implementation would. Used only to prove that the per-row/per-column
-/// depth tables built in `Evaluator::new` agree with it everywhere, never
-/// for production.
+/// evaluates every pair at the query point and takes the minimum ramp per
+/// axis directly, exactly as an unprecomputed implementation would, with no
+/// per-edge envelope and no row/column tables. Used only to prove that the
+/// tables built in `Evaluator::new` agree with it everywhere, never for
+/// production.
 fn naive_raw_weight(sources: &[CanvasRect], index: usize, x: f64, y: f64) -> Option<f64> {
     let r = &sources[index];
     if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
         return None;
     }
-    let (mut left, mut right_depth) = (0.0_f64, 0.0_f64);
-    let (mut top, mut bottom_depth) = (0.0_f64, 0.0_f64);
-    for (j, q) in sources.iter().enumerate() {
-        if j == index {
+    let (mut across, mut down) = (1.0_f64, 1.0_f64);
+    for pair in seam_pairs(sources).iter().filter(|p| p.source == index) {
+        let (along, cross) = if pair.axis_x { (x, y) } else { (y, x) };
+        if cross < pair.cross.0 || cross > pair.cross.1 {
             continue;
         }
-        if q.y <= y && y <= bottom(q) {
-            if q.x < r.x && r.x < right(q) {
-                left = left.max((right(q) - r.x).min(r.width));
-            }
-            if q.x < right(r) && right(r) < right(q) {
-                right_depth = right_depth.max((right(r) - q.x).min(r.width));
-            }
-        }
-        if q.x <= x && x <= right(q) {
-            if q.y < r.y && r.y < bottom(q) {
-                top = top.max((bottom(q) - r.y).min(r.height));
-            }
-            if q.y < bottom(r) && bottom(r) < bottom(q) {
-                bottom_depth = bottom_depth.max((bottom(r) - q.y).min(r.height));
-            }
+        let (low_distance, high_distance) = if pair.axis_x {
+            (along - r.x, right(r) - along)
+        } else {
+            (along - r.y, bottom(r) - along)
+        };
+        let ramp = edge_ramp(low_distance, pair.low).min(edge_ramp(high_distance, pair.high));
+        if pair.axis_x {
+            across = across.min(ramp);
+        } else {
+            down = down.min(ramp);
         }
     }
-    Some(
-        edge_ramp(x - r.x, left)
-            * edge_ramp(right(r) - x, right_depth)
-            * edge_ramp(y - r.y, top)
-            * edge_ramp(bottom(r) - y, bottom_depth),
-    )
+    Some(across * down)
 }
 
 /// Whether the complete canvas mapping has the integer translation fast path.
@@ -899,6 +989,18 @@ mod tests {
                 rect(0.3, 0.0, 0.4, 1.0),
                 rect(0.6, 0.0, 0.4, 1.0),
             ],
+            // The misaligned grid's proportions on a square canvas: every
+            // pair overlaps in both axes, so this is what exercises the
+            // cross-ranges and the diagonal pairs that repeat a neighbor's
+            // ramp.
+            vec![
+                rect(0.0, 0.0, 0.53, 0.30),
+                rect(0.47, 0.01, 0.53, 0.30),
+                rect(0.01, 0.26, 0.53, 0.30),
+                rect(0.47, 0.26, 0.53, 0.30),
+            ],
+            // And the inner-slice branch.
+            nested_rects(),
         ];
         for rects in cases {
             let input = spec(&rects);
@@ -1154,102 +1256,394 @@ mod tests {
             .sum()
     }
 
+    /// One scan line across a layout, with the lines where it is allowed —
+    /// and required — to step. See
+    /// [`irregular_layouts_sum_to_one_and_step_only_where_a_crop_ends`].
+    struct ScanCase {
+        name: &'static str,
+        rects: Vec<CanvasRect>,
+        /// Scan down a column (`true`) or across a row (`false`).
+        vertical: bool,
+        /// The scan line's own fixed coordinate, in canvas units.
+        at: f64,
+        /// Canvas-unit coordinates along the scan where some slice's own
+        /// crop ends in the middle of a neighbor, so the SPLIT between the
+        /// covering slices steps there — see the "What this rule does NOT
+        /// smooth" paragraph on [`Evaluator`]. Each one must really step.
+        steps: &'static [f64],
+    }
+
     /// Properties 5 and 6: irregular three-way overlaps, a nested layout and
-    /// unequal-height partial overlaps all sum to 1 and stay continuous —
-    /// no step larger than 2/256 between adjacent pixels along a scan line
-    /// that crosses every edge in the layout.
+    /// unequal-height partial overlaps all sum to 1, and are continuous
+    /// everywhere — no step larger than 2/256 between adjacent pixels along
+    /// a scan line that crosses every edge in the layout — EXCEPT where a
+    /// slice's own crop ends inside a neighbor. Those lines are listed per
+    /// case and asserted to be genuine steps (over 8/256), never quietly
+    /// tolerated: a projector whose image simply stops in the middle of
+    /// another's has a hard edge there under any weighting, and the rule
+    /// does not pretend otherwise. The composite still sums to 1 across
+    /// such a line, which this test also checks.
     ///
     /// The canvas is 4000x4000, not the 100x100 used elsewhere in this
     /// module, because "2/256 between adjacent pixels" bounds a SLOPE, and a
     /// slope is only a continuity statement once the pixel pitch is fine
     /// enough to resolve it. A perfectly correct linear ramp across a
     /// 25-pixel seam steps by 10/256 per pixel by construction, and no rule
-    /// can do better. The steepest gradient in these four layouts is the
-    /// "nested span" case, where the middle source is attenuated to a
-    /// quarter by its straddled top and bottom edges while its tall
-    /// neighbors are not attenuated vertically at all, so the horizontal
-    /// crossover between them happens over a short stretch: about 17 weight
-    /// units per canvas unit, which needs roughly 2200 pixels of canvas
-    /// before it falls under 2/256 per pixel. Halving the canvas halves
-    /// every jump reported here, which is what continuity means.
+    /// can do better. The steepest gradient in these layouts is the
+    /// "nested span" case, where the middle source's seams with both of its
+    /// neighbors are narrow, so the crossover between them happens over a
+    /// short stretch. Halving the canvas halves every jump reported here,
+    /// which is what continuity means.
     #[test]
-    fn irregular_layouts_sum_to_one_and_have_no_discontinuity() {
+    fn irregular_layouts_sum_to_one_and_step_only_where_a_crop_ends() {
         const SPAN: usize = 4000;
-        /// The scan line, halfway down the canvas; `NAN` selects the
-        /// symmetric scan straight down the canvas's vertical midline.
-        const SCAN: f64 = SPAN as f64 / 2.0 + 0.5;
-        let cases: [(&str, Vec<CanvasRect>, f64); 4] = [
+        /// The scan line's fixed coordinate, halfway across the canvas.
+        const MIDDLE: f64 = 0.5;
+        let cases = [
             // Three strips with unequal overlaps, seams at every x edge.
-            (
-                "three-way",
-                vec![
+            ScanCase {
+                name: "three-way",
+                rects: vec![
                     rect(0.0, 0.0, 0.5, 1.0),
                     rect(0.25, 0.0, 0.55, 1.0),
                     rect(0.4, 0.0, 0.6, 1.0),
                 ],
-                SCAN,
-            ),
+                vertical: false,
+                at: MIDDLE,
+                steps: &[],
+            },
             // A short middle source nested in the vertical span of two tall
-            // neighbors: its top and bottom edges are both straddled.
-            (
-                "nested span",
-                vec![
+            // neighbors. Both of its seams are vertical, so a horizontal
+            // scan crosses only ramps.
+            ScanCase {
+                name: "nested span",
+                rects: vec![
                     rect(0.0, 0.0, 0.45, 1.0),
                     rect(0.3, 0.25, 0.4, 0.5),
                     rect(0.55, 0.0, 0.45, 1.0),
                 ],
-                SCAN,
-            ),
+                vertical: false,
+                at: MIDDLE,
+                steps: &[],
+            },
             // Unequal heights with a partial overlap, scanned horizontally.
-            (
-                "unequal heights",
-                vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.2, 0.6, 0.6)],
-                SCAN,
-            ),
-            // The same layout scanned across its own vertical midline.
-            (
-                "unequal heights, vertical scan",
-                vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.2, 0.6, 0.6)],
-                f64::NAN,
-            ),
+            ScanCase {
+                name: "unequal heights",
+                rects: vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.2, 0.6, 0.6)],
+                vertical: false,
+                at: MIDDLE,
+                steps: &[],
+            },
+            // The same layout scanned down its own vertical midline, which
+            // is inside the column overlap: the short source's top and
+            // bottom edges are where its crop ends inside its tall
+            // neighbor, and the split steps at both.
+            ScanCase {
+                name: "unequal heights, vertical scan",
+                rects: vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.2, 0.6, 0.6)],
+                vertical: true,
+                at: MIDDLE,
+                steps: &[0.2, 0.8],
+            },
+            // A three-way overlap whose middle source is short: scanned
+            // across, every crossing is a ramp.
+            ScanCase {
+                name: "three-way, short middle",
+                rects: vec![
+                    rect(0.0, 0.0, 0.5, 1.0),
+                    rect(0.25, 0.15, 0.55, 0.7),
+                    rect(0.4, 0.0, 0.6, 1.0),
+                ],
+                vertical: false,
+                at: MIDDLE,
+                steps: &[],
+            },
+            // The same three-way overlap scanned down the middle source's
+            // left seam: it steps where that source's crop begins and ends.
+            ScanCase {
+                name: "three-way, short middle, vertical scan",
+                rects: vec![
+                    rect(0.0, 0.0, 0.5, 1.0),
+                    rect(0.25, 0.15, 0.55, 0.7),
+                    rect(0.4, 0.0, 0.6, 1.0),
+                ],
+                vertical: true,
+                at: 0.45,
+                steps: &[0.15, 0.85],
+            },
+            // A slice nested inside another across the seam axis, scanned
+            // through its interior: its ramp peaks at its center and falls
+            // to zero at each of its own left and right edges, so nothing
+            // steps.
+            ScanCase {
+                name: "nested",
+                rects: nested_rects(),
+                vertical: false,
+                at: 0.35,
+                steps: &[],
+            },
+            // The same layout scanned down the nested slice's center,
+            // crossing the wide slice's top and bottom edges: that is where
+            // the wide slice's own crop ends inside the tall one.
+            ScanCase {
+                name: "nested, vertical scan",
+                rects: nested_rects(),
+                vertical: true,
+                at: 0.4,
+                steps: &[0.2, 0.5],
+            },
         ];
-        for (name, rects, scan) in cases {
-            let input = spec(&rects);
+        for case in cases {
+            let input = spec(&case.rects);
             let evaluator = Evaluator::new(&input, SPAN as i32, SPAN as i32).unwrap();
-            let vertical = scan.is_nan();
+            let fixed = case.at * SPAN as f64;
+            let expected_steps: Vec<usize> = case
+                .steps
+                .iter()
+                .map(|s| (s * SPAN as f64).round() as usize)
+                .collect();
+            let mut seen_steps = vec![false; expected_steps.len()];
             let mut previous: Option<[i64; 8]> = None;
             for step in 0..SPAN {
                 let center = step as f64 + 0.5;
-                let (cx, cy) = if vertical {
-                    (SPAN as f64 / 2.0 + 0.5, center)
+                let (cx, cy) = if case.vertical {
+                    (fixed, center)
                 } else {
-                    (center, scan)
+                    (center, fixed)
                 };
-                let covered = rects
+                let covered = case
+                    .rects
                     .iter()
                     .filter(|r| contains(r, cx / SPAN as f64, cy / SPAN as f64))
                     .count();
-                let sum = gain_sum(&evaluator, rects.len(), cx, cy);
+                let sum = gain_sum(&evaluator, case.rects.len(), cx, cy);
                 let expected = if covered > 0 { 256 } else { 0 };
                 assert!(
-                    (sum - expected).abs() <= rects.len() as i64,
-                    "{name}: gains at ({cx}, {cy}) summed to {sum}, not {expected}"
+                    (sum - expected).abs() <= case.rects.len() as i64,
+                    "{}: gains at ({cx}, {cy}) summed to {sum}, not {expected}",
+                    case.name
                 );
                 let mut gains = [0i64; 8];
-                for (i, gain) in gains.iter_mut().enumerate().take(rects.len()) {
+                for (i, gain) in gains.iter_mut().enumerate().take(case.rects.len()) {
                     *gain = i64::from(evaluator.transfer(i, cx, cy, 1.0, 0.0, 1.0).0);
                 }
+                // Where the scan leaves the covered area altogether there is
+                // nothing to be continuous with: the canvas is simply dark
+                // beyond the last slice.
+                if covered == 0 {
+                    previous = None;
+                    continue;
+                }
                 if let Some(previous) = previous {
-                    for i in 0..rects.len() {
-                        assert!(
-                            (gains[i] - previous[i]).abs() <= 2,
-                            "{name}: source {i} jumped from {} to {} at ({cx}, {cy})",
-                            previous[i],
-                            gains[i]
-                        );
+                    let jump = (0..case.rects.len())
+                        .map(|i| (gains[i] - previous[i]).abs())
+                        .max()
+                        .unwrap_or(0);
+                    match expected_steps.iter().position(|s| *s == step) {
+                        Some(which) => {
+                            assert!(
+                                jump > 8,
+                                "{}: the crop end at {} should step, but the largest change \
+                                 at ({cx}, {cy}) was {jump}/256",
+                                case.name,
+                                case.steps[which]
+                            );
+                            seen_steps[which] = true;
+                        }
+                        None => {
+                            for i in 0..case.rects.len() {
+                                assert!(
+                                    (gains[i] - previous[i]).abs() <= 2,
+                                    "{}: source {i} jumped from {} to {} at ({cx}, {cy})",
+                                    case.name,
+                                    previous[i],
+                                    gains[i]
+                                );
+                            }
+                        }
                     }
                 }
                 previous = Some(gains);
+            }
+            assert!(
+                seen_steps.iter().all(|s| *s),
+                "{}: not every listed crop end was reached by the scan",
+                case.name
+            );
+        }
+    }
+
+    /// A narrow, tall slice (source 1) nested inside a wide, short one
+    /// (source 0) ACROSS the seam axis: source 0 spans it in x, which is the
+    /// axis their intersection is thinnest across, so source 1 is the
+    /// inner slice of the pair and ramps from both of its own edges.
+    ///
+    /// A slice nested inside another in BOTH axes cannot be tested here,
+    /// and not for want of trying: a pair whose intersection is the whole of
+    /// the smaller rectangle is a near-total overlap, and
+    /// `model::geometry::validate_sources` accepts near-total pairs only
+    /// when EVERY pair in the layout is near-total — a deliberate stack,
+    /// where every source runs at full brightness and no seam rule applies.
+    /// A layout mixing one fully nested pair with any ordinary seam is
+    /// rejected outright (`mixed_stack_topology`). Nesting across one axis
+    /// is therefore the only nesting a blended layout can contain, and it is
+    /// what the inner-slice branch of the rule exists for.
+    fn nested_rects() -> Vec<CanvasRect> {
+        vec![rect(0.0, 0.2, 1.0, 0.3), rect(0.3, 0.0, 0.2, 0.9)]
+    }
+
+    /// The nested slice ramps from both of its own left and right edges
+    /// over half its width, so it fades in and out across its host instead
+    /// of appearing with a hard vertical edge, peaks at an even half-and-half
+    /// split at its center, and the pair sums to 1 at every point.
+    #[test]
+    fn a_nested_slice_ramps_from_both_of_its_own_edges() {
+        const SPAN: i32 = 4000;
+        let rects = nested_rects();
+        let input = spec(&rects);
+        let evaluator = Evaluator::new(&input, SPAN, SPAN).unwrap();
+        assert!(
+            !evaluator.stacked,
+            "nesting across one axis only must stay an ordinary seam layout"
+        );
+        // Along a row inside the overlap band, at a quarter, a half and
+        // three quarters of the way across the nested slice: the tent ramp
+        // is 0.5, 1 and 0.5, against the host's flat 1.
+        let cy = 0.35 * f64::from(SPAN);
+        for (x, expected) in [(0.35, 0.5), (0.4, 1.0), (0.45, 0.5)] {
+            let cx = x * f64::from(SPAN);
+            let host = f64::from(evaluator.transfer(0, cx, cy, 1.0, 0.0, 1.0).0);
+            let inner = f64::from(evaluator.transfer(1, cx, cy, 1.0, 0.0, 1.0).0);
+            let share = expected / (1.0 + expected);
+            assert!(
+                (inner / 256.0 - share).abs() <= 1.0 / 256.0,
+                "nested slice at x={x} had share {}, expected {share}",
+                inner / 256.0
+            );
+            assert!(
+                (host + inner - 256.0).abs() <= 2.0,
+                "nested pair at x={x} summed to {}",
+                host + inner
+            );
+        }
+        // And it really does reach zero at its own edges, where the host
+        // takes the whole pixel back.
+        for x in [0.3, 0.5] {
+            let cx = x * f64::from(SPAN);
+            assert_eq!(evaluator.transfer(1, cx, cy, 1.0, 0.0, 1.0).0, 0);
+            assert_eq!(evaluator.transfer(0, cx, cy, 1.0, 0.0, 1.0).0, 256);
+        }
+    }
+
+    /// A 2x2 wall that is slightly out of true, on brain's canvas: the
+    /// right column sits 1% of the canvas width lower than the left column,
+    /// and the bottom row 1% further right than the top row. Every seam is
+    /// still straight — only the slices meeting along it are offset.
+    fn misaligned_grid() -> LayoutSpec {
+        let (width, height) = (0.53, 0.30);
+        let outputs = [
+            ("TL", 0.0, 0.0),
+            ("TR", 0.47, 0.01),
+            ("BL", 0.01, 0.26),
+            ("BR", 0.47, 0.26),
+        ];
+        LayoutSpec {
+            aspect: 1.68,
+            blend: true,
+            participants: outputs
+                .into_iter()
+                .map(|(output, x, y)| LayoutParticipant {
+                    output: output.into(),
+                    source: rect(x, y, width, height),
+                    raster_footprint: rect(x, y, width, height),
+                })
+                .collect(),
+        }
+    }
+
+    /// Every canvas-pixel center along one seam of [`misaligned_grid`],
+    /// between `from` and `to` in canvas units. `across` is the fixed
+    /// canvas-unit coordinate ACROSS the seam; `column_seam` says whether
+    /// the seam runs down the rows (a vertical seam between two columns) or
+    /// along the columns (a horizontal seam between two rows).
+    ///
+    /// Canvas units are normalized by the canvas WIDTH in both axes, so one
+    /// pixel is `1/3864` of a unit either way; the vertical axis simply
+    /// stops at row 2300.
+    fn misaligned_seam_points(
+        column_seam: bool,
+        across: f64,
+        from: f64,
+        to: f64,
+    ) -> Vec<(f64, f64)> {
+        const WIDTH: f64 = 3864.0;
+        let steps = if column_seam { 2300 } else { 3864 };
+        (0..steps)
+            .map(|s| f64::from(s) + 0.5)
+            .filter(|along| (from..to).contains(&(along / WIDTH)))
+            .map(|along| {
+                if column_seam {
+                    (across * WIDTH, along)
+                } else {
+                    (along, across * WIDTH)
+                }
+            })
+            .collect()
+    }
+
+    /// Round 3's acceptance test. On [`misaligned_grid`] every seam carries
+    /// the ratio its own geometry asks for, unchanged along its whole
+    /// length: a quarter of the way into an overlap is 192/64 at every
+    /// point of that seam where only its own pair covers.
+    ///
+    /// Under the round-2 per-edge rule the two seams that involve the
+    /// offset slices ran a gradient along their own length instead. At 25%
+    /// into the TL/TR column overlap the split ran 253/3 at the top of the
+    /// wall to 98/158 near the bottom of those slices, and at 25% into the
+    /// TL/BL row overlap it ran 249/7 at the left to 90/166 at the right:
+    /// the 1% offset made each slice straddle its neighbor's edge in the
+    /// WRONG axis by nearly a whole slice, and that straddle became a ramp
+    /// running the length of the seam. The two seams between slices that
+    /// are NOT offset from each other (BL/BR and TR/BR) were already
+    /// constant, and still are.
+    ///
+    /// Each seam is checked over the stretch where only its own pair
+    /// covers. In the corner where all four slices meet, the left column's
+    /// row overlap is 0.04 canvas units deep and the right column's 0.05:
+    /// two different vertical ramps multiply the two columns' shares there,
+    /// so the column ratio in the corner is not 3:1 and cannot be under any
+    /// separable rule. That is a property of the misalignment, four slices
+    /// wide and one corner in size, not a gradient running down a seam.
+    #[test]
+    fn a_misaligned_grid_blends_each_seam_across_itself_only() {
+        let evaluator = Evaluator::new(&misaligned_grid(), 3864, 2300).unwrap();
+        let index = |name: &str| evaluator.index(name).unwrap();
+        // (name, near slice, far slice, a column seam?, a quarter of the
+        // way into the overlap, and the stretch of the seam over which only
+        // this pair covers).
+        let seams = [
+            ("TL/TR column seam", "TL", "TR", true, 0.485, 0.01, 0.26),
+            ("BL/BR column seam", "BL", "BR", true, 0.4875, 0.31, 0.56),
+            ("TL/BL row seam", "TL", "BL", false, 0.27, 0.01, 0.47),
+            ("TR/BR row seam", "TR", "BR", false, 0.2725, 0.54, 1.0),
+        ];
+        for (name, near, far, column_seam, across, from, to) in seams {
+            let points = misaligned_seam_points(column_seam, across, from, to);
+            assert!(
+                points.len() > 100,
+                "{name}: only {} sampled points",
+                points.len()
+            );
+            for (cx, cy) in points {
+                let gains = (
+                    evaluator.transfer(index(near), cx, cy, 1.0, 0.0, 1.0).0,
+                    evaluator.transfer(index(far), cx, cy, 1.0, 0.0, 1.0).0,
+                );
+                assert_eq!(
+                    gains,
+                    (192, 64),
+                    "{name}: {near}/{far} at ({cx}, {cy}) is not the quarter-way ratio"
+                );
             }
         }
     }

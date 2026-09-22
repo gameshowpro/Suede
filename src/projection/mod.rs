@@ -14,13 +14,16 @@
 //!
 //! A map of the pieces, roughly in the order data flows through them:
 //!
-//! - [`layout`] holds the one blend-weight rule, `Evaluator`: each edge a
-//!   neighbor straddles contributes a ramp across that overlap's own depth,
-//!   a source's raw share is the product of those ramps, and the shares of
-//!   the sources covering a point are normalized. Every canvas
-//!   plan — including a legacy integer-position layout, which synthesizes
-//!   one — carries a `LayoutSpec` built from this, so there is exactly one
-//!   place seam weights are computed.
+//! - [`layout`] holds the one blend-weight rule, `Evaluator`: a seam blends
+//!   across itself and nothing else. Each overlapping PAIR of sources takes
+//!   its seam axis from the shape of its own intersection — a horizontal
+//!   seam fades vertically, a vertical one horizontally — and ramps across
+//!   that overlap only where the pair actually covers; a source's raw share
+//!   is the smallest ramp asked of it on each axis, multiplied together,
+//!   and the shares of the sources covering a point are normalized. Every
+//!   canvas plan — including a legacy integer-position layout, which
+//!   synthesizes one — carries a `LayoutSpec` built from this, so there is
+//!   exactly one place seam weights are computed.
 //! - [`blend`] plans the canvas itself: given each output's place in the
 //!   layout, it produces the `CanvasPlan`/`SlicerSpec` the slicer is told to
 //!   realize, and the pure per-pixel transfer arithmetic (gamma shaping,
@@ -55,9 +58,11 @@
 //!
 //! Two pieces exist for tests only and carry no runtime or public
 //! configuration dependency: `seam_oracle`, an independently implemented
-//! reference for [`layout::Evaluator`]'s blend weights, checked against
-//! production per-pixel; and `warp_spike`, retained research fixtures for an
-//! alternative (arbitrary-polygon) seam model that was not built.
+//! reference for [`layout::Evaluator`]'s blend weights on arbitrary convex
+//! quads, checked against production per-pixel on the rectangles a
+//! configured layout actually contains; and `warp_spike`, retained research
+//! fixtures for an alternative (arbitrary-polygon) seam model that was not
+//! built.
 //!
 //! The whole module is compiled out without the `projection` cargo feature;
 //! the configuration schema is not, so every build speaks the same API.

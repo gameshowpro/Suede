@@ -2,8 +2,15 @@
 //!
 //! These are shared *source coverage* polygons, never destination pins. Public
 //! pinning still selects a fixed source rectangle. The supported topology,
-//! the boundary convention and the active-edge rule shared with production are
-//! documented on the items below and on `layout::Evaluator`.
+//! the boundary convention and the pairwise seam rule shared with production
+//! are documented on the items below and on `layout::Evaluator`.
+//!
+//! The oracle takes arbitrary convex quads, but it implements the seam rule
+//! on the axis-aligned BOUNDING BOX of each intersection polygon and of each
+//! source. It is therefore required to agree with production exactly on
+//! axis-aligned RECTANGLES — which is all a configured layout ever contains,
+//! and what the per-pixel comparison tests check — while on skewed quads it
+//! is only a well-defined reference of its own.
 
 type CanvasPoint = [f64; 2];
 type SourceQuad = [CanvasPoint; 4];
@@ -21,6 +28,8 @@ pub(super) struct Oracle {
     sources: Vec<Polygon>,
     visible: Vec<Polygon>,
     stacked: bool,
+    /// Every seam, built once from `sources` — see [`seam_pairs`].
+    pairs: Vec<SeamPair>,
 }
 
 fn sub(a: CanvasPoint, b: CanvasPoint) -> CanvasPoint {
@@ -113,118 +122,99 @@ fn project(poly: &[CanvasPoint], dir: CanvasPoint) -> (f64, f64) {
     (lo, hi)
 }
 
-/// Whether `other` makes edge `(a, b)` active at query point `p` — the same
-/// seam rule stated on `layout::Evaluator` in production, generalized from
-/// axis-aligned rectangles to arbitrary convex quads.
-///
-/// A rectangle's left/right edge is active only when a neighbor's rectangle
-/// STRADDLES it: extends past it on the outward side and reaches past it on
-/// the inward side too (`q.x < r.x && r.x < right(q)`), and covers the
-/// point's row. Decomposed into perpendicular/parallel components against
-/// the edge's own line, that becomes: `other`'s extent along the edge's
-/// outward normal must strictly contain the edge's own line position (not
-/// merely touch it — a touching neighbor never activates an edge, matching
-/// [`shared_edge`]'s "touching is not overlapping" convention), and
-/// `other`'s extent along the edge's direction must cover `p`'s position
-/// there (closed, matching [`inward_distance`]'s closed boundary).
-fn edge_active(a: CanvasPoint, b: CanvasPoint, other: &[CanvasPoint], p: CanvasPoint) -> bool {
-    let d = sub(b, a);
-    let len = d[0].hypot(d[1]);
-    if len <= LENGTH_EPS {
-        return false;
-    }
-    let dir = [d[0] / len, d[1] / len];
-    // Any perpendicular direction works: the strict-interior test below is
-    // invariant to which of the two normals is chosen.
-    let normal = [-dir[1], dir[0]];
-    let edge_pos = a[0] * normal[0] + a[1] * normal[1];
-    let (lo_n, hi_n) = project(other, normal);
-    if !(lo_n < edge_pos - LENGTH_EPS && edge_pos + LENGTH_EPS < hi_n) {
-        return false;
-    }
-    let p_dir = p[0] * dir[0] + p[1] * dir[1];
-    let (lo_d, hi_d) = project(other, dir);
-    lo_d - LENGTH_EPS <= p_dir && p_dir <= hi_d + LENGTH_EPS
+/// A polygon's axis-aligned bounding box as `(low corner, high corner)`.
+fn bounds(poly: &[CanvasPoint]) -> (CanvasPoint, CanvasPoint) {
+    let (lo_x, hi_x) = project(poly, [1.0, 0.0]);
+    let (lo_y, hi_y) = project(poly, [0.0, 1.0]);
+    ([lo_x, lo_y], [hi_x, hi_y])
 }
 
-/// The largest `t >= 0` for which `foot + t * dir` is still inside the
-/// convex polygon `poly`, or `None` when the ray never enters it. This is
-/// the ray cast that measures an overlap depth: for an axis-aligned
-/// rectangle and an axis-aligned edge normal it reduces to exactly
-/// production's `right(q) - r.x` (and its three symmetric forms).
-fn ray_exit(poly: &[CanvasPoint], foot: CanvasPoint, dir: CanvasPoint) -> Option<f64> {
-    let (mut enter, mut exit) = (f64::NEG_INFINITY, f64::INFINITY);
-    for (a, b) in edges(poly) {
-        let d = sub(b, a);
-        // Interior of a clockwise y-down polygon: cross(d, p - a) >= 0, so
-        // along the ray the constraint is `offset + t * slope >= 0`.
-        let offset = cross(d, sub(foot, a));
-        let slope = cross(d, dir);
-        if slope.abs() <= LENGTH_EPS {
-            if offset < -LENGTH_EPS {
-                return None;
-            }
-        } else if slope > 0.0 {
-            enter = enter.max(-offset / slope);
-        } else {
-            exit = exit.min(-offset / slope);
-        }
-    }
-    (exit > 0.0 && exit >= enter).then_some(exit)
+/// One ordered pair of overlapping sources `(r, q)`, reduced to the single
+/// ramp `q` imposes on `r` — the seam rule stated once on
+/// `layout::Evaluator`, applied here to the axis-aligned BOUNDING BOX of the
+/// intersection polygon and to each source's own bounding box.
+#[derive(Clone, Copy, Debug)]
+struct SeamPair {
+    /// The attenuated source `r`.
+    source: usize,
+    /// The seam axis: `0` for x, `1` for y.
+    axis: usize,
+    /// The intersection box's closed extent along the OTHER axis, outside
+    /// which the pair imposes no ramp.
+    cross: (f64, f64),
+    /// Ramp denominators measured from `r`'s low and high bounding-box
+    /// edges across the seam axis; `0.0` means no ramp from that edge.
+    low: f64,
+    high: f64,
 }
 
-/// The seam rule (see `layout::Evaluator`'s doc comment, which states it
-/// once for both production and this independent oracle), generalized from
-/// axis-aligned rectangles to arbitrary convex quads: the PRODUCT over
-/// `sources[index]`'s ACTIVE edges of `clamp(distance / depth, 0, 1)`, and
-/// exactly `1` when no edge of it is active at `p`.
+/// Every ordered pair of `sources` that overlaps in positive area, with the
+/// ramp it imposes — see the seam-rule doc comment on `layout::Evaluator`.
 ///
-/// For edge `e`, the distance is `p` projected onto `e`'s inward normal.
-/// The depth is measured along that same normal line through `p`: drop a
-/// foot point from `p` onto `e`, cast a ray inward from it, and take the
-/// farthest exit of any other polygon that straddles `e` at that foot point
-/// — clamped to this polygon's own exit along the same ray.
+/// This is the one place the oracle is deliberately weaker than its
+/// production counterpart: a seam between two arbitrary convex quads is
+/// measured on bounding boxes, so for anything but axis-aligned rectangles
+/// the answer is a reasonable definition rather than the same definition.
+/// Agreement with `layout::Evaluator` is required — and tested per pixel —
+/// on RECTANGLES, which is what a configured layout ever contains; the
+/// skewed-quad cases below exist to show the oracle stays well defined, not
+/// to pin production's behavior on them.
 ///
 /// `sources` are the unclipped source quads (not the canvas-clipped
-/// `visible` set): production's `layout::Evaluator` computes activity and
-/// depth from unclipped configured source rectangles too, so canvas clipping
-/// only decides which portion of the canvas is queried, never which edges
-/// attenuate.
-fn raw_weight(sources: &[Polygon], index: usize, p: CanvasPoint) -> Option<f64> {
-    let poly = &sources[index];
-    inward_distance(poly, p)?;
-    let mut weight = 1.0;
-    for (a, b) in edges(poly) {
-        let d = sub(b, a);
-        let len = d[0].hypot(d[1]);
-        if len <= LENGTH_EPS {
-            continue;
-        }
-        // The inward unit normal, chosen so that `cross(d, p - a) / len` —
-        // the same quantity `inward_distance` uses — is `normal . (p - a)`.
-        let normal = [-d[1] / len, d[0] / len];
-        let distance = (cross(d, sub(p, a)) / len).max(0.0);
-        let foot = [p[0] - distance * normal[0], p[1] - distance * normal[1]];
-        let mut depth = 0.0_f64;
-        for (q, other) in sources.iter().enumerate() {
-            if q == index || !edge_active(a, b, other, p) {
+/// `visible` set): production computes its pairs from unclipped configured
+/// source rectangles too, so canvas clipping only decides which portion of
+/// the canvas is queried, never which seams attenuate.
+fn seam_pairs(sources: &[Polygon]) -> Vec<SeamPair> {
+    let mut pairs = Vec::new();
+    for (i, r) in sources.iter().enumerate() {
+        for (j, q) in sources.iter().enumerate() {
+            if i == j {
                 continue;
             }
-            if let Some(reach) = ray_exit(other, foot, normal) {
-                depth = depth.max(reach);
+            let (overlap_lo, overlap_hi) = bounds(&intersection(r, q));
+            // Positive extent both ways, so quads that merely touch — or
+            // miss — form no seam. An empty intersection projects to an
+            // inverted box and fails this too.
+            if !(overlap_hi[0] > overlap_lo[0] && overlap_hi[1] > overlap_lo[1]) {
+                continue;
             }
-        }
-        if depth <= 0.0 {
-            continue;
-        }
-        if let Some(own) = ray_exit(poly, foot, normal) {
-            depth = depth.min(own);
-        }
-        if depth > 0.0 {
-            weight *= (distance / depth).clamp(0.0, 1.0);
+            let axis = usize::from(overlap_hi[0] - overlap_lo[0] >= overlap_hi[1] - overlap_lo[1]);
+            let other = 1 - axis;
+            let extent = overlap_hi[axis] - overlap_lo[axis];
+            let (r_lo, r_hi) = bounds(r);
+            let (q_lo, q_hi) = bounds(q);
+            let inside_low = q_lo[axis] < r_lo[axis] && r_lo[axis] < q_hi[axis];
+            let inside_high = q_lo[axis] < r_hi[axis] && r_hi[axis] < q_hi[axis];
+            let (low, high) = match (inside_low, inside_high) {
+                // `q` spans `r`: `r` is the pair's inner slice and ramps
+                // from both of its edges over half its own extent, which is
+                // half of `extent` because the overlap then covers all of
+                // `r` along this axis.
+                (true, true) => (extent * 0.5, extent * 0.5),
+                (true, false) => (extent, 0.0),
+                (false, true) => (0.0, extent),
+                (false, false) => continue,
+            };
+            pairs.push(SeamPair {
+                source: i,
+                axis,
+                cross: (overlap_lo[other], overlap_hi[other]),
+                low,
+                high,
+            });
         }
     }
-    Some(weight)
+    pairs
+}
+
+/// One edge's contribution to a ramp: `clamp(distance / denominator, 0, 1)`,
+/// or `1` when no pair ramps from that edge.
+fn edge_ramp(distance: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 {
+        (distance / denominator).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 impl Oracle {
@@ -306,13 +296,38 @@ impl Oracle {
         if reached.iter().any(|v| !v) {
             return Err("disconnected_sources: require positive-area overlap or a shared edge segment within the canvas; gaps and point contacts do not connect".into());
         }
+        let pairs = seam_pairs(&sources);
         Ok(Self {
             scale,
             canvas,
             sources,
             visible,
             stacked: duplicate_pairs > 0,
+            pairs,
         })
+    }
+
+    /// The seam rule (see `layout::Evaluator`'s doc comment, which states it
+    /// once for both production and this independent oracle): the smallest
+    /// ramp any x-axis seam of `sources[index]` imposes at `p`, times the
+    /// smallest any y-axis seam imposes, and exactly `1` when no seam
+    /// attenuates it there. `None` outside the polygon.
+    fn raw_weight(&self, index: usize, p: CanvasPoint) -> Option<f64> {
+        let poly = &self.sources[index];
+        inward_distance(poly, p)?;
+        let (lo, hi) = bounds(poly);
+        let mut ramps = [1.0_f64; 2];
+        for pair in self.pairs.iter().filter(|pair| pair.source == index) {
+            let across = p[1 - pair.axis];
+            if across < pair.cross.0 || across > pair.cross.1 {
+                continue;
+            }
+            let along = p[pair.axis];
+            let ramp = edge_ramp(along - lo[pair.axis], pair.low)
+                .min(edge_ramp(hi[pair.axis] - along, pair.high));
+            ramps[pair.axis] = ramps[pair.axis].min(ramp);
+        }
+        Some(ramps[0] * ramps[1])
     }
 
     /// Closed source boundaries. At a covered point where all distances are
@@ -327,7 +342,7 @@ impl Oracle {
             return Ok(result);
         }
         let raw: Vec<_> = (0..self.sources.len())
-            .map(|i| raw_weight(&self.sources, i, p))
+            .map(|i| self.raw_weight(i, p))
             .collect();
         let count = raw.iter().filter(|v| v.is_some()).count();
         let total: f64 = raw.iter().flatten().sum();
@@ -431,10 +446,8 @@ mod tests {
         .unwrap();
         close(&oracle.weights([925.0, 500.0]).unwrap(), &[0.75, 0.25]);
         close(&oracle.weights([900.0, 500.0]).unwrap(), &[1.0, 0.0]);
-        // Active-edge distances keep the same ratio up to a common top
-        // edge, unlike the old all-edges-always rule this oracle used
-        // before: neither rectangle's top edge is straddled by the other
-        // (same height, same y origin), so it never enters the minimum.
+        // The pair's only seam is vertical, so its ramp is a function of x
+        // alone and the same ratio holds right up to the common top edge.
         close(&oracle.weights([925.0, 10.0]).unwrap(), &[0.75, 0.25]);
         check_sum(&oracle);
         let unequal = Oracle::new(
@@ -445,17 +458,16 @@ mod tests {
             ],
         )
         .unwrap();
-        // The short source is straddled top and bottom by the tall one, so
-        // it carries three ramps, not one: 25% across its 100-unit left
-        // seam, and half of its own 600-unit height from each of its top and
-        // bottom edges. Its raw weight is 0.25 * 0.5 * 0.5 = 0.0625 against
-        // the tall source's single 0.75 ramp. Under the old minimum-distance
-        // rule the vertical straddles were invisible here and the split was
-        // a flat 0.75/0.25.
-        close(
-            &unequal.weights([925.0, 500.0]).unwrap(),
-            &[0.75 / 0.8125, 0.0625 / 0.8125],
-        );
+        // The pair's intersection is 100 units wide and 600 tall, so its
+        // seam axis is x and the short source's height is not a seam at all:
+        // both sources ramp across the 100-unit overlap only, 25% into it.
+        // (Round 2's per-edge rule saw the tall source straddling the short
+        // one's top and bottom edges and attenuated it to 0.25 * 0.5 * 0.5
+        // here — a gradient running along a vertical seam, which is exactly
+        // what the pairwise rule exists to remove.)
+        close(&unequal.weights([925.0, 500.0]).unwrap(), &[0.75, 0.25]);
+        // Above the short source the pair does not cover the row at all, so
+        // its ramp does not apply and the tall source keeps the whole pixel.
         close(&unequal.weights([950.0, 100.0]).unwrap(), &[1.0, 0.0]);
         check_sum(&unequal);
     }
@@ -468,15 +480,17 @@ mod tests {
         // This pair is near-total; use a shifted diamond for an ordinary seam.
         let shifted = diamond.map(|p| [p[0] + 0.75, p[1]]);
         let oracle = Oracle::new([3.0, 2.0], &[rect(0.0, 0.0, 1.5, 2.0), shifted]).unwrap();
-        // The square's right edge is 0.25 into a ray-cast depth of 0.75 (the
-        // diamond reaches back to x = 0.75 along the query point's row), so
-        // its single ramp is 1/3. Both of the diamond's left-facing edges
-        // are straddled: the point is 0.3536 along each edge's inward
-        // normal, and each ray leaves the square 0.7071 further on, giving
-        // 0.5 * 0.5 = 0.25. Raw weights 1/3 and 1/4 normalize to 4/7, 3/7.
+        // The intersection is a triangle spanning x in [0.75, 1.5] and y in
+        // [0.25, 1.75], so its bounding box is 0.75 wide and 1.5 tall and
+        // the seam axis is x. The square's right edge is 0.25 inside that
+        // 0.75-wide overlap (ramp 1/3) and the diamond's left vertex is 0.5
+        // inside it (ramp 2/3); the two already sum to 1. This is the
+        // bounding-box approximation the module doc calls out: on skewed
+        // quads the oracle is a definition of its own, not a claim about
+        // production, which only ever sees rectangles.
         close(
             &oracle.weights([1.25, 1.0]).unwrap(),
-            &[4.0 / 7.0, 3.0 / 7.0],
+            &[1.0 / 3.0, 2.0 / 3.0],
         );
         check_sum(&oracle);
     }
@@ -503,7 +517,20 @@ mod tests {
         check_sum(&oracle);
         let triple = Oracle::new([3.0, 3.0], &cross[..3]).unwrap();
         let weights = triple.weights([1.5, 1.5]).unwrap();
-        close(&weights, &[1.0 / 3.0; 3]);
+        // An L of three squares, at the center of the corner where all
+        // three overlap. The top-left square has a vertical seam with the
+        // top-right one and a horizontal seam with the bottom-left one, so
+        // it carries both ramps: 0.5 * 0.5. The top-right and bottom-left
+        // squares overlap each other in a perfect square, whose seam axis
+        // the rule breaks towards y, so the top-right square carries a
+        // vertical ramp as well (0.5 * 0.5) and the bottom-left one carries
+        // only its horizontal ramp (0.5). The three raw weights still sum
+        // to exactly 1, so normalization is the identity — but the corner
+        // is not shared equally, as it would be if the diagonal pair had no
+        // seam at all. An L of three projectors has no symmetric answer
+        // here: whichever axis that diagonal pair picks, one of the two
+        // ends its image inside the other's with a hard edge.
+        close(&weights, &[0.25, 0.25, 0.5]);
         let signals: Vec<_> = weights.iter().map(|w| w.powf(1.0 / 2.2)).collect();
         assert!(signals.iter().sum::<f64>() > 1.0);
         close(&[signals.iter().map(|r| r.powf(2.2)).sum()], &[1.0]);
@@ -652,13 +679,17 @@ mod tests {
 
     #[test]
     fn fixed_point_gain_error_is_bounded_across_every_weight_and_gamma() {
-        // Two overlapping sources — A = [0, 2] x [0, 1], B = [-1, 1] x [0, 1]
-        // — give A's active-edge distance (only its left edge is active, via
-        // B's straddle) as exactly `x`, and B's (only its right edge, via A)
-        // as exactly `1 - x`, so `layout::Evaluator`'s own weight for A at
-        // canvas-unit x = w is exactly w. That passes w through the actual
-        // production evaluator — not a synthetic ramp — for the fixed-point
-        // rounding/gamma contract this checks. (The lift half of the
+        // Two overlapping sources — A = [0, 2] x [0, 2], B = [-1, 1] x [0, 2]
+        // — overlap in a band 1 wide and 2 tall, so the seam axis is x and
+        // the overlap depth is exactly 1. A ramps from its left edge (the
+        // only one of its two that lies inside B) as exactly `x`, and B from
+        // its right edge as exactly `1 - x`, so `layout::Evaluator`'s own
+        // weight for A at canvas-unit x = w is exactly w. That passes w
+        // through the actual production evaluator — not a synthetic ramp —
+        // for the fixed-point rounding/gamma contract this checks. (The
+        // sources are twice as tall as the canvas so that the overlap is
+        // unambiguously a VERTICAL seam: a square overlap is the rule's tie
+        // case, which it breaks towards a horizontal seam.) (The lift half of the
         // fixed-point contract is exhaustively covered by
         // `layout`'s own `footprint_maximum_is_canvas_clipped_and_does_not_follow_pins`.)
         let spec = LayoutSpec {
@@ -671,13 +702,13 @@ mod tests {
                         x: 0.0,
                         y: 0.0,
                         width: 2.0,
-                        height: 1.0,
+                        height: 2.0,
                     },
                     raster_footprint: CanvasRect {
                         x: 0.0,
                         y: 0.0,
                         width: 2.0,
-                        height: 1.0,
+                        height: 2.0,
                     },
                 },
                 LayoutParticipant {
@@ -686,13 +717,13 @@ mod tests {
                         x: -1.0,
                         y: 0.0,
                         width: 2.0,
-                        height: 1.0,
+                        height: 2.0,
                     },
                     raster_footprint: CanvasRect {
                         x: -1.0,
                         y: 0.0,
                         width: 2.0,
-                        height: 1.0,
+                        height: 2.0,
                     },
                 },
             ],
@@ -893,12 +924,15 @@ mod tests {
         )
         .unwrap();
         let expected = oracle.weights([8.5, 5.5]).unwrap();
-        // Raw weights at x = 8.5: the first source's right edge is 1.5 into
-        // a depth of 5 (its deepest straddler starts at x = 5), so 0.3; the
-        // middle source is 3.5 into 5 on the left and 6.5 into 7 on the
-        // right, so 0.65; the last is 0.5 into 7, so 1/14. Those sum to
-        // 1.0214, and normalizing gives the triple below.
-        let raw = [0.3, 0.7 * (6.5 / 7.0), 0.5 / 7.0];
+        // Raw weights at x = 8.5. Every pair here is a vertical seam, so
+        // each source takes the SMALLEST ramp any of its seams asks for.
+        // The first source ramps from its right edge over its widest
+        // overlap, the 5-unit one with the middle source: 1.5/5 = 0.3. The
+        // middle source ramps 3.5 into 5 from its left and 6.5 into 7 from
+        // its right, and the smaller of those is 0.7. The last ramps 0.5
+        // into 7 from its left: 1/14. Those sum to 1.0714, and normalizing
+        // gives the triple below.
+        let raw = [0.3, 0.7, 0.5 / 7.0];
         let total: f64 = raw.iter().sum();
         close(&expected, &raw.map(|w| w / total));
         let sum: u32 = production.iter().map(|&g| u32::from(g)).sum();
@@ -1085,6 +1119,40 @@ mod tests {
         rows.extend((0..2300).step_by(53));
         let mut columns: Vec<i32> = (1810..1830).collect();
         columns.extend((0..3864).step_by(61));
+        compare_production_and_oracle_at(&rects, 3864, 2300, &columns, &rows);
+    }
+
+    /// The same wall one percent out of true, which is what round 3 is
+    /// about: the right column sits 1% of the canvas width lower than the
+    /// left, and the bottom row 1% further right than the top. Every pair
+    /// then straddles its neighbor in BOTH axes, so it is the layout that
+    /// most exercises the choice of seam axis and the cross-range, and the
+    /// one where the two implementations are most likely to disagree.
+    /// Sampled like brain's wall above: dense bands across every seam and
+    /// every crop edge, a coprime stride elsewhere.
+    #[test]
+    fn production_matches_oracle_for_a_misaligned_2x2_grid() {
+        const SCALE: f64 = 3864.0;
+        let (w, h) = (0.53, 0.30);
+        let rects: Vec<(f64, f64, f64, f64)> =
+            [(0.0, 0.0), (0.47, 0.01), (0.01, 0.26), (0.47, 0.26)]
+                .into_iter()
+                .map(|(x, y)| (x * SCALE, y * SCALE, w * SCALE, h * SCALE))
+                .collect();
+        // Column overlap [0.47, 0.54], row overlap [0.26, 0.31], plus every
+        // slice's own top/bottom and left/right crop edge.
+        let mut columns: Vec<i32> = Vec::new();
+        for edge in [0.0, 0.01, 0.47, 0.53, 0.54, 1.0] {
+            let center = (edge * SCALE) as i32;
+            columns.extend((center - 6).max(0)..(center + 6).min(3864));
+        }
+        columns.extend((0..3864).step_by(61));
+        let mut rows: Vec<i32> = Vec::new();
+        for edge in [0.0, 0.01, 0.26, 0.30, 0.31, 0.56] {
+            let center = (edge * SCALE) as i32;
+            rows.extend((center - 6).max(0)..(center + 6).min(2300));
+        }
+        rows.extend((0..2300).step_by(53));
         compare_production_and_oracle_at(&rects, 3864, 2300, &columns, &rows);
     }
 

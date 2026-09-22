@@ -7796,23 +7796,27 @@ mod tests {
 /// `(original/255)^gamma`, up to the gain's 1/256 quantization and
 /// `Blend::shade`'s integer-floor shading.
 ///
-/// That sum-to-one composite is necessary but not sufficient: the current
-/// (pre-fix) `Evaluator` rule always makes covering weights sum to one, so
-/// it cannot see a defect that is a wrong SPLIT between two slices showing
-/// the same content rather than a wrong total. `reconstruction::share_at`
-/// and the `row_independence_*`/`grid_share_separability` tests below
+/// That sum-to-one composite is necessary but not sufficient: ANY rule that
+/// normalizes over the covering sources makes their weights sum to one, so
+/// the composite cannot see a defect that is a wrong SPLIT between two
+/// slices showing the same content rather than a wrong total.
+/// `reconstruction::share_at` and the `row_independence_*`,
+/// `misaligned_grid_seams_*` and `grid_share_separability` tests below
 /// isolate one slice's own share of a pixel (not the composite) and check
 /// it against what the geometry says it should be, independent of the
 /// other covering slices' particular values.
 ///
-/// See `.claude/plans/warp-fixes.md`, "Round 2 ... Slice SEAM": layout `d`
+/// The layouts here are the ones whose seam geometry has actually been got
+/// wrong on a wall, per `.claude/plans/warp-fixes.md`. Layout `d`
 /// (`brain_scaled_slices(0.07)`, brain's real 0.07-canvas-pixel row sliver,
-/// as opposed to `c`'s exact touch) reproduces the wall geometry that
-/// produced a wedge-shaped error at the row boundary under the old
-/// minimum-distance seam rule. `row_independence_brain_scaled_rows_overlap_sliver`
-/// is that slice's acceptance test: it currently FAILS (left failing, not
-/// `#[ignore]`d, per instructions), and its measured per-row shares are the
-/// evidence of the wedge.
+/// as opposed to `c`'s exact touch) is the wall geometry that produced a
+/// wedge-shaped error at the row boundary under round 1's minimum-distance
+/// rule; `row_independence_brain_scaled_rows_overlap_sliver` is round 2's
+/// acceptance test for it. Layout `e` (`misaligned_grid_slices`) is a wall
+/// one percent out of true, whose seams ran a gradient along their own
+/// length under round 2's per-edge rule;
+/// `misaligned_grid_seams_are_constant_along_their_own_length` is round 3's
+/// acceptance test for it, in both seam directions.
 #[cfg(test)]
 mod reconstruction {
     use super::super::{layout, warp_update};
@@ -8111,6 +8115,69 @@ mod reconstruction {
             ("C2R2", row2_geom(col2_x, col2_width)),
         ];
         (slices, row_height)
+    }
+
+    /// Layout (e): a 2x2 wall that is one percent of the canvas width out of
+    /// true, scaled to this canvas — the geometry of round 3 (see
+    /// `.claude/plans/warp-fixes.md`, "Round 3"). The vertical seam between
+    /// the two columns sits 4 px further right in the bottom row than in the
+    /// top one, and the horizontal seam between the two rows sits 4 px lower
+    /// in the right column than in the left one. Every slice still reaches
+    /// the canvas edge it is on, so the canvas stays fully covered; only the
+    /// two interior seams are offset, which is what a wall looks like when a
+    /// projector is nudged.
+    ///
+    /// Returns `(slices, column band, row band)`, the bands being the
+    /// canvas-pixel ranges spanned by BOTH rows' column overlaps and BOTH
+    /// columns' row overlaps respectively. Outside its own band a seam is
+    /// covered by its pair alone, which is where its share must be constant
+    /// along the seam.
+    #[allow(clippy::type_complexity)]
+    fn misaligned_grid_slices() -> (Vec<(&'static str, SliceGeom)>, (i32, i32), (i32, i32)) {
+        // One percent of the canvas width, the offset of the round-3 wall.
+        let offset = CANVAS_WIDTH / 100; // 4
+        let column_seam = 188; // the top row's vertical seam starts here
+        let overlap_x = 24;
+        let row_seam = 104; // the left column's horizontal seam starts here
+        let overlap_y = 16;
+        let slices = vec![
+            (
+                "TL",
+                SliceGeom::exact(0, 0, column_seam + overlap_x, row_seam + overlap_y),
+            ),
+            (
+                "TR",
+                SliceGeom::exact(
+                    column_seam,
+                    0,
+                    CANVAS_WIDTH - column_seam,
+                    row_seam + offset + overlap_y,
+                ),
+            ),
+            (
+                "BL",
+                SliceGeom::exact(
+                    0,
+                    row_seam,
+                    column_seam + offset + overlap_x,
+                    CANVAS_HEIGHT - row_seam,
+                ),
+            ),
+            (
+                "BR",
+                SliceGeom::exact(
+                    column_seam + offset,
+                    row_seam + offset,
+                    CANVAS_WIDTH - column_seam - offset,
+                    CANVAS_HEIGHT - row_seam - offset,
+                ),
+            ),
+        ];
+        (
+            slices,
+            (column_seam, column_seam + offset + overlap_x),
+            (row_seam, row_seam + offset + overlap_y),
+        )
     }
 
     // ---- rendering the real CPU content path --------------------------
@@ -8428,6 +8495,12 @@ mod reconstruction {
         );
     }
 
+    #[test]
+    fn misaligned_2x2_grid_offset_seams() {
+        let (slices, ..) = misaligned_grid_slices();
+        assert_reconstructs("misaligned 2x2 grid, seams offset by 1%", &slices, None);
+    }
+
     // ---- assertion set 2a: row independence of the column split -------
 
     struct RowIndependenceReport {
@@ -8621,14 +8694,13 @@ mod reconstruction {
         let canvas = build_flat_canvas();
         let (slices, row_boundary) = brain_scaled_slices(0.07);
         let spec = slicer_spec(&slices, true);
-        // Expected to FAIL under the current minimum-distance seam rule:
-        // the 0.07px row sliver spuriously activates the row edge across
-        // the whole column-overlap band (`build_edge_masks`'s per-column
-        // tables do not depend on the query row), pinning the C1/C2 column
-        // split near 0.5 for a wedge below the row boundary before it
-        // "snaps" to the correct ramp. See .claude/plans/warp-fixes.md,
-        // "Round 2 ... Slice SEAM" — this is that slice's acceptance test.
-        // Left failing on purpose: do not add #[ignore].
+        // Round 2's acceptance test (see .claude/plans/warp-fixes.md,
+        // "Round 2 ... Slice SEAM"). Under round 1's minimum-distance rule
+        // the 0.07px row sliver pinned the C1/C2 column split near 0.5 for
+        // a wedge below the row boundary before it "snapped" to the correct
+        // ramp; now the sliver's own overlap depth is what normalizes its
+        // ramp, so it is clamped to 1 at every sampled pixel center and the
+        // column split is the same on every row.
         assert_row_independence(
             "brain-scaled, rows overlap by a 0.07px sliver",
             &spec,
@@ -8640,6 +8712,148 @@ mod reconstruction {
             130.0,
             191,
         );
+    }
+
+    /// The transpose of [`check_row_independence`]: for every output in
+    /// `outputs` and every canvas row, compares that output's share at each
+    /// of its own columns (skipping `reference_column` itself and any column
+    /// whose pixel center falls inside `[exclude_x_lo, exclude_x_hi]`, the
+    /// column-overlap band) against its share at `reference_column` in that
+    /// same row. This is what a HORIZONTAL seam needs: it blends vertically,
+    /// so its split must not depend on the column.
+    #[allow(clippy::too_many_arguments)]
+    fn check_column_independence(
+        rendered: &[RenderedSlice],
+        outputs: &[&str],
+        reference_column: i32,
+        exclude_x_lo: f64,
+        exclude_x_hi: f64,
+        canvas_height: i32,
+        sample_y: i32,
+    ) -> RowIndependenceReport {
+        let mut max_deviation = 0.0f64;
+        let mut worst = None;
+        let mut samples = Vec::new();
+
+        for name in outputs {
+            let rs = rendered
+                .iter()
+                .find(|s| s.output == *name)
+                .expect("named output is among the rendered slices");
+            for y in 0..canvas_height {
+                let Some(reference_share) = share_at(rs, reference_column, y, GAMMA) else {
+                    continue;
+                };
+                for lx in 0..rs.width {
+                    let x = rs.x + lx as i32;
+                    if x == reference_column {
+                        continue;
+                    }
+                    let xc = f64::from(x) + 0.5;
+                    if xc >= exclude_x_lo && xc <= exclude_x_hi {
+                        continue;
+                    }
+                    let Some(share) = share_at(rs, x, y, GAMMA) else {
+                        continue;
+                    };
+                    if y == sample_y {
+                        samples.push((x, share));
+                    }
+                    let deviation = (share - reference_share).abs();
+                    if deviation > max_deviation {
+                        max_deviation = deviation;
+                        worst = Some(((*name).to_string(), x, y, share, reference_share));
+                    }
+                }
+            }
+        }
+        samples.sort_by_key(|(x, _)| *x);
+        RowIndependenceReport {
+            max_deviation,
+            worst,
+            samples,
+        }
+    }
+
+    /// Layout (e)'s acceptance test: on the misaligned grid every seam's
+    /// share is constant ALONG the seam, outside the band where the other
+    /// axis' seams also cover.
+    ///
+    /// The two column slices' split must not depend on the row (the column
+    /// seam is vertical and blends horizontally), and the two row slices'
+    /// split must not depend on the column. Under the round-2 per-edge rule
+    /// this failed on both counts: the 1% offset made each slice straddle
+    /// its neighbor's edge in the wrong axis over nearly a whole slice, and
+    /// that straddle became a gradient running the length of the seam.
+    #[test]
+    fn misaligned_grid_seams_are_constant_along_their_own_length() {
+        let canvas = build_flat_canvas();
+        let (slices, column_band, row_band) = misaligned_grid_slices();
+        let spec = slicer_spec(&slices, true);
+        // The middle of each band, where BOTH rows' column overlaps (and
+        // both columns' row overlaps) cover, for the printed profiles.
+        let sample_x = (column_band.0 + column_band.1) / 2;
+        let sample_y = (row_band.0 + row_band.1) / 2;
+
+        assert_row_independence(
+            "misaligned grid, column seams",
+            &spec,
+            &canvas,
+            &["TL", "TR"],
+            &["BL", "BR"],
+            (row_band.0 + row_band.1) / 2,
+            f64::from(row_band.0),
+            f64::from(row_band.1),
+            sample_x,
+        );
+
+        let rendered = render_slices(&spec, &canvas);
+        let left = check_column_independence(
+            &rendered,
+            &["TL", "BL"],
+            0,
+            f64::from(column_band.0),
+            f64::from(column_band.1),
+            CANVAS_HEIGHT,
+            sample_y,
+        );
+        let right = check_column_independence(
+            &rendered,
+            &["TR", "BR"],
+            CANVAS_WIDTH - 1,
+            f64::from(column_band.0),
+            f64::from(column_band.1),
+            CANVAS_HEIGHT,
+            sample_y,
+        );
+        for (name, report) in [("left column", &left), ("right column", &right)] {
+            eprintln!(
+                "misaligned grid, row seams, {name}: max deviation {:.4} (tolerance {:.4})",
+                report.max_deviation, SHARE_TOLERANCE
+            );
+            if let Some((output, x, y, share, reference)) = &report.worst {
+                eprintln!(
+                    "  worst: {output} at ({x},{y}) share {share:.4} vs reference {reference:.4}"
+                );
+            }
+        }
+        eprintln!("misaligned grid, row seams: share by column at row y={sample_y}:");
+        for (x, share) in left
+            .samples
+            .iter()
+            .filter(|(x, _)| x % 40 == 0 || *x == column_band.0 - 1)
+        {
+            eprintln!("    column {x}: share {share:.4}");
+        }
+        for (name, report) in [("left column", &left), ("right column", &right)] {
+            assert!(
+                report.max_deviation <= SHARE_TOLERANCE,
+                "misaligned grid, row seams, {name}: share depends on column \
+                 (max deviation {} > {}) — a horizontal seam must blend vertically only",
+                report.max_deviation,
+                SHARE_TOLERANCE
+            );
+        }
     }
 
     // ---- assertion set 2b: grid separability ---------------------------
