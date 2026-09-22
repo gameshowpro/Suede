@@ -102,11 +102,6 @@ pub enum StateError {
     },
     #[error("state document at {path} is not readable as JSON: {detail}")]
     Unreadable { path: PathBuf, detail: String },
-    #[error(
-        "a working copy is live: this write must carry the If-Config-Generation of the working \
-         copy it replaces, or discard it first with POST /config/revert"
-    )]
-    WorkingCopyLive,
 }
 
 /// The saved document and the unsaved one, under a single lock.
@@ -189,13 +184,10 @@ pub struct StatePrecondition {
 /// A rejected conditional transition, or an error returned while preparing it.
 #[derive(Debug)]
 pub enum ConditionalWriteError<E> {
+    /// An `If-Match`/`If-Config-Generation`/`If-Config-Epoch` value was sent
+    /// and did not match. A precondition is always optional: a transition
+    /// that names none never lands here.
     Precondition {
-        current: StateVersion,
-    },
-    /// A working copy is live and the transition did not name it. Every
-    /// transition is conditional while somebody is mid-edit, so that one
-    /// client's unconditional save cannot silently discard another's preview.
-    WorkingCopy {
         current: StateVersion,
     },
     Rejected(E),
@@ -446,7 +438,7 @@ impl StateStore {
         F: FnOnce(&DesiredState) -> Result<DesiredState, E>,
     {
         let mut documents = self.documents.write().unwrap();
-        self.check_transition(&documents, &expected)?;
+        self.check_expected(&documents, &expected)?;
         let basis = documents
             .preview
             .as_ref()
@@ -489,7 +481,7 @@ impl StateStore {
         F: FnOnce(&DesiredState) -> Result<DesiredState, E>,
     {
         let mut documents = self.documents.write().unwrap();
-        self.check_transition(&documents, &expected)?;
+        self.check_expected(&documents, &expected)?;
         let effective = documents
             .preview
             .as_ref()
@@ -510,7 +502,7 @@ impl StateStore {
         expected: StatePrecondition,
     ) -> Result<(DesiredState, StateVersion), ConditionalWriteError<std::convert::Infallible>> {
         let mut documents = self.documents.write().unwrap();
-        self.check_transition(&documents, &expected)?;
+        self.check_expected(&documents, &expected)?;
         documents.preview = None;
         documents.generation = documents.generation.saturating_add(1);
         let document = documents.current.clone();
@@ -547,7 +539,6 @@ impl StateStore {
         match result {
             Ok((state, _)) => Ok(state),
             Err(ConditionalWriteError::State(error)) => Err(error),
-            Err(ConditionalWriteError::WorkingCopy { .. }) => Err(StateError::WorkingCopyLive),
             Err(ConditionalWriteError::Precondition { .. }) => {
                 unreachable!("an empty precondition cannot be rejected")
             }
@@ -640,27 +631,13 @@ impl StateStore {
         }
     }
 
-    /// The precondition check every transition shares.
-    ///
-    /// While a working copy is live, a transition must name it: an
-    /// unconditional write would otherwise discard another operator's
-    /// unsaved edit without either of them seeing anything. With no working
-    /// copy there is nothing to lose, so unconditional writes — a script, a
-    /// `curl` — keep working exactly as before.
-    fn check_transition<E>(
-        &self,
-        documents: &Documents,
-        expected: &StatePrecondition,
-    ) -> Result<(), ConditionalWriteError<E>> {
-        self.check_expected(documents, expected)?;
-        if documents.preview.is_some() && expected.generation.is_none() {
-            return Err(ConditionalWriteError::WorkingCopy {
-                current: self.version(documents),
-            });
-        }
-        Ok(())
-    }
-
+    /// The precondition check every transition shares: optional, and
+    /// rejected only when a value was actually sent and no longer matches.
+    /// Anyone may replace, commit or revert the one shared working copy
+    /// unconditionally — the earlier rule that an unconditional write while
+    /// a working copy was live got a 409 is withdrawn; every connected
+    /// client learns of the change through `config_changed` instead of
+    /// being blocked from making it.
     fn check_expected<E>(
         &self,
         documents: &Documents,
@@ -1664,9 +1641,13 @@ mod tests {
         assert_eq!(failure.revision, 1);
     }
 
-    /// A10: two operators, one of them mid-edit.
+    /// Round 4: the earlier rule that an unconditional write while a
+    /// working copy was live got a 409 is withdrawn. Anyone may commit or
+    /// revert the one shared working copy; the section write folds it in
+    /// rather than clobbering it unseen, because `stage_replace_if` builds
+    /// on the live preview as its one basis.
     #[test]
-    fn an_unconditional_write_cannot_discard_a_live_working_copy() {
+    fn an_unconditional_write_commits_a_live_working_copy_rather_than_discarding_it() {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::ephemeral(dir.path().to_path_buf());
         store
@@ -1677,12 +1658,13 @@ mod tests {
             })
             .unwrap();
 
-        let error = store
+        let saved = store
             .update(|state| state.settings.output_poll_interval_seconds = 9)
-            .expect_err("an unconditional write must not clobber somebody's preview");
-        assert!(matches!(error, StateError::WorkingCopyLive), "{error}");
-        assert!(store.has_preview());
-        assert!(!store.effective().settings.hide_cursor);
+            .expect("an unconditional write now commits the live working copy");
+        assert!(!store.has_preview());
+        assert!(!saved.settings.hide_cursor, "the preview's edit survives");
+        assert_eq!(saved.settings.output_poll_interval_seconds, 9);
+        assert!(saved.committed);
     }
 
     #[test]

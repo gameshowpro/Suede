@@ -1333,10 +1333,13 @@ impl Reconciler {
             .collect();
 
         match staged {
-            Ok(_) => {
+            Ok((ref document, ref version)) => {
                 if let Err(error) = self.persist().await {
                     tracing::warn!(%error, "failed to persist adopted output values");
                 }
+                self.events.publish(ServerEvent::ConfigChanged(Box::new(
+                    crate::api::config_change("outputs", document, version),
+                )));
                 for (rule, adopted) in &pins {
                     // Only what was actually written: the rest are reported
                     // as divergences above.
@@ -1361,8 +1364,7 @@ impl Reconciler {
                     );
                 }
             }
-            Err(ConditionalWriteError::Precondition { current })
-            | Err(ConditionalWriteError::WorkingCopy { current }) => {
+            Err(ConditionalWriteError::Precondition { current }) => {
                 tracing::debug!(
                     expected_revision = desired.revision,
                     expected_generation = config_generation,
@@ -2739,6 +2741,51 @@ mod tests {
             "an unchanged adoption must not write again"
         );
         assert_eq!(after_third.outputs[0].adopted, Some(adopted));
+        harness.supervisor.shutdown().await;
+    }
+
+    /// Round 4: a daemon-side write — reconciler adoption — is published
+    /// exactly like a client's, so a connected UI learns of a pinned mode
+    /// without having to poll.
+    #[tokio::test]
+    async fn a_settled_mode_being_adopted_publishes_a_config_changed_event() {
+        let harness = harness();
+        harness.reconciler.detect_capabilities().await;
+        harness
+            .store
+            .update(|state| {
+                state
+                    .outputs
+                    .push(OutputConfig::new(OutputMatch::by_name("HDMI-A-1")));
+            })
+            .unwrap();
+
+        // First pass: nothing settled yet.
+        harness.reconciler.reconcile().await;
+
+        // Second pass: the value is pinned and persisted.
+        let mut receiver = harness.events.subscribe();
+        harness.reconciler.reconcile().await;
+        assert!(
+            harness.store.get().outputs[0].adopted.is_some(),
+            "the setup must actually have adopted something"
+        );
+
+        let event = loop {
+            let event = receiver.try_recv().expect(
+                "an adopted pin must publish config_changed among this pass's other events",
+            );
+            if event.name() == "config_changed" {
+                break event;
+            }
+        };
+        let data = event.data();
+        assert_eq!(data["committed"], true);
+        assert_eq!(data["section"], "outputs");
+        assert_eq!(
+            data["config"]["outputs"][0]["adopted"]["mode"]["width"],
+            1920
+        );
         harness.supervisor.shutdown().await;
     }
 

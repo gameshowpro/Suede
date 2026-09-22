@@ -1284,23 +1284,27 @@ always commit), and `POST /api/v1/config/revert` return the exact accepted
 revision in `ETag` and effective working-copy identity in
 `X-Config-Generation`, plus the store instance in `X-Config-Epoch`.
 
-**While no working copy is live**, an unconditional write — no `If-Match`,
-`If-Config-Generation`, or `If-Config-Epoch` at all — still works, so a
-script or a `curl` one-liner needs no preamble.
+**The server holds at most one working copy, shared by everyone.** It is not
+scoped to a client, a session, or a browser tab: it exists to let anyone
+defer the decision to save or discard an edit, not to give one editor
+exclusive possession of it. Any write, preview, commit, or revert applies to
+whatever is currently live, whoever made it — a script's unconditional `PUT`
+folds straight into another operator's in-progress edit rather than being
+turned away, and an unconditional `POST /api/v1/config/revert` discards
+whatever working copy is live, not only one this caller created. Nothing
+about that is silent: every connected client, including third-party apps,
+learns of the change in real time through the `config_changed` SSE event (see
+[Events (SSE)](specification.md#events-sse)), so an operator watching the
+page sees another operator's edit, commit, or revert happen live.
 
-**Once a working copy is live**, any write, preview, or revert must send
-`If-Config-Generation` naming the exact working copy it replaces (it may
-also send `If-Match` and `If-Config-Epoch`); one without it is refused with
-`409`, rather than silently discarding another client's unsaved edit. A
-write that does name it commits on that one working copy alone — never a
-hybrid of it and the last saved document — so two operators editing at once
-resolve predictably: whichever of them last read the current working copy
-can build on it and save; the other gets `409` and reloads to see what
-happened. This is one atomic check-and-transition, including when the
-write comes through a section endpoint, so a late Save or Revert can never
-replace newer work or revive a preview from before a daemon restart (the
-store's epoch changes on restart, so `If-Config-Epoch` catches that case
-too).
+`If-Match`, `If-Config-Generation`, and `If-Config-Epoch` remain fully
+optional compare-and-swap preconditions, for a client that wants its *own*
+write rejected if the document moved since it last read it — a UI that wants
+to warn about a conflicting edit rather than silently overwrite one, say. A
+precondition that is actually sent and no longer matches still gets `409`;
+one that is simply omitted never does. A write that does name a working copy
+commits on that one working copy alone — never a hybrid of it and the last
+saved document.
 
 ```bash
 # A plain read establishes the working-copy identity to build on.
@@ -1308,7 +1312,8 @@ curl -sD - http://appliance:9088/api/v1/config/settings -o /dev/null \
   | grep -i x-config-generation
 # x-config-generation: 4
 
-# The next write must repeat it, or a live working copy refuses the write.
+# Optional: reject this write if the document has moved on since the read
+# above (a stale value still gets 409; omitting the header never does).
 curl -X PUT http://appliance:9088/api/v1/config/settings \
   -H 'Content-Type: application/json' \
   -H 'If-Config-Generation: 4' \

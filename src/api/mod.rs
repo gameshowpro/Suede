@@ -65,8 +65,9 @@ impl ApiState {
     /// asynchronous and may currently be impossible. `wait` opts into blocking
     /// until reconciliation settles.
     ///
-    /// Unconditional, so it is refused with a 409 while somebody else has a
-    /// working copy live; see [`StateStore::stage_replace_if`].
+    /// Unconditional: it folds the one shared working copy in (if a working
+    /// copy is live, it — not the saved document — is the basis this commits
+    /// on) rather than being refused; see [`StateStore::stage_replace_if`].
     pub async fn commit(
         &self,
         next: DesiredState,
@@ -116,11 +117,7 @@ impl ApiState {
         // and stays visible in `/status` until one succeeds.
         let persisted = self.persist().await;
 
-        self.events
-            .publish(ServerEvent::ConfigChanged(ConfigChange {
-                revision: saved.revision,
-                section: section.to_string(),
-            }));
+        self.publish_config_change(section, &saved, &version);
 
         match wait {
             Some(seconds) => {
@@ -171,11 +168,7 @@ impl ApiState {
 
         let persisted = self.persist().await;
 
-        self.events
-            .publish(ServerEvent::ConfigChanged(ConfigChange {
-                revision: saved.revision,
-                section: section.to_string(),
-            }));
+        self.publish_config_change(section, &saved, &version);
 
         match wait {
             Some(seconds) => {
@@ -209,7 +202,8 @@ impl ApiState {
     }
 
     /// Apply an uncommitted working copy under the same atomic precondition
-    /// contract used by saves.
+    /// contract used by saves. Every connected client — not only this one —
+    /// learns of it through `config_changed`.
     pub fn preview_if(
         &self,
         expected: StatePrecondition,
@@ -223,6 +217,7 @@ impl ApiState {
             Ok(next)
         });
         let accepted = result.map_err(map_conditional_write_error)?;
+        self.publish_config_change("all", &accepted.0, &accepted.1);
         if projection_only {
             self.trigger.request_projection();
         } else {
@@ -231,8 +226,10 @@ impl ApiState {
         Ok(accepted)
     }
 
-    /// Discard an uncommitted working copy only when it is still the one the
-    /// caller read. This prevents a late Cancel from erasing a newer preview.
+    /// Discard the working copy — anyone's — only when the caller named a
+    /// version that still matches (a stale precondition still gets a 409); an
+    /// unconditional call discards whatever is live. Published like every
+    /// other change to the effective document.
     pub fn revert_if(
         &self,
         expected: StatePrecondition,
@@ -241,8 +238,26 @@ impl ApiState {
             .store
             .clear_preview_if(expected)
             .map_err(map_revert_error)?;
+        self.publish_config_change("all", &accepted.0, &accepted.1);
         self.trigger.request("revert");
         Ok(accepted)
+    }
+
+    /// Publish `config_changed` for a change to the effective document: a
+    /// preview PUT, a commit, a revert, reconciler adoption, or load-time
+    /// repair. `document` is the effective document that produced `version`
+    /// — the working copy if one exists, else the saved one — and
+    /// `committed` mirrors `document.committed`.
+    pub fn publish_config_change(
+        &self,
+        section: &str,
+        document: &DesiredState,
+        version: &StateVersion,
+    ) {
+        self.events
+            .publish(ServerEvent::ConfigChanged(Box::new(config_change(
+                section, document, version,
+            ))));
     }
 
     pub fn validate_configuration(&self, next: &mut DesiredState) -> ApiResult<()> {
@@ -359,7 +374,6 @@ pub fn map_conditional_write_error(error: ConditionalWriteError<ApiError>) -> Ap
     match error {
         ConditionalWriteError::Rejected(error) => error,
         ConditionalWriteError::Precondition { current } => stale_precondition(&current),
-        ConditionalWriteError::WorkingCopy { current } => working_copy_live(&current),
         ConditionalWriteError::State(error) => ApiError::Internal(error.to_string()),
     }
 }
@@ -368,11 +382,14 @@ fn map_revert_error(error: ConditionalWriteError<std::convert::Infallible>) -> A
     match error {
         ConditionalWriteError::Rejected(never) => match never {},
         ConditionalWriteError::Precondition { current } => stale_precondition(&current),
-        ConditionalWriteError::WorkingCopy { current } => working_copy_live(&current),
         ConditionalWriteError::State(error) => ApiError::Internal(error.to_string()),
     }
 }
 
+/// A precondition was named — `If-Match`, `If-Config-Generation` or
+/// `If-Config-Epoch` — and no longer matches. Only sent when the client
+/// chose to name a version at all: an unconditional write is never rejected
+/// this way.
 fn stale_precondition(current: &StateVersion) -> ApiError {
     ApiError::Conflict(format!(
         "document is at revision {} and generation {}",
@@ -380,16 +397,23 @@ fn stale_precondition(current: &StateVersion) -> ApiError {
     ))
 }
 
-/// Unconditional writes keep working until somebody is mid-edit. From then on
-/// every write names the working copy it is replacing, so one client's save
-/// cannot discard another client's unsaved work unseen.
-fn working_copy_live(current: &StateVersion) -> ApiError {
-    ApiError::Conflict(format!(
-        "a working copy is live at revision {} and generation {}: repeat this write with \
-         If-Config-Generation: {} and If-Config-Epoch: {} to build on it, or discard it first \
-         with POST /config/revert",
-        current.revision, current.generation, current.generation, current.epoch
-    ))
+/// Build the `config_changed` payload for a change to the effective
+/// document. `document` is what `version` identifies — the working copy if
+/// one exists, else the saved one — and `committed` mirrors
+/// `document.committed`.
+pub fn config_change(
+    section: &str,
+    document: &DesiredState,
+    version: &StateVersion,
+) -> ConfigChange {
+    ConfigChange {
+        revision: version.revision,
+        generation: version.generation,
+        epoch: version.epoch.clone(),
+        committed: document.committed,
+        section: section.to_string(),
+        config: document.clone(),
+    }
 }
 
 /// Build the complete application router.

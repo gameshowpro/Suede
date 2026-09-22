@@ -312,11 +312,6 @@ window.addEventListener("error", (event) => {
     <button role="tab" aria-selected="false" data-tab="config">Raw config</button>
   </nav>
 
-  <div class="alert warn" id="config-conflict" hidden>
-    <strong>Configuration conflict</strong><p id="config-conflict-message"></p>
-    <button class="action ghost" id="config-export">Export local edits</button>
-    <button class="action" id="config-discard">Discard local edits and reload</button>
-  </div>
   <!-- Displays -->
   <section id="tab-displays">
     <!-- Page-level so it is visible in both Simple and Warp: shared crop and
@@ -946,55 +941,52 @@ const bytes = (n) => n > 1048576 ? `${num(n / 1048576)} MB` : `${num(n / 1024, 0
 
 // --- live preview --------------------------------------------------------
 //
-// Edits are pushed to the outputs as they are made, but nothing touches disk
-// until Save: the daemon holds them as a preview that any committed write or
-// restart discards. Cancel reverts to what the server reports after undoing
-// the working copy.
+// Edits are pushed to the server as they are made, but nothing touches disk
+// until Save: the daemon holds them as one shared working copy that any
+// commit, revert or restart replaces. There is no per-client ownership of
+// it — any connected client, including a third party, may save or revert
+// what another one typed, and every client learns about it through
+// `config_changed`. `config` therefore always mirrors the server's
+// effective document; the only state kept locally is the in-progress text
+// of the control currently focused (each render function skips repainting
+// it) and the queued/in-flight preview write below. `acceptedConfig` is
+// narrower than that sounds: not a client-side notion of ownership, just
+// the last document a server response or event actually confirmed, so a
+// preview the server rejects (a 422, not a conflict — there is nothing left
+// to conflict with) has something to roll back to instead of leaving the
+// rejected edit sitting in `config`.
 let configGeneration = null, configEpoch = null, observedConfigEpoch = null, acceptedConfig = null;
-let previewTimer = null, previewActive = false, previewQueued = null;
+let previewTimer = null, previewQueued = null;
 let previewFlight = null, writeTail = Promise.resolve(), lastPreviewAt = -Infinity;
-let editVersion = 0, configLoadSerial = 0, configConflict = false, configBusy = false;
+let editVersion = 0, configLoadSerial = 0, configBusy = false;
 let recommendation = null;
 let recommendationTimer = null, recommendationFlight = null, recommendationPending = null;
 let recommendationInput = 0;
 let displayValidationError = null;
 function setDisplayError(message) { displayValidationError = message || null; $("warp-error").textContent = message || ""; }
 
-function configHeaders() {
-  if (configGeneration == null || configEpoch == null) throw new Error("Reload configuration to establish a working-copy version.");
-  return { "content-type": "application/json", "If-Match": String(config.revision),
-    "If-Config-Generation": String(configGeneration), "If-Config-Epoch": configEpoch };
-}
 function exclusiveWrite(operation) {
   const result = writeTail.then(operation);
   writeTail = result.catch(() => {});
   return result;
 }
-function flagConflict(message) {
-  configConflict = true;
-  clearTimeout(previewTimer); previewQueued = null;
-  $("config-conflict").hidden = false;
-  $("config-conflict-message").textContent = message;
-  renderWarpStatus();
-}
+// Writes are unconditional: there is one shared working copy, and nothing
+// here claims ownership of it or names a version it must still match. The
+// generation/epoch this captures are read-only bookkeeping — kept for
+// display and for correlating a slow-to-arrive async response (see
+// `requestRecommendation`) with the document it was requested against, not
+// for a precondition header.
 async function writeConfig(path, options) {
-  if (configConflict) throw new Error("Configuration changed elsewhere. Export your edits or reload before writing.");
   const metadata = {};
-  try {
-    const result = await rawApi(path, { ...options, headers: { ...options.headers, ...configHeaders() } }, metadata);
-    if (metadata.generation == null || metadata.epoch !== configEpoch) throw new Error("The daemon did not return a working-copy version. Reload before editing.");
-    configGeneration = metadata.generation;
-    if (result?.revision != null) config.revision = result.revision;
-    return result;
-  } catch (error) {
-    if (error.status === 409 || error.status >= 500 || !error.status) flagConflict(error.message);
-    throw error;
-  }
+  const result = await rawApi(path, options, metadata);
+  if (metadata.generation != null) configGeneration = metadata.generation;
+  if (metadata.epoch != null) configEpoch = metadata.epoch;
+  if (result?.revision != null && config) config.revision = result.revision;
+  return result;
 }
 function pushPreview(material = false) {
-  if (configBusy || configConflict) return;
+  if (configBusy) return;
   editVersion++;
-  previewActive = true;
   if (material) invalidateRecommendation();
   previewQueued = structuredClone(config);
   schedulePreview();
@@ -1015,7 +1007,7 @@ function scheduleRecommendation(input = recommendationInput) {
   recommendationTimer = setTimeout(() => requestRecommendation(input), 250);
 }
 async function requestRecommendation(input) {
-  if (!config || configBusy || configConflict || input !== recommendationInput) return;
+  if (!config || configBusy || input !== recommendationInput) return;
   if (recommendationFlight) { recommendationPending = input; return; }
   // Reserve the only request slot before waiting for the preview queue; a
   // pointer move can schedule another recommendation during that await.
@@ -1047,27 +1039,31 @@ function recommendationSignature() {
 }
 function schedulePreview() {
   clearTimeout(previewTimer);
-  if (!previewQueued || previewFlight || configBusy || configConflict) return;
+  if (!previewQueued || previewFlight || configBusy) return;
   previewTimer = setTimeout(sendPreview, Math.max(0, Math.ceil(50 - (performance.now() - lastPreviewAt))));
 }
 function sendPreview() {
-  if (!previewQueued || previewFlight || configBusy || configConflict) return;
+  if (!previewQueued || previewFlight || configBusy) return;
   if (performance.now() - lastPreviewAt < 50) { schedulePreview(); return; }
   const next = previewQueued, version = editVersion;
   previewQueued = null;
   previewFlight = exclusiveWrite(async () => {
     lastPreviewAt = performance.now();
-    const accepted = await writeConfig("/config", { method: "PUT", body: JSON.stringify({ ...next, committed: false }) });
+    const accepted = await writeConfig("/config", { method: "PUT",
+      headers: { "content-type": "application/json" }, body: JSON.stringify({ ...next, committed: false }) });
     acceptedConfig = structuredClone(accepted);
-    // Keep newer local pointer feedback while this response is in flight.
+    // Keep newer local pointer feedback while this response is in flight; a
+    // Save, Revert or explicit Reload bumps editVersion to say so.
     if (version === editVersion) config = structuredClone(accepted);
   }).catch((error) => {
-    if (!configConflict) {
-      previewQueued = null;
-      if (acceptedConfig) config = structuredClone(acceptedConfig);
+    previewQueued = null;
+    // Not a conflict (there is no other client's document to defer to here)
+    // — a rejected edit (422) or a network failure just should not sit in
+    // `config` looking accepted, so fall back to the last document a
+    // response or event actually confirmed.
+    if (acceptedConfig) config = structuredClone(acceptedConfig);
     setDisplayError(error.message);
-      renderWarpEditor();
-    }
+    renderWarpEditor();
     toast(error.message, true);
   }).finally(() => { previewFlight = null; schedulePreview(); renderWarpStatus(); });
 }
@@ -1079,7 +1075,6 @@ async function flushPreviews() {
       sendPreview();
     }
   }
-  if (configConflict) throw new Error("Reload after resolving the configuration conflict.");
 }
 async function finishConfigWrite(path, options) {
   if (configBusy) throw new Error("A configuration operation is already in progress.");
@@ -1089,12 +1084,7 @@ async function finishConfigWrite(path, options) {
   clearTimeout(previewTimer); previewQueued = null;
   editVersion++;
   try {
-    return await exclusiveWrite(async () => {
-      const result = await writeConfig(path, options);
-      previewActive = false;
-      acceptedConfig = null;
-      return result;
-    });
+    return await exclusiveWrite(() => writeConfig(path, options));
   } finally { configBusy = false; document.querySelector("main").inert = false; renderDirtyStatus(); }
 }
 async function cancelPreview() {
@@ -1103,11 +1093,13 @@ async function cancelPreview() {
   applyLoadedConfig(await api("/config/revert", { method: "POST" }));
 }
 
+// The server is the only source of truth for what is dirty: `config` always
+// mirrors its effective document, so an edit this client just made is not
+// "dirty" until the server has said so by accepting the preview (or, on the
+// gap before that response lands, whatever it was before — a debounce-width
+// discrepancy, not a client-side flag pretending to be authoritative).
 function isDirty() {
   return Boolean(
-    previewActive ||
-    previewQueued != null ||
-    previewFlight != null ||
     (config && config.committed === false) ||
     (status && status.committed === false)
   );
@@ -1117,20 +1109,20 @@ function renderDirtyStatus() {
   const dirty = isDirty();
   // These two sit in the header, outside <main>, so main.inert during a
   // write does not cover them — they need their own disabled state, kept in
-  // step with configBusy/configConflict here rather than relying on inert.
-  const locked = configBusy || configConflict;
+  // step with configBusy here rather than relying on inert.
+  const locked = configBusy;
   const saveBtn = $("pj-save");
   const cancelBtn = $("pj-cancel");
   if (saveBtn) {
     saveBtn.classList.toggle("dirty", dirty);
     saveBtn.disabled = locked;
-    saveBtn.title = locked ? "A configuration operation is in progress or a conflict needs resolving first"
+    saveBtn.title = locked ? "A configuration operation is in progress"
       : dirty ? "Save configuration to disk" : "Configuration is saved";
   }
   if (cancelBtn) {
     cancelBtn.classList.toggle("dirty", dirty);
     cancelBtn.disabled = locked;
-    cancelBtn.title = locked ? "A configuration operation is in progress or a conflict needs resolving first"
+    cancelBtn.title = locked ? "A configuration operation is in progress"
       : dirty ? "Revert to saved configuration" : "Revert configuration";
   }
 }
@@ -2859,7 +2851,7 @@ const outputKey = o => {
 };
 const warpOutput = () => configEntry(selected);
 const warpAvailable = () => projectionStats?.geometry?.warpAvailable === true && config?.projection?.renderer !== "cpu";
-const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy && !configConflict;
+const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy;
 let warpDrag = null, rejectedHandle = null;
 let projectionEventVersion = 0;
 
@@ -2979,6 +2971,14 @@ function warpPinPrecision(axis) {
 function renderWarpNumbers() {
   const g = warpOutput()?.geometry;
   if (!g) return;
+  // This rebuilds the whole matrix from scratch (`innerHTML =`), which would
+  // otherwise yank the caret and any unsent keystrokes out of whichever pin
+  // or center field the operator is mid-typing into every time a
+  // `config_changed` event (now applied unconditionally, including while a
+  // preview of this operator's own is queued or in flight) reaches this
+  // page. Skip while one of these fields is focused; the focusout listener
+  // below re-renders the moment it is not.
+  if ($("warp-numbers").contains(document.activeElement)) return;
   const editable = warpEditable();
   const pinIn = (i, a, label) =>
     `<div><label for="pin-${i}-${a}">${label}</label><input id="pin-${i}-${a}" type="number" step="any" data-config-field="corners" value="${editNumber(g.corners[i][a], warpPinPrecision(a))}" ${editable ? "" : "disabled"}></div>`;
@@ -3018,6 +3018,7 @@ function renderWarpNumbers() {
   g.corners.forEach((p,i)=>p.forEach((v,a)=>$( `pin-${i}-${a}`).onchange = e => editGeometry(n=>n.corners[i][a]=Number(e.target.value),i)));
   g.center.forEach((v,a)=>$(`center-${a}`).onchange = e => editGeometry(n=>n.center[a]=Number(e.target.value),a?6:4));
 }
+for (const event of ["focusin", "focusout"]) $("warp-numbers").addEventListener(event, () => setTimeout(renderWarpNumbers));
 function renderWarpEditor() {
   if (!config || warpDrag) return;
   const visibleWarp = warpAvailable() && config.projection?.mode === "warp";
@@ -3036,13 +3037,12 @@ function renderWarpStatus() {
     : requested === "warp" ? "Warp capability verified. Shared crop edits keep the calibration." : "Simple uses the shared canvas and crop without geometric correction.";
   $("mode-simple").setAttribute("aria-pressed", String(forcedSimple || requested === "simple"));
   $("mode-warp").setAttribute("aria-pressed", String(!forcedSimple && requested === "warp"));
-  $("mode-simple").disabled = configConflict || configBusy;
-  $("mode-warp").disabled = !warpAvailable() || configConflict || configBusy;
+  $("mode-simple").disabled = configBusy;
+  $("mode-warp").disabled = !warpAvailable() || configBusy;
   for (const id of ["warp-reset-pins","warp-reset-centers"]) $(id).disabled = !warpEditable();
   $("warp-controls").inert = !warpEditable();
-  let message = previewActive || config?.committed === false ? "Unsaved edits. " : "";
-  if (configConflict) message += "Resolve the configuration conflict before editing.";
-  else if (previewQueued || previewFlight) message += "Preview awaiting server acceptance.";
+  let message = config?.committed === false ? "Unsaved edits. " : "";
+  if (previewQueued || previewFlight) message += "Preview awaiting server acceptance.";
   else if (projectionStats?.running && c?.session && c?.configGeneration?.applied != null && String(c.configGeneration.applied) === String(configGeneration))
     message += "Effective projection installed for the latest accepted settings.";
   else message += "Settings accepted; installation of this working copy is not yet confirmed.";
@@ -3805,18 +3805,20 @@ document.querySelectorAll("nav button").forEach((button) => {
 
 // The one place a freshly received document becomes the page's state,
 // shared by an ordinary load, Revert (which fetches the server's reverted
-// copy) and Discard (which reloads through loadConfig(true)) so the three
-// cannot drift into rendering slightly different things. Clears whatever a
-// previous document's edits left behind: the recommendation (it is a
-// function of the new document, not the old one) and any validation error
-// (it described a draft that no longer exists).
+// copy), the Raw Config tab's Reload, and a `config_changed` event (which
+// carries the document itself, so this runs directly against it with no
+// GET) — so none of them can drift into rendering slightly differently.
+// `config` is always the server's effective document; there is no local
+// "my edits vs. their edits" to reconcile, so this always applies what it
+// is given. Individual render functions are responsible for not stomping
+// the control the operator is currently typing into (see e.g.
+// `renderWarpNumbers`, `renderSharedContent`, `renderCanvas`) — this
+// function does not try to guess which one that is.
 function applyLoadedConfig(incoming) {
   config = incoming;
   acceptedConfig = structuredClone(config);
-  previewActive = false; configConflict = false;
   recommendation = null;
   setDisplayError(null);
-  $("config-conflict").hidden = true;
   if (document.activeElement !== $("config-json")) $("config-json").value = JSON.stringify(config, null, 2);
   renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
   invalidateRecommendation();
@@ -3824,7 +3826,14 @@ function applyLoadedConfig(incoming) {
   if (selected) selectOutput(selected);
   renderDirtyStatus();
 }
-async function loadConfig(force = false) {
+// Only used for the initial load and an explicit resync (a reconnect, or the
+// Raw Config tab's Reload): every other update to the effective document
+// arrives as a `config_changed` event and is applied directly, without a
+// GET. The X-Config-Epoch check stays — an appliance that restarted reuses
+// small numeric generations, and `projectionStats.control`/the SSE stream
+// are keyed off session identity, not off this document, so a restart still
+// needs its own detection independent of anything below.
+async function loadConfig() {
   const serial = ++configLoadSerial, version = editVersion, metadata = {};
   const incoming = await rawApi("/config", undefined, metadata);
   if (serial !== configLoadSerial || version !== editVersion || configBusy || previewFlight) return;
@@ -3836,26 +3845,11 @@ async function loadConfig(force = false) {
     observedConfigEpoch = metadata.epoch;
     if (stream) { stream.close(); stream = null; connect(); }
   } else observedConfigEpoch = metadata.epoch;
-  if (!force && (previewActive || configConflict)) {
-    if (metadata.generation !== configGeneration || metadata.epoch !== configEpoch) flagConflict("Another client changed the working copy. Your local edits are preserved here.");
-    return;
-  }
   if (configEpoch != null && configEpoch !== metadata.epoch && projectionStats) projectionStats.control = null;
   configEpoch = metadata.epoch;
   configGeneration = metadata.generation;
   applyLoadedConfig(incoming);
 }
-$("config-discard").onclick = () => run(async () => {
-  clearTimeout(previewTimer); previewQueued = null;
-  await writeTail;
-  editVersion++;
-  await loadConfig(true);
-}, "loaded current working copy");
-$("config-export").onclick = () => {
-  const link = document.createElement("a");
-  link.href = URL.createObjectURL(new Blob([JSON.stringify(config, null, 2)], { type: "application/json" }));
-  link.download = "suede-local-edits.json"; link.click(); URL.revokeObjectURL(link.href);
-};
 async function loadWallpapers() { wallpapers = await api("/wallpapers"); renderWallpapers(); }
 async function loadChecks() {
   checks = await api("/system/checks");
@@ -3888,7 +3882,15 @@ async function loadAll() {
 $("c-save").onclick = () => run(() =>
   save("/config", { ...JSON.parse($("config-json").value), committed: true }),
   "saved configuration");
-$("c-reload").onclick = () => { $("config-json").blur(); $("config-discard").click(); };
+// Abandons any local edit and re-fetches what the server currently has —
+// the same recovery the removed "Discard local edits" conflict-banner
+// button used to offer, now the Raw Config tab's own affordance for it
+// since there is no more per-client working copy to conflict over.
+$("c-reload").onclick = () => { $("config-json").blur(); run(async () => {
+  clearTimeout(previewTimer); previewQueued = null;
+  await writeTail;
+  editVersion++;
+}, "loaded current working copy"); };
 $("c-reconcile").onclick = () => run(() => api("/reconcile", { method: "POST" }), "reconciliation requested");
 
 // A laptop that slept has a stale page and an EventSource still working its
@@ -4024,7 +4026,19 @@ function connect() {
     renderApps();
   });
   source.addEventListener("status_changed", (e) => { status = JSON.parse(e.data); renderStatus(); });
-  source.addEventListener("config_changed", () => loadConfig().catch(error => toast(error.message, true)));
+  // The server holds one shared working copy and pushes this on every
+  // change to its effective document — a preview PUT (from any client),
+  // a commit, a revert, or a daemon-side write such as adoption or
+  // load-time repair — so this applies `data.config` directly rather than
+  // issuing a GET. It applies even while this client's own preview is
+  // queued or in flight; that write's response, when it lands, still wins
+  // (see the `version === editVersion` check in `sendPreview`).
+  source.addEventListener("config_changed", (e) => {
+    const data = JSON.parse(e.data);
+    if (data.generation != null) configGeneration = data.generation;
+    if (data.epoch != null) configEpoch = data.epoch;
+    applyLoadedConfig(data.config);
+  });
   source.addEventListener("checks_changed", (e) => { checks = JSON.parse(e.data); renderChecks(); renderAlerts(); });
   source.addEventListener("projection_stats_changed", (e) => {
     if (stream !== source) return;

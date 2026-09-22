@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::desired::DesiredState;
+
 /// How far an advertised refresh rate may sit from a requested one and still
 /// be considered the mode the client meant. Wide enough for EDID jitter
 /// (59.81–60.02 for "60"), narrow enough to never confuse 50, 60, 72 or 75.
@@ -672,13 +674,34 @@ pub struct WindowChange {
     pub window: Window,
 }
 
-/// Payload of the `config_changed` event.
+/// Payload of the `config_changed` event, published on every change to the
+/// one shared effective document: a preview PUT, a commit, a revert,
+/// reconciler adoption, or a load-time repair. There is no per-client
+/// working copy and nothing stops one client from committing or reverting
+/// another's unsaved edit — every connected client, including third-party
+/// apps, learns of the change through this event rather than being blocked
+/// from making it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigChange {
+    /// Persisted document revision, as `ETag`/`If-Match`.
     pub revision: u64,
-    /// Which part of the document changed: `all`, `outputs`, `apps`, `settings`.
+    /// In-memory working-copy generation, as `X-Config-Generation`.
+    pub generation: u64,
+    /// Store instance identity, as `X-Config-Epoch`.
+    pub epoch: String,
+    /// Mirrors `config.committed`: `false` while this change leaves a
+    /// working copy live, `true` for a commit, a revert, an adoption, or a
+    /// repair (which only ever touch the saved document).
+    pub committed: bool,
+    /// Which part of the document changed: `all`, `outputs`, `apps`,
+    /// `settings`, `projection`, `backgrounds`, or `repair` for a load-time
+    /// repair.
     pub section: String,
+    /// The effective document that this change produced: the working copy
+    /// if one exists, else the saved one. A client applies this directly
+    /// rather than re-fetching `GET /config`.
+    pub config: DesiredState,
 }
 
 /// What the projection pipeline is doing right now, as served by `GET

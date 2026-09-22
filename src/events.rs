@@ -18,7 +18,9 @@ pub enum ServerEvent {
     WindowsChanged(Box<WindowChange>),
     AvChanged(AvDevices),
     AppStatusChanged(Box<AppStatus>),
-    ConfigChanged(ConfigChange),
+    /// Boxed like the other large payloads: `config` carries a whole
+    /// [`crate::model::DesiredState`].
+    ConfigChanged(Box<ConfigChange>),
     StatusChanged(Box<Status>),
     ChecksChanged(Vec<Check>),
     /// Same shape as `GET /projection/stats`: whether a slicer is alive,

@@ -183,6 +183,21 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     let snapshot = Arc::new(Snapshot::new());
     let store = Arc::new(StateStore::load(bootstrap.state_dir.clone())?);
 
+    // A document repaired at load is a daemon-side change to the effective
+    // document exactly like a commit or a revert, so it is published the
+    // same way — here, the first place anything after `load` consults the
+    // store, and the only time `load_repairs` is non-empty (it clears once
+    // the repaired document has been saved once). No SSE client is likely to
+    // be connected this early, so this is a best-effort courtesy for one
+    // already watching across a restart; `/status` (`state_document_repaired`)
+    // is the durable way an operator finds out.
+    if !store.load_repairs().is_empty() {
+        let (document, version) = store.effective_with_version();
+        events.publish(suede::events::ServerEvent::ConfigChanged(Box::new(
+            api::config_change("repair", &document, &version),
+        )));
+    }
+
     // --- backends ---
     let sway: Arc<dyn SwayClient> = if args.mock {
         tracing::warn!("running with a mock compositor; no real displays will change");

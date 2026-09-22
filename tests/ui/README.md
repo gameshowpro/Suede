@@ -22,8 +22,10 @@ The suite exercises real pointer events and keyboard focus, inverse-projective
 center movement, invalid crossings, numeric edits, identity pin/center resets, shared crop/scale edits, automatic arrangement,
 coalescing with delayed responses, final state delivery, Save/Revert barriers,
 server rejection rollback, pattern preservation, capability fallback and
-recovery, stale recommendations, direct resolution edits and focus presets, two-client
-conflicts, resynchronization, and daemon restart identity.
+recovery, stale recommendations, direct resolution edits and focus presets, one
+client's edit and revert arriving on another as a `config_changed` event
+(fields, dirty state, the diagram, and a focused field held until it blurs),
+resynchronization, and daemon restart identity.
 It also checks adaptive compensation fields through pattern previews,
 Save/Cancel, numeric fixed-mode restoration, and telemetry updates that never
 send configuration writes. Stale samples, unavailable measurement, and
@@ -51,7 +53,9 @@ and results. Unchecked items are not claimed as passed by the browser suite.
       and unchanged browser dimensions during pin movement.
 - [ ] Save or Cancel during a slow preview. Open two browser clients, edit
       concurrently, disconnect/reconnect, and restart the temporary daemon.
-      Verify explicit conflict handling and export/reload recovery.
+      There is one shared working copy: verify each client's edits, saves and
+      reverts appear on the other as they happen, and that a reconnect
+      resynchronizes to whatever the server currently holds.
 - [ ] Switch every diagnostic pattern and return to content. Save and reload;
       confirm retained geometry and requested mode survive.
 - [ ] Force CPU fallback, edit shared crop pixels/content scale and canvas width,

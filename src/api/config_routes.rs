@@ -51,10 +51,10 @@ impl IntoResponse for VersionedConfig {
 /// Subresource GETs answer from the *effective* document, exactly like
 /// `GET /api/v1/config`: a `GET /config/outputs` that described the saved
 /// document while `GET /config` described the working copy would be two
-/// answers to the same question. They carry the same three headers too,
-/// because every write made while a working copy is live has to name the
-/// document it replaces, and a client that only ever reads one section would
-/// otherwise have nowhere to read those values from.
+/// answers to the same question. They carry the same three headers too, so a
+/// client that only ever reads one section still has an `If-Match`/
+/// `If-Config-Generation`/`If-Config-Epoch` to send if it wants a write
+/// rejected under it (optional: see [`precondition`]).
 pub struct VersionedSection<T> {
     body: T,
     version: StateVersion,
@@ -1445,8 +1445,16 @@ mod tests {
 
         let event = receiver.try_recv().unwrap();
         assert_eq!(event.name(), "config_changed");
-        assert_eq!(event.data()["section"], "apps");
-        assert_eq!(event.data()["revision"], 1);
+        let data = event.data();
+        assert_eq!(data["section"], "apps");
+        assert_eq!(data["revision"], 1);
+        // A commit always ends with no working copy live, so it always
+        // reports `committed: true`, mirroring `config.committed`.
+        assert_eq!(data["committed"], true);
+        assert_eq!(data["config"]["committed"], true);
+        assert_eq!(data["config"]["revision"], 1);
+        assert!(data["generation"].as_u64().is_some());
+        assert!(!data["epoch"].as_str().unwrap().is_empty());
     }
 
     // --- background presets ----------------------------------------------
@@ -1694,8 +1702,8 @@ mod tests {
         assert!(harness.state.store.get().committed);
 
         // Revert discards the working copy and returns the saved document.
-        // It names the working copy it is discarding, because by now there is
-        // one and it might be somebody else's.
+        // Naming it is optional now, but this client happens to have just
+        // read it, so it sends the precondition anyway.
         let (status, body) =
             call_conditionally(&harness, "POST", "/api/v1/config/revert", None).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -1750,58 +1758,16 @@ mod tests {
         assert!(!harness.state.store.has_preview());
     }
 
-    /// Replaces `a_committed_section_write_discards_the_working_copy`, which
-    /// asserted the behavior the September 21 review lists as A10: a section
-    /// PUT with no preconditions silently discarded another client's live
-    /// preview. Two operators editing at once is a real scenario, so the
-    /// unconditional write is now refused and the conditional one commits on
-    /// the working copy rather than on a hybrid of it and the saved document.
+    /// Round 4 (September 21, evening): the server holds at most one shared
+    /// working copy, and nothing stops one client from committing another's
+    /// unsaved edit. Replaces
+    /// `a_section_write_cannot_discard_a_working_copy_unless_it_names_it`,
+    /// which asserted the withdrawn rule: a section PUT with no
+    /// preconditions used to get a 409 while a working copy was live. Now it
+    /// folds the live working copy in — one basis, the preview, exactly as
+    /// a conditional write already did — and publishes the result once.
     #[tokio::test]
-    async fn a_section_write_cannot_discard_a_working_copy_unless_it_names_it() {
-        let harness = harness(None);
-        let mut working = harness.state.store.get();
-        working.settings.hide_cursor = false;
-        working.committed = false;
-        call(
-            &harness,
-            "PUT",
-            "/api/v1/config",
-            Some(&serde_json::to_string(&working).unwrap()),
-        )
-        .await;
-        assert!(harness.state.store.has_preview());
-
-        let (status, body) = call(&harness, "PUT", "/api/v1/config/backgrounds", Some("[]")).await;
-        assert_eq!(
-            status,
-            StatusCode::CONFLICT,
-            "an unconditional save must not discard an unsaved edit: {body}"
-        );
-        assert!(
-            body["detail"]
-                .as_str()
-                .unwrap()
-                .contains("If-Config-Generation"),
-            "the client is told how to retry: {body}"
-        );
-        assert!(
-            harness.state.store.has_preview(),
-            "and the working copy is still there"
-        );
-
-        let (status, body) =
-            call_conditionally(&harness, "PUT", "/api/v1/config/backgrounds", Some("[]")).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(!harness.state.store.has_preview());
-        assert!(
-            !harness.state.store.get().settings.hide_cursor,
-            "one basis: the section write commits the working copy it named"
-        );
-    }
-
-    /// A10's interleaving: two browsers, one appliance.
-    #[tokio::test]
-    async fn one_operators_save_cannot_erase_another_operators_preview() {
+    async fn a_section_write_commits_another_operators_live_working_copy_and_publishes_once() {
         let harness = harness(None);
 
         // A is mid-edit: a working copy on the outputs, not saved.
@@ -1816,41 +1782,10 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        let a_generation = harness.state.store.generation();
 
-        // B saves a section, from a page loaded before A started.
-        let (status, _) = call(
-            &harness,
-            "PUT",
-            "/api/v1/config/settings",
-            Some(r#"{"hideCursor":true,"outputPollIntervalSeconds":11}"#),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            harness.state.store.generation(),
-            a_generation,
-            "the refused write left the working copy exactly as it was"
-        );
-        assert!(!harness.state.store.effective().settings.hide_cursor);
-        assert_eq!(
-            harness
-                .state
-                .store
-                .effective()
-                .settings
-                .output_poll_interval_seconds,
-            5,
-            "and B's edit went nowhere"
-        );
-
-        // B's revert is refused for the same reason: it would discard A's work.
-        let (status, _) = call(&harness, "POST", "/api/v1/config/revert", None).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(harness.state.store.has_preview());
-
-        // B reloads, sees A's working copy, and now may either commit it...
-        let (status, body) = call_conditionally(
+        // B section-PUTs without naming any version at all.
+        let mut receiver = harness.state.events.subscribe();
+        let (status, body) = call(
             &harness,
             "PUT",
             "/api/v1/config/settings",
@@ -1861,13 +1796,35 @@ mod tests {
         assert_eq!(body["settings"]["outputPollIntervalSeconds"], 11);
         assert!(
             !body["settings"]["hideCursor"].as_bool().unwrap(),
-            "A's unsaved change was committed with B's, not silently dropped: {body}"
+            "A's unsaved change was committed along with B's, not silently dropped: {body}"
         );
-        assert!(!harness.state.store.has_preview());
+        assert!(
+            !harness.state.store.has_preview(),
+            "the write folded the working copy into the commit rather than leaving it live"
+        );
+        assert!(harness.state.store.get().committed);
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.name(), "config_changed");
+        let data = event.data();
+        assert_eq!(data["committed"], true);
+        assert_eq!(data["config"]["settings"]["outputPollIntervalSeconds"], 11);
+        assert!(!data["config"]["settings"]["hideCursor"].as_bool().unwrap());
+        assert!(
+            receiver.try_recv().is_err(),
+            "the combined change is published exactly once, not once per contributor"
+        );
     }
 
+    /// Replaces `a_stale_revert_cannot_discard_a_newer_working_copy`'s sibling
+    /// scenario: an unconditional revert — nobody named a version — used to
+    /// get a 409 while a working copy was live. Now it discards whatever is
+    /// live, whoever made it, and publishes the saved document. A stale
+    /// *named* precondition still 409s; see `if_match_guards_concurrent_writes`
+    /// and `stale_conditional_commit_cannot_clear_a_newer_preview` in
+    /// `src/state.rs`.
     #[tokio::test]
-    async fn a_stale_revert_cannot_discard_a_newer_working_copy() {
+    async fn an_unconditional_revert_discards_whatever_working_copy_is_live_and_publishes_it() {
         let harness = harness(None);
         let mut previewed = harness.state.store.get();
         previewed.settings.hide_cursor = false;
@@ -1879,36 +1836,52 @@ mod tests {
             Some(&serde_json::to_string(&previewed).unwrap()),
         )
         .await;
-        let stale = conditions(&harness);
+        assert!(harness.state.store.has_preview());
 
-        // A second edit moves the working copy on.
-        previewed.settings.output_poll_interval_seconds = 7;
-        let (status, _) = call_conditionally(
+        let mut receiver = harness.state.events.subscribe();
+        let (status, body) = call(&harness, "POST", "/api/v1/config/revert", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!harness.state.store.has_preview());
+        assert!(
+            harness.state.store.get().settings.hide_cursor,
+            "the saved document is back, not the discarded preview"
+        );
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.name(), "config_changed");
+        let data = event.data();
+        assert_eq!(data["committed"], true);
+        assert_eq!(
+            data["config"]["settings"]["hideCursor"], true,
+            "the saved document, not the discarded preview, is what was published"
+        );
+    }
+
+    /// The other half of the same event contract: a preview PUT publishes
+    /// `committed: false` with the working copy itself as `config`.
+    #[tokio::test]
+    async fn preview_publishes_committed_false_with_the_working_copy() {
+        let harness = harness(None);
+        let mut receiver = harness.state.events.subscribe();
+        let mut working = harness.state.store.get();
+        working.settings.hide_cursor = false;
+        working.committed = false;
+        let (status, _) = call(
             &harness,
             "PUT",
             "/api/v1/config",
-            Some(&serde_json::to_string(&previewed).unwrap()),
+            Some(&serde_json::to_string(&working).unwrap()),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
 
-        let headers: Vec<(&str, &str)> = stale
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
-            .collect();
-        let (status, _, _) =
-            call_with_headers(&harness, "POST", "/api/v1/config/revert", None, &headers).await;
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert_eq!(
-            harness
-                .state
-                .store
-                .effective()
-                .settings
-                .output_poll_interval_seconds,
-            7,
-            "the newer working copy survived the late Cancel"
-        );
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.name(), "config_changed");
+        let data = event.data();
+        assert_eq!(data["committed"], false);
+        assert_eq!(data["section"], "all");
+        assert_eq!(data["config"]["committed"], false);
+        assert_eq!(data["config"]["settings"]["hideCursor"], false);
     }
 
     /// A10 acceptance 5: one answer to "what is the configuration", whichever

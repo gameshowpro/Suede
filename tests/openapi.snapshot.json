@@ -800,21 +800,44 @@
         "type": "object"
       },
       "ConfigChange": {
-        "description": "Payload of the `config_changed` event.",
+        "description": "Payload of the `config_changed` event, published on every change to the\none shared effective document: a preview PUT, a commit, a revert,\nreconciler adoption, or a load-time repair. There is no per-client\nworking copy and nothing stops one client from committing or reverting\nanother's unsaved edit — every connected client, including third-party\napps, learns of the change through this event rather than being blocked\nfrom making it.",
         "properties": {
+          "committed": {
+            "description": "Mirrors `config.committed`: `false` while this change leaves a\nworking copy live, `true` for a commit, a revert, an adoption, or a\nrepair (which only ever touch the saved document).",
+            "type": "boolean"
+          },
+          "config": {
+            "$ref": "#/components/schemas/DesiredState",
+            "description": "The effective document that this change produced: the working copy\nif one exists, else the saved one. A client applies this directly\nrather than re-fetching `GET /config`."
+          },
+          "epoch": {
+            "description": "Store instance identity, as `X-Config-Epoch`.",
+            "type": "string"
+          },
+          "generation": {
+            "description": "In-memory working-copy generation, as `X-Config-Generation`.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "revision": {
+            "description": "Persisted document revision, as `ETag`/`If-Match`.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
           },
           "section": {
-            "description": "Which part of the document changed: `all`, `outputs`, `apps`, `settings`.",
+            "description": "Which part of the document changed: `all`, `outputs`, `apps`,\n`settings`, `projection`, `backgrounds`, or `repair` for a load-time\nrepair.",
             "type": "string"
           }
         },
         "required": [
           "revision",
-          "section"
+          "generation",
+          "epoch",
+          "committed",
+          "section",
+          "config"
         ],
         "type": "object"
       },

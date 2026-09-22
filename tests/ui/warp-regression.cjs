@@ -25,7 +25,12 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
       history.push({path,method:req.method(),data,time:Date.now()});
       await sleep(delay);
       let status=200, body;
-      if(headers['if-config-epoch']!==epoch || headers['if-config-generation']!==String(generation) || Number(headers['if-match'])!==current.revision) {status=409;body={detail:'Working copy changed elsewhere'};}
+      // Round 4: there is one shared working copy and writes are unconditional.
+      // The UI itself no longer sends any of these three headers, but a
+      // precondition is still honored when a caller (a script, `curl`) opts
+      // into naming a version — and rejected only then, on a stale value.
+      const hasPrecondition=headers['if-config-epoch']!=null || headers['if-config-generation']!=null || headers['if-match']!=null;
+      if(hasPrecondition && (headers['if-config-epoch']!==epoch || headers['if-config-generation']!==String(generation) || Number(headers['if-match'])!==current.revision)) {status=409;body={detail:'Working copy changed elsewhere'};}
       else if(rejection) {status=422;body={detail:'Fixture rejects geometry'};rejection=false;}
       else {
         if(path==='/config/revert') current=structuredClone(committed);
@@ -107,14 +112,14 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   assert(history.length<10);for(let i=1;i<history.length;i++)assert(history[i].time-history[i-1].time>=45);
   mark('bounded preview coalescing, sustained progress, final state, and 20Hz ceiling');
   await page.evaluate(()=>editGeometry(g=>g.corners[0][0]=.08));await sleep(30);
-  await page.locator('#pj-save').click();await page.waitForFunction(()=>!configBusy && !previewActive);await sleep(180);
+  await page.locator('#pj-save').click();await page.waitForFunction(()=>!configBusy);await sleep(180);
   assert.equal(history.at(-1).data.committed,true);assert.equal(current.outputs[0].geometry.corners[0][0],.08);
   await page.evaluate(()=>editGeometry(g=>g.corners[0][0]=.09));await sleep(30);
-  await page.locator('#pj-cancel').click();await page.waitForFunction(()=>!configBusy && !previewActive);await sleep(180);
+  await page.locator('#pj-cancel').click();await page.waitForFunction(()=>!configBusy);await sleep(180);
   assert.equal(history.at(-1).path,'/config/revert');assert.equal(current.outputs[0].geometry.corners[0][0],.08);mark('Save and Revert barriers prevent late previews');
   delay=0;
   const beforePattern=structuredClone(current.outputs[0].geometry);
-  await page.locator('#tp-pattern').selectOption('grid');await settle();await page.locator('#pj-save').click();await page.waitForFunction(()=>!configBusy && !previewActive);
+  await page.locator('#tp-pattern').selectOption('grid');await settle();await page.locator('#pj-save').click();await page.waitForFunction(()=>!configBusy);
   assert.equal(current.projection.testPattern,null);assert.equal(current.projection.mode,'warp');assert.deepEqual(current.outputs[0].geometry,beforePattern);mark('pattern switching and Save preserve geometry and mode');
   rejection=true;await page.evaluate(()=>editGeometry(g=>g.corners[0][0]=.11));await settle();
   assert.deepEqual((await read()).outputs[0].geometry,beforePattern);assert.match(await page.locator('#warp-error').textContent(),/rejects/);mark('server validation rejection rolls back to last accepted geometry');
@@ -147,12 +152,56 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   await page.locator('#canvas-presets button').filter({hasText:'50%'}).click();
   await page.waitForFunction(()=>config.projection.canvas.renderWidth===4000);await settle();
   assert.equal(current.projection.canvas.renderWidth,4000);assert.equal(current.projection.canvas.scale,oldMetadata);mark('automatic recommendation is read-only until explicit width preset');
+  // --- one shared working copy: the server pushes every change as an event,
+  // and there is nothing left to "conflict" over between two clients.
   const second=await context.newPage();await second.goto('http://suede.test/?nosse');await second.waitForFunction(()=>configGeneration!=null);await second.locator('#output-table tbody tr').first().click();
-  await page.evaluate(()=>editGeometry(g=>g.corners[0][0]=.05));await settle();
-  await second.evaluate(()=>editGeometry(g=>g.corners[0][0]=.07));await second.evaluate(()=>flushPreviews().catch(()=>{}));
-  assert(await second.locator('#config-conflict').isVisible());assert.equal(current.outputs[0].geometry.corners[0][0],.05);
-  await second.evaluate(()=>loadAll());assert.equal((await second.evaluate(()=>config.outputs[0].geometry.corners[0][0])),.07);
-  await second.locator('#config-discard').click();await second.waitForFunction(()=>!configConflict);assert.equal(await second.evaluate(()=>config.outputs[0].geometry.corners[0][0]),.05);mark('two clients conflict; reconnect preserves local edits; explicit reload resolves');
+  await second.evaluate(()=>{
+    window.fixtureSources=[];
+    window.EventSource=class {
+      constructor(){this.listeners={};fixtureSources.push(this);}
+      addEventListener(name,fn){this.listeners[name]=fn;}
+      close(){this.closed=true;}
+    };
+    connect();
+  });
+  // Simulates the server push a real daemon makes on every effective-document
+  // change (B3); this fixture has no live SSE transport of its own, so the
+  // test drives the same `config_changed` listener the real EventSource
+  // would, with the payload shape B3 defines.
+  const sendConfigChanged=(target,doc,section='outputs')=>{
+    const payload={revision:doc.revision,generation,epoch,committed:doc.committed,section,config:doc};
+    return target.evaluate(payload=>fixtureSources[0].listeners.config_changed({data:JSON.stringify(payload)}),payload);
+  };
+  await page.evaluate(()=>editGeometry(g=>g.corners[0][0]=.21));await settle();
+  await sendConfigChanged(second,current);
+  assert.equal(await second.evaluate(()=>config.outputs[0].geometry.corners[0][0]),.21);
+  assert.equal(await second.evaluate(()=>document.getElementById('pj-save').classList.contains('dirty')),true);
+  assert(String(await second.locator('#warp-quad').getAttribute('points')).startsWith('0.21,'));
+  mark('one client\'s preview arrives on another page as an event and updates fields, dirty state and the diagram');
+
+  // While `#canvas-width` is focused, an event must not yank the operator's
+  // half-typed digits out from under them (it still applies to `config`
+  // underneath — see `applyLoadedConfig` — just not to this one field's
+  // displayed text). Once they blur, the field is no longer protected: this
+  // one has an onchange handler like every other editable field, so what
+  // lands is the operator's own completed edit — not silently discarded by
+  // the event that arrived mid-keystroke, and not silently overwritten by
+  // it either.
+  await second.locator('#canvas-width').focus();await second.locator('#canvas-width').fill('4321');
+  const remoteWidth=structuredClone(current);remoteWidth.projection.canvas.renderWidth=5000;
+  await sendConfigChanged(second,remoteWidth);
+  assert.equal(await second.locator('#canvas-width').inputValue(),'4321');
+  await second.locator('#canvas-width').blur();
+  await second.waitForFunction(()=>config.projection.canvas.renderWidth===4321);
+  await second.evaluate(()=>flushPreviews());
+  mark('a field being typed into is not overwritten by an event until it blurs');
+
+  await page.locator('#pj-cancel').click();await page.waitForFunction(()=>!configBusy);
+  await sendConfigChanged(second,current,'revert');
+  assert.equal(await second.evaluate(()=>config.committed),true);
+  assert.equal(await second.evaluate(()=>document.getElementById('pj-save').classList.contains('dirty')),false);
+  mark('a remote revert clears dirty state on another client');
+
   await page.evaluate(()=>{projectionStats.control={session:'new-session',configGeneration:{applied:Number(configGeneration)-1}};renderWarpStatus();});
   assert.doesNotMatch(await page.locator('#warp-status').textContent(),/Effective projection installed/);
   await page.evaluate(()=>{projectionStats.control.configGeneration.applied=Number(configGeneration);renderWarpStatus();});
@@ -167,12 +216,18 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
     connect();
   });
   epoch="restarted-fixture";
-  await page.evaluate(()=>loadAll());assert(await page.locator('#config-conflict').isVisible());
+  // X-Config-Epoch detection is kept for projection-status correlation (a
+  // restarted daemon reuses small numeric generations, and `configGeneration`
+  // above is compared against `projectionStats.control.configGeneration`) —
+  // not for a conflict banner, which no longer exists. `loadConfig` applies
+  // the fetched document unconditionally either way.
+  await page.evaluate(()=>loadAll());
   assert(await page.evaluate(()=>fixtureSources[0].closed));
+  assert.equal(await page.evaluate(()=>fixtureSources.length),2);
   await page.evaluate(()=>fixtureSources[0].listeners.projection_stats_changed({data:JSON.stringify({running:true,control:{session:'stale',configGeneration:{applied:Number(configGeneration)}}})}));
   assert.notEqual(await page.evaluate(()=>projectionStats?.control?.session),'stale');
-  await page.locator('#config-discard').click();await page.waitForFunction(()=>!configConflict);
-  assert.equal(await page.evaluate(()=>configEpoch),'restarted-fixture');mark('daemon restart epoch prevents repeated-generation ABA conflicts');
+  assert.equal(await page.evaluate(()=>configEpoch),'restarted-fixture');
+  mark('daemon restart epoch still retires the old event source for status correlation');
   await page.locator('#pj-lift-mode').selectOption('adaptive');await settle();
   await page.locator('#pj-lift').fill('0.2');await settle();
   await page.locator('#pj-rise').fill('800');await settle();

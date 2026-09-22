@@ -97,11 +97,11 @@ const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
   assert.equal(await page.locator('#mode-simple').getAttribute('aria-pressed'), 'true');
   assert.equal(await page.locator('#mode-warp').isDisabled(), true);
   assert.equal((await read()).projection.mode, 'warp');
-  await page.locator('#pj-save').click(); await page.waitForFunction(() => !configBusy && !previewActive);
+  await page.locator('#pj-save').click(); await page.waitForFunction(() => !configBusy);
   assert.equal(current.committed, true);
   const savedSourceX = (await read()).outputs[1].geometry.source.x;
   await page.locator('#source-x').fill('5'); await page.locator('#source-x').press('Tab'); await settle();
-  await page.locator('#pj-cancel').click(); await page.waitForFunction(() => !configBusy && !previewActive);
+  await page.locator('#pj-cancel').click(); await page.waitForFunction(() => !configBusy);
   // Cancel must restore the exact saved value, not merely land on something
   // other than the discarded edit.
   assert.equal((await read()).outputs[1].geometry.source.x, savedSourceX);
