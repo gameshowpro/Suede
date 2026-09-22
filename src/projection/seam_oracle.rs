@@ -147,34 +147,84 @@ fn edge_active(a: CanvasPoint, b: CanvasPoint, other: &[CanvasPoint], p: CanvasP
     lo_d - LENGTH_EPS <= p_dir && p_dir <= hi_d + LENGTH_EPS
 }
 
-/// The seam rule (see `layout::Evaluator`'s doc comment, which states it
-/// once for both production and this independent oracle): minimum distance
-/// to `sources[index]`'s ACTIVE edges at `p`, falling back to the plain
-/// inward distance to all four (here, all) edges — [`inward_distance`] —
-/// when none are active. `sources` are the unclipped source quads (not the
-/// canvas-clipped `visible` set): production's `layout::Evaluator` computes
-/// activity from unclipped configured source rectangles too, so canvas
-/// clipping only decides which portion of the canvas is queried, never
-/// which edges attenuate.
-fn active_inward_distance(sources: &[Polygon], index: usize, p: CanvasPoint) -> Option<f64> {
-    let poly = &sources[index];
-    let fallback = inward_distance(poly, p)?;
-    let mut active_min = f64::INFINITY;
+/// The largest `t >= 0` for which `foot + t * dir` is still inside the
+/// convex polygon `poly`, or `None` when the ray never enters it. This is
+/// the ray cast that measures an overlap depth: for an axis-aligned
+/// rectangle and an axis-aligned edge normal it reduces to exactly
+/// production's `right(q) - r.x` (and its three symmetric forms).
+fn ray_exit(poly: &[CanvasPoint], foot: CanvasPoint, dir: CanvasPoint) -> Option<f64> {
+    let (mut enter, mut exit) = (f64::NEG_INFINITY, f64::INFINITY);
     for (a, b) in edges(poly) {
-        let active = (0..sources.len()).any(|q| q != index && edge_active(a, b, &sources[q], p));
-        if !active {
-            continue;
+        let d = sub(b, a);
+        // Interior of a clockwise y-down polygon: cross(d, p - a) >= 0, so
+        // along the ray the constraint is `offset + t * slope >= 0`.
+        let offset = cross(d, sub(foot, a));
+        let slope = cross(d, dir);
+        if slope.abs() <= LENGTH_EPS {
+            if offset < -LENGTH_EPS {
+                return None;
+            }
+        } else if slope > 0.0 {
+            enter = enter.max(-offset / slope);
+        } else {
+            exit = exit.min(-offset / slope);
         }
+    }
+    (exit > 0.0 && exit >= enter).then_some(exit)
+}
+
+/// The seam rule (see `layout::Evaluator`'s doc comment, which states it
+/// once for both production and this independent oracle), generalized from
+/// axis-aligned rectangles to arbitrary convex quads: the PRODUCT over
+/// `sources[index]`'s ACTIVE edges of `clamp(distance / depth, 0, 1)`, and
+/// exactly `1` when no edge of it is active at `p`.
+///
+/// For edge `e`, the distance is `p` projected onto `e`'s inward normal.
+/// The depth is measured along that same normal line through `p`: drop a
+/// foot point from `p` onto `e`, cast a ray inward from it, and take the
+/// farthest exit of any other polygon that straddles `e` at that foot point
+/// — clamped to this polygon's own exit along the same ray.
+///
+/// `sources` are the unclipped source quads (not the canvas-clipped
+/// `visible` set): production's `layout::Evaluator` computes activity and
+/// depth from unclipped configured source rectangles too, so canvas clipping
+/// only decides which portion of the canvas is queried, never which edges
+/// attenuate.
+fn raw_weight(sources: &[Polygon], index: usize, p: CanvasPoint) -> Option<f64> {
+    let poly = &sources[index];
+    inward_distance(poly, p)?;
+    let mut weight = 1.0;
+    for (a, b) in edges(poly) {
         let d = sub(b, a);
         let len = d[0].hypot(d[1]);
-        let signed = (cross(d, sub(p, a)) / len).max(0.0);
-        active_min = active_min.min(signed);
+        if len <= LENGTH_EPS {
+            continue;
+        }
+        // The inward unit normal, chosen so that `cross(d, p - a) / len` —
+        // the same quantity `inward_distance` uses — is `normal . (p - a)`.
+        let normal = [-d[1] / len, d[0] / len];
+        let distance = (cross(d, sub(p, a)) / len).max(0.0);
+        let foot = [p[0] - distance * normal[0], p[1] - distance * normal[1]];
+        let mut depth = 0.0_f64;
+        for (q, other) in sources.iter().enumerate() {
+            if q == index || !edge_active(a, b, other, p) {
+                continue;
+            }
+            if let Some(reach) = ray_exit(other, foot, normal) {
+                depth = depth.max(reach);
+            }
+        }
+        if depth <= 0.0 {
+            continue;
+        }
+        if let Some(own) = ray_exit(poly, foot, normal) {
+            depth = depth.min(own);
+        }
+        if depth > 0.0 {
+            weight *= (distance / depth).clamp(0.0, 1.0);
+        }
     }
-    Some(if active_min.is_finite() {
-        active_min
-    } else {
-        fallback
-    })
+    Some(weight)
 }
 
 impl Oracle {
@@ -276,17 +326,17 @@ impl Oracle {
         if p[0] < 0.0 || p[1] < 0.0 || p[0] > self.canvas[0] || p[1] > self.canvas[1] {
             return Ok(result);
         }
-        let distances: Vec<_> = (0..self.sources.len())
-            .map(|i| active_inward_distance(&self.sources, i, p))
+        let raw: Vec<_> = (0..self.sources.len())
+            .map(|i| raw_weight(&self.sources, i, p))
             .collect();
-        let count = distances.iter().filter(|v| v.is_some()).count();
-        let total: f64 = distances.iter().flatten().sum();
-        for (weight, distance) in result.iter_mut().zip(distances) {
-            if let Some(distance) = distance {
+        let count = raw.iter().filter(|v| v.is_some()).count();
+        let total: f64 = raw.iter().flatten().sum();
+        for (weight, raw) in result.iter_mut().zip(raw) {
+            if let Some(raw) = raw {
                 *weight = if self.stacked {
                     1.0
                 } else if total > 0.0 {
-                    distance / total
+                    raw / total
                 } else {
                     1.0 / count as f64
                 };
@@ -395,7 +445,17 @@ mod tests {
             ],
         )
         .unwrap();
-        close(&unequal.weights([925.0, 500.0]).unwrap(), &[0.75, 0.25]);
+        // The short source is straddled top and bottom by the tall one, so
+        // it carries three ramps, not one: 25% across its 100-unit left
+        // seam, and half of its own 600-unit height from each of its top and
+        // bottom edges. Its raw weight is 0.25 * 0.5 * 0.5 = 0.0625 against
+        // the tall source's single 0.75 ramp. Under the old minimum-distance
+        // rule the vertical straddles were invisible here and the split was
+        // a flat 0.75/0.25.
+        close(
+            &unequal.weights([925.0, 500.0]).unwrap(),
+            &[0.75 / 0.8125, 0.0625 / 0.8125],
+        );
         close(&unequal.weights([950.0, 100.0]).unwrap(), &[1.0, 0.0]);
         check_sum(&unequal);
     }
@@ -408,10 +468,15 @@ mod tests {
         // This pair is near-total; use a shifted diamond for an ordinary seam.
         let shifted = diamond.map(|p| [p[0] + 0.75, p[1]]);
         let oracle = Oracle::new([3.0, 2.0], &[rect(0.0, 0.0, 1.5, 2.0), shifted]).unwrap();
-        let d = 0.5_f64 / 2.0_f64.sqrt();
+        // The square's right edge is 0.25 into a ray-cast depth of 0.75 (the
+        // diamond reaches back to x = 0.75 along the query point's row), so
+        // its single ramp is 1/3. Both of the diamond's left-facing edges
+        // are straddled: the point is 0.3536 along each edge's inward
+        // normal, and each ray leaves the square 0.7071 further on, giving
+        // 0.5 * 0.5 = 0.25. Raw weights 1/3 and 1/4 normalize to 4/7, 3/7.
         close(
             &oracle.weights([1.25, 1.0]).unwrap(),
-            &[0.25 / (0.25 + d), d / (0.25 + d)],
+            &[4.0 / 7.0, 3.0 / 7.0],
         );
         check_sum(&oracle);
     }
@@ -426,9 +491,14 @@ mod tests {
         ];
         let oracle = Oracle::new([3.0, 3.0], &cross).unwrap();
         close(&oracle.weights([1.5, 1.5]).unwrap(), &[0.25; 4]);
+        // A 2x2 grid is exactly separable: with `a` the left column's share
+        // in x and `b` the top row's share in y, the four raw weights are
+        // `a*b`, `(1-a)*b`, `a*(1-b)`, `(1-a)*(1-b)` and already sum to 1,
+        // so normalization is the identity. Here a = b = 0.75.
+        let (a, b) = (0.75, 0.75);
         close(
             &oracle.weights([1.25, 1.25]).unwrap(),
-            &[0.5, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0],
+            &[a * b, (1.0 - a) * b, a * (1.0 - b), (1.0 - a) * (1.0 - b)],
         );
         check_sum(&oracle);
         let triple = Oracle::new([3.0, 3.0], &cross[..3]).unwrap();
@@ -823,7 +893,14 @@ mod tests {
         )
         .unwrap();
         let expected = oracle.weights([8.5, 5.5]).unwrap();
-        close(&expected, &[3.0 / 11.0, 7.0 / 11.0, 1.0 / 11.0]);
+        // Raw weights at x = 8.5: the first source's right edge is 1.5 into
+        // a depth of 5 (its deepest straddler starts at x = 5), so 0.3; the
+        // middle source is 3.5 into 5 on the left and 6.5 into 7 on the
+        // right, so 0.65; the last is 0.5 into 7, so 1/14. Those sum to
+        // 1.0214, and normalizing gives the triple below.
+        let raw = [0.3, 0.7 * (6.5 / 7.0), 0.5 / 7.0];
+        let total: f64 = raw.iter().sum();
+        close(&expected, &raw.map(|w| w / total));
         let sum: u32 = production.iter().map(|&g| u32::from(g)).sum();
         assert!((sum as i64 - 256).abs() <= 2, "sum was {sum}, not ~256");
         for i in 0..3 {
@@ -853,6 +930,22 @@ mod tests {
     /// pixel's weight agrees within old test's tolerance: `1/512` gain
     /// quantization plus a small epsilon.
     fn compare_production_and_oracle(rects: &[(f64, f64, f64, f64)], width: i32, height: i32) {
+        let columns: Vec<i32> = (0..width).collect();
+        let rows: Vec<i32> = (0..height).collect();
+        compare_production_and_oracle_at(rects, width, height, &columns, &rows);
+    }
+
+    /// As [`compare_production_and_oracle`], but only at the listed canvas
+    /// columns and rows. A wall-sized canvas has too many pixels to sweep
+    /// exhaustively in a debug build, so its test names the bands that
+    /// matter and samples the rest.
+    fn compare_production_and_oracle_at(
+        rects: &[(f64, f64, f64, f64)],
+        width: i32,
+        height: i32,
+        columns: &[i32],
+        rows: &[i32],
+    ) {
         let aspect = f64::from(width) / f64::from(height);
         let participants: Vec<_> = rects
             .iter()
@@ -879,8 +972,8 @@ mod tests {
         let evaluator = Evaluator::new(&spec, width, height).unwrap();
         let quads: Vec<SourceQuad> = rects.iter().map(|&(x, y, w, h)| rect(x, y, w, h)).collect();
         let oracle = Oracle::new([f64::from(width), f64::from(height)], &quads).unwrap();
-        for gy in 0..height {
-            for gx in 0..width {
+        for &gy in rows {
+            for &gx in columns {
                 let (cx, cy) = (f64::from(gx) + 0.5, f64::from(gy) + 0.5);
                 let expected = oracle.weights([cx, cy]).unwrap();
                 for (i, expected) in expected.iter().enumerate() {
@@ -951,6 +1044,48 @@ mod tests {
                 "index {i} at the corner: gain {gain}"
             );
         }
+
+        // The product property itself, stated independently of either
+        // implementation: at every pixel each source's weight is the product
+        // of the same two 1-D ramps, one per axis, and the four already sum
+        // to 1 without normalization.
+        for gy in 0..100 {
+            for gx in 0..100 {
+                let (cx, cy) = (f64::from(gx) + 0.5, f64::from(gy) + 0.5);
+                let a = ((60.0 - cx) / 20.0).clamp(0.0, 1.0);
+                let b = ((60.0 - cy) / 20.0).clamp(0.0, 1.0);
+                close(
+                    &oracle.weights([cx, cy]).unwrap(),
+                    &[a * b, (1.0 - a) * b, a * (1.0 - b), (1.0 - a) * (1.0 - b)],
+                );
+            }
+        }
+    }
+
+    /// The configuration of a real four-projector wall (brain, September
+    /// 2026): a 3864x2300 canvas at aspect 1.68, columns overlapping by 225
+    /// pixels and rows that touch with a 0.07-pixel sliver. That sliver is
+    /// what made the old minimum-distance rule paint a bright triangle at
+    /// the center of the wall, so it is the case both implementations most
+    /// need to agree on. Rows around the row boundary and columns across the
+    /// horizontal seam are swept densely; the rest of the canvas — far too
+    /// many pixels to sweep exhaustively in a debug build — is sampled at a
+    /// coprime stride so the samples do not line up with any edge.
+    #[test]
+    fn production_matches_oracle_for_brains_four_projector_wall() {
+        const SCALE: f64 = 3864.0;
+        let (w, h) = (0.5291176764326357, 0.2976286929933576);
+        let (column_x, row_y) = (0.47088232356736426, 0.29760940224473764);
+        let rects: Vec<(f64, f64, f64, f64)> =
+            [(0.0, 0.0), (column_x, 0.0), (0.0, row_y), (column_x, row_y)]
+                .into_iter()
+                .map(|(x, y)| (x * SCALE, y * SCALE, w * SCALE, h * SCALE))
+                .collect();
+        let mut rows: Vec<i32> = (1130..1180).collect();
+        rows.extend((0..2300).step_by(53));
+        let mut columns: Vec<i32> = (1810..1830).collect();
+        columns.extend((0..3864).step_by(61));
+        compare_production_and_oracle_at(&rects, 3864, 2300, &columns, &rows);
     }
 
     #[test]

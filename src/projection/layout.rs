@@ -34,43 +34,71 @@ pub(crate) struct LocalKey {
 }
 
 /// **The seam rule**, stated once here and implemented identically in
-/// production ([`Evaluator::distance`] below) and in the independent test
+/// production ([`Evaluator::raw_weight`] below) and in the independent test
 /// oracle (`seam_oracle::Oracle`, generalized to arbitrary convex quads):
 ///
-/// A source's distance at a point it covers is the minimum distance to
-/// those of its own edges that are ACTIVE at that point. An edge is active
-/// when another source's rectangle straddles it: for a left/right edge,
-/// some other source spans the point's *row* across that edge; for a
-/// top/bottom edge, some other source spans the point's *column* across it.
-/// "Spans across" is strict on the perpendicular axis (the neighbor must
-/// extend past the edge on both sides, not merely touch it) and closed on
-/// the axis along the edge (the neighbor's own extent there, inclusive).
+/// For a source `r` and each of its four edges, that edge is ACTIVE at the
+/// queried row (for the left and right edges) or column (for the top and
+/// bottom edges) when some other source `q` STRADDLES it there: `q` reaches
+/// past the edge on both sides — `q.y < r.y && r.y < bottom(q)` for `r`'s
+/// top edge — while covering the queried column (for a top/bottom edge) or
+/// row (for a left/right edge). "Straddles" is strict on the axis across the
+/// edge, so a neighbor that merely touches the edge never activates it, and
+/// closed on the axis along the edge.
 ///
-/// A source with no active edge at the point — its rectangle is nested
-/// inside a neighbor with no edge straddled, or every neighbor only touches
-/// without straddling — uses its plain inward distance to its own boundary
-/// instead, on all four edges. It is never the fixed value `1.0`: that
-/// sentinel set real blend ratios for nested layouts with no physical basis
-/// (review finding A7).
+/// An active edge carries an overlap DEPTH: the largest distance that any
+/// straddling neighbor extends inward past that edge at that row or column,
+/// clamped to the source's own extent across the edge. For `r`'s top edge
+/// that is `max over straddling q of (bottom(q) - r.y)`, capped at
+/// `r.height`. Each active edge contributes the ramp
+/// `clamp(distance_from_the_point_to_that_edge / depth, 0, 1)`, and the
+/// source's RAW weight is the PRODUCT of its active edges' ramps — exactly
+/// `1` when no edge of it is active at that point.
 ///
-/// The weight of a covering source is `own_distance / sum(distances of every
-/// source covering the point)`. `!blend`, or a detected all-pairs stack,
-/// gives every covering source weight 1 instead.
+/// The final weight of a covering source is its raw weight divided by the
+/// sum of the raw weights of every source covering the point. `!blend`, or a
+/// detected all-pairs stack, gives every covering source weight 1 instead.
 ///
-/// **Boundary convention.** Both [`distance`] (which decides whether a point
-/// is covered at all, and computes the active-edge and inward distances) and
-/// [`contains`] (used for physical raster-footprint coverage counting) treat
-/// a source rectangle as CLOSED: all four edges included. This matches the
-/// independent oracle's documented "closed source boundaries" convention, so
-/// two rectangles that only touch — no overlap — still split a shared edge
-/// 50/50 rather than leaving it undefined. The alternative (half-open, as
-/// [`super::blend::Coverage::at`] uses for raw pixel-rectangle *coverage
-/// counting*, where avoiding a double count at a shared boundary matters
-/// more than symmetry) would leave that shared line owned by neither side
-/// here, silently zeroing the blend along it. Being consistent removes a
-/// second convention to reason about, at the cost of a physical footprint
-/// that exactly touches a neighbor's being double-counted on the one shared
-/// line — a measure-zero edge case for a coverage count.
+/// Normalizing each edge by its own overlap depth, and multiplying the ramps
+/// instead of taking the minimum distance, is what makes the rule separable.
+/// Two strips overlapping by 20% already sum to exactly 1 before
+/// normalization, and so does a grid overlapping in both axes, where every
+/// source's raw weight is the product of the same two independent 1-D ramps.
+/// The previous "minimum distance to an active edge" rule was not separable,
+/// and that cost a real four-projector wall: its two rows touched with a
+/// 0.07-pixel overlap, which made the bottom row's top edge active with a
+/// distance that dominated the minimum for the first 112 rows below the row
+/// boundary. The horizontal seam froze at 50/50 there instead of following
+/// its gamma ramp, painting a visible bright triangle at the center of the
+/// wall. Raising a threshold would not have fixed it: with a genuine
+/// vertical overlap band the same minimum still compressed the horizontal
+/// gradient inside the band, giving a left share of 1/3 where the geometry
+/// asks for 1/4. Dividing by the depth instead makes a sub-pixel sliver
+/// produce a ramp that is already clamped to 1 at every sampled pixel
+/// center, so it changes nothing at all.
+///
+/// A source with no active edge at the point is not attenuated: its raw
+/// weight is 1, which is the physical answer — nothing overlaps it there, so
+/// it has nothing to give away. This is not the old `Some(1.0)` sentinel of
+/// review finding A7, which stood in for a *distance* and so invented blend
+/// ratios for nested layouts; under this rule a nested source still gets a
+/// real ramp, because a neighbor that contains it straddles all four of its
+/// edges and supplies four real depths.
+///
+/// **Boundary convention.** Both [`Evaluator::raw_weight`] (which decides
+/// whether a point is covered at all, and evaluates the active-edge ramps)
+/// and [`contains`] (used for physical raster-footprint coverage counting)
+/// treat a source rectangle as CLOSED: all four edges included. This matches
+/// the independent oracle's documented "closed source boundaries"
+/// convention, so two rectangles that only touch — no overlap — still split
+/// a shared edge 50/50 rather than leaving it undefined. The alternative
+/// (half-open, as [`super::blend::Coverage::at`] uses for raw
+/// pixel-rectangle *coverage counting*, where avoiding a double count at a
+/// shared boundary matters more than symmetry) would leave that shared line
+/// owned by neither side here, silently zeroing the blend along it. Being
+/// consistent removes a second convention to reason about, at the cost of a
+/// physical footprint that exactly touches a neighbor's being double-counted
+/// on the one shared line — a measure-zero edge case for a coverage count.
 pub(crate) struct Evaluator {
     spec: LayoutSpec,
     sources: Vec<CanvasRect>,
@@ -80,14 +108,17 @@ pub(crate) struct Evaluator {
     vertical_density: f64,
     rows: usize,
     cols: usize,
-    /// Per-row activity, one bit per source (bit `i` set = source `i` has
-    /// that edge active on this row). Precomputed once per [`Evaluator`] so
-    /// `distance` is a bitmask lookup, never a scan over every other source.
-    row_left: Vec<u8>,
-    row_right: Vec<u8>,
-    /// Per-column activity, symmetric to the row tables above.
-    col_top: Vec<u8>,
-    col_bottom: Vec<u8>,
+    /// Per-row overlap depth for every source's left and right edge, indexed
+    /// `row * sources.len() + source`. `0.0` means the edge is not active on
+    /// that row; an active edge always has a strictly positive depth, because
+    /// straddling is strict. Precomputed once per [`Evaluator`] so
+    /// `raw_weight` is a table lookup, never a scan over every other source.
+    row_left: Vec<f64>,
+    row_right: Vec<f64>,
+    /// Per-column depths for the top and bottom edges, symmetric to the rows
+    /// above and indexed `col * sources.len() + source`.
+    col_top: Vec<f64>,
+    col_bottom: Vec<f64>,
 }
 
 fn right(r: &CanvasRect) -> f64 {
@@ -100,63 +131,83 @@ fn intersects(a: &CanvasRect, b: &CanvasRect) -> bool {
     a.x <= right(b) && b.x <= right(a) && a.y <= bottom(b) && b.y <= bottom(a)
 }
 /// Closed rectangle containment — see the seam-rule doc comment above for
-/// why this matches [`distance`]'s convention rather than a half-open one.
+/// why this matches [`Evaluator::raw_weight`]'s convention rather than a
+/// half-open one.
 fn contains(r: &CanvasRect, x: f64, y: f64) -> bool {
     x >= r.x && x <= right(r) && y >= r.y && y <= bottom(r)
 }
 
-/// Precompute, once per row and once per column, which sources have an
-/// active left/right/top/bottom edge there (see the seam-rule doc comment
-/// on [`Evaluator`]). `has_left`/`has_right` depend only on the row because
-/// the straddle test's "along the edge" axis is Y for a vertical edge;
-/// `has_top`/`has_bottom` depend only on the column for the symmetric
-/// reason. Sources are capped at eight by [`crate::model::geometry::validate_sources`],
-/// so one `u8` per row/column holds a full source bitmask.
-fn build_edge_masks(
+/// Precompute, once per row and once per column, each source's active-edge
+/// overlap DEPTH for its left/right (per row) and top/bottom (per column)
+/// edges — see the seam-rule doc comment on [`Evaluator`]. `0.0` records an
+/// inactive edge. Left/right depths depend only on the row because the
+/// straddle test's "along the edge" axis is Y for a vertical edge;
+/// top/bottom depends only on the column for the symmetric reason.
+///
+/// Every depth is capped at the source's own extent across that edge, so a
+/// neighbor reaching clear through the source cannot make its ramp shallower
+/// than the source itself.
+fn build_edge_depths(
     sources: &[CanvasRect],
     cols: usize,
     rows: usize,
     width: f64,
     vertical_density: f64,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
-    debug_assert!(sources.len() <= 8);
-    let mut row_left = vec![0u8; rows];
-    let mut row_right = vec![0u8; rows];
-    let mut col_top = vec![0u8; cols];
-    let mut col_bottom = vec![0u8; cols];
-    for (row, (left, right_mask)) in row_left.iter_mut().zip(row_right.iter_mut()).enumerate() {
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+    let count = sources.len();
+    let mut row_left = vec![0.0; rows * count];
+    let mut row_right = vec![0.0; rows * count];
+    let mut col_top = vec![0.0; cols * count];
+    let mut col_bottom = vec![0.0; cols * count];
+    for row in 0..rows {
         let y = (row as f64 + 0.5) / vertical_density;
         for (i, r) in sources.iter().enumerate() {
+            let (mut left, mut right_depth) = (0.0_f64, 0.0_f64);
             for (j, q) in sources.iter().enumerate() {
                 if i == j || !(q.y <= y && y <= bottom(q)) {
                     continue;
                 }
                 if q.x < r.x && r.x < right(q) {
-                    *left |= 1 << i;
+                    left = left.max((right(q) - r.x).min(r.width));
                 }
                 if q.x < right(r) && right(r) < right(q) {
-                    *right_mask |= 1 << i;
+                    right_depth = right_depth.max((right(r) - q.x).min(r.width));
                 }
             }
+            row_left[row * count + i] = left;
+            row_right[row * count + i] = right_depth;
         }
     }
-    for (col, (top, bottom_mask)) in col_top.iter_mut().zip(col_bottom.iter_mut()).enumerate() {
+    for col in 0..cols {
         let x = (col as f64 + 0.5) / width;
         for (i, r) in sources.iter().enumerate() {
+            let (mut top, mut bottom_depth) = (0.0_f64, 0.0_f64);
             for (j, q) in sources.iter().enumerate() {
                 if i == j || !(q.x <= x && x <= right(q)) {
                     continue;
                 }
                 if q.y < r.y && r.y < bottom(q) {
-                    *top |= 1 << i;
+                    top = top.max((bottom(q) - r.y).min(r.height));
                 }
                 if q.y < bottom(r) && bottom(r) < bottom(q) {
-                    *bottom_mask |= 1 << i;
+                    bottom_depth = bottom_depth.max((bottom(r) - q.y).min(r.height));
                 }
             }
+            col_top[col * count + i] = top;
+            col_bottom[col * count + i] = bottom_depth;
         }
     }
     (row_left, row_right, col_top, col_bottom)
+}
+
+/// One edge's contribution to a raw weight: `clamp(distance / depth, 0, 1)`,
+/// or `1` when the edge is not active (`depth == 0.0`).
+fn edge_ramp(distance: f64, depth: f64) -> f64 {
+    if depth > 0.0 {
+        (distance / depth).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 impl Evaluator {
@@ -240,7 +291,7 @@ impl Evaluator {
         let (cols, rows) = (width as usize, height as usize);
         let vertical_density = height as f64 * spec.aspect;
         let (row_left, row_right, col_top, col_bottom) =
-            build_edge_masks(&sources, cols, rows, width as f64, vertical_density);
+            build_edge_depths(&sources, cols, rows, width as f64, vertical_density);
         Ok(Self {
             spec: spec.clone(),
             sources,
@@ -257,49 +308,25 @@ impl Evaluator {
         })
     }
 
-    /// The seam rule (see the doc comment on [`Evaluator`]): minimum distance
-    /// to `index`'s active edges at canvas-unit point `(x, y)`, falling back
-    /// to the plain inward distance to all four edges when none are active.
-    /// `row`/`col` are the precomputed-table indices for this query point —
-    /// callers derive them once and reuse them across every source index.
-    fn distance(&self, index: usize, x: f64, y: f64, row: usize, col: usize) -> Option<f64> {
+    /// The seam rule (see the doc comment on [`Evaluator`]): the product of
+    /// `index`'s active-edge ramps at canvas-unit point `(x, y)`, or `1` when
+    /// no edge of it is active there; `None` outside `index`'s own source
+    /// rectangle. `row`/`col` are the precomputed-table indices for this
+    /// query point — callers derive them once and reuse them across every
+    /// source index.
+    fn raw_weight(&self, index: usize, x: f64, y: f64, row: usize, col: usize) -> Option<f64> {
         let r = &self.sources[index];
         if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
             return None;
         }
-        let bit = 1u8 << index;
-        let has_left = self.row_left[row] & bit != 0;
-        let has_right = self.row_right[row] & bit != 0;
-        let has_top = self.col_top[col] & bit != 0;
-        let has_bottom = self.col_bottom[col] & bit != 0;
-
-        let mut min_d = f64::INFINITY;
-        if has_left {
-            min_d = min_d.min(x - r.x);
-        }
-        if has_right {
-            min_d = min_d.min(right(r) - x);
-        }
-        if has_top {
-            min_d = min_d.min(y - r.y);
-        }
-        if has_bottom {
-            min_d = min_d.min(bottom(r) - y);
-        }
-
-        if min_d.is_infinite() {
-            // No active edge: the plain inward distance to this source's own
-            // boundary, on every edge — never the old constant sentinel.
-            Some(
-                (x - r.x)
-                    .min(right(r) - x)
-                    .min(y - r.y)
-                    .min(bottom(r) - y)
-                    .max(0.0),
-            )
-        } else {
-            Some(min_d.max(0.0))
-        }
+        let count = self.sources.len();
+        let (row_base, col_base) = (row * count + index, col * count + index);
+        Some(
+            edge_ramp(x - r.x, self.row_left[row_base])
+                * edge_ramp(right(r) - x, self.row_right[row_base])
+                * edge_ramp(y - r.y, self.col_top[col_base])
+                * edge_ramp(bottom(r) - y, self.col_bottom[col_base]),
+        )
     }
 
     /// Row/column table indices for a canvas-pixel point, clamped into the
@@ -372,14 +399,14 @@ impl Evaluator {
             return None;
         }
         let (row, col) = self.cell(cx, cy);
-        let own = self.distance(index, x, y, row, col)?;
+        let own = self.raw_weight(index, x, y, row, col)?;
         let weight = if !self.spec.blend || self.stacked {
             1.0
         } else {
             let mut count = 0;
             let mut total = 0.0;
             for i in 0..self.sources.len() {
-                if let Some(d) = self.distance(i, x, y, row, col) {
+                if let Some(d) = self.raw_weight(i, x, y, row, col) {
                     count += 1;
                     total += d;
                 }
@@ -435,53 +462,45 @@ impl Evaluator {
 }
 
 #[cfg(test)]
-/// A deliberately naive, unoptimized reference for [`Evaluator::distance`]:
-/// scans every other source per predicate, exactly as the pre-precomputation
-/// code did. Used only to prove the precomputed-table version in
-/// `Evaluator` agrees with it everywhere, never for production.
-fn naive_distance(sources: &[CanvasRect], index: usize, x: f64, y: f64) -> Option<f64> {
+/// A deliberately naive, unoptimized reference for [`Evaluator::raw_weight`]:
+/// scans every other source per edge, exactly as an unprecomputed
+/// implementation would. Used only to prove that the per-row/per-column
+/// depth tables built in `Evaluator::new` agree with it everywhere, never
+/// for production.
+fn naive_raw_weight(sources: &[CanvasRect], index: usize, x: f64, y: f64) -> Option<f64> {
     let r = &sources[index];
     if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
         return None;
     }
-    let has_left = sources
-        .iter()
-        .enumerate()
-        .any(|(j, q)| j != index && q.x < r.x && r.x < right(q) && q.y <= y && y <= bottom(q));
-    let has_right = sources.iter().enumerate().any(|(j, q)| {
-        j != index && q.x < right(r) && right(r) < right(q) && q.y <= y && y <= bottom(q)
-    });
-    let has_top = sources
-        .iter()
-        .enumerate()
-        .any(|(j, q)| j != index && q.y < r.y && r.y < bottom(q) && q.x <= x && x <= right(q));
-    let has_bottom = sources.iter().enumerate().any(|(j, q)| {
-        j != index && q.y < bottom(r) && bottom(r) < bottom(q) && q.x <= x && x <= right(q)
-    });
-    let mut min_d = f64::INFINITY;
-    if has_left {
-        min_d = min_d.min(x - r.x);
+    let (mut left, mut right_depth) = (0.0_f64, 0.0_f64);
+    let (mut top, mut bottom_depth) = (0.0_f64, 0.0_f64);
+    for (j, q) in sources.iter().enumerate() {
+        if j == index {
+            continue;
+        }
+        if q.y <= y && y <= bottom(q) {
+            if q.x < r.x && r.x < right(q) {
+                left = left.max((right(q) - r.x).min(r.width));
+            }
+            if q.x < right(r) && right(r) < right(q) {
+                right_depth = right_depth.max((right(r) - q.x).min(r.width));
+            }
+        }
+        if q.x <= x && x <= right(q) {
+            if q.y < r.y && r.y < bottom(q) {
+                top = top.max((bottom(q) - r.y).min(r.height));
+            }
+            if q.y < bottom(r) && bottom(r) < bottom(q) {
+                bottom_depth = bottom_depth.max((bottom(r) - q.y).min(r.height));
+            }
+        }
     }
-    if has_right {
-        min_d = min_d.min(right(r) - x);
-    }
-    if has_top {
-        min_d = min_d.min(y - r.y);
-    }
-    if has_bottom {
-        min_d = min_d.min(bottom(r) - y);
-    }
-    if min_d.is_infinite() {
-        Some(
-            (x - r.x)
-                .min(right(r) - x)
-                .min(y - r.y)
-                .min(bottom(r) - y)
-                .max(0.0),
-        )
-    } else {
-        Some(min_d.max(0.0))
-    }
+    Some(
+        edge_ramp(x - r.x, left)
+            * edge_ramp(right(r) - x, right_depth)
+            * edge_ramp(y - r.y, top)
+            * edge_ramp(bottom(r) - y, bottom_depth),
+    )
 }
 
 /// Whether the complete canvas mapping has the integer translation fast path.
@@ -861,12 +880,12 @@ mod tests {
         assert_ne!(evaluator.key(0, 0.0, true), evaluator.key(0, 0.0, false));
     }
 
-    /// The precomputed per-row/per-column `Evaluator::distance` must agree,
-    /// pixel for pixel, with the unoptimized reference that scans every
-    /// other source on every call — proving the bitmask precomputation in
-    /// `Evaluator::new` changed performance, not the answer.
+    /// The precomputed per-row/per-column `Evaluator::raw_weight` must
+    /// agree, pixel for pixel, with the unoptimized reference that scans
+    /// every other source on every call — proving the depth-table
+    /// precomputation in `Evaluator::new` changed performance, not the answer.
     #[test]
-    fn precomputed_distance_matches_the_naive_per_pixel_reference() {
+    fn precomputed_raw_weight_matches_the_naive_per_pixel_reference() {
         let cases = [
             vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)],
             vec![
@@ -891,8 +910,8 @@ mod tests {
                     let (row, col) = evaluator.cell(cx, cy);
                     for i in 0..rects.len() {
                         assert_eq!(
-                            evaluator.distance(i, px, py, row, col),
-                            naive_distance(&evaluator.sources, i, px, py),
+                            evaluator.raw_weight(i, px, py, row, col),
+                            naive_raw_weight(&evaluator.sources, i, px, py),
                             "source {i} at ({x}, {y})"
                         );
                     }
@@ -901,40 +920,337 @@ mod tests {
         }
     }
 
-    /// A source with no active edge anywhere (its neighbor only touches it,
-    /// never straddles) uses its plain inward distance to its own boundary,
-    /// not the old constant `1.0` sentinel — the two rectangles below only
-    /// share the line `x = 0.5`, so neither ever straddles the other's edge,
-    /// and `distance` (not just the post-ratio `transfer`, where a lone
-    /// covering source's weight is always 1 regardless of the magnitude
-    /// used) is the direct, honest place to check this.
+    /// Two rectangles that only share the line `x = 0.5` never straddle each
+    /// other, so neither has an active edge anywhere: both raw weights are a
+    /// flat 1, both sources run at full brightness right up to the shared
+    /// line, and the line itself — covered by both — splits 50/50.
     #[test]
-    fn no_active_edge_uses_plain_inward_distance_not_a_constant() {
+    fn a_touching_pair_has_no_active_edge_and_is_never_attenuated() {
         let rects = [rect(0.0, 0.0, 0.5, 1.0), rect(0.5, 0.0, 0.5, 1.0)];
         let input = spec(&rects);
         let evaluator = Evaluator::new(&input, 100, 100).unwrap();
-        // Near the left rectangle's own left edge: close to it.
-        let (row, col) = evaluator.cell(5.0, 50.0);
-        let near_own_edge = evaluator.distance(0, 0.05, 0.5, row, col).unwrap();
-        assert!(
-            (near_own_edge - 0.05).abs() < 1e-9,
-            "distance was {near_own_edge}, expected the plain inward distance 0.05, not a constant"
-        );
-        // At the rectangle's own center, farther from every one of its own
-        // four edges (including the touching one, which is not active).
-        let (row2, col2) = evaluator.cell(25.0, 50.0);
-        let center = evaluator.distance(0, 0.25, 0.5, row2, col2).unwrap();
-        assert!((center - 0.25).abs() < 1e-9);
-        assert_ne!(
-            near_own_edge, center,
-            "distance must vary with position, never sit at a fixed constant"
-        );
-        // At the touching line itself, both rectangles are equally close to
-        // their own boundary (distance 0), so `transfer` still splits 50/50
-        // there via the zero-total tie rule — this one point coincides with
-        // what the old constant sentinel also gave, so it alone would not
-        // have caught the bug; the assertions above do.
+        for cx in [0.5_f64, 5.0, 25.0, 49.5] {
+            let (row, col) = evaluator.cell(cx, 50.0);
+            let raw = evaluator
+                .raw_weight(0, cx / 100.0, 0.5, row, col)
+                .expect("covered");
+            assert_eq!(raw, 1.0, "raw weight at cx={cx} was {raw}, not 1");
+            assert_eq!(evaluator.transfer(0, cx, 50.0, 1.0, 0.0, 1.0).0, 256);
+        }
         assert_eq!(evaluator.transfer(0, 50.0, 50.0, 1.0, 0.0, 1.0).0, 128);
         assert_eq!(evaluator.transfer(1, 50.0, 50.0, 1.0, 0.0, 1.0).0, 128);
+    }
+
+    /// Property 1: two strips with a 20% overlap give exactly the 1-D ramp
+    /// at every row, and normalization is the identity — the raw weights
+    /// already sum to 1 before any division.
+    #[test]
+    fn two_strips_give_the_exact_one_dimensional_ramp_at_every_row() {
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let input = spec(&rects);
+        let evaluator = Evaluator::new(&input, 100, 100).unwrap();
+        for y in 0..100 {
+            let cy = y as f64 + 0.5;
+            for x in 0..100 {
+                let cx = x as f64 + 0.5;
+                let (row, col) = evaluator.cell(cx, cy);
+                let (px, py) = (cx / 100.0, cy / 100.0);
+                let raws: Vec<_> = (0..2)
+                    .filter_map(|i| evaluator.raw_weight(i, px, py, row, col))
+                    .collect();
+                // Normalization is the identity: the raw weights of the
+                // covering sources already sum to exactly 1.
+                let total: f64 = raws.iter().sum();
+                assert!(
+                    (total - 1.0).abs() < 1e-12,
+                    "raw weights at ({cx}, {cy}) summed to {total}, not 1"
+                );
+                // The 1-D ramp: 1 left of the seam, (0.6 - x)/0.2 inside it,
+                // 0 right of it, for source 0; the complement for source 1.
+                let expected = ((0.6 - px) / 0.2).clamp(0.0, 1.0);
+                let actual = evaluator
+                    .raw_weight(0, px, py, row, col)
+                    .unwrap_or(0.0 * expected);
+                if px <= 0.6 {
+                    assert!(
+                        (actual - expected).abs() < 1e-12,
+                        "source 0 at ({cx}, {cy}) was {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
+        // And the 75/25 split a quarter of the way into the seam survives
+        // the fixed-point encoding, at the top row and the bottom row alike.
+        for cy in [0.5, 50.0, 99.5] {
+            assert_eq!(evaluator.transfer(0, 45.0, cy, 1.0, 0.0, 1.0).0, 192);
+            assert_eq!(evaluator.transfer(1, 45.0, cy, 1.0, 0.0, 1.0).0, 64);
+        }
+    }
+
+    /// Property 2: a 2x2 grid with 20% overlaps in both axes gives every
+    /// source the product of the same two independent 1-D ramps, everywhere,
+    /// and those raw products sum to exactly 1 before normalization.
+    #[test]
+    fn a_grid_gives_the_product_of_two_one_dimensional_ramps_everywhere() {
+        let rects = [
+            rect(0.0, 0.0, 0.6, 0.6), // 0: top-left
+            rect(0.4, 0.0, 0.6, 0.6), // 1: top-right
+            rect(0.0, 0.4, 0.6, 0.6), // 2: bottom-left
+            rect(0.4, 0.4, 0.6, 0.6), // 3: bottom-right
+        ];
+        let input = spec(&rects);
+        let evaluator = Evaluator::new(&input, 100, 100).unwrap();
+        for y in 0..100 {
+            let cy = y as f64 + 0.5;
+            for x in 0..100 {
+                let cx = x as f64 + 0.5;
+                let (px, py) = (cx / 100.0, cy / 100.0);
+                let (row, col) = evaluator.cell(cx, cy);
+                // The two independent 1-D ramps: `a` is the left column's
+                // share in x, `b` is the top row's share in y.
+                let a = ((0.6 - px) / 0.2).clamp(0.0, 1.0);
+                let b = ((0.6 - py) / 0.2).clamp(0.0, 1.0);
+                let expected = [a * b, (1.0 - a) * b, a * (1.0 - b), (1.0 - a) * (1.0 - b)];
+                let mut total = 0.0;
+                for (i, expected) in expected.iter().enumerate() {
+                    let Some(actual) = evaluator.raw_weight(i, px, py, row, col) else {
+                        assert_eq!(*expected, 0.0, "source {i} at ({cx}, {cy}) is not covered");
+                        continue;
+                    };
+                    assert!(
+                        (actual - expected).abs() < 1e-12,
+                        "source {i} at ({cx}, {cy}) was {actual}, expected {expected}"
+                    );
+                    total += actual;
+                }
+                assert!(
+                    (total - 1.0).abs() < 1e-12,
+                    "raw weights at ({cx}, {cy}) summed to {total}, not 1"
+                );
+            }
+        }
+    }
+
+    /// Brain's four-projector wall, exactly as the daemon holds it: canvas
+    /// aspect 1.68 at 3864 px wide, columns overlapping by 225 px and rows
+    /// touching with a 0.07-pixel sliver.
+    fn brain_layout() -> LayoutSpec {
+        let (width, height) = (0.5291176764326357, 0.2976286929933576);
+        let (right_x, bottom_y) = (0.47088232356736426, 0.29760940224473764);
+        let (footprint_w, footprint_h) = (0.4968944099378882, 0.2795031055900621);
+        let (footprint_x, footprint_y) = (0.4554865424430642, 0.23809523809523808);
+        let outputs = [
+            ("DP-1", 0.0, 0.0, 0.0, 0.0),
+            ("DP-2", right_x, 0.0, footprint_x, 0.0),
+            ("DP-3", 0.0, bottom_y, 0.0, footprint_y),
+            ("DP-4", right_x, bottom_y, footprint_x, footprint_y),
+        ];
+        LayoutSpec {
+            aspect: 1.68,
+            blend: true,
+            participants: outputs
+                .into_iter()
+                .map(|(output, x, y, fx, fy)| LayoutParticipant {
+                    output: output.into(),
+                    source: rect(x, y, width, height),
+                    raster_footprint: rect(fx, fy, footprint_w, footprint_h),
+                })
+                .collect(),
+        }
+    }
+
+    /// Property 3: on brain's real configuration the horizontal seam between
+    /// the bottom two slices (DP-3 and DP-4) is the same at EVERY row inside
+    /// them, including the very first row below the row boundary. The
+    /// 0.07-pixel sliver where the two rows touch is a real straddle, but its
+    /// overlap depth is 0.07 px, so its ramp is already clamped to 1 at every
+    /// sampled pixel center and cannot shape the horizontal seam.
+    ///
+    /// Under the old minimum-distance rule this failed: the first 112 rows
+    /// below the boundary were a flat 128/128 instead of the gamma ramp,
+    /// which is the bright triangle seen at the center of the wall.
+    #[test]
+    fn brain_horizontal_seam_has_no_wedge_below_the_row_boundary() {
+        let layout = brain_layout();
+        let evaluator = Evaluator::new(&layout, 3864, 2300).unwrap();
+        let bottom_index = evaluator.index("DP-3").unwrap();
+        let other_index = evaluator.index("DP-4").unwrap();
+        // The first canvas row whose center lies inside the bottom slices.
+        let first = (0.29760940224473764_f64 * 3864.0).ceil() as i32;
+        assert_eq!(first, 1150);
+        let sample_columns: Vec<f64> = (0..=10)
+            .map(|k| (0.47088232356736426 + 0.05823535286527144 * f64::from(k) / 10.0) * 3864.0)
+            .collect();
+        // Row 1950 is 800 rows below the boundary, far from any sliver.
+        let reference: Vec<_> = sample_columns
+            .iter()
+            .map(|&cx| {
+                (
+                    evaluator.transfer(bottom_index, cx, 1950.5, 2.2, 0.0, 1.0),
+                    evaluator.transfer(other_index, cx, 1950.5, 2.2, 0.0, 1.0),
+                )
+            })
+            .collect();
+        for row in first..2300 {
+            let cy = f64::from(row) + 0.5;
+            for (column, expected) in sample_columns.iter().zip(&reference) {
+                let actual = (
+                    evaluator.transfer(bottom_index, *column, cy, 2.2, 0.0, 1.0),
+                    evaluator.transfer(other_index, *column, cy, 2.2, 0.0, 1.0),
+                );
+                assert_eq!(
+                    actual, *expected,
+                    "row {row} at column {column} differs from row 1950"
+                );
+            }
+        }
+        // And the ramp really is a ramp, not a plateau. Ten percent into the
+        // 225-pixel seam the split is 230/26 (90/10 of 256) on the very first
+        // row below the boundary, where the old rule gave a flat 128/128.
+        let ten_percent = (0.47088232356736426 + 0.05823535286527144 * 0.1) * 3864.0;
+        let (left, _) = evaluator.transfer(bottom_index, ten_percent, 1150.5, 1.0, 0.0, 1.0);
+        let (right_gain, _) = evaluator.transfer(other_index, ten_percent, 1150.5, 1.0, 0.0, 1.0);
+        assert_eq!((left, right_gain), (230, 26));
+    }
+
+    /// Property 4: a sub-pixel overlap sliver is indistinguishable, at every
+    /// sampled pixel center, from rectangles that exactly touch. This is the
+    /// general statement of what brain's 0.07-pixel row overlap does.
+    #[test]
+    fn a_sub_pixel_sliver_weighs_the_same_as_exactly_touching_rectangles() {
+        let sliver = 0.07 / 100.0;
+        let overlapping = spec(&[
+            rect(0.0, 0.0, 0.6, 0.5 + sliver),
+            rect(0.4, 0.0, 0.6, 0.5 + sliver),
+            rect(0.0, 0.5, 0.6, 0.5),
+            rect(0.4, 0.5, 0.6, 0.5),
+        ]);
+        let touching = spec(&[
+            rect(0.0, 0.0, 0.6, 0.5),
+            rect(0.4, 0.0, 0.6, 0.5),
+            rect(0.0, 0.5, 0.6, 0.5),
+            rect(0.4, 0.5, 0.6, 0.5),
+        ]);
+        let a = Evaluator::new(&overlapping, 100, 100).unwrap();
+        let b = Evaluator::new(&touching, 100, 100).unwrap();
+        for y in 0..100 {
+            for x in 0..100 {
+                let (cx, cy) = (x as f64 + 0.5, y as f64 + 0.5);
+                for i in 0..4 {
+                    assert_eq!(
+                        a.transfer(i, cx, cy, 2.2, 0.0, 1.0),
+                        b.transfer(i, cx, cy, 2.2, 0.0, 1.0),
+                        "source {i} at ({cx}, {cy})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Sum the gains of every source at one canvas pixel.
+    fn gain_sum(evaluator: &Evaluator, count: usize, cx: f64, cy: f64) -> i64 {
+        (0..count)
+            .map(|i| i64::from(evaluator.transfer(i, cx, cy, 1.0, 0.0, 1.0).0))
+            .sum()
+    }
+
+    /// Properties 5 and 6: irregular three-way overlaps, a nested layout and
+    /// unequal-height partial overlaps all sum to 1 and stay continuous —
+    /// no step larger than 2/256 between adjacent pixels along a scan line
+    /// that crosses every edge in the layout.
+    ///
+    /// The canvas is 4000x4000, not the 100x100 used elsewhere in this
+    /// module, because "2/256 between adjacent pixels" bounds a SLOPE, and a
+    /// slope is only a continuity statement once the pixel pitch is fine
+    /// enough to resolve it. A perfectly correct linear ramp across a
+    /// 25-pixel seam steps by 10/256 per pixel by construction, and no rule
+    /// can do better. The steepest gradient in these four layouts is the
+    /// "nested span" case, where the middle source is attenuated to a
+    /// quarter by its straddled top and bottom edges while its tall
+    /// neighbors are not attenuated vertically at all, so the horizontal
+    /// crossover between them happens over a short stretch: about 17 weight
+    /// units per canvas unit, which needs roughly 2200 pixels of canvas
+    /// before it falls under 2/256 per pixel. Halving the canvas halves
+    /// every jump reported here, which is what continuity means.
+    #[test]
+    fn irregular_layouts_sum_to_one_and_have_no_discontinuity() {
+        const SPAN: usize = 4000;
+        /// The scan line, halfway down the canvas; `NAN` selects the
+        /// symmetric scan straight down the canvas's vertical midline.
+        const SCAN: f64 = SPAN as f64 / 2.0 + 0.5;
+        let cases: [(&str, Vec<CanvasRect>, f64); 4] = [
+            // Three strips with unequal overlaps, seams at every x edge.
+            (
+                "three-way",
+                vec![
+                    rect(0.0, 0.0, 0.5, 1.0),
+                    rect(0.25, 0.0, 0.55, 1.0),
+                    rect(0.4, 0.0, 0.6, 1.0),
+                ],
+                SCAN,
+            ),
+            // A short middle source nested in the vertical span of two tall
+            // neighbors: its top and bottom edges are both straddled.
+            (
+                "nested span",
+                vec![
+                    rect(0.0, 0.0, 0.45, 1.0),
+                    rect(0.3, 0.25, 0.4, 0.5),
+                    rect(0.55, 0.0, 0.45, 1.0),
+                ],
+                SCAN,
+            ),
+            // Unequal heights with a partial overlap, scanned horizontally.
+            (
+                "unequal heights",
+                vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.2, 0.6, 0.6)],
+                SCAN,
+            ),
+            // The same layout scanned across its own vertical midline.
+            (
+                "unequal heights, vertical scan",
+                vec![rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.2, 0.6, 0.6)],
+                f64::NAN,
+            ),
+        ];
+        for (name, rects, scan) in cases {
+            let input = spec(&rects);
+            let evaluator = Evaluator::new(&input, SPAN as i32, SPAN as i32).unwrap();
+            let vertical = scan.is_nan();
+            let mut previous: Option<[i64; 8]> = None;
+            for step in 0..SPAN {
+                let center = step as f64 + 0.5;
+                let (cx, cy) = if vertical {
+                    (SPAN as f64 / 2.0 + 0.5, center)
+                } else {
+                    (center, scan)
+                };
+                let covered = rects
+                    .iter()
+                    .filter(|r| contains(r, cx / SPAN as f64, cy / SPAN as f64))
+                    .count();
+                let sum = gain_sum(&evaluator, rects.len(), cx, cy);
+                let expected = if covered > 0 { 256 } else { 0 };
+                assert!(
+                    (sum - expected).abs() <= rects.len() as i64,
+                    "{name}: gains at ({cx}, {cy}) summed to {sum}, not {expected}"
+                );
+                let mut gains = [0i64; 8];
+                for (i, gain) in gains.iter_mut().enumerate().take(rects.len()) {
+                    *gain = i64::from(evaluator.transfer(i, cx, cy, 1.0, 0.0, 1.0).0);
+                }
+                if let Some(previous) = previous {
+                    for i in 0..rects.len() {
+                        assert!(
+                            (gains[i] - previous[i]).abs() <= 2,
+                            "{name}: source {i} jumped from {} to {} at ({cx}, {cy})",
+                            previous[i],
+                            gains[i]
+                        );
+                    }
+                }
+                previous = Some(gains);
+            }
+        }
     }
 }

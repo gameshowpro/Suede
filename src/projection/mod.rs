@@ -14,9 +14,10 @@
 //!
 //! A map of the pieces, roughly in the order data flows through them:
 //!
-//! - [`layout`] holds the one blend-weight rule, `Evaluator`: a source's
-//!   share of a seam is its normalized distance to that seam's active edges,
-//!   or its plain inward distance where no edge is active. Every canvas
+//! - [`layout`] holds the one blend-weight rule, `Evaluator`: each edge a
+//!   neighbor straddles contributes a ramp across that overlap's own depth,
+//!   a source's raw share is the product of those ramps, and the shares of
+//!   the sources covering a point are normalized. Every canvas
 //!   plan — including a legacy integer-position layout, which synthesizes
 //!   one — carries a `LayoutSpec` built from this, so there is exactly one
 //!   place seam weights are computed.
