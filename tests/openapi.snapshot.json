@@ -236,6 +236,219 @@
         ],
         "type": "object"
       },
+      "ArrangedOutput": {
+        "description": "One enabled output's placement.",
+        "properties": {
+          "key": {
+            "description": "[`super::desired::OutputMatch::key`] of the output this places.",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/CanvasRect",
+            "description": "The normalized canvas rectangle this output samples."
+          }
+        },
+        "required": [
+          "key",
+          "source"
+        ],
+        "type": "object"
+      },
+      "Arrangement": {
+        "additionalProperties": false,
+        "description": "The resolved grid arrangement last applied to a document.\n\nAll five values are resolved: whichever of overlap or content scale the\nclient supplied, this records what the solver settled on. It is a record\nof *intent*, not canonical geometry — the source rectangles remain the\ntruth, and a later manual geometry edit leaves this in place. See\n[`in_effect`] for the test of whether it still describes the document.",
+        "properties": {
+          "columns": {
+            "description": "Grid columns; at least 1.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "contentScale": {
+            "description": "Output pixels per canvas pixel; `1.0` samples the canvas 1:1.",
+            "format": "double",
+            "type": "number"
+          },
+          "overlapX": {
+            "description": "Fraction of the smaller of two adjacent columns' raster widths that\nthey share; `0 <= overlapX < 1`.",
+            "format": "double",
+            "type": "number"
+          },
+          "overlapY": {
+            "description": "As `overlapX`, for adjacent rows' raster heights.",
+            "format": "double",
+            "type": "number"
+          },
+          "rows": {
+            "description": "Grid rows; at least 1.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "columns",
+          "overlapX",
+          "overlapY",
+          "contentScale"
+        ],
+        "type": "object"
+      },
+      "ArrangementDryRun": {
+        "description": "A solved grid arrangement, without writing it: [`crate::model::ArrangementSolution`]'s\nfields, copied rather than `#[serde(flatten)]`'d — [`Arrangement`] denies\nunknown fields, and serde cannot combine that with `flatten` — plus the\ndocument identity it was solved against, so a client can tell whether its\nnext write should still expect to land cleanly.",
+        "properties": {
+          "arrangement": {
+            "$ref": "#/components/schemas/Arrangement"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "impliedAspect": {
+            "format": "double",
+            "type": "number"
+          },
+          "outputs": {
+            "items": {
+              "$ref": "#/components/schemas/ArrangedOutput"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unusedCanvas": {
+            "$ref": "#/components/schemas/UnusedCanvas"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "arrangement",
+          "unusedCanvas",
+          "impliedAspect",
+          "outputs",
+          "warnings",
+          "revision",
+          "generation"
+        ],
+        "type": "object"
+      },
+      "ArrangementRequest": {
+        "description": "What a client asks for: the grid, plus *either* the overlaps *or* the\ncontent scale.\n\nSupplying both is over-determined and is an error; supplying neither\nmeans both overlaps are zero.",
+        "properties": {
+          "columns": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "committed": {
+            "description": "As on `PUT /config`: `false` applies to the outputs and leaves disk\nuntouched, `true` persists. The solver itself ignores this.",
+            "type": "boolean"
+          },
+          "contentScale": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "overlapX": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "overlapY": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "rows": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "rows",
+          "columns"
+        ],
+        "type": "object"
+      },
+      "ArrangementSolution": {
+        "description": "A solved arrangement: what would be written, without writing it.",
+        "properties": {
+          "arrangement": {
+            "$ref": "#/components/schemas/Arrangement",
+            "description": "The resolved five values, exactly as [`apply`] records them."
+          },
+          "impliedAspect": {
+            "description": "The canvas aspect at which both axes would fill exactly, leaving no\nunused band. Reported, never applied: changing the aspect resizes the\nheadless canvas and the browser, so it is the operator's decision.",
+            "format": "double",
+            "type": "number"
+          },
+          "outputs": {
+            "description": "Every enabled output, in document order.",
+            "items": {
+              "$ref": "#/components/schemas/ArrangedOutput"
+            },
+            "type": "array"
+          },
+          "unusedCanvas": {
+            "$ref": "#/components/schemas/UnusedCanvas",
+            "description": "The uncovered fraction of the canvas on each axis."
+          },
+          "warnings": {
+            "description": "Advisory notes about the solution; never a reason to refuse it.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "arrangement",
+          "unusedCanvas",
+          "impliedAspect",
+          "outputs",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "ArrangementStatus": {
+        "description": "The persisted grid-arrangement record from the effective document, and\nwhether re-solving it still reproduces the current sources. See\n[`crate::model::in_effect`]: the record is intent, not canonical geometry,\nso a later manual geometry edit leaves it in place and turns `inEffect`\nfalse rather than reverting or dropping it.",
+        "properties": {
+          "arrangement": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Arrangement"
+              }
+            ]
+          },
+          "inEffect": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "inEffect"
+        ],
+        "type": "object"
+      },
       "AudioConfig": {
         "additionalProperties": false,
         "description": "Where an application's audio should go.\n\nOmitting this field entirely is the third option and a different one:\nit defers the choice to each launch, so the app follows whatever\nPipeWire's default sink is at the time. Naming a sink here locks the app\nto it however the machine's default moves.",
@@ -1944,6 +2157,18 @@
         "additionalProperties": false,
         "description": "Shared multi-projector content layout and retained Warp correction.\n\nThere is no overlap setting here, because the source layout determines\noverlap. Simple and Warp share the configured canvas and normalized source\nrectangles. Warp adds destination correction to that content selection.\nWithout an explicit canvas, integer output positions define the layout.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
         "properties": {
+          "arrangement": {
+            "default": null,
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Arrangement",
+                "description": "The grid arrangement last applied, as a record of what was asked for.\n\nExplicit geometry stays canonical: this holds the resolved rows,\ncolumns, overlaps and content scale so a slider client can pick up\nwhere the last one left off, and nothing else reads it. A later\nmanual geometry edit leaves it in place — see\n[`crate::model::arrangement::in_effect`], which reports whether it\nstill describes the document's sources."
+              }
+            ]
+          },
           "blackLift": {
             "default": 0.0,
             "oneOf": [
@@ -2884,6 +3109,24 @@
           "flipped-270"
         ],
         "type": "string"
+      },
+      "UnusedCanvas": {
+        "description": "The fraction of the canvas left uncovered on each axis.\n\nAt most one of the two is non-zero: the binding axis fills the canvas\nexactly and the slack axis is centered, so half of its value is left\nbefore the first slot and half after the last.",
+        "properties": {
+          "x": {
+            "format": "double",
+            "type": "number"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
       },
       "VideoSource": {
         "description": "A video input (capture) device, surfaced via WirePlumber's v4l2 monitor.",
@@ -4434,6 +4677,156 @@
         ]
       }
     },
+    "/api/v1/config/projection/arrangement": {
+      "get": {
+        "operationId": "get_projection_arrangement",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArrangementStatus"
+                }
+              }
+            },
+            "description": "The persisted grid-arrangement record from the effective document, and whether re-solving it still reproduces the current sources",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "config"
+        ]
+      },
+      "put": {
+        "operationId": "put_projection_arrangement",
+        "parameters": [
+          {
+            "description": "Block until reconciliation settles, or this many seconds elapse.",
+            "in": "query",
+            "name": "wait",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Optional persisted revision precondition from ETag",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional working-copy generation precondition",
+            "in": "header",
+            "name": "If-Config-Generation",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Optional store-instance precondition from X-Config-Epoch",
+            "in": "header",
+            "name": "If-Config-Epoch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ArrangementRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            },
+            "description": "The accepted document; the resolved five values are at `projection.arrangement` and every enabled output's `geometry.source` reflects the solve",
+            "headers": {
+              "ETag": {
+                "description": "Persisted document revision, quoted for If-Match",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Epoch": {
+                "description": "Store instance identity for If-Config-Epoch",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Config-Generation": {
+                "description": "Effective working-copy generation",
+                "schema": {
+                  "format": "int64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "If-Match, If-Config-Generation, or If-Config-Epoch is stale"
+          },
+          "422": {
+            "description": "The grid does not fit the outputs, an output has no known raster, the request is over- or under-determined, or the result fails document validation"
+          }
+        },
+        "summary": "Solve a grid arrangement and write it — each enabled output's\n`geometry.source`, and the resolved five values at\n`projection.arrangement` — exactly like any other config write:\n`committed: false` (the default) replaces the shared working copy and\napplies to the outputs; `committed: true` persists it. See\n[`crate::model::arrangement`] for the solver itself and\n`docs/configuration.md`'s \"Grid arrangement\" section for the contract.",
+        "tags": [
+          "config"
+        ]
+      }
+    },
     "/api/v1/config/projection/canvas": {
       "delete": {
         "operationId": "delete_projection_canvas",
@@ -4729,6 +5122,79 @@
         },
         "tags": [
           "observed"
+        ]
+      }
+    },
+    "/api/v1/projection/arrangement": {
+      "get": {
+        "operationId": "get_arrangement",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "rows",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "columns",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "overlapX",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "overlapY",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          {
+            "in": "query",
+            "name": "contentScale",
+            "required": false,
+            "schema": {
+              "format": "double",
+              "type": "number"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ArrangementDryRun"
+                }
+              }
+            },
+            "description": "The solved arrangement; nothing is written"
+          },
+          "422": {
+            "description": "The grid does not fit the outputs, an output has no known raster, the canvas is missing, or the request is over- or under-determined"
+          }
+        },
+        "summary": "`GET /api/v1/projection/arrangement` — solve a grid arrangement without\nwriting it, exactly like [`recommend_resolution`]: reads the effective\ndocument and changes nothing. Pure arithmetic over a handful of outputs,\nso unlike the recommendation endpoint this needs no `spawn_blocking`.",
+        "tags": [
+          "projection"
         ]
       }
     },

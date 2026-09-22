@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::arrangement::Arrangement;
 use super::black_lift::BlackLift;
 use super::geometry::{validate_sources, CanvasConfig, OutputGeometry, ProjectionMode};
 use super::observed::{Mode, Output, Position};
@@ -114,6 +115,16 @@ pub struct ProjectionConfig {
     pub free_run: bool,
     /// Which pipeline the slicer composites with; see [`Renderer`].
     pub renderer: Renderer,
+    /// The grid arrangement last applied, as a record of what was asked for.
+    ///
+    /// Explicit geometry stays canonical: this holds the resolved rows,
+    /// columns, overlaps and content scale so a slider client can pick up
+    /// where the last one left off, and nothing else reads it. A later
+    /// manual geometry edit leaves it in place — see
+    /// [`crate::model::arrangement::in_effect`], which reports whether it
+    /// still describes the document's sources.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrangement: Option<Arrangement>,
 }
 
 impl Default for ProjectionConfig {
@@ -127,6 +138,7 @@ impl Default for ProjectionConfig {
             test_pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
+            arrangement: None,
         }
     }
 }
@@ -463,6 +475,29 @@ impl DesiredState {
         // is no black level anyone measured.
         if let Err(error) = projection.black_lift.validate() {
             errors.push(format!("projection.{error}"));
+        }
+        // A record of intent, but a nonsensical one would be handed straight
+        // back to a client as the starting point for its next solve.
+        if let Some(arrangement) = &projection.arrangement {
+            if arrangement.rows == 0 || arrangement.columns == 0 {
+                errors.push("projection.arrangement rows and columns must be at least 1".into());
+            }
+            for (label, overlap) in [
+                ("overlapX", arrangement.overlap_x),
+                ("overlapY", arrangement.overlap_y),
+            ] {
+                if !(0.0..1.0).contains(&overlap) {
+                    errors.push(format!(
+                        "projection.arrangement.{label} must be at least 0 and less than 1, not {overlap}"
+                    ));
+                }
+            }
+            if !(arrangement.content_scale.is_finite() && arrangement.content_scale > 0.0) {
+                errors.push(format!(
+                    "projection.arrangement.contentScale must be a positive number, not {}",
+                    arrangement.content_scale
+                ));
+            }
         }
 
         // A shared canvas has one complete configured roster in either

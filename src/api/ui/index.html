@@ -543,12 +543,13 @@ window.addEventListener("error", (event) => {
     <dialog id="arrange-dialog" aria-labelledby="arrange-title">
       <form method="dialog">
         <h2 id="arrange-title">Arrange outputs</h2>
-        <p class="hint">Enabled outputs are placed left to right, then top to bottom. Content scale (100% = 1:1 pixel sampling) and overlap are linked: changing one calculates the other to fill the canvas.</p>
+        <p class="hint">Enabled outputs are placed left to right, then top to bottom. The daemon does the arithmetic. Both overlaps are honored exactly: the content scale (100% = 1:1 pixel sampling) is the one that fills the canvas on whichever axis binds first, so the canvas may be left partly unused on the other axis — the line below says how much, and which canvas aspect would fill it. Setting the content scale instead derives both overlaps and fills the canvas on both axes.</p>
         <div class="fields">
           <div><label for="arrange-rows">Rows</label><input id="arrange-rows" type="number" min="1" step="1" value="1"></div>
           <div><label for="arrange-columns">Columns</label><input id="arrange-columns" type="number" min="1" step="1" value="1"></div>
           <div><label for="arrange-scale">Content scale (%)</label><input id="arrange-scale" type="number" min="0.01" step="any"></div>
-          <div><label for="arrange-overlap">Overlap (%)</label><input id="arrange-overlap" type="number" min="0" max="99" step="any" value="0"></div>
+          <div><label for="arrange-overlap-x">Overlap X (%)</label><input id="arrange-overlap-x" type="number" min="0" max="99" step="any" value="0"></div>
+          <div><label for="arrange-overlap-y">Overlap Y (%)</label><input id="arrange-overlap-y" type="number" min="0" max="99" step="any" value="0"></div>
         </div>
         <p class="hint" id="arrange-preview"></p>
         <div class="row"><button class="action" type="button" id="arrange-apply">Apply arrangement</button><button class="action ghost" id="arrange-cancel" value="cancel">Cancel</button></div>
@@ -2134,111 +2135,6 @@ $("content-scale").onchange = event => editSharedContent((source, pixels, mode) 
   source.height = mode.height / (scale * pixels.yDensity);
 });
 
-// Pure, deterministic grid solver with linked content scale and overlap.
-// If content scale is specified, slices fill the canvas at that scale with natural overlaps.
-// If overlap is specified, scale is calculated to guarantee at least that overlap in both dimensions.
-function getArrangementMetrics(outputs, rows, columns, canvas) {
-  if (!Number.isInteger(rows) || !Number.isInteger(columns) || rows < 1 || columns < 1 || outputs.length > rows * columns)
-    throw new Error("Choose positive rows and columns with a slot for every enabled output.");
-  if (!canvas?.width || !canvas?.height || !canvas?.yDensity) throw new Error("Canvas dimensions are unavailable.");
-  if (outputs.some(o => !(rasterDimensions(o)?.width > 0 && rasterDimensions(o)?.height > 0))) throw new Error("Every enabled output needs a known raster size.");
-
-  const colWidth = Array(columns).fill(0), rowHeight = Array(rows).fill(0);
-  outputs.forEach((o, index) => {
-    const row = Math.floor(index / columns), column = index % columns;
-    const raster = rasterDimensions(o);
-    colWidth[column] = Math.max(colWidth[column], raster.width);
-    rowHeight[row] = Math.max(rowHeight[row], raster.height);
-  });
-
-  const sumW = colWidth.reduce((a, b) => a + b, 0);
-  const sumH = rowHeight.reduce((a, b) => a + b, 0);
-  let divW = 0;
-  for (let i = 1; i < columns; i++) divW += Math.min(colWidth[i - 1], colWidth[i]);
-  let divH = 0;
-  for (let j = 1; j < rows; j++) divH += Math.min(rowHeight[j - 1], rowHeight[j]);
-
-  return { colWidth, rowHeight, sumW, sumH, divW, divH, Wc: canvas.width, Hc: canvas.height };
-}
-
-function scaleFromOverlap(metrics, overlap) {
-  const { sumW, divW, sumH, divH, Wc, Hc, colWidth, rowHeight } = metrics;
-  const hasX = colWidth.length > 1 && divW > 0;
-  const hasY = rowHeight.length > 1 && divH > 0;
-  const sx = hasX ? (sumW - overlap * divW) / Wc : sumW / Wc;
-  const sy = hasY ? (sumH - overlap * divH) / Hc : sumH / Hc;
-  if (hasX && hasY) return Math.min(sx, sy);
-  if (hasX) return sx;
-  if (hasY) return sy;
-  return Math.min(sx, sy);
-}
-
-function overlapsFromScale(metrics, scale) {
-  const { sumW, divW, sumH, divH, Wc, Hc, colWidth, rowHeight } = metrics;
-  const hasX = colWidth.length > 1 && divW > 0;
-  const hasY = rowHeight.length > 1 && divH > 0;
-  const ox = hasX ? (sumW - scale * Wc) / divW : 0;
-  const oy = hasY ? (sumH - scale * Hc) / divH : 0;
-  return {
-    ox,
-    oy,
-    minOverlap: (hasX && hasY) ? Math.min(ox, oy) : (hasX ? ox : (hasY ? oy : 0)),
-  };
-}
-
-function solveArrangement(outputs, rows, columns, scaleOrOpts, canvas) {
-  const metrics = getArrangementMetrics(outputs, rows, columns, canvas);
-  let scale;
-  if (typeof scaleOrOpts === "object" && scaleOrOpts !== null) {
-    scale = scaleOrOpts.scale ?? scaleFromOverlap(metrics, scaleOrOpts.overlap ?? 0);
-  } else {
-    scale = Number(scaleOrOpts);
-  }
-  if (!(scale > 0 && Number.isFinite(scale))) throw new Error("Content scale must be positive.");
-  const { colWidth, rowHeight, sumW, sumH, divW, divH, Wc, Hc } = metrics;
-  const { ox, oy, minOverlap } = overlapsFromScale(metrics, scale);
-  if ((colWidth.length > 1 && ox >= 1.0) || (rowHeight.length > 1 && oy >= 1.0)) {
-    throw new Error("Content scale is too small for this grid: overlap cannot reach 100%.");
-  }
-
-  const xOrigins = [0];
-  for (let i = 1; i < columns; i++) {
-    const seam = ox * Math.min(colWidth[i - 1], colWidth[i]);
-    xOrigins.push(Math.max(xOrigins[i - 1], xOrigins[i - 1] + (colWidth[i - 1] - seam) / scale));
-  }
-  const yOrigins = [0];
-  for (let j = 1; j < rows; j++) {
-    const seam = oy * Math.min(rowHeight[j - 1], rowHeight[j]);
-    yOrigins.push(Math.max(yOrigins[j - 1], yOrigins[j - 1] + (rowHeight[j - 1] - seam) / scale));
-  }
-
-  if (columns === 1) {
-    xOrigins[0] = Math.max(0, (Wc - colWidth[0] / scale) / 2);
-  }
-  if (rows === 1) {
-    yOrigins[0] = Math.max(0, (Hc - rowHeight[0] / scale) / 2);
-  }
-
-  return outputs.map((output, index) => {
-    const row = Math.floor(index / columns), column = index % columns;
-    const raster = rasterDimensions(output);
-    return {
-      output,
-      source: {
-        x: xOrigins[column] / canvas.width,
-        y: yOrigins[row] / canvas.yDensity,
-        width: raster.width / (scale * canvas.width),
-        height: raster.height / (scale * canvas.yDensity),
-      },
-      scale,
-      fit: 1 / scale,
-      ox,
-      oy,
-      minOverlap,
-      unused: { width: 0, height: 0 },
-    };
-  });
-}
 const unitPins = [[0,0],[1,0],[1,1],[0,1]];
 function identityGeometry(source) {
   return { source: structuredClone(source), corners: structuredClone(unitPins), center: [.5, .5], rasterFootprint: structuredClone(source) };
@@ -2274,86 +2170,106 @@ function ensureWarpGeometries() {
   }
 }
 
+// --- arrange automatically -----------------------------------------------
+//
+// The grid solver is the daemon's (`GET /projection/arrangement` for a dry
+// run, `PUT /config/projection/arrangement` to apply), so this page and a
+// show controller with overlap sliders place the same wall identically.
+// This dialog therefore only collects numbers, shows what the daemon says
+// they mean, and asks it to write the result: it computes no geometry, and
+// it never mutates `config` itself — the applied document arrives in the
+// response and again as a `config_changed` event, like any remote edit.
+//
+// The two overlaps and the content scale are one relationship seen from two
+// ends, so whichever family was edited last is what gets sent; the other
+// field is filled in from the answer.
 let lastArrangeEdit = "overlap";
+let arrangeSerial = 0, arrangeTimer = null;
 
-function updateArrangeFromOverlap() {
-  lastArrangeEdit = "overlap";
-  try {
-    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
-    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
-    const canvas = canvasPixels();
-    if (!entries.length || !canvas) return;
-    const metrics = getArrangementMetrics(entries, rows, columns, canvas);
-    const overlapVal = Number($("arrange-overlap").value);
-    const overlap = Number.isFinite(overlapVal) ? overlapVal / 100 : 0;
-    const scale = scaleFromOverlap(metrics, overlap);
-    if (scale > 0 && Number.isFinite(scale)) {
-      $("arrange-scale").value = editNumber(scale * 100, 2);
-    }
-  } catch (_) {}
-  arrangementPreview();
-}
+// Never repaint the control being typed into, exactly as the panel render
+// functions do not.
+const arrangeField = (id, value) => {
+  const element = $(id);
+  if (document.activeElement !== element) element.value = value;
+};
 
-function updateArrangeFromScale() {
-  lastArrangeEdit = "scale";
-  try {
-    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
-    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
-    const canvas = canvasPixels();
-    if (!entries.length || !canvas) return;
-    const metrics = getArrangementMetrics(entries, rows, columns, canvas);
-    const scaleVal = Number($("arrange-scale").value);
-    const scale = Number.isFinite(scaleVal) ? scaleVal / 100 : 1;
-    if (scale > 0 && Number.isFinite(scale)) {
-      const { minOverlap } = overlapsFromScale(metrics, scale);
-      $("arrange-overlap").value = editNumber(Math.max(0, Math.min(99.9, minOverlap * 100)), 1);
-    }
-  } catch (_) {}
-  arrangementPreview();
-}
-
-function updateArrangeGrid() {
+// Throws with the message to show when the numbers on screen cannot make a
+// request at all; anything the daemon can judge (too many outputs for the
+// grid, a content scale too small, an unknown raster) is left to it.
+function arrangeRequest() {
+  const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
+  if (!(Number.isInteger(rows) && Number.isInteger(columns) && rows >= 1 && columns >= 1))
+    throw new Error("Choose a positive whole number of rows and columns.");
   if (lastArrangeEdit === "scale") {
-    updateArrangeFromScale();
-  } else {
-    updateArrangeFromOverlap();
+    const contentScale = Number($("arrange-scale").value) / 100;
+    if (!(contentScale > 0 && Number.isFinite(contentScale))) throw new Error("Content scale must be positive.");
+    return { rows, columns, contentScale };
+  }
+  const overlap = (id) => {
+    const text = $(id).value.trim();
+    const value = text === "" ? 0 : Number(text) / 100;
+    if (!(value >= 0 && value < 1)) throw new Error("Each overlap must be at least 0% and less than 100%.");
+    return value;
+  };
+  return { rows, columns, overlapX: overlap("arrange-overlap-x"), overlapY: overlap("arrange-overlap-y") };
+}
+
+// Latest wins: the serial retires whatever is already in flight or pending,
+// and the debounce keeps a held arrow key from sending one request per
+// repeat.
+function scheduleArrangePreview() {
+  const serial = ++arrangeSerial;
+  clearTimeout(arrangeTimer);
+  arrangeTimer = setTimeout(() => requestArrangement(serial), 150);
+}
+
+async function requestArrangement(serial) {
+  if (!config || serial !== arrangeSerial) return;
+  let request;
+  try { request = arrangeRequest(); }
+  catch (error) { arrangeUnavailable(error.message); return; }
+  try {
+    // The daemon solves against its effective document, so this client's
+    // own edits have to be there first — the ordering `requestRecommendation`
+    // keeps, for the same reason.
+    await flushPreviews();
+    if (serial !== arrangeSerial) return;
+    const solution = await api(`/projection/arrangement?${new URLSearchParams(request)}`);
+    if (serial !== arrangeSerial) return;
+    renderArrangement(solution);
+  } catch (error) {
+    if (serial !== arrangeSerial) return;
+    arrangeUnavailable(error.message);
   }
 }
 
-function arrangementPreview() {
-  try {
-    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
-    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
-    const canvas = canvasPixels();
-    const metrics = getArrangementMetrics(entries, rows, columns, canvas);
-    let scale = Number($("arrange-scale").value) / 100;
-    if (!(scale > 0 && Number.isFinite(scale))) {
-      const overlapVal = Number($("arrange-overlap").value);
-      const overlap = Number.isFinite(overlapVal) ? overlapVal / 100 : 0;
-      scale = scaleFromOverlap(metrics, overlap);
-      $("arrange-scale").value = editNumber(scale * 100, 2);
-    }
-    const result = solveArrangement(entries, rows, columns, scale, canvas);
-    const first = result[0];
-    let msg = `Content scale ${displayNumber(scale * 100, 2)}%`;
-    if (columns > 1 || rows > 1) {
-      msg += ` · Overlap: ${columns > 1 ? `${displayNumber(first.ox * 100, 1)}% H` : ""}${columns > 1 && rows > 1 ? ", " : ""}${rows > 1 ? `${displayNumber(first.oy * 100, 1)}% V` : ""}`;
-    } else {
-      msg += " (single output fills canvas)";
-    }
-    if (first.ox < -0.001 || first.oy < -0.001) {
-      msg += " · ⚠ Canvas is larger than outputs at this scale (gap).";
-    } else if (first.ox > 0.8 || first.oy > 0.8) {
-      msg += " · ⚠ Overlap is very high (>80%); outputs almost entirely cover each other.";
-    } else {
-      msg += " · Slices fill canvas.";
-    }
-    $("arrange-preview").textContent = msg;
-    $("arrange-apply").disabled = false;
-  } catch (error) {
-    $("arrange-preview").textContent = error.message;
-    $("arrange-apply").disabled = true;
+function arrangeUnavailable(message) {
+  $("arrange-preview").textContent = message;
+  $("arrange-apply").disabled = true;
+}
+
+function renderArrangement(solution) {
+  const resolved = solution.arrangement;
+  if (lastArrangeEdit === "scale") {
+    arrangeField("arrange-overlap-x", editNumber(resolved.overlapX * 100, 1));
+    arrangeField("arrange-overlap-y", editNumber(resolved.overlapY * 100, 1));
+  } else {
+    arrangeField("arrange-scale", editNumber(resolved.contentScale * 100, 2));
   }
+  let message = `Content scale ${displayNumber(resolved.contentScale * 100, 2)}%`;
+  message += resolved.rows > 1 || resolved.columns > 1
+    ? ` · Overlap: ${displayNumber(resolved.overlapX * 100, 1)}% H, ${displayNumber(resolved.overlapY * 100, 1)}% V`
+    : " (single output fills canvas)";
+  // An exact pair of overlaps only fills one axis; the other is centered and
+  // the daemon reports the band it leaves, plus the canvas aspect that would
+  // close it (changing the aspect is the operator's call, never implicit).
+  const unused = solution.unusedCanvas ?? { x: 0, y: 0 };
+  const aspect = displayNumber(solution.impliedAspect, 3);
+  if (unused.x > .001) message += ` · ${displayNumber(unused.x * 100, 1)}% of the canvas is unused horizontally; aspect ${aspect} would fill it.`;
+  if (unused.y > .001) message += ` · ${displayNumber(unused.y * 100, 1)}% of the canvas is unused vertically; aspect ${aspect} would fill it.`;
+  for (const warning of solution.warnings ?? []) message += ` · ⚠ ${warning}`;
+  $("arrange-preview").textContent = message;
+  $("arrange-apply").disabled = false;
 }
 
 $("arrange-outputs").onclick = () => {
@@ -2363,54 +2279,75 @@ $("arrange-outputs").onclick = () => {
     return;
   }
   const count = entries.length;
-  let rows = Number($("arrange-rows").value) || 1;
-  let cols = Number($("arrange-columns").value) || count;
+  // The record of the last applied arrangement is there to be picked up
+  // again; without one, keep whatever the dialog last held.
+  const record = config?.projection?.arrangement;
+  let rows = Number(record?.rows ?? $("arrange-rows").value) || 1;
+  let cols = Number(record?.columns ?? $("arrange-columns").value) || count;
   if (rows * cols < count) {
     if (count === 4) { rows = 2; cols = 2; }
     else if (count === 6) { rows = 2; cols = 3; }
     else { rows = 1; cols = count; }
-    $("arrange-rows").value = rows;
-    $("arrange-columns").value = cols;
   }
-  const canvas = canvasPixels();
-  if (canvas) {
-    try {
-      const metrics = getArrangementMetrics(entries, rows, cols, canvas);
-      let overlapVal = Number($("arrange-overlap").value);
-      if (!Number.isFinite(overlapVal) || overlapVal < 0 || overlapVal >= 100) {
-        overlapVal = 0;
-        $("arrange-overlap").value = "0";
-      }
-      const scale = scaleFromOverlap(metrics, overlapVal / 100);
-      $("arrange-scale").value = editNumber(scale * 100, 2);
-    } catch (_) {}
+  $("arrange-rows").value = rows;
+  $("arrange-columns").value = cols;
+  if (record) {
+    $("arrange-overlap-x").value = editNumber(record.overlapX * 100, 1);
+    $("arrange-overlap-y").value = editNumber(record.overlapY * 100, 1);
+    $("arrange-scale").value = editNumber(record.contentScale * 100, 2);
+  } else {
+    for (const id of ["arrange-overlap-x", "arrange-overlap-y"]) {
+      const value = Number($(id).value);
+      if (!(Number.isFinite(value) && value >= 0 && value < 100)) $(id).value = "0";
+    }
   }
-  arrangementPreview();
+  lastArrangeEdit = "overlap";
+  $("arrange-preview").textContent = "Calculating…";
+  $("arrange-apply").disabled = true;
+  scheduleArrangePreview();
   $("arrange-dialog").showModal();
 };
 
-$("arrange-overlap").onchange = updateArrangeFromOverlap;
-$("arrange-scale").onchange = updateArrangeFromScale;
-$("arrange-rows").onchange = updateArrangeGrid;
-$("arrange-columns").onchange = updateArrangeGrid;
+const arrangeEdited = (family) => () => { lastArrangeEdit = family; scheduleArrangePreview(); };
+$("arrange-overlap-x").onchange = arrangeEdited("overlap");
+$("arrange-overlap-y").onchange = arrangeEdited("overlap");
+$("arrange-scale").onchange = arrangeEdited("scale");
+$("arrange-rows").onchange = () => scheduleArrangePreview();
+$("arrange-columns").onchange = () => scheduleArrangePreview();
 
-$("arrange-apply").onclick = () => {
+$("arrange-apply").onclick = async () => {
+  if (!config) return;
+  let request;
+  try { request = arrangeRequest(); }
+  catch (error) { arrangeUnavailable(error.message); return; }
+  $("arrange-apply").disabled = true;
+  // Retire any dry run still pending or in flight: from here the write's own
+  // response is the authority.
+  arrangeSerial++;
+  clearTimeout(arrangeTimer);
   try {
-    const entries = layoutEntries().filter(({ r }) => r.configured?.enable !== false).map(({ r }) => r.configured);
-    const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
-    const canvas = canvasPixels();
-    const scale = Number($("arrange-scale").value) / 100;
-    for (const item of solveArrangement(entries, rows, columns, scale, canvas)) {
-      item.output.geometry ??= identityGeometry(item.source);
-      item.output.geometry.source = item.source;
-    }
+    await flushPreviews();
+    const version = editVersion;
+    const accepted = await exclusiveWrite(() => writeConfig("/config/projection/arrangement", {
+      method: "PUT", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...request, committed: false }),
+    }));
+    // Adopt the server's document exactly as a preview response is adopted:
+    // it is what was accepted, but pointer feedback newer than this request
+    // still wins (`editVersion`). No local mutation and no pushPreview — the
+    // daemon already holds the arrangement, and its `config_changed` will
+    // arrive like any other client's edit.
+    acceptedConfig = structuredClone(accepted);
+    if (version === editVersion) config = structuredClone(accepted);
     $("arrange-dialog").close();
-    pushPreview(true);
-    renderLayout();
-    renderSharedContent();
-    renderWarpEditor();
+    renderLayout(); renderSharedContent(); renderWarpEditor();
+    renderWarpStatus(); renderDirtyStatus();
+    // Sources moved, so any canvas recommendation on screen was computed
+    // against the old ones (what pushPreview(true) did for the old dialog).
+    invalidateRecommendation();
   } catch (error) {
     $("arrange-preview").textContent = error.message;
+    $("arrange-apply").disabled = false;
   }
 };
 
@@ -3826,6 +3763,29 @@ function applyLoadedConfig(incoming) {
   if (selected) selectOutput(selected);
   renderDirtyStatus();
 }
+// A client dragging an overlap slider makes the daemon publish a whole
+// document per tick, and `applyLoadedConfig` redraws every panel — so a
+// burst is applied at most once per frame, keeping only the newest document
+// of the run. Intermediate documents are dropped, never queued: the last
+// event of a burst is always applied, which is the only one that describes
+// where things ended up. (`requestAnimationFrame` never fires in a hidden
+// tab, which would hold that final event indefinitely, so a hidden page
+// uses a short timer instead.)
+let pendingConfigEvent = null, configEventWake = null;
+function queueConfigEvent(data) {
+  pendingConfigEvent = data;
+  if (configEventWake !== null) return;
+  const apply = () => {
+    configEventWake = null;
+    const event = pendingConfigEvent;
+    pendingConfigEvent = null;
+    if (!event) return;
+    if (event.generation != null) configGeneration = event.generation;
+    if (event.epoch != null) configEpoch = event.epoch;
+    applyLoadedConfig(event.config);
+  };
+  configEventWake = document.hidden ? setTimeout(apply, 16) : requestAnimationFrame(apply);
+}
 // Only used for the initial load and an explicit resync (a reconnect, or the
 // Raw Config tab's Reload): every other update to the effective document
 // arrives as a `config_changed` event and is applied directly, without a
@@ -4033,12 +3993,7 @@ function connect() {
   // issuing a GET. It applies even while this client's own preview is
   // queued or in flight; that write's response, when it lands, still wins
   // (see the `version === editVersion` check in `sendPreview`).
-  source.addEventListener("config_changed", (e) => {
-    const data = JSON.parse(e.data);
-    if (data.generation != null) configGeneration = data.generation;
-    if (data.epoch != null) configEpoch = data.epoch;
-    applyLoadedConfig(data.config);
-  });
+  source.addEventListener("config_changed", (e) => queueConfigEvent(JSON.parse(e.data)));
   source.addEventListener("checks_changed", (e) => { checks = JSON.parse(e.data); renderChecks(); renderAlerts(); });
   source.addEventListener("projection_stats_changed", (e) => {
     if (stream !== source) return;

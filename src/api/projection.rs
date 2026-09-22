@@ -6,16 +6,16 @@
 //! endpoint follows the same rule: its answer is advisory and includes the
 //! state generation on which it was calculated.
 
-use axum::extract::State;
+use axum::extract::{Query, State};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::api::json::Json;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    validate_sources, CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, ProjectionMode,
-    Transform,
+    validate_sources, ArrangedOutput, Arrangement, ArrangementRequest, CanvasConfig, CanvasRect,
+    OutputConfig, OutputGeometry, ProjectionMode, Transform, UnusedCanvas,
 };
 
 /// One converted output, addressed by its stable configuration key.
@@ -263,6 +263,89 @@ pub async fn recommend_resolution(
         .map_err(|error| ApiError::Internal(format!("recommendation task panicked: {error}")))?
         .map(Json)
         .map_err(ApiError::Validation)
+}
+
+/// Query form of [`ArrangementRequest`], for the read-only dry run: the same
+/// five fields minus `committed`, which has no meaning for a solve that never
+/// writes.
+#[derive(Debug, Clone, Copy, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrangementQuery {
+    pub rows: u32,
+    pub columns: u32,
+    #[serde(default)]
+    pub overlap_x: Option<f64>,
+    #[serde(default)]
+    pub overlap_y: Option<f64>,
+    #[serde(default)]
+    pub content_scale: Option<f64>,
+}
+
+impl From<ArrangementQuery> for ArrangementRequest {
+    fn from(query: ArrangementQuery) -> Self {
+        Self {
+            rows: query.rows,
+            columns: query.columns,
+            overlap_x: query.overlap_x,
+            overlap_y: query.overlap_y,
+            content_scale: query.content_scale,
+            committed: false,
+        }
+    }
+}
+
+/// A solved grid arrangement, without writing it: [`crate::model::ArrangementSolution`]'s
+/// fields, copied rather than `#[serde(flatten)]`'d — [`Arrangement`] denies
+/// unknown fields, and serde cannot combine that with `flatten` — plus the
+/// document identity it was solved against, so a client can tell whether its
+/// next write should still expect to land cleanly.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrangementDryRun {
+    pub arrangement: Arrangement,
+    pub unused_canvas: UnusedCanvas,
+    pub implied_aspect: f64,
+    pub outputs: Vec<ArrangedOutput>,
+    pub warnings: Vec<String>,
+    pub revision: u64,
+    pub generation: u64,
+}
+
+/// `GET /api/v1/projection/arrangement` — solve a grid arrangement without
+/// writing it, exactly like [`recommend_resolution`]: reads the effective
+/// document and changes nothing. Pure arithmetic over a handful of outputs,
+/// so unlike the recommendation endpoint this needs no `spawn_blocking`.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projection/arrangement",
+    tag = "projection",
+    params(ArrangementQuery),
+    responses(
+        (status = 200, description = "The solved arrangement; nothing is written", body = ArrangementDryRun),
+        (status = 422, description = "The grid does not fit the outputs, an output \
+                       has no known raster, the canvas is missing, or the \
+                       request is over- or under-determined"),
+    )
+)]
+pub async fn get_arrangement(
+    State(state): State<crate::api::ApiState>,
+    Query(query): Query<ArrangementQuery>,
+) -> ApiResult<Json<ArrangementDryRun>> {
+    let (document, generation) = state.store.effective_with_generation();
+    let request: ArrangementRequest = query.into();
+    let raster = crate::api::raster_lookup(&state.snapshot);
+    let solution =
+        crate::model::solve_document(&document, &request, raster).map_err(ApiError::Validation)?;
+    Ok(Json(ArrangementDryRun {
+        arrangement: solution.arrangement,
+        unused_canvas: solution.unused_canvas,
+        implied_aspect: solution.implied_aspect,
+        outputs: solution.outputs,
+        warnings: solution.warnings,
+        revision: document.revision,
+        generation,
+    }))
 }
 
 /// Pure recommendation implementation, kept separate so tests can call it
@@ -1130,5 +1213,160 @@ mod tests {
         assert_eq!(body["generation"], generation);
         assert_eq!(harness.state.store.revision(), revision);
         assert_eq!(harness.state.store.generation(), generation);
+    }
+
+    // --- grid arrangement dry run ------------------------------------------
+
+    /// `count` enabled outputs at 1920x1080 on a 3840-wide 16:9 canvas, with
+    /// no geometry: a dry run does not write, so unlike the config-route
+    /// tests this never needs `allow_overlaps` or document validation to
+    /// pass — it is pure arithmetic over the document as given.
+    fn arrangement_document(count: usize) -> crate::model::DesiredState {
+        let mut outputs = Vec::new();
+        for index in 0..count {
+            let mut output = OutputConfig::new(OutputMatch::by_name(format!("HDMI-{}", index + 1)));
+            output.enable = true;
+            output.mode = Some(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            });
+            outputs.push(output);
+        }
+        let mut document = crate::model::DesiredState::new();
+        document.outputs = outputs;
+        document.projection = Some(crate::model::ProjectionConfig {
+            canvas: Some(CanvasConfig {
+                aspect: 16.0 / 9.0,
+                render_width: 3840,
+            }),
+            ..Default::default()
+        });
+        document
+    }
+
+    #[tokio::test]
+    async fn dry_run_solves_without_writing() {
+        let harness = crate::api::test_support::harness(None);
+        harness
+            .state
+            .store
+            .update(|document| *document = arrangement_document(4))
+            .unwrap();
+        let before = harness.state.store.get();
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/api/v1/projection/arrangement?rows=2&columns=2&overlapX=0.2&overlapY=0.2",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["arrangement"]["rows"], 2);
+        assert_eq!(body["arrangement"]["columns"], 2);
+        assert_eq!(body["outputs"].as_array().unwrap().len(), 4);
+        assert!(
+            (body["arrangement"]["contentScale"].as_f64().unwrap() - 0.9).abs() < 1e-9,
+            "{body}"
+        );
+
+        assert_eq!(
+            harness.state.store.get(),
+            before,
+            "a dry run must not write"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_the_solvers_error_as_a_422() {
+        let harness = crate::api::test_support::harness(None);
+        harness
+            .state
+            .store
+            .update(|document| *document = arrangement_document(5))
+            .unwrap();
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projection/arrangement?rows=2&columns=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("do not fit a 2x2 grid"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_change_generation_and_reports_the_working_copys_identity() {
+        let harness = crate::api::test_support::harness(None);
+        harness
+            .state
+            .store
+            .update(|document| *document = arrangement_document(4))
+            .unwrap();
+
+        // A live working copy, so the effective document differs from the
+        // persisted one and bumps the generation.
+        let mut previewed = harness.state.store.get();
+        previewed.settings.hide_cursor = false;
+        previewed.committed = false;
+        harness.state.store.set_preview(Some(previewed));
+        let revision_before = harness.state.store.revision();
+        let generation_before = harness.state.store.generation();
+
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/api/v1/projection/arrangement?rows=2&columns=2&overlapX=0.2&overlapY=0.2",
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["revision"], revision_before);
+        assert_eq!(body["generation"], generation_before);
+        assert_eq!(
+            harness.state.store.generation(),
+            generation_before,
+            "a dry run must not change the generation"
+        );
     }
 }

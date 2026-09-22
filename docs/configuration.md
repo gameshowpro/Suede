@@ -312,8 +312,10 @@ would mean one loose connector resizing the canvas mid-show, reflowing the
 application, and moving the picture on every *working* projector. A rig can
 therefore also be configured completely before the projectors are unpacked.
 
-!!! info "Layout is the client's job"
-    Suede does no layout arithmetic. Positions are always explicit. The web UI offers left-to-right arrangement as a convenience that simply computes `position` values, and any client can do the same.
+!!! info "Layout is the client's job, with one exception"
+    Suede does no general layout arithmetic. Positions are always explicit, and stay the canonical stored form. The web UI offers left-to-right arrangement as a convenience that simply computes `position` values, and any client can do the same.
+
+    The one exception, added 2026-09-21: solving a regular overlapping grid for the shared projection canvas (rows, columns, independent X/Y overlap, or a content scale) is arithmetic every slider-driven client needs to agree on, so the daemon exposes it as an API call instead of leaving it to each client to reimplement. See [Grid arrangement](#grid-arrangement).
 
 !!! info "The Displays tab shows every connector"
     Being *in the layout* means having a configuration entry, which has
@@ -984,6 +986,7 @@ Warp adds retained corner and center correction to the same content selection:
 | `testPattern` | string or null | null | `grid`, `warp-alignment`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
+| `arrangement` | object or null | `null` | Optional. The resolved record of the last applied [grid arrangement](#grid-arrangement): `{ rows, columns, overlapX, overlapY, contentScale }`. A record of intent, not canonical geometry — a later manual geometry edit leaves it in place |
 
 #### Adaptive black lift
 
@@ -1157,6 +1160,82 @@ the physical raster. Those buffers also obey the output allocation limit.
 Builds without projection machinery cannot render arbitrary shared crops;
 they report `projection_unavailable`. Direct tiling configurations must not
 configure a shared canvas: it requires `allow_overlaps = true` and a slicer.
+
+#### Grid arrangement {: #grid-arrangement }
+
+Placing a regular grid of outputs on the shared canvas — the common case for
+a projector wall — is arithmetic the daemon can do for you, so that every
+client driving the same wall (the reference UI's **Arrange automatically**
+dialog, a show controller with sliders) gets the same answer.
+`PUT /api/v1/config/projection/arrangement` solves the grid and writes each
+enabled output's `geometry.source`; `GET /api/v1/projection/arrangement` runs
+the same solve without writing anything, so a client can preview before
+committing to a value.
+
+```json
+{
+  "rows": 2,
+  "columns": 2,
+  "overlapX": 0.2,
+  "overlapY": 0.05
+}
+```
+
+Enabled outputs are placed in document order, `row = i / columns`,
+`column = i % columns`; the enabled count must not exceed `rows * columns`,
+or the request is `422`. Give either `overlapX` and `overlapY` together, or
+`contentScale` alone — never both (`422`, "over-determined"), and never
+neither (overlaps then default to `0`).
+
+**Exact overlap, or exact scale — never both solved at once.** With
+`overlapX`/`overlapY`, each is honored exactly: the axis whose content just
+fills the canvas at that overlap is the *binding* axis, and the other axis is
+centered on the canvas, with `unusedCanvas` left on either side — reported as
+a fraction of the canvas, per axis. This is deliberate: with two independent
+overlap sliders, silently absorbing slack into whichever axis has room would
+make one slider inert, and would show a doubled seam where the projectors do
+not actually overlap. `impliedAspect` is the canvas aspect that would make
+`unusedCanvas` zero; apply it explicitly if you want the band gone, since the
+endpoint never changes the canvas aspect itself. With `contentScale` alone,
+the canvas fills exactly on both axes and `overlapX`/`overlapY` are derived
+from it; if the derived overlap would need to reach 100% or more — the
+content scale is too small for this grid to reach the canvas edges — the
+result is `422`, "content scale is too small for this grid".
+
+The dry-run `GET` responds with the five resolved values (`rows`, `columns`,
+`overlapX`, `overlapY`, `contentScale`) under `arrangement`, together with
+`unusedCanvas`, `impliedAspect`, each output's resulting `source` rectangle
+under `outputs`, any `warnings` (for example, an overlap above 80%), and the
+`revision` and `generation` of the document it was solved against. The `PUT`
+responds with the whole document, where the same five values are
+`projection.arrangement`.
+
+The resolved values are also kept as `projection.arrangement`: a record of
+intent, not canonical geometry. `source` rectangles stay the canonical stored
+form, exactly like a hand-edited grid, so a later manual geometry tweak is
+never overwritten or reverted — it simply leaves the record in place.
+`GET /api/v1/config/projection/arrangement` reports that record together with
+`inEffect`, which is `true` only while re-solving it still reproduces the
+current sources; it turns `false` the moment any source is nudged by hand. A
+client can use the record to prefill a rearrangement dialog, or a slider's
+starting position, without tracking the grid itself.
+
+The `PUT` behaves like any other config write: `committed: false` (the
+default) replaces the shared working copy and applies immediately; `committed:
+true` persists it. It takes the same optional preconditions as any other
+write, and none of the ownership rules change — see [Multiple
+clients](multi-user.md), and especially [High-rate
+writers](multi-user.md#high-rate-writers) before driving `overlapX` or
+`overlapY` from a slider.
+
+!!! warning "The CPU renderer restarts the slicer on every arrangement change"
+    This is not specific to arrangement: the CPU renderer restarts its
+    slicer on any geometry change, arrangement included, so a slider driven
+    at interactive rates against a CPU-rendered appliance restarts the
+    slicer at that rate. The GPU renderer's live control channel does not —
+    an arrangement change updates it in place — which is what makes
+    slider-driven arrangement practical. See [Where the blend
+    runs](how-it-works.md#where-the-blend-runs).
 
 `GET /api/v1/projection/stats` reports the live `geometry` status alongside
 frame and lifecycle statistics. It includes requested and effective mode,
@@ -1340,14 +1419,23 @@ repeated resolution changes. Aspect edits keep crop pixel origins and content
 scale anchored, exposing unused or out-of-bounds areas for adjustment.
 
 **Arrange automatically** accepts positive integer rows/columns, a Content
-scale percentage (100% is 1:1 pixel sampling), and overlap as a percentage of
-adjacent tile extents. Content scale and overlap are linked: changing either
-one recalculates the other so the arrangement fills the canvas. It places
-enabled configured outputs in table order, including disconnected outputs
-with known modes, and uniformly fits their composition inside the chosen
-canvas. Disabled outputs and existing calibration stay unchanged. Unused
-canvas is visible; mixed-size grids that fail source topology validation are
-rejected. Arrangement is one unsaved edit.
+scale percentage (100% is 1:1 pixel sampling), and separate **Overlap X** and
+**Overlap Y** percentages of adjacent tile extents. Content scale and the two
+overlaps are linked: editing either overlap fills Content scale, and editing
+Content scale fills both overlaps. The dialog calls the daemon
+(`GET /api/v1/projection/arrangement` while previewing,
+`PUT /api/v1/config/projection/arrangement` on Apply) rather than solving
+locally, so every client previewing the same grid — including a show
+controller driving it by sliders — sees the same result. Both overlaps are
+honored exactly: the axis with the larger resulting scale fills the canvas
+and the other axis is centered with any unused canvas on either side, shown
+in the dialog alongside the aspect that would remove it. See [Grid
+arrangement](#grid-arrangement) for the full contract. It places enabled
+configured outputs in table order, including disconnected outputs with known
+modes. Disabled outputs and existing calibration stay unchanged; mixed-size
+grids that fail source topology validation are rejected. Arrangement is one
+unsaved edit — `committed: false` — exactly like any other working-copy
+change, so a subsequent Save or Revert still applies to the whole page.
 
 Drag the four corner handles to place the picture inside the output raster.
 The four center-line handles control two shared fractions: moving either end

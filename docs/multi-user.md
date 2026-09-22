@@ -109,6 +109,56 @@ curl -X PUT http://appliance:9088/api/v1/config/settings \
   -d '{"hideCursor": true}'
 ```
 
+## High-rate writers {: #high-rate-writers }
+
+A slider or a show controller driving a value at interactive rates —
+dragging an overlap slider, nudging black lift — is a different traffic
+pattern from an operator's occasional edit, and needs different discipline
+from the client to stay smooth for everyone watching.
+
+- **Keep one request in flight and one pending.** Do not queue every
+  intermediate value: while a request is outstanding, hold at most one more,
+  and replace it with the newest value whenever the slider moves again. When
+  the in-flight request completes, send the pending one, if any, and drop
+  whatever value it superseded. A client that instead queues every
+  `mousemove` falls further and further behind the pointer.
+- **Send `committed: false` while dragging.** Each preview replaces the
+  working copy, same as any other preview, and the outputs follow
+  immediately. On release, either send one final write with
+  `committed: true` to persist it, or leave it uncommitted and let the
+  operator use Save — both are legitimate, and the choice belongs to the
+  client's own UI, not to the protocol.
+- **Do not use `?wait`.** It blocks the response until a reconciliation pass
+  has run, which is the opposite of what a client sending dozens of writes a
+  second wants.
+- **Do not send preconditions.** `If-Match`, `If-Config-Generation`, and
+  `If-Config-Epoch` exist to refuse a write built on a stale copy; a slider
+  has no stale copy to protect, since each of its writes is meant to
+  overwrite the one before it, from itself or from anyone else. Sending
+  preconditions from a slider only invites spurious `409`s.
+- **Expect the event stream to thin a burst.** `config_changed` carries the
+  whole document, so a slider at 60 Hz is 60 full documents a second to every
+  subscriber. The server coalesces: after each event it drains whatever is
+  already queued and forwards only the newest `config_changed` of that
+  drained run, so a watcher may not see every intermediate value — only the
+  latest one at the rate it can keep up. It always receives the final value;
+  it just cannot assume it saw every step in between. Apply what arrives at
+  most once per animation frame if you are re-rendering a whole panel from
+  it, exactly as the reference UI does.
+- **Accept that another client may Save or Revert mid-drag.** The working
+  copy still belongs to nobody. If another operator presses Revert while your
+  slider is dragging, the next `config_changed` says so, and your slider's
+  next write simply previews on top of whatever is there now — there is no
+  special case for "someone moved my working copy out from under me",
+  because that is the model everywhere, not just here.
+
+[Grid arrangement](configuration.md#grid-arrangement) is the worked example:
+`PUT /api/v1/config/projection/arrangement` with `committed: false` on every
+slider tick, a final `committed: true` (or a plain Save) on release, and no
+`?wait` or preconditions in between. Its CPU-renderer caveat matters here
+too: a CPU-rendered appliance restarts its slicer on every one of those
+ticks, so interactive dragging is a GPU-renderer feature in practice.
+
 ## Validation is whole-document
 
 A preview or a save is validated as the complete document it produces, not

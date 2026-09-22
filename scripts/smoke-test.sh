@@ -179,8 +179,11 @@ kill "$DAEMON_PID" 2>/dev/null
 wait "$DAEMON_PID" 2>/dev/null
 check "state file was written" "true" \
   "$([[ -f "${STATE_DIR}/state.json" ]] && echo true || echo false)"
+# Check the app the daemon was supervising by pid, not by a `pgrep -f 'sleep
+# 300'` pattern: other software on the host (an IDE's remote server keeps
+# itself alive with exactly that command) makes the pattern a false positive.
 check "no orphaned app process" "true" \
-  "$(pgrep -f 'sleep 300' >/dev/null && echo false || echo true)"
+  "$([[ "$NEW_PID" =~ ^[0-9]+$ ]] && kill -0 "$NEW_PID" 2>/dev/null && echo false || echo true)"
 
 start_daemon || exit 1
 # Give the boot-restore pass time to enable outputs (which includes a settle

@@ -168,9 +168,13 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   // change (B3); this fixture has no live SSE transport of its own, so the
   // test drives the same `config_changed` listener the real EventSource
   // would, with the payload shape B3 defines.
-  const sendConfigChanged=(target,doc,section='outputs')=>{
+  const sendConfigChanged=async (target,doc,section='outputs')=>{
     const payload={revision:doc.revision,generation,epoch,committed:doc.committed,section,config:doc};
-    return target.evaluate(payload=>fixtureSources[0].listeners.config_changed({data:JSON.stringify(payload)}),payload);
+    await target.evaluate(payload=>fixtureSources[0].listeners.config_changed({data:JSON.stringify(payload)}),payload);
+    // The page applies at most one `config_changed` per animation frame
+    // (a slider client can publish a whole document per tick), so the
+    // payload is held until that frame runs; wait for it before asserting.
+    await target.waitForFunction(()=>pendingConfigEvent===null);
   };
   await page.evaluate(()=>editGeometry(g=>g.corners[0][0]=.21));await settle();
   await sendConfigChanged(second,current);

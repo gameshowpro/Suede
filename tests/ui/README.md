@@ -19,12 +19,16 @@ release, use a supported test host. The test fixture intercepts requests to
 writes a browser/version/result record and screenshot.
 
 The suite exercises real pointer events and keyboard focus, inverse-projective
-center movement, invalid crossings, numeric edits, identity pin/center resets, shared crop/scale edits, automatic arrangement,
+center movement, invalid crossings, numeric edits, identity pin/center resets, shared crop/scale edits, automatic arrangement
+through the daemon's dry-run and apply endpoints (separate X and Y overlaps,
+the unused-canvas band, a refused content scale, and the applied document
+adopted from the response rather than solved in the page),
 coalescing with delayed responses, final state delivery, Save/Revert barriers,
 server rejection rollback, pattern preservation, capability fallback and
 recovery, stale recommendations, direct resolution edits and focus presets, one
 client's edit and revert arriving on another as a `config_changed` event
-(fields, dirty state, the diagram, and a focused field held until it blurs),
+(fields, dirty state, the diagram, a focused field held until it blurs, and
+the event applied on an animation frame rather than on arrival),
 resynchronization, and daemon restart identity.
 It also checks adaptive compensation fields through pattern previews,
 Save/Cancel, numeric fixed-mode restoration, and telemetry updates that never

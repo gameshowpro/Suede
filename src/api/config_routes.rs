@@ -14,8 +14,8 @@ use utoipa::IntoParams;
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    AppConfig, BackgroundPreset, DesiredState, OutputConfig, OutputMatch, ProjectionConfig,
-    Settings,
+    AppConfig, Arrangement, ArrangementRequest, BackgroundPreset, DesiredState, OutputConfig,
+    OutputMatch, ProjectionConfig, Settings,
 };
 use crate::state::{StatePrecondition, StateVersion};
 
@@ -759,6 +759,124 @@ pub async fn delete_projection_canvas(
         .map(|(document, version)| VersionedConfig::new(document, version))
 }
 
+/// The persisted grid-arrangement record from the effective document, and
+/// whether re-solving it still reproduces the current sources. See
+/// [`crate::model::in_effect`]: the record is intent, not canonical geometry,
+/// so a later manual geometry edit leaves it in place and turns `inEffect`
+/// false rather than reverting or dropping it.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ArrangementStatus {
+    pub arrangement: Option<Arrangement>,
+    pub in_effect: bool,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/config/projection/arrangement", tag = "config",
+    responses((
+        status = 200,
+        description = "The persisted grid-arrangement record from the effective \
+                       document, and whether re-solving it still reproduces the \
+                       current sources",
+        body = ArrangementStatus,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        ),
+    ))
+)]
+pub async fn get_projection_arrangement(
+    State(state): State<ApiState>,
+) -> VersionedSection<ArrangementStatus> {
+    let (document, version) = state.store.effective_with_version();
+    let raster = super::raster_lookup(&state.snapshot);
+    let in_effect = crate::model::in_effect(&document, raster);
+    let arrangement = document
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.arrangement);
+    VersionedSection::new(
+        ArrangementStatus {
+            arrangement,
+            in_effect,
+        },
+        version,
+    )
+}
+
+/// Solve a grid arrangement and write it — each enabled output's
+/// `geometry.source`, and the resolved five values at
+/// `projection.arrangement` — exactly like any other config write:
+/// `committed: false` (the default) replaces the shared working copy and
+/// applies to the outputs; `committed: true` persists it. See
+/// [`crate::model::arrangement`] for the solver itself and
+/// `docs/configuration.md`'s "Grid arrangement" section for the contract.
+#[utoipa::path(
+    put, path = "/api/v1/config/projection/arrangement", tag = "config",
+    params(
+        WaitQuery,
+        ("If-Match" = Option<String>, Header, description = "Optional persisted revision precondition from ETag"),
+        ("If-Config-Generation" = Option<u64>, Header, description = "Optional working-copy generation precondition"),
+        ("If-Config-Epoch" = Option<String>, Header, description = "Optional store-instance precondition from X-Config-Epoch"),
+    ), request_body = ArrangementRequest,
+    responses(
+        (status = 200,
+        description = "The accepted document; the resolved five values are at \
+                       `projection.arrangement` and every enabled output's \
+                       `geometry.source` reflects the solve",
+        body = DesiredState,
+        headers(
+            ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
+            ("X-Config-Generation" = u64, description = "Effective working-copy generation"),
+            ("X-Config-Epoch" = String, description = "Store instance identity for If-Config-Epoch"),
+        )),
+        (status = 409, description = "If-Match, If-Config-Generation, or If-Config-Epoch is stale"),
+        (status = 422, description = "The grid does not fit the outputs, an output \
+                       has no known raster, the request is over- or \
+                       under-determined, or the result fails document validation"),
+    )
+)]
+pub async fn put_projection_arrangement(
+    State(state): State<ApiState>,
+    Query(query): Query<WaitQuery>,
+    headers: HeaderMap,
+    Json(body): Json<ArrangementRequest>,
+) -> ApiResult<VersionedConfig> {
+    let expected = precondition(&headers)?;
+    let raster = super::raster_lookup(&state.snapshot);
+
+    if body.committed {
+        state
+            .commit_if(expected, "projection", query.wait, move |current| {
+                let solution = crate::model::solve_document(current, &body, raster)
+                    .map_err(ApiError::Validation)?;
+                let mut next = current.clone();
+                crate::model::apply(&mut next, &solution);
+                Ok(next)
+            })
+            .await
+            .map(|(document, version)| VersionedConfig::new(document, version))
+    } else {
+        // The working copy is shared and owned by nobody: an uncommitted
+        // write always builds on the effective document — the live working
+        // copy if one exists, else the saved one — exactly like any other
+        // preview, so another client's unrelated edit survives underneath
+        // this one. The solve runs inside `preview_with_if`'s closure, under
+        // the store's write lock, so a concurrent preview from another
+        // client cannot land between reading the basis and staging this one.
+        state
+            .preview_with_if(expected, move |basis| {
+                let solution = crate::model::solve_document(basis, &body, raster)
+                    .map_err(ApiError::Validation)?;
+                let mut next = basis.clone();
+                crate::model::apply(&mut next, &solution);
+                Ok(next)
+            })
+            .map(|(document, version)| VersionedConfig::new(document, version))
+    }
+}
+
 #[utoipa::path(
     post, path = "/api/v1/config/revert", tag = "config",
     params(
@@ -794,6 +912,9 @@ pub const OK: StatusCode = StatusCode::OK;
 mod tests {
     use super::{CONFIG_EPOCH_HEADER, CONFIG_GENERATION_HEADER};
     use crate::api::test_support::{harness, Harness};
+    use crate::model::{
+        CanvasConfig, DesiredState, Mode, OutputConfig, OutputMatch, ProjectionConfig,
+    };
     use axum::body::Body;
     use axum::http::{HeaderMap, Request, StatusCode};
     use tower::ServiceExt;
@@ -2008,5 +2129,368 @@ mod tests {
                 call(&harness, "PUT", "/api/v1/config/projection", Some(&input)).await;
             assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{value}");
         }
+    }
+
+    // --- grid arrangement --------------------------------------------------
+
+    /// `count` enabled outputs at 1920x1080, plus a 3840-wide 16:9 shared
+    /// canvas — no geometry yet, which is exactly the state the arrangement
+    /// endpoint is for. This document would fail `DesiredState::validate`
+    /// as it stands (a shared canvas requires every enabled output to
+    /// already have geometry), but that is fine: it is written straight into
+    /// the store with `StateStore::update`, which does not validate, and the
+    /// arrangement PUT under test is what is expected to make it valid by
+    /// seeding geometry for every output it places.
+    fn arrangement_document(count: usize) -> DesiredState {
+        let mut outputs = Vec::new();
+        for index in 0..count {
+            let mut output = OutputConfig::new(OutputMatch::by_name(format!("HDMI-{}", index + 1)));
+            output.enable = true;
+            output.mode = Some(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            });
+            outputs.push(output);
+        }
+        let mut document = DesiredState::new();
+        document.outputs = outputs;
+        document.projection = Some(ProjectionConfig {
+            canvas: Some(CanvasConfig {
+                aspect: 16.0 / 9.0,
+                render_width: 3840,
+            }),
+            ..ProjectionConfig::default()
+        });
+        document
+    }
+
+    /// A shared canvas requires `allow_overlaps = true` (see
+    /// `validate_projection`), so every arrangement test needs it, and the
+    /// router has to be rebuilt from the mutated bootstrap for the change to
+    /// take effect, exactly as
+    /// `deleting_projection_canvas_really_clears_it_and_a_later_put_does_not_resurrect_it`
+    /// does.
+    fn arrangement_harness(count: usize) -> Harness {
+        let mut harness = harness(None);
+        std::sync::Arc::make_mut(&mut harness.state.bootstrap).allow_overlaps = true;
+        harness.router = crate::api::router(harness.state.clone());
+        harness
+            .state
+            .store
+            .update(|document| *document = arrangement_document(count))
+            .unwrap();
+        harness
+    }
+
+    const ARRANGE_2X2_20: &str = r#"{"rows":2,"columns":2,"overlapX":0.2,"overlapY":0.2}"#;
+
+    #[tokio::test]
+    async fn uncommitted_arrangement_reaches_the_outputs_but_not_the_disk() {
+        let harness = arrangement_harness(4);
+        let before = harness.state.store.get();
+        let mut receiver = harness.state.events.subscribe();
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(ARRANGE_2X2_20),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["committed"], false);
+        assert_eq!(body["projection"]["arrangement"]["rows"], 2);
+        assert_eq!(body["projection"]["arrangement"]["columns"], 2);
+        assert!(
+            (body["projection"]["arrangement"]["contentScale"]
+                .as_f64()
+                .unwrap()
+                - 0.9)
+                .abs()
+                < 1e-9,
+            "{body}"
+        );
+
+        // Every enabled output's source matches the dry run's.
+        let (dry_status, dry_body) = call(
+            &harness,
+            "GET",
+            "/api/v1/projection/arrangement?rows=2&columns=2&overlapX=0.2&overlapY=0.2",
+            None,
+        )
+        .await;
+        assert_eq!(dry_status, StatusCode::OK, "{dry_body}");
+        let dry_outputs = dry_body["outputs"].as_array().unwrap();
+        assert_eq!(dry_outputs.len(), 4);
+        for (index, arranged) in dry_outputs.iter().enumerate() {
+            assert_eq!(
+                body["outputs"][index]["geometry"]["source"], arranged["source"],
+                "output {index}: {body}"
+            );
+        }
+
+        // Disk is untouched by a preview.
+        assert_eq!(
+            harness.state.store.get(),
+            before,
+            "a preview must not reach disk"
+        );
+
+        // `config_changed` carries the working copy, honestly flagged.
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.name(), "config_changed");
+        let data = event.data();
+        assert_eq!(data["committed"], false);
+        assert_eq!(data["config"], body);
+    }
+
+    #[tokio::test]
+    async fn uncommitted_arrangement_builds_on_another_clients_live_working_copy() {
+        let harness = arrangement_harness(4);
+
+        // A is mid-edit: an unrelated setting, previewed but not saved. Set
+        // directly on the store (as `dry_run_does_not_change_generation...`
+        // in `api::projection::tests` also does) rather than through the
+        // ordinary `PUT /config`, which would itself be refused here: the
+        // fixture's canvas requires every enabled output to already have
+        // geometry, and seeding that would only obscure what this test is
+        // about.
+        let mut previewed = harness.state.store.get();
+        previewed.settings.hide_cursor = false;
+        previewed.committed = false;
+        harness.state.store.set_preview(Some(previewed));
+        assert!(harness.state.store.has_preview());
+
+        // B arranges without naming any version.
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(ARRANGE_2X2_20),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["arrangement"]["rows"], 2);
+        assert!(
+            !body["settings"]["hideCursor"].as_bool().unwrap(),
+            "A's unrelated edit survives underneath B's arrangement: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_arrangement_persists_and_clears_the_working_copy() {
+        let harness = arrangement_harness(4);
+        let before_revision = harness.state.store.get().revision;
+        let mut receiver = harness.state.events.subscribe();
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(r#"{"rows":2,"columns":2,"overlapX":0.2,"overlapY":0.2,"committed":true}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["committed"], true);
+        assert_eq!(harness.state.store.get().revision, before_revision + 1);
+        assert!(harness.state.store.get().committed);
+        assert!(!harness.state.store.has_preview());
+
+        let event = receiver.try_recv().unwrap();
+        assert_eq!(event.name(), "config_changed");
+        let data = event.data();
+        assert_eq!(data["committed"], true);
+        assert_eq!(data["section"], "projection");
+    }
+
+    #[tokio::test]
+    async fn a_stale_generation_is_a_conflict() {
+        let harness = arrangement_harness(4);
+        let (status, _, body) = call_with_headers(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(ARRANGE_2X2_20),
+            &[("if-config-generation", "999")],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_canvas_is_a_422_with_the_solvers_message() {
+        // No canvas at all: `allow_overlaps` never even comes into it.
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(ARRANGE_2X2_20),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["detail"], "projection.canvas is required to arrange outputs",
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grid_too_small_for_the_outputs_is_a_422_with_the_solvers_message() {
+        let harness = arrangement_harness(5);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(r#"{"rows":2,"columns":2}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("do not fit a 2x2 grid"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_arrangement_json_is_rejected() {
+        let harness = arrangement_harness(4);
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some("{ not json"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn arrangement_status_reports_in_effect_until_a_source_is_moved_by_hand() {
+        let harness = arrangement_harness(4);
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(ARRANGE_2X2_20),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            &harness,
+            "GET",
+            "/api/v1/config/projection/arrangement",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["inEffect"], true, "{body}");
+        assert_eq!(body["arrangement"]["rows"], 2);
+
+        // Move one source by hand, well beyond the solver's own 1e-9
+        // tolerance but too small to change the layout's topology.
+        let mut moved = harness.state.store.effective();
+        moved.outputs[0].geometry.as_mut().unwrap().source.x += 1.0e-6;
+        moved.committed = false;
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&moved).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, body) = call(
+            &harness,
+            "GET",
+            "/api/v1/config/projection/arrangement",
+            None,
+        )
+        .await;
+        assert_eq!(body["inEffect"], false, "{body}");
+        assert_eq!(
+            body["arrangement"]["rows"], 2,
+            "the record survives the manual edit: {body}"
+        );
+    }
+
+    /// The smoothness claim in the plan's "Rapid change" section: a burst of
+    /// uncommitted arrangement writes is pure in-memory arithmetic under the
+    /// store lock, wakes the projection `Notify` (not the debounced ordinary
+    /// queue), and never touches disk. Fifty PUTs land in a tight loop —
+    /// nothing here awaits a debounce or a reconciler pass, so if this test
+    /// were slow it would mean a write had started blocking on something it
+    /// should not.
+    #[tokio::test]
+    async fn fifty_uncommitted_arrangement_puts_coalesce_onto_the_projection_trigger() {
+        let mut harness = arrangement_harness(4);
+        let saved_before = harness.state.store.get();
+        let projection = harness.requests.projection_handle();
+        // Nothing queued yet: the fixture seeds the store directly, not
+        // through the API.
+        assert!(harness.requests.try_recv().is_err());
+
+        let mut last_overlap_x = 0.0_f64;
+        for step in 0..50 {
+            let overlap_x = 0.02 + (0.5 - 0.02) * (step as f64) / 49.0;
+            last_overlap_x = overlap_x;
+            let body = serde_json::json!({
+                "rows": 2,
+                "columns": 2,
+                "overlapX": overlap_x,
+                "overlapY": 0.1,
+            })
+            .to_string();
+            let (status, response_body) = call(
+                &harness,
+                "PUT",
+                "/api/v1/config/projection/arrangement",
+                Some(&body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "step {step}: {response_body}");
+        }
+
+        // The effective document reflects the last request sent, not some
+        // earlier one that a race let land out of order.
+        let effective = harness.state.store.effective();
+        let arrangement = effective
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.arrangement)
+            .expect("an arrangement was applied");
+        assert!(
+            (arrangement.overlap_x - last_overlap_x).abs() < 1e-9,
+            "expected overlapX {last_overlap_x}, got {}",
+            arrangement.overlap_x
+        );
+
+        // Every PUT was a preview: the saved document on disk never moved.
+        assert_eq!(
+            harness.state.store.get(),
+            saved_before,
+            "an uncommitted burst must not reach disk"
+        );
+
+        // The burst woke the projection fast path...
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), projection.notified())
+                .await
+                .is_ok(),
+            "a burst of uncommitted arrangement writes must signal the projection trigger"
+        );
+        // ...and never the debounced ordinary queue: every one of the fifty
+        // writes changed only the projection, so each took the
+        // `request_projection` branch, not `request(\"working copy\")`.
+        assert!(
+            harness.requests.try_recv().is_err(),
+            "an arrangement-only burst must not enqueue an ordinary debounced request"
+        );
     }
 }

@@ -28,7 +28,7 @@ use crate::checks::CheckRunner;
 use crate::config::BootstrapConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::events::{EventHub, ServerEvent};
-use crate::model::{ConfigChange, DesiredState};
+use crate::model::{ConfigChange, DesiredState, OutputConfig};
 use crate::reconciler::{ReconcileTrigger, Reconciler};
 use crate::snapshot::Snapshot;
 use crate::state::{ConditionalWriteError, StatePrecondition, StateStore, StateVersion};
@@ -207,11 +207,32 @@ impl ApiState {
     pub fn preview_if(
         &self,
         expected: StatePrecondition,
-        mut next: DesiredState,
+        next: DesiredState,
     ) -> ApiResult<(DesiredState, StateVersion)> {
+        self.preview_with_if(expected, move |_basis| Ok(next))
+    }
+
+    /// Like [`Self::preview_if`], but `prepare` computes the candidate
+    /// document from the effective basis *inside* the store's write lock,
+    /// rather than the caller reading `effective()` beforehand and handing
+    /// over an already-built document. That closes the gap where another
+    /// client's preview could land between reading the basis and staging the
+    /// new one: whatever `prepare` sees is guaranteed to still be current
+    /// when it runs. `preview_if` is the common case where the candidate
+    /// does not depend on the basis and is just this call with a
+    /// basis-ignoring closure.
+    pub fn preview_with_if<F>(
+        &self,
+        expected: StatePrecondition,
+        prepare: F,
+    ) -> ApiResult<(DesiredState, StateVersion)>
+    where
+        F: FnOnce(&DesiredState) -> ApiResult<DesiredState>,
+    {
         let context = self.validation_context();
         let mut projection_only = false;
         let result = self.store.set_preview_if(expected, |basis| {
+            let mut next = prepare(basis)?;
             validate_configuration_against(&mut next, basis, &context)?;
             projection_only = projection_only_change(basis, &next);
             Ok(next)
@@ -416,6 +437,31 @@ pub fn config_change(
     }
 }
 
+/// The output-raster lookup every arrangement handler shares.
+///
+/// Resolves, per output: the configured mode if there is one, else whatever
+/// was adopted (`OutputConfig::effective_mode` already covers both), else
+/// the observed output's current mode, matched by the output's own match
+/// rule — the same lookup the reconciler and `api/observed.rs` use to pair a
+/// configuration entry with what Sway reports. Returns unrotated mode
+/// dimensions; the arrangement solver applies the 90/270 transform swap
+/// itself, so this lookup is free of that concern.
+pub fn raster_lookup(snapshot: &Snapshot) -> impl Fn(&OutputConfig) -> Option<(u32, u32)> {
+    let observed = snapshot.outputs();
+    move |output: &OutputConfig| {
+        let mode = output.effective_mode().or_else(|| {
+            observed
+                .iter()
+                .find(|candidate| output.r#match.matches(candidate))
+                .and_then(|candidate| candidate.current_mode)
+        })?;
+        Some((
+            u32::try_from(mode.width).ok()?,
+            u32::try_from(mode.height).ok()?,
+        ))
+    }
+}
+
 /// Build the complete application router.
 pub fn router(state: ApiState) -> Router {
     let api = Router::new()
@@ -431,6 +477,7 @@ pub fn router(state: ApiState) -> Router {
             "/projection/recommendation",
             get(projection::recommend_resolution),
         )
+        .route("/projection/arrangement", get(projection::get_arrangement))
         .route("/system", get(observed::get_system))
         .route("/system/checks", get(observed::list_checks))
         .route("/system/checks/{id}/fix", post(observed::fix_check))
@@ -515,6 +562,11 @@ pub fn router(state: ApiState) -> Router {
         .route(
             "/config/projection/canvas",
             delete(config_routes::delete_projection_canvas),
+        )
+        .route(
+            "/config/projection/arrangement",
+            get(config_routes::get_projection_arrangement)
+                .put(config_routes::put_projection_arrangement),
         )
         .route("/config/revert", post(config_routes::revert_config))
         // Imperative escape hatches.
@@ -632,7 +684,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 pub mod test_support {
     use super::*;
     use crate::audio::mock::MockAudio;
-    use crate::reconciler::ReconcilerDeps;
+    use crate::reconciler::{ReconcileRequests, ReconcilerDeps};
     use crate::supervisor::LaunchContext;
     use crate::sway::mock::MockSway;
 
@@ -642,6 +694,11 @@ pub mod test_support {
         pub sway: Arc<MockSway>,
         pub audio: Arc<MockAudio>,
         pub power: Arc<observed::power_mock::MockPower>,
+        /// The receiving half of `state.trigger`'s channel, kept (rather than
+        /// dropped, as it used to be) so a test can inspect what a write
+        /// actually signaled: an ordinary debounced request via `try_recv`,
+        /// or the projection `Notify` via `projection_handle`.
+        pub requests: ReconcileRequests,
         pub _dir: tempfile::TempDir,
     }
 
@@ -694,7 +751,7 @@ pub mod test_support {
             allow_overlaps: bootstrap.allow_overlaps,
         }));
         let capability_store = Arc::new(crate::capabilities::CapabilityStore::new(dir.path()));
-        let (trigger, _receiver) = Reconciler::channel();
+        let (trigger, requests) = Reconciler::channel();
         let checks = Arc::new(CheckRunner::new(
             bootstrap.clone(),
             sway.clone(),
@@ -732,6 +789,7 @@ pub mod test_support {
             sway,
             audio,
             power,
+            requests,
             _dir: dir,
         }
     }
@@ -750,6 +808,47 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    #[test]
+    fn raster_lookup_falls_back_to_the_observed_current_mode() {
+        let snapshot = Snapshot::new();
+        snapshot.set_outputs(vec![crate::model::Output {
+            name: "HDMI-A-1".into(),
+            active: true,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: Some(crate::model::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            }),
+            modes: vec![],
+            rect: crate::model::Rect::default(),
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        }]);
+        let lookup = raster_lookup(&snapshot);
+
+        // No configured mode: falls back to the observed current mode,
+        // matched by the output's own match rule.
+        let configured = OutputConfig::new(crate::model::OutputMatch::by_name("HDMI-A-1"));
+        assert_eq!(lookup(&configured), Some((1920, 1080)));
+
+        // A configured mode wins over the observed one.
+        let mut with_mode = configured.clone();
+        with_mode.mode = Some(crate::model::Mode {
+            width: 3840,
+            height: 2160,
+            refresh_hz: 60.0,
+        });
+        assert_eq!(lookup(&with_mode), Some((3840, 2160)));
+
+        // No match at all: nothing to report.
+        let unmatched = OutputConfig::new(crate::model::OutputMatch::by_name("HDMI-A-9"));
+        assert_eq!(lookup(&unmatched), None);
     }
 
     #[test]

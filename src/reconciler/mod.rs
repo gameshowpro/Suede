@@ -70,6 +70,14 @@ impl ReconcileRequests {
         self.ordinary.try_recv()
     }
 
+    /// A shared handle to the projection wakeup, so a test elsewhere in the
+    /// crate can check whether `request_projection` fired without reaching
+    /// into this type's private field.
+    #[cfg(test)]
+    pub(crate) fn projection_handle(&self) -> Arc<Notify> {
+        self.projection.clone()
+    }
+
     async fn coalesce(&mut self) {
         tokio::select! {
             _ = tokio::time::sleep(DEBOUNCE) => {},

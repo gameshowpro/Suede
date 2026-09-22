@@ -1310,6 +1310,65 @@ mod tests {
         assert_ne!(slicer_fingerprint(&cpu, false), cpu_fingerprint);
     }
 
+    /// With a layout set (the arrangement endpoint's shared-canvas path) and
+    /// no pattern, `slicer_topology_fingerprint` hashes only each slice's
+    /// raster width/height, not its `source_rect` or `source.x`/`source.y`.
+    /// So moving a source — exactly what a grid arrangement PUT does — is a
+    /// live control update on the GPU path (`live_control: true`), never a
+    /// restart, even though the CPU path (`live_control: false`, which
+    /// always restarts on any geometry change) still sees it.
+    #[test]
+    fn a_layout_source_move_is_live_on_gpu_but_restarts_the_cpu_path() {
+        use crate::model::{CanvasRect, Rect};
+        use crate::projection::blend::SliceSpec;
+        use crate::projection::layout::{LayoutParticipant, LayoutSpec};
+
+        fn spec_at(x: i32, y: i32, source_rect: [f64; 4]) -> SlicerSpec {
+            let mut spec = minimal_slicer_spec();
+            spec.slices.push(SliceSpec {
+                output: "DP-1".into(),
+                source: Rect {
+                    x,
+                    y,
+                    width: 100,
+                    height: 100,
+                },
+                source_rect: Some(source_rect),
+                geometry: None,
+            });
+            let participant_source = CanvasRect {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            };
+            spec.layout = Some(LayoutSpec {
+                aspect: 1.0,
+                blend: true,
+                participants: vec![LayoutParticipant {
+                    output: "DP-1".into(),
+                    source: participant_source,
+                    raster_footprint: participant_source,
+                }],
+            });
+            spec
+        }
+
+        let a = spec_at(0, 0, [0.0, 0.0, 100.0, 100.0]);
+        let b = spec_at(10, 20, [10.0, 20.0, 100.0, 100.0]);
+
+        assert_eq!(
+            slicer_fingerprint(&a, true),
+            slicer_fingerprint(&b, true),
+            "a source move under a layout is a live control update, not a restart"
+        );
+        assert_ne!(
+            slicer_fingerprint(&a, false),
+            slicer_fingerprint(&b, false),
+            "the CPU path restarts on any geometry change, by design"
+        );
+    }
+
     #[test]
     fn generation_exhaustion_never_repeats_a_generation() {
         let mut manager = manager_for_test();
