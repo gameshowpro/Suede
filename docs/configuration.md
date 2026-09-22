@@ -1261,6 +1261,8 @@ application, the background is already visible by the time the browser exits
 
 #### Working copies and the committed flag {: #live-preview }
 
+More than one client at a time, and what a client should do about it, is covered in [Multiple clients](multi-user.md).
+
 The document carries a truth flag, `committed`. Reads report it honestly:
 `true` for the saved document, `false` when a working copy is live. Writes
 use it to speak:
