@@ -7774,3 +7774,1010 @@ mod tests {
             .all(|p| p.stale && p.warp_revision == 7));
     }
 }
+
+/// End-to-end reconstruction: the slices the CPU pipeline actually renders,
+/// placed back on the canvas at their offsets and summed in linear light,
+/// must reproduce the original canvas picture. Built through the real
+/// pipeline entry points, not a re-implementation of the blend math:
+/// `layout::canvas_plan_with_correction` (the plan the daemon builds),
+/// `warp_update::fill_rows` (the transfer table the slicer builds at
+/// startup), and `Blend::rows` (the CPU content path).
+///
+/// Why summing shaded 8-bit values as `(v/255)^gamma` reconstructs the
+/// original: `Evaluator::transfer` (layout.rs) returns a gain
+/// `round(weight^(1/gamma) * 256)` applied to the raw sampled byte in the
+/// *gamma-encoded* domain (`Blend::shade`: `(gain * value) >> 8`). Since
+/// `weight` is the linear-light seam share and encoded values are
+/// (approximately) `linear^(1/gamma)`, shading in the encoded domain by
+/// `weight^(1/gamma)` is exactly weighting the corresponding linear-light
+/// value by `weight`. Every source's `weight` sums to 1 across the sources
+/// covering a point (see the `Evaluator` doc comment in layout.rs), so
+/// summing the shaded slices' `(v/255)^gamma` back together reconstructs
+/// `(original/255)^gamma`, up to the gain's 1/256 quantization and
+/// `Blend::shade`'s integer-floor shading.
+///
+/// That sum-to-one composite is necessary but not sufficient: the current
+/// (pre-fix) `Evaluator` rule always makes covering weights sum to one, so
+/// it cannot see a defect that is a wrong SPLIT between two slices showing
+/// the same content rather than a wrong total. `reconstruction::share_at`
+/// and the `row_independence_*`/`grid_share_separability` tests below
+/// isolate one slice's own share of a pixel (not the composite) and check
+/// it against what the geometry says it should be, independent of the
+/// other covering slices' particular values.
+///
+/// See `.claude/plans/warp-fixes.md`, "Round 2 ... Slice SEAM": layout `d`
+/// (`brain_scaled_slices(0.07)`, brain's real 0.07-canvas-pixel row sliver,
+/// as opposed to `c`'s exact touch) reproduces the wall geometry that
+/// produced a wedge-shaped error at the row boundary under the old
+/// minimum-distance seam rule. `row_independence_brain_scaled_rows_overlap_sliver`
+/// is that slice's acceptance test: it currently FAILS (left failing, not
+/// `#[ignore]`d, per instructions), and its measured per-row shares are the
+/// evidence of the wedge.
+#[cfg(test)]
+mod reconstruction {
+    use super::super::{layout, warp_update};
+    use super::{Blend, PixelFormat};
+
+    const CANVAS_WIDTH: i32 = 400;
+    const CANVAS_HEIGHT: i32 = 260;
+    const GAMMA: f64 = 2.2;
+    /// Tolerance for the per-slice SHARE assertions below: 2 parts in 256,
+    /// matching the gain table's own quantization
+    /// (`Evaluator::transfer`'s `* 256.0`) rather than the coarser 8-bit
+    /// (`/255`) rounding the composite assertions use — a share is computed
+    /// directly from one rendered slice's byte, without the extra summation
+    /// step that the composite assertions' wider 3-code-value tolerance
+    /// accounts for.
+    const SHARE_TOLERANCE: f64 = 2.0 / 256.0;
+    /// The separability check multiplies two measured shares and compares
+    /// with a third. Each share comes from one floored 8-bit byte
+    /// (`Blend::shade` floors `(gain * value) >> 8`) of a gain that is itself
+    /// rounded to 1/256, so each carries up to about one code value of error;
+    /// at gamma 2.2 on a byte around 100 that is a little over 2% of the
+    /// share, and three of them compound to about 6/256. The weights
+    /// themselves are proven to factor exactly in
+    /// `layout::tests::a_grid_gives_the_product_of_two_one_dimensional_ramps_everywhere`;
+    /// this bound only has to be tight enough to catch a rule that does not
+    /// factor, which the minimum-distance rule missed by 0.13.
+    const SEPARABILITY_TOLERANCE: f64 = 6.0 / 256.0;
+
+    /// One output's placement: a canvas-space source rectangle (fractional
+    /// canvas pixels, as `geometry.source` stores it) and an independent
+    /// destination raster size (`mode.width`/`mode.height`, whatever the
+    /// output's own resolution is). The two are equal, integer values for
+    /// every slice except `brain_scaled_slices`' bottom row when it carries
+    /// a sub-pixel sliver: the destination is still an integer raster (it
+    /// has to be), but the source that raster is placed against in the
+    /// `Evaluator`'s canvas-space geometry can be fractional.
+    #[derive(Clone, Copy)]
+    struct SliceGeom {
+        source_x: f64,
+        source_y: f64,
+        source_width: f64,
+        source_height: f64,
+        mode_width: i32,
+        mode_height: i32,
+    }
+
+    impl SliceGeom {
+        /// Integer placement at 100% content scale: raster and canvas-space
+        /// source rectangle are pixel-identical, so sampling is exact (no
+        /// warp, no bilinear interpolation).
+        fn exact(x: i32, y: i32, width: i32, height: i32) -> Self {
+            Self {
+                source_x: f64::from(x),
+                source_y: f64::from(y),
+                source_width: f64::from(width),
+                source_height: f64::from(height),
+                mode_width: width,
+                mode_height: height,
+            }
+        }
+    }
+
+    /// A smooth diagonal gradient, two hard edges (a vertical step at 1/3
+    /// width, a horizontal step at 2/3 height), and a flat mid-gray field in
+    /// the canvas center. Values span the full 0..255 range, including near
+    /// both ends within every overlap band exercised below, so the
+    /// blend-off "doubled overlap" assertion is never vacuous.
+    fn content_value(x: i32, y: i32) -> u8 {
+        let gx = f64::from(x) / f64::from(CANVAS_WIDTH - 1);
+        let gy = f64::from(y) / f64::from(CANVAS_HEIGHT - 1);
+        let mut v = 0.5 * (gx + gy) * 255.0;
+        if x >= CANVAS_WIDTH / 3 {
+            v += 60.0;
+        }
+        if y >= 2 * CANVAS_HEIGHT / 3 {
+            v -= 40.0;
+        }
+        v = v.clamp(0.0, 255.0);
+        let (cx0, cx1) = (CANVAS_WIDTH * 3 / 8, CANVAS_WIDTH * 5 / 8);
+        let (cy0, cy1) = (CANVAS_HEIGHT * 3 / 8, CANVAS_HEIGHT * 5 / 8);
+        if x >= cx0 && x < cx1 && y >= cy0 && y < cy1 {
+            v = 128.0;
+        }
+        v.round() as u8
+    }
+
+    /// The canvas picture, packed BGRA to match `PixelFormat` below.
+    /// R = G = B at every pixel, so one channel's arithmetic proves all
+    /// three; a captured canvas is never anything but 8-bit RGB(A) here.
+    fn build_canvas() -> Vec<u8> {
+        build_canvas_with(content_value)
+    }
+
+    /// A flat field for the share checks. A share is read back out of 8-bit
+    /// slice bytes, and `Blend::shade` floors `(gain * value) >> 8`, so with
+    /// content that changes from row to row the floor lands differently on
+    /// neighboring rows and reads as a share difference of about 1.5/256 that
+    /// has nothing to do with geometry. On a flat field the only noise left is
+    /// the quantization of the gain itself and of the one output byte.
+    fn build_flat_canvas() -> Vec<u8> {
+        build_canvas_with(|_, _| 200)
+    }
+
+    fn build_canvas_with(value: impl Fn(i32, i32) -> u8) -> Vec<u8> {
+        let stride = CANVAS_WIDTH as usize * 4;
+        let mut canvas = vec![0u8; stride * CANVAS_HEIGHT as usize];
+        for y in 0..CANVAS_HEIGHT {
+            for x in 0..CANVAS_WIDTH {
+                let v = value(x, y);
+                let offset = y as usize * stride + x as usize * 4;
+                canvas[offset] = v; // blue
+                canvas[offset + 1] = v; // green
+                canvas[offset + 2] = v; // red
+                canvas[offset + 3] = 255;
+            }
+        }
+        canvas
+    }
+
+    fn canvas_config() -> crate::model::CanvasConfig {
+        crate::model::CanvasConfig {
+            aspect: f64::from(CANVAS_WIDTH) / f64::from(CANVAS_HEIGHT),
+            render_width: CANVAS_WIDTH as u32,
+        }
+    }
+
+    /// A shared-canvas output: identity corners, center `[0.5, 0.5]`,
+    /// `source == raster_footprint`.
+    fn output_config(name: &str, geom: SliceGeom) -> crate::model::OutputConfig {
+        let mut config = crate::model::OutputConfig::new(crate::model::OutputMatch::by_name(name));
+        config.mode = Some(crate::model::Mode {
+            width: geom.mode_width,
+            height: geom.mode_height,
+            refresh_hz: 60.0,
+        });
+        let source = crate::model::CanvasRect {
+            x: geom.source_x / f64::from(CANVAS_WIDTH),
+            y: geom.source_y / f64::from(CANVAS_WIDTH),
+            width: geom.source_width / f64::from(CANVAS_WIDTH),
+            height: geom.source_height / f64::from(CANVAS_WIDTH),
+        };
+        config.geometry = Some(crate::model::OutputGeometry {
+            source,
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: source,
+        });
+        config
+    }
+
+    /// The attached display `canvas_plan_with_correction` needs to actually
+    /// emit a slice for this output (an output absent from `observed` only
+    /// shapes the layout, contributing no slice of its own).
+    fn observed_output(name: &str, geom: SliceGeom) -> crate::model::Output {
+        let mode = crate::model::Mode {
+            width: geom.mode_width,
+            height: geom.mode_height,
+            refresh_hz: 60.0,
+        };
+        crate::model::Output {
+            name: name.to_string(),
+            active: true,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: Some(mode),
+            modes: vec![mode],
+            rect: crate::model::Rect {
+                x: 0,
+                y: 0,
+                width: geom.mode_width,
+                height: geom.mode_height,
+            },
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        }
+    }
+
+    fn desired_state(slices: &[(&str, SliceGeom)], blend: bool) -> crate::model::DesiredState {
+        let mut desired = crate::model::DesiredState::new();
+        desired.projection = Some(crate::model::ProjectionConfig {
+            mode: crate::model::ProjectionMode::Simple,
+            canvas: Some(canvas_config()),
+            blend,
+            ..Default::default()
+        });
+        for (name, geom) in slices {
+            desired.outputs.push(output_config(name, *geom));
+        }
+        desired
+    }
+
+    /// Builds the `SlicerSpec` the reconciler hands the slicer, through the
+    /// real `canvas_plan_with_correction` entry point. `apply_correction:
+    /// false` so no warp stage is involved.
+    fn slicer_spec(slices: &[(&str, SliceGeom)], blend: bool) -> super::SlicerSpec {
+        let desired = desired_state(slices, blend);
+        let observed: Vec<crate::model::Output> = slices
+            .iter()
+            .map(|(name, geom)| observed_output(name, *geom))
+            .collect();
+        let plan = layout::canvas_plan_with_correction(&desired, &observed, false)
+            .expect("a shared canvas with identity corners and a valid layout plans");
+        let projection = desired.projection.as_ref().unwrap();
+        super::SlicerSpec {
+            control_session: String::new(),
+            source: "canvas".to_string(),
+            canvas_width: plan.canvas_width,
+            canvas_height: plan.canvas_height,
+            gamma: projection.gamma,
+            black_lift: projection.black_lift.level(),
+            adaptive_lift: None,
+            pattern: None,
+            free_run: false,
+            renderer: crate::model::Renderer::Cpu,
+            layout: plan.layout,
+            coverage_rects: plan.coverage_rects,
+            slices: plan.slices,
+        }
+    }
+
+    // ---- shared layout geometry --------------------------------------
+
+    fn two_strip_slices() -> Vec<(&'static str, SliceGeom)> {
+        let overlap = (f64::from(CANVAS_HEIGHT) * 0.2).round() as i32; // 52
+        let strip_height = (CANVAS_HEIGHT + overlap) / 2; // 156
+        let y2 = CANVAS_HEIGHT - strip_height; // 104
+        vec![
+            ("TOP", SliceGeom::exact(0, 0, CANVAS_WIDTH, strip_height)),
+            (
+                "BOTTOM",
+                SliceGeom::exact(0, y2, CANVAS_WIDTH, strip_height),
+            ),
+        ]
+    }
+
+    /// `(slices, x2, col_width, y2, strip_height)`: the last four values are
+    /// the column/row overlap-band bounds, returned so callers (the sum
+    /// test and the separability test) never recompute them independently
+    /// and risk disagreeing.
+    fn grid_slices() -> (Vec<(&'static str, SliceGeom)>, i32, i32, i32, i32) {
+        let overlap_y = (f64::from(CANVAS_HEIGHT) * 0.2).round() as i32; // 52
+        let strip_height = (CANVAS_HEIGHT + overlap_y) / 2; // 156
+        let y2 = CANVAS_HEIGHT - strip_height; // 104
+        let overlap_x = (f64::from(CANVAS_WIDTH) * 0.2).round() as i32; // 80
+        let col_width = (CANVAS_WIDTH + overlap_x) / 2; // 240
+        let x2 = CANVAS_WIDTH - col_width; // 160
+        let slices = vec![
+            ("TL", SliceGeom::exact(0, 0, col_width, strip_height)),
+            ("TR", SliceGeom::exact(x2, 0, col_width, strip_height)),
+            ("BL", SliceGeom::exact(0, y2, col_width, strip_height)),
+            ("BR", SliceGeom::exact(x2, y2, col_width, strip_height)),
+        ];
+        (slices, x2, col_width, y2, strip_height)
+    }
+
+    /// brain's real wall geometry, scaled to this 400x260 canvas: two
+    /// columns overlapping 5.75% of the canvas width (nearest integer pixel
+    /// to brain's measured 5.8%), two rows separated by `row_sliver` canvas
+    /// pixels of overlap — `0.0` is an exact touch (`c`, as before),
+    /// `0.07` is brain's real sub-pixel sliver (`d`), the value that
+    /// produces the wedge. Returns `(slices, row_boundary)`.
+    ///
+    /// The destination (raster) height of the bottom row is derived from
+    /// its floored source origin so it always reaches the canvas edge
+    /// (`CANVAS_HEIGHT - floor(row_height - row_sliver)`): the raster is an
+    /// integer buffer regardless of the sliver, but the canvas-space source
+    /// rectangle the `Evaluator` sees for it is not, which is exactly what
+    /// lets a sub-pixel sliver exist in the first place.
+    fn brain_scaled_slices(row_sliver: f64) -> (Vec<(&'static str, SliceGeom)>, i32) {
+        let col1_width = 212;
+        let overlap_x = 23;
+        let col2_x = col1_width - overlap_x; // 189
+        let col2_width = CANVAS_WIDTH - col2_x; // 211
+        let row_height = CANVAS_HEIGHT / 2; // 130
+
+        let row2_source_y = f64::from(row_height) - row_sliver;
+        let row2_dest_y = row2_source_y.floor() as i32;
+        let row2_dest_height = CANVAS_HEIGHT - row2_dest_y;
+        let row2_source_height = f64::from(CANVAS_HEIGHT) - row2_source_y;
+
+        let row2_geom = |x: i32, width: i32| SliceGeom {
+            source_x: f64::from(x),
+            source_y: row2_source_y,
+            source_width: f64::from(width),
+            source_height: row2_source_height,
+            mode_width: width,
+            mode_height: row2_dest_height,
+        };
+
+        let slices = vec![
+            ("C1R1", SliceGeom::exact(0, 0, col1_width, row_height)),
+            ("C2R1", SliceGeom::exact(col2_x, 0, col2_width, row_height)),
+            ("C1R2", row2_geom(0, col1_width)),
+            ("C2R2", row2_geom(col2_x, col2_width)),
+        ];
+        (slices, row_height)
+    }
+
+    // ---- rendering the real CPU content path --------------------------
+
+    /// One slice's rendered raster (BGRA, matching `PixelFormat` below) and
+    /// where it sits on the canvas.
+    struct RenderedSlice {
+        output: String,
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+        pixels: Vec<u8>,
+        /// The canvas the slice was rendered from, so a share is measured
+        /// against what the pipeline actually saw, whatever content a test
+        /// chose.
+        canvas: Vec<u8>,
+    }
+
+    impl RenderedSlice {
+        fn original_at(&self, x: i32, y: i32) -> u8 {
+            if x < 0 || y < 0 || x >= CANVAS_WIDTH || y >= CANVAS_HEIGHT {
+                return 0;
+            }
+            self.canvas[(y as usize * CANVAS_WIDTH as usize + x as usize) * 4 + 1]
+        }
+    }
+
+    impl RenderedSlice {
+        /// The shaded red-channel byte (R = G = B in this canvas) at canvas
+        /// pixel `(cx, cy)`, or `None` if this slice's raster does not
+        /// cover that pixel.
+        fn value_at(&self, cx: i32, cy: i32) -> Option<u8> {
+            let lx = cx - self.x;
+            let ly = cy - self.y;
+            if lx < 0 || ly < 0 || lx as u32 >= self.width || ly as u32 >= self.height {
+                return None;
+            }
+            let offset = (ly as u32 * self.width + lx as u32) as usize * 4;
+            Some(self.pixels[offset + 2])
+        }
+    }
+
+    /// Renders every slice `spec` describes with the real CPU content path:
+    /// `warp_update::fill_rows` builds the transfer table exactly as the
+    /// slicer's startup bootstrap does, and `Blend::rows` is the same
+    /// per-pixel shading `present_frame_cpu` calls.
+    fn render_slices(spec: &super::SlicerSpec, canvas: &[u8]) -> Vec<RenderedSlice> {
+        let coverage = super::Coverage::new(warp_update::coverage_rects(spec));
+        let evaluator = spec
+            .layout
+            .as_ref()
+            .map(|l| layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height).unwrap());
+
+        spec.slices
+            .iter()
+            .map(|slice| {
+                let width = slice.source.width as u32;
+                let height = slice.source.height as u32;
+                let layout_index = evaluator
+                    .as_ref()
+                    .map(|e| (e, e.index(&slice.output).unwrap()));
+
+                let mut transfer = vec![(0u16, 0u8); (width * height) as usize];
+                warp_update::fill_rows(
+                    spec,
+                    slice,
+                    None,
+                    &coverage,
+                    layout_index,
+                    (width, height),
+                    0,
+                    &mut transfer,
+                );
+
+                let blend = Blend {
+                    canvas,
+                    transfer: &transfer,
+                    format: PixelFormat {
+                        bytes: 4,
+                        red: 2,
+                        green: 1,
+                        blue: 0,
+                    },
+                    stride: spec.canvas_width as u32 * 4,
+                    y_invert: false,
+                    usable_width: spec.canvas_width as u32,
+                    usable_height: spec.canvas_height as u32,
+                    source_x: slice.source.x.max(0) as u32,
+                    source_y: slice.source.y.max(0) as u32,
+                    width,
+                    sample: None,
+                };
+                let mut output = vec![0u8; (width * height * 4) as usize];
+                blend.rows(&mut output, 0, height);
+
+                RenderedSlice {
+                    output: slice.output.clone(),
+                    x: slice.source.x,
+                    y: slice.source.y,
+                    width,
+                    height,
+                    pixels: output,
+                    canvas: canvas.to_vec(),
+                }
+            })
+            .collect()
+    }
+
+    /// `(slice_v/255)^gamma / (original/255)^gamma` at canvas pixel
+    /// `(x, y)` for one rendered slice — the linear-light fraction of the
+    /// original that this slice alone is showing there. `None` when the
+    /// original is too dark to keep quantization noise small (below 64),
+    /// or when the slice's shaded byte is exactly 0. An exact 0 is the
+    /// `fill_rows` "not covered" sentinel (`(0, 0)` in the transfer table,
+    /// written as black by `Blend::shade`), not a very small real share —
+    /// it shows up at a slice's own raster edge when that edge's floored
+    /// integer origin extends slightly beyond its true (possibly
+    /// fractional) canvas-space source rectangle, which is not part of the
+    /// geometry this function is measuring.
+    fn share_at(rs: &RenderedSlice, x: i32, y: i32, gamma: f64) -> Option<f64> {
+        let original = rs.original_at(x, y);
+        if original < 64 {
+            return None;
+        }
+        let shaded = rs.value_at(x, y)?;
+        if shaded == 0 {
+            return None;
+        }
+        let original_linear = (f64::from(original) / 255.0).powf(gamma);
+        let shaded_linear = (f64::from(shaded) / 255.0).powf(gamma);
+        Some(shaded_linear / original_linear)
+    }
+
+    // ---- assertion set 1: sum-to-one composite -------------------------
+
+    struct Reconstruction {
+        max_error: f64,
+        mean_error: f64,
+        max_error_near_row_boundary: Option<f64>,
+        covered_everywhere: bool,
+    }
+
+    /// Places every rendered slice back on the canvas at its offset and
+    /// sums in linear light. `row_boundary`, when given, is a canvas row
+    /// index to track a separate max error within 30 rows of.
+    fn reconstruct(
+        spec: &super::SlicerSpec,
+        canvas: &[u8],
+        row_boundary: Option<i32>,
+    ) -> Reconstruction {
+        let rendered = render_slices(spec, canvas);
+
+        let mut composite = vec![0.0f64; (spec.canvas_width * spec.canvas_height) as usize];
+        let mut coverage_count = vec![0u32; composite.len()];
+
+        for rs in &rendered {
+            for ly in 0..rs.height {
+                for lx in 0..rs.width {
+                    let cx = rs.x + lx as i32;
+                    let cy = rs.y + ly as i32;
+                    if cx < 0 || cy < 0 || cx >= spec.canvas_width || cy >= spec.canvas_height {
+                        continue;
+                    }
+                    let Some(shaded) = rs.value_at(cx, cy) else {
+                        continue;
+                    };
+                    let idx = (cy * spec.canvas_width + cx) as usize;
+                    composite[idx] += (f64::from(shaded) / 255.0).powf(GAMMA);
+                    coverage_count[idx] += 1;
+                }
+            }
+        }
+
+        let mut max_error = 0.0f64;
+        let mut max_error_near_boundary = row_boundary.map(|_| 0.0f64);
+        let mut sum_error = 0.0f64;
+        let mut n = 0usize;
+        let mut covered_everywhere = true;
+
+        for y in 0..spec.canvas_height {
+            for x in 0..spec.canvas_width {
+                let idx = (y * spec.canvas_width + x) as usize;
+                if coverage_count[idx] == 0 {
+                    covered_everywhere = false;
+                    continue;
+                }
+                let original = f64::from(content_value(x, y));
+                let composite_code = 255.0 * composite[idx].powf(1.0 / GAMMA);
+                let error = (composite_code - original).abs();
+                max_error = max_error.max(error);
+                sum_error += error;
+                n += 1;
+                if let (Some(boundary), Some(max_boundary)) =
+                    (row_boundary, max_error_near_boundary.as_mut())
+                {
+                    if (y - boundary).abs() <= 30 {
+                        *max_boundary = max_boundary.max(error);
+                    }
+                }
+            }
+        }
+
+        Reconstruction {
+            max_error,
+            mean_error: sum_error / n.max(1) as f64,
+            max_error_near_row_boundary: max_error_near_boundary,
+            covered_everywhere,
+        }
+    }
+
+    /// Runs both the blend-on and blend-off composites for one layout,
+    /// prints every measurement (so a failure still reports the numbers),
+    /// then checks them.
+    fn assert_reconstructs(name: &str, slices: &[(&str, SliceGeom)], row_boundary: Option<i32>) {
+        let canvas = build_canvas();
+
+        let on_spec = slicer_spec(slices, true);
+        let on = reconstruct(&on_spec, &canvas, row_boundary);
+        let off_spec = slicer_spec(slices, false);
+        let off = reconstruct(&off_spec, &canvas, None);
+
+        eprintln!(
+            "{name}: blend-on max {:.3}, mean {:.3}{}; blend-off max {:.3}",
+            on.max_error,
+            on.mean_error,
+            on.max_error_near_row_boundary
+                .map(|e| format!(", boundary-band max {e:.3}"))
+                .unwrap_or_default(),
+            off.max_error,
+        );
+
+        assert!(
+            on.covered_everywhere,
+            "{name}: every canvas pixel must be covered by at least one slice"
+        );
+
+        // The gain `Evaluator::transfer` writes is quantized to 1/256
+        // (`round(weight^(1/gamma) * 256.0)`), and `Blend::shade` then
+        // floors `(gain * value) >> 8` rather than rounding it, so a single
+        // covering source can already be off by close to one code value.
+        // A seam pixel sums two (or more) such shaded values, each with its
+        // own independent rounding, so 3 code values covers the worst case
+        // without being a loose margin; tighten it if the measurement above
+        // comes in lower.
+        assert!(
+            on.max_error <= 3.0,
+            "{name}: blend-on max error {} exceeds the 3 code value bound",
+            on.max_error
+        );
+        assert!(
+            on.mean_error <= 0.5,
+            "{name}: blend-on mean error {} exceeds the 0.5 code value bound",
+            on.mean_error
+        );
+        if let Some(boundary_error) = on.max_error_near_row_boundary {
+            assert!(
+                boundary_error <= 3.0,
+                "{name}: max error within 30 rows of the row boundary is {boundary_error}, \
+                 exceeding the 3 code value bound that holds everywhere else"
+            );
+        }
+
+        // Blend off (`projection.blend = false`) gives every covering
+        // source weight 1 (`Evaluator::weight_and_coverage`), so an overlap
+        // is the sum of `n` full-strength copies instead of one: proof the
+        // comparison above is not vacuous.
+        assert!(
+            off.max_error > 60.0,
+            "{name}: blend-off composite should double overlaps (error over 60 code values \
+             somewhere), got {}",
+            off.max_error
+        );
+    }
+
+    #[test]
+    fn two_horizontal_strips_20_percent_overlap() {
+        let slices = two_strip_slices();
+        assert_reconstructs("two horizontal strips, 20% overlap", &slices, None);
+    }
+
+    #[test]
+    fn two_by_two_grid_20_percent_overlaps() {
+        let (slices, ..) = grid_slices();
+        assert_reconstructs("2x2 grid, 20% overlaps both ways", &slices, None);
+    }
+
+    #[test]
+    fn brain_scaled_columns_overlap_rows_touch() {
+        // brain's real wall (see the SEAM slice notes in
+        // .claude/plans/warp-fixes.md): two columns overlapping 5.8% of the
+        // canvas width, two rows that touch with essentially no overlap.
+        // Scaled to this 400x260 canvas at integer pixels: the nearest
+        // integer overlap to 5.8% of 400 (23.2px) is 23px, i.e. 5.75%.
+        let (slices, row_boundary) = brain_scaled_slices(0.0);
+        assert_reconstructs(
+            "brain-scaled: columns overlap 5.75%, rows touch",
+            &slices,
+            Some(row_boundary),
+        );
+    }
+
+    #[test]
+    fn brain_scaled_columns_overlap_rows_overlap_sliver() {
+        // As above, but with brain's real measured 0.07-canvas-pixel row
+        // sliver instead of an exact touch. The sum-to-one composite still
+        // passes here (see the module doc comment: it cannot see a wrong
+        // SPLIT, only a wrong total) — `row_independence_brain_scaled_rows_overlap_sliver`
+        // below is the test that catches the wedge this sliver produces.
+        let (slices, row_boundary) = brain_scaled_slices(0.07);
+        assert_reconstructs(
+            "brain-scaled: columns overlap 5.75%, rows overlap by a 0.07px sliver",
+            &slices,
+            Some(row_boundary),
+        );
+    }
+
+    // ---- assertion set 2a: row independence of the column split -------
+
+    struct RowIndependenceReport {
+        max_deviation: f64,
+        worst: Option<(String, i32, i32, f64, f64)>,
+        /// `(row, share)` at one representative column, sorted by row, for
+        /// reporting a by-row profile near the boundary.
+        samples: Vec<(i32, f64)>,
+    }
+
+    /// For every output in `outputs` and every canvas column, compares that
+    /// output's share at each of its own rows (skipping `reference_row`
+    /// itself and any row whose pixel center falls inside
+    /// `[exclude_y_lo, exclude_y_hi]`, the row-overlap band) against its
+    /// share at `reference_row` in that same column. `sample_x` is recorded
+    /// at every row for the by-row report.
+    #[allow(clippy::too_many_arguments)]
+    fn check_row_independence(
+        rendered: &[RenderedSlice],
+        outputs: &[&str],
+        reference_row: i32,
+        exclude_y_lo: f64,
+        exclude_y_hi: f64,
+        canvas_width: i32,
+        sample_x: i32,
+    ) -> RowIndependenceReport {
+        let mut max_deviation = 0.0f64;
+        let mut worst = None;
+        let mut samples = Vec::new();
+
+        for name in outputs {
+            let rs = rendered
+                .iter()
+                .find(|s| s.output == *name)
+                .expect("named output is among the rendered slices");
+            for x in 0..canvas_width {
+                let Some(reference_share) = share_at(rs, x, reference_row, GAMMA) else {
+                    continue;
+                };
+                for ly in 0..rs.height {
+                    let y = rs.y + ly as i32;
+                    if y == reference_row {
+                        continue;
+                    }
+                    let yc = f64::from(y) + 0.5;
+                    if yc >= exclude_y_lo && yc <= exclude_y_hi {
+                        continue;
+                    }
+                    let Some(share) = share_at(rs, x, y, GAMMA) else {
+                        continue;
+                    };
+                    if x == sample_x {
+                        samples.push((y, share));
+                    }
+                    let deviation = (share - reference_share).abs();
+                    if deviation > max_deviation {
+                        max_deviation = deviation;
+                        worst = Some(((*name).to_string(), x, y, share, reference_share));
+                    }
+                }
+            }
+        }
+        samples.sort_by_key(|(y, _)| *y);
+        RowIndependenceReport {
+            max_deviation,
+            worst,
+            samples,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn assert_row_independence(
+        name: &str,
+        spec: &super::SlicerSpec,
+        canvas: &[u8],
+        top: &[&str],
+        bottom: &[&str],
+        row_boundary: i32,
+        band_lo: f64,
+        band_hi: f64,
+        sample_x: i32,
+    ) {
+        let rendered = render_slices(spec, canvas);
+        let top_report =
+            check_row_independence(&rendered, top, 0, band_lo, band_hi, CANVAS_WIDTH, sample_x);
+        let bottom_report = check_row_independence(
+            &rendered,
+            bottom,
+            CANVAS_HEIGHT - 1,
+            band_lo,
+            band_hi,
+            CANVAS_WIDTH,
+            sample_x,
+        );
+
+        eprintln!(
+            "{name}: top-half (reference row 0) max deviation {:.4} (tolerance {:.4})",
+            top_report.max_deviation, SHARE_TOLERANCE
+        );
+        if let Some((output, x, y, share, reference)) = &top_report.worst {
+            eprintln!(
+                "  worst: {output} at ({x},{y}) share {share:.4} vs row-0 reference {reference:.4}"
+            );
+        }
+        eprintln!(
+            "{name}: bottom-half (reference row {}) max deviation {:.4} (tolerance {:.4})",
+            CANVAS_HEIGHT - 1,
+            bottom_report.max_deviation,
+            SHARE_TOLERANCE
+        );
+        if let Some((output, x, y, share, reference)) = &bottom_report.worst {
+            eprintln!(
+                "  worst: {output} at ({x},{y}) share {share:.4} vs row-{}-reference {reference:.4}",
+                CANVAS_HEIGHT - 1
+            );
+        }
+        eprintln!(
+            "{name}: sample column x={sample_x}, bottom-half share by row near the boundary:"
+        );
+        for (y, share) in bottom_report
+            .samples
+            .iter()
+            .filter(|(y, _)| (*y - row_boundary).abs() <= 30)
+        {
+            eprintln!(
+                "    row {y} (boundary+{}): share {share:.4}",
+                y - row_boundary
+            );
+        }
+
+        assert!(
+            top_report.max_deviation <= SHARE_TOLERANCE,
+            "{name}: top-half share depends on row (max deviation {} > {})",
+            top_report.max_deviation,
+            SHARE_TOLERANCE
+        );
+        assert!(
+            bottom_report.max_deviation <= SHARE_TOLERANCE,
+            "{name}: bottom-half share depends on row (max deviation {} > {}) — a wrong SPLIT \
+             between the two column slices, not a wrong total",
+            bottom_report.max_deviation,
+            SHARE_TOLERANCE
+        );
+    }
+
+    #[test]
+    fn row_independence_two_horizontal_strips() {
+        // No column split at all in this layout (a single output per row),
+        // so every column has exactly one covering row-slice outside the
+        // row-overlap band: a trivial sanity check that the harness itself
+        // is not the source of any deviation seen in the brain-scaled
+        // layouts below.
+        let canvas = build_flat_canvas();
+        let slices = two_strip_slices();
+        let spec = slicer_spec(&slices, true);
+        assert_row_independence(
+            "two horizontal strips",
+            &spec,
+            &canvas,
+            &["TOP"],
+            &["BOTTOM"],
+            130,
+            104.0,
+            156.0,
+            200,
+        );
+    }
+
+    #[test]
+    fn row_independence_brain_scaled_rows_touch() {
+        let canvas = build_flat_canvas();
+        let (slices, row_boundary) = brain_scaled_slices(0.0);
+        let spec = slicer_spec(&slices, true);
+        // Sample column: 10% into the column-overlap band from its left
+        // edge (189 + 10% of 23px).
+        assert_row_independence(
+            "brain-scaled, rows touch exactly",
+            &spec,
+            &canvas,
+            &["C1R1", "C2R1"],
+            &["C1R2", "C2R2"],
+            row_boundary,
+            130.0,
+            130.0,
+            191,
+        );
+    }
+
+    #[test]
+    fn row_independence_brain_scaled_rows_overlap_sliver() {
+        let canvas = build_flat_canvas();
+        let (slices, row_boundary) = brain_scaled_slices(0.07);
+        let spec = slicer_spec(&slices, true);
+        // Expected to FAIL under the current minimum-distance seam rule:
+        // the 0.07px row sliver spuriously activates the row edge across
+        // the whole column-overlap band (`build_edge_masks`'s per-column
+        // tables do not depend on the query row), pinning the C1/C2 column
+        // split near 0.5 for a wedge below the row boundary before it
+        // "snaps" to the correct ramp. See .claude/plans/warp-fixes.md,
+        // "Round 2 ... Slice SEAM" — this is that slice's acceptance test.
+        // Left failing on purpose: do not add #[ignore].
+        assert_row_independence(
+            "brain-scaled, rows overlap by a 0.07px sliver",
+            &spec,
+            &canvas,
+            &["C1R1", "C2R1"],
+            &["C1R2", "C2R2"],
+            row_boundary,
+            129.93,
+            130.0,
+            191,
+        );
+    }
+
+    // ---- assertion set 2b: grid separability ---------------------------
+
+    /// Each grid corner's share should be the product of a pure horizontal
+    /// ramp (measured along a row far from the row-overlap band, where only
+    /// that corner's own column-neighbor covers) and a pure vertical ramp
+    /// (measured along a column far from the column-overlap band, where
+    /// only its own row-neighbor covers). Reports and asserts this for all
+    /// four corners; "report whether this holds" per the brief — this is
+    /// not something the harness assumes, it is measured.
+    fn assert_grid_share_separability(
+        spec: &super::SlicerSpec,
+        canvas: &[u8],
+        x2: i32,
+        col_width: i32,
+        y2: i32,
+        strip_height: i32,
+    ) {
+        let rendered = render_slices(spec, canvas);
+
+        // Reference lines 80px in from each edge: comfortably outside both
+        // the [x2, col_width) column-overlap band and the [y2, strip_height)
+        // row-overlap band used below.
+        let far_left = 80;
+        let far_right = CANVAS_WIDTH - 1 - 80;
+        let top_row = 0;
+        let bottom_row = CANVAS_HEIGHT - 1;
+
+        struct Corner {
+            name: &'static str,
+            ramp_x_row: i32,
+            ramp_y_col: i32,
+        }
+        let corners = [
+            Corner {
+                name: "TL",
+                ramp_x_row: top_row,
+                ramp_y_col: far_left,
+            },
+            Corner {
+                name: "TR",
+                ramp_x_row: top_row,
+                ramp_y_col: far_right,
+            },
+            Corner {
+                name: "BL",
+                ramp_x_row: bottom_row,
+                ramp_y_col: far_left,
+            },
+            Corner {
+                name: "BR",
+                ramp_x_row: bottom_row,
+                ramp_y_col: far_right,
+            },
+        ];
+
+        struct CornerResult {
+            name: &'static str,
+            checked: usize,
+            max_deviation: f64,
+            worst: Option<(i32, i32, f64, f64)>,
+        }
+
+        let mut results = Vec::new();
+        for corner in &corners {
+            let rs = rendered
+                .iter()
+                .find(|s| s.output == corner.name)
+                .expect("corner output is among the rendered slices");
+
+            let ramp_x: Vec<(i32, Option<f64>)> = (x2..col_width)
+                .map(|x| (x, share_at(rs, x, corner.ramp_x_row, GAMMA)))
+                .collect();
+            let ramp_y: Vec<(i32, Option<f64>)> = (y2..strip_height)
+                .map(|y| (y, share_at(rs, corner.ramp_y_col, y, GAMMA)))
+                .collect();
+
+            let mut max_deviation = 0.0f64;
+            let mut worst = None;
+            let mut checked = 0usize;
+            for &(x, rx) in &ramp_x {
+                let Some(rx) = rx else { continue };
+                for &(y, ry) in &ramp_y {
+                    let Some(ry) = ry else { continue };
+                    let Some(actual) = share_at(rs, x, y, GAMMA) else {
+                        continue;
+                    };
+                    let expected = rx * ry;
+                    let deviation = (actual - expected).abs();
+                    checked += 1;
+                    if deviation > max_deviation {
+                        max_deviation = deviation;
+                        worst = Some((x, y, actual, expected));
+                    }
+                }
+            }
+            results.push(CornerResult {
+                name: corner.name,
+                checked,
+                max_deviation,
+                worst,
+            });
+        }
+
+        for result in &results {
+            eprintln!(
+                "grid separability, {}: checked {} points, max deviation {:.4} (tolerance {:.4})",
+                result.name, result.checked, result.max_deviation, SEPARABILITY_TOLERANCE
+            );
+            if let Some((x, y, actual, expected)) = result.worst {
+                eprintln!(
+                    "  worst: ({x},{y}) actual share {actual:.4} vs ramp_x*ramp_y {expected:.4}"
+                );
+            }
+        }
+
+        for result in &results {
+            assert!(
+                result.checked > 0,
+                "grid separability: {} had no comparable points (bright-enough overlap)",
+                result.name
+            );
+            assert!(
+                result.max_deviation <= SEPARABILITY_TOLERANCE,
+                "grid separability failed for {}: max deviation {} > {}",
+                result.name,
+                result.max_deviation,
+                SEPARABILITY_TOLERANCE
+            );
+        }
+    }
+
+    #[test]
+    fn grid_share_separability() {
+        let canvas = build_flat_canvas();
+        let (slices, x2, col_width, y2, strip_height) = grid_slices();
+        let spec = slicer_spec(&slices, true);
+        assert_grid_share_separability(&spec, &canvas, x2, col_width, y2, strip_height);
+    }
+}
