@@ -94,7 +94,7 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<Status> {
     // be visible immediately, not only once the next reconciliation gets
     // around to republishing. Both are cheap reads off the same `StateStore`
     // the reconciler itself consults, so refreshing them here costs nothing.
-    status.committed = !state.store.has_preview();
+    status.committed = !state.store.has_unsaved_edits();
     status.current_revision = state.store.revision();
     // The runner's last results, not a fresh run: checks shell out to other
     // programs, so this stays a cheap read, matching whatever `main.rs`'s
@@ -544,24 +544,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn committed_reflects_whether_a_working_copy_is_live() {
+    async fn committed_reflects_whether_a_working_copy_has_a_real_edit() {
         // Set and clear a preview directly through the store, the way
         // src/api/config_routes.rs's own tests do, rather than driving a
         // PUT through the router: what is under test is `get_status`
         // reading the store live, not the write path that populates it.
+        //
+        // Was `committed_reflects_whether_a_working_copy_is_live`, and used a
+        // preview identical to `current` to prove `!committed` — that stopped
+        // being true once "unsaved" started meaning "differs from `current`"
+        // rather than "a preview exists" (`StateStore::has_unsaved_edits`,
+        // added for `TemporarySettings`). The preview here now carries a real
+        // edit, which is what the renamed test is actually about.
         let harness = harness(None);
 
         let status = super::get_status(State(harness.state.clone())).await.0;
         assert!(status.committed, "no working copy yet");
 
-        harness
-            .state
-            .store
-            .set_preview(Some(harness.state.store.get()));
+        let mut edited = harness.state.store.get();
+        edited.settings.hide_cursor = !edited.settings.hide_cursor;
+        harness.state.store.set_preview(Some(edited));
         let status = super::get_status(State(harness.state.clone())).await.0;
         assert!(
             !status.committed,
-            "a live working copy is not what is saved on disk"
+            "a live working copy with a real edit is not what is saved on disk"
         );
 
         harness.state.store.set_preview(None);

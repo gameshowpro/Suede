@@ -1204,6 +1204,7 @@ mod tests {
             adaptive_lift: None,
             layout: None,
             coverage_rects: Vec::new(),
+            highlight_overlaps: false,
             control_session: String::new(),
             source: "HEADLESS-1".to_string(),
             canvas_width: 100,

@@ -145,7 +145,26 @@ pub struct SlicerSpec {
     /// Configured simple-mode coverage, including unattached outputs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_rects: Vec<Rect>,
+    /// Draw the seam-boundary lineup markers over every output — the
+    /// ephemeral `projection.temporary.highlightOverlaps` toggle, threaded
+    /// here beside `pattern` and `gamma` because it shapes the per-pixel
+    /// transfer table exactly as they do. A live-updatable field: it is
+    /// deliberately absent from [`super::warp_update::same_topology`], so
+    /// toggling it rebuilds the tables on the running slicer instead of
+    /// restarting it. `false` is a complete no-op — see [`MARKER_NONE`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub highlight_overlaps: bool,
     pub slices: Vec<SliceSpec>,
+}
+
+impl SlicerSpec {
+    /// The marker colors to paint with, or `None` while the markers are off.
+    /// Both renderers pick their marker variant from this when a spec is
+    /// installed, so a gamma change reaches the colors only while it is on.
+    pub fn marker_palette(&self) -> Option<MarkerPalette> {
+        self.highlight_overlaps
+            .then(|| MarkerPalette::for_gamma(self.gamma))
+    }
 }
 
 /// Everything the reconciler derives from the configured layout.
@@ -373,9 +392,10 @@ pub struct Coverage {
 /// Shape-transfer format used by adaptive black lift. Bit 31 tags this as a
 /// dynamic entry. Bits 0..15 store the gamma-shaped ramp, bits 16..23 store
 /// output-pixel picture coverage, bits 24..27 store physical coverage count,
-/// and bits 28..30 are reserved and zero. All floating values are clamped
-/// before positive-ties-up rounding; coverage counts above eight are rejected
-/// by the update validator and saturate here for defensive callers.
+/// bits 28..29 carry the seam-boundary marker tag (see [`MARKER_NONE`]) and
+/// bit 30 is reserved and zero. All floating values are clamped before
+/// positive-ties-up rounding; coverage counts above eight are rejected by the
+/// update validator and saturate here for defensive callers.
 pub const DYNAMIC_TRANSFER_TAG: u32 = 1 << 31;
 
 pub fn pack_dynamic_shape(ramp: f64, edge: f64, coverage: u32) -> u32 {
@@ -385,12 +405,22 @@ pub fn pack_dynamic_shape(ramp: f64, edge: f64, coverage: u32) -> u32 {
     DYNAMIC_TRANSFER_TAG | r | (e << 16) | (n << 24)
 }
 
+/// The ramp, border coverage and coverage count of a dynamic entry, or
+/// `None` if it is not one. The marker tag in bits 28..29 is deliberately
+/// ignored here rather than rejected: a marker overrides the shade this
+/// triple produces, it does not change it, so the two are independent. Bit
+/// 30 remains reserved and a set one is still not a valid entry.
 pub fn unpack_dynamic_shape(value: u32) -> Option<(u16, u8, u8)> {
-    (value & DYNAMIC_TRANSFER_TAG != 0 && value & 0x7000_0000 == 0).then_some((
+    (value & DYNAMIC_TRANSFER_TAG != 0 && value & 0x4000_0000 == 0).then_some((
         (value & 0xffff) as u16,
         ((value >> 16) & 0xff) as u8,
         ((value >> 24) & 0xf) as u8,
     ))
+}
+
+/// The marker tag carried by a packed transfer word, fixed or dynamic.
+pub fn marker_of_packed(value: u32) -> u8 {
+    ((value >> MARKER_PACKED_SHIFT) & 0x3) as u8
 }
 
 /// Reference arithmetic for the tagged dynamic transfer. The ramp and edge
@@ -475,6 +505,124 @@ impl Coverage {
         }
         (black_lift.clamp(0.0, 1.0) * f64::from(self.max - n) / f64::from(n)).clamp(0.0, 1.0)
     }
+}
+
+/// Seam-boundary marker tags — the `highlightOverlaps` lineup aid.
+///
+/// A tagged destination pixel is painted a flat, full-strength palette
+/// color, **overriding** whatever the transfer above would have produced.
+/// That override is not a stylistic choice, it is the only thing that can
+/// work: the blue line marks the point where this source's own blend weight
+/// reaches exactly zero, so a marker composited as ordinary pre-transfer
+/// content would be multiplied away precisely where it is drawn. See
+/// [`super::layout::Evaluator::marker_at`] for where the two boundaries are.
+///
+/// **Why a spare-bit tag rather than a second buffer.** The tag has to reach
+/// two consumers that already carry one per-destination-pixel word each, and
+/// both words have unused range:
+/// - the fixed `(a, b)` pair's gain is `0..=256` ([`pixel_transfer`],
+///   [`super::layout::Evaluator::transfer`]), so bits 9..15 of its `u16` are
+///   always zero — this uses the top two, 14..15, as
+///   [`MARKER_GAIN_SHIFT`];
+/// - the packed `u32` the GPU reads is `a << 8 | b` for a fixed entry (bits
+///   17..31 zero) and [`pack_dynamic_shape`] for a dynamic one (bits 28..30
+///   documented reserved zero), so bits 28..29 are free in *both* — this
+///   uses them, as [`MARKER_PACKED_SHIFT`], so the shader has exactly one
+///   place to look regardless of transfer mode.
+///
+/// Adding a parallel buffer instead would have meant a fourth SSBO binding,
+/// a descriptor-layout and pipeline change, a per-output allocation and
+/// upload path and a push constant to say whether it is bound — all to carry
+/// two bits that the existing word already has room for.
+///
+/// Nothing is spent when the aid is off. An untagged entry is bit-for-bit the
+/// value this daemon has always produced, and only the marker variants read
+/// the tag: `blend_markers.frag` on the GPU (see `Gpu::set_markers`) and
+/// `Blend::marked_rows` / `SyncPaint::marked_rows` on the CPU. Each is chosen
+/// when a spec is installed, so the plain shader, row loops and table
+/// closures run unchanged while the aid is off.
+pub const MARKER_NONE: u8 = 0;
+/// Orange (see [`MarkerPalette`]), at this source's own gradient START — the
+/// boundary between the last full-weight pixel and the first attenuated one.
+pub const MARKER_ORANGE: u8 = 1;
+/// Blue (see [`MarkerPalette`]), at the OUTSIDE edge of the same overlap,
+/// where this source's own blend weight reaches exactly zero.
+pub const MARKER_BLUE: u8 = 2;
+
+/// Where a tag lives in the fixed `(a, b)` pair's `u16` gain.
+pub const MARKER_GAIN_SHIFT: u32 = 14;
+/// Everything below [`MARKER_GAIN_SHIFT`]: the gain itself, `0..=256`.
+pub const MARKER_GAIN_MASK: u16 = (1 << MARKER_GAIN_SHIFT) - 1;
+/// Where a tag lives in the packed `u32` both transfer formats share.
+pub const MARKER_PACKED_SHIFT: u32 = 28;
+
+/// The green both marker colors share at `gamma`: `round(255 × 0.5^(1/gamma))`,
+/// the signal that emits exactly half the light. 186 (`0xba`) at 2.2.
+pub fn marker_green(gamma: f64) -> u8 {
+    (255.0 * 0.5f64.powf(1.0 / gamma)).round() as u8
+}
+
+/// The two marker colors, orange `(255, g, 0)` and blue `(0, g, 255)` with
+/// `g` from [`marker_green`] at the configured gamma.
+///
+/// The two are complementary in LIGHT, not in signal: projectors add light,
+/// so each green emits half and the pair sums to `(1, 1, 1)`. Where a wall is
+/// lined up correctly one output's orange lands on its neighbor's blue and
+/// the pair reads as a white line; any misalignment shows as an orange or
+/// blue fringe instead. That also makes an aligned line a gamma check: if it
+/// reads green or magenta rather than white, the configured gamma does not
+/// match the projectors'.
+///
+/// Computed only when a spec is installed with markers on (see
+/// [`SlicerSpec::marker_palette`]), never per frame.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarkerPalette {
+    green: u8,
+}
+
+impl MarkerPalette {
+    pub fn for_gamma(gamma: f64) -> Self {
+        MarkerPalette {
+            green: marker_green(gamma),
+        }
+    }
+
+    pub fn green(self) -> u8 {
+        self.green
+    }
+
+    /// The color a tag paints, or `None` for [`MARKER_NONE`] and any value
+    /// outside the palette. RGB, in the order a `#rrggbb` literal reads.
+    pub fn color(self, tag: u8) -> Option<[u8; 3]> {
+        match tag {
+            MARKER_ORANGE => Some([0xff, self.green, 0x00]),
+            MARKER_BLUE => Some([0x00, self.green, 0xff]),
+            _ => None,
+        }
+    }
+}
+
+/// The tag carried by a fixed `(a, b)` pair's gain.
+pub fn marker_of_gain(a: u16) -> u8 {
+    (a >> MARKER_GAIN_SHIFT) as u8
+}
+
+/// That gain with its tag removed — the `0..=256` the transfer arithmetic
+/// wants. Every consumer of a `(u16, u8)` table entry must go through this,
+/// or through [`marker_of_gain`], rather than reading the `u16` raw.
+pub fn gain_of(a: u16) -> u16 {
+    a & MARKER_GAIN_MASK
+}
+
+/// Tag a fixed `(a, b)` pair. `MARKER_NONE` returns it unchanged, which is
+/// what makes the aid a byte-for-byte no-op while it is off.
+pub fn with_marker((a, b): (u16, u8), tag: u8) -> (u16, u8) {
+    (a | (u16::from(tag) << MARKER_GAIN_SHIFT), b)
+}
+
+/// Tag a packed dynamic-shape word.
+pub fn with_packed_marker(value: u32, tag: u32) -> u32 {
+    value | (tag << MARKER_PACKED_SHIFT)
 }
 
 /// The signal transfer for one pixel with no seam weighting — full own-source
@@ -1212,6 +1360,26 @@ mod tests {
         assert!(pixels.iter().all(|&b| b == 0));
     }
 
+    /// Each marker green emits half the light at its gamma, so an aligned
+    /// orange and blue pair sums to white; 2.2 keeps the original `0xba`.
+    #[test]
+    fn marker_green_emits_half_the_light_at_the_configured_gamma() {
+        for (gamma, green) in [(1.8, 174), (2.2, 186), (2.4, 191)] {
+            assert_eq!(marker_green(gamma), green, "gamma {gamma}");
+            let palette = MarkerPalette::for_gamma(gamma);
+            assert_eq!(palette.color(MARKER_ORANGE), Some([255, green, 0]));
+            assert_eq!(palette.color(MARKER_BLUE), Some([0, green, 255]));
+            assert_eq!(palette.color(MARKER_NONE), None);
+            let light = |v: u8| (f64::from(v) / 255.0).powf(gamma);
+            for i in 0..3 {
+                let orange = palette.color(MARKER_ORANGE).unwrap()[i];
+                let blue = palette.color(MARKER_BLUE).unwrap()[i];
+                let sum = light(orange) + light(blue);
+                assert!((sum - 1.0).abs() < 0.01, "gamma {gamma} channel {i}: {sum}");
+            }
+        }
+    }
+
     #[test]
     fn a_pattern_overlay_is_opaque() {
         let spec = OverlaySpec {
@@ -1273,6 +1441,7 @@ mod tests {
             pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
+            highlight_overlaps: false,
             slices: vec![SliceSpec {
                 source_rect: None,
                 geometry: None,

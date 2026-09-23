@@ -4,7 +4,10 @@
 //! splitting. The control reader and build completion wake the Wayland poll;
 //! neither reads files nor waits on stdin in the render thread.
 use super::{
-    blend::{pack_dynamic_shape, pixel_transfer, Coverage, SliceSpec, SlicerSpec},
+    blend::{
+        pack_dynamic_shape, pixel_transfer, with_marker, with_packed_marker, Coverage, SliceSpec,
+        SlicerSpec,
+    },
     control::{ControlEvent, ControlEventKind, ControlUpdate, CONTROL_VERSION},
     warp::Warp,
 };
@@ -26,6 +29,20 @@ struct Key {
     layout: Option<super::layout::LocalKey>,
     coverage: Vec<crate::model::Rect>,
     dynamic: bool,
+    /// Whether this generation's table carries the seam-boundary marker
+    /// tags. Held here, not in [`super::layout::LocalKey`], because the
+    /// marker POSITIONS depend on nothing `LocalKey` does not already
+    /// record (`Evaluator::row_bands` reads the same tables `raw_weight`
+    /// does, and only while the layout is blending, which is exactly when
+    /// `LocalKey` records the neighbor rectangles). All that is left is the
+    /// toggle itself, and it invalidates every output's table.
+    ///
+    /// The marker WIDTHS also depend on the output size
+    /// (`Evaluator::marker_widths`). That needs no field here: a
+    /// [`Controller`]'s sizes are fixed for its lifetime, and a presenter
+    /// whose size changes fails the install check and restarts the slicer.
+    /// The source rectangle they scale from is in `slice` and `layout`.
+    markers: bool,
 }
 
 pub struct Output {
@@ -385,6 +402,12 @@ impl Controller {
     }
 }
 
+/// Whether two specs describe the same child-lifetime topology, so the
+/// difference between them can be rebuilt live instead of needing a restart.
+///
+/// `highlight_overlaps` is deliberately absent: it changes only the contents
+/// of the per-pixel tables, which is exactly what a live update rebuilds, so
+/// toggling the lineup aid must never restart the slicer.
 pub fn same_topology(a: &SlicerSpec, b: &SlicerSpec) -> bool {
     a.source == b.source
         && a.canvas_width == b.canvas_width
@@ -523,6 +546,7 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
                     spec.black_lift
                 },
                 dynamic: dynamic_mode(spec),
+                markers: spec.highlight_overlaps,
             })
         })
         .collect()
@@ -639,6 +663,66 @@ fn fill_generic<T: Copy>(
     }
 }
 
+/// [`fill_generic`] for the seam-marker tables only: the same walk, whose
+/// `value_of` also gets the pixel center's canvas position BEFORE the
+/// source-border texel-center clamp. Markers must be placed from that
+/// position. An output pixel can be much smaller than a canvas pixel (about
+/// a quarter on brain), and then a blue line, which lies against the
+/// source's own edge and is two output pixels wide, falls entirely inside
+/// the half-texel border that the clamp moves every sample out of.
+///
+/// Kept separate so the ordinary tables keep `fill_generic` exactly as it
+/// was. `highlight_overlaps_only_adds_tags_and_is_a_no_op_when_off` and
+/// `brains_wall_carries_both_marker_colors_through_the_real_pipeline` hold
+/// the two walks to the same coverage and transfer values.
+#[allow(clippy::too_many_arguments)]
+fn fill_marked<T: Copy>(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    warp: Option<&Warp>,
+    size: (u32, u32),
+    first_row: usize,
+    dest: &mut [T],
+    empty: T,
+    mut value_of: impl FnMut([f64; 2], [f64; 2], f64) -> T,
+) {
+    let width = size.0;
+    let origin = [slice.source.x as f64, slice.source.y as f64];
+    for (offset, value) in dest.iter_mut().enumerate() {
+        let x = (offset % width as usize) as u32;
+        let y = (first_row + offset / width as usize) as u32;
+        *value = empty;
+        let edge = warp.map_or(1.0, |w| w.coverage(x, y));
+        if edge == 0.0 {
+            continue;
+        }
+        let center = [x as f64 + 0.5, y as f64 + 0.5];
+        let Some((clamped, raw)) = warp.map_or(
+            Some((
+                [origin[0] + center[0], origin[1] + center[1]],
+                [origin[0] + center[0], origin[1] + center[1]],
+            )),
+            |w| {
+                Some((
+                    w.clamped_canvas_at(center[0], center[1], origin)?,
+                    w.canvas_at(center[0], center[1], origin)?,
+                ))
+            },
+        ) else {
+            continue;
+        };
+        let [cx, cy] = clamped;
+        if cx < 0.5
+            || cy < 0.5
+            || cx > spec.canvas_width as f64 - 0.5
+            || cy > spec.canvas_height as f64 - 0.5
+        {
+            continue;
+        }
+        *value = value_of(clamped, raw, edge);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rows(
     spec: &SlicerSpec,
@@ -650,6 +734,27 @@ pub(crate) fn fill_rows(
     first_row: usize,
     dest: &mut [(u16, u8)],
 ) {
+    // The marker variant is chosen once per table, so the ordinary closure
+    // below carries no per-pixel test for it.
+    if let Some((layout, index)) = layout.filter(|_| spec.highlight_overlaps) {
+        let widths = layout.marker_widths(index, size);
+        fill_marked(
+            spec,
+            slice,
+            warp,
+            size,
+            first_row,
+            dest,
+            (0, 0),
+            |[cx, cy], [rx, ry], edge| {
+                with_marker(
+                    layout.transfer(index, cx, cy, spec.gamma, spec.black_lift, edge),
+                    layout.marker_at(index, rx, ry, widths),
+                )
+            },
+        );
+        return;
+    }
     fill_generic(
         spec,
         slice,
@@ -679,6 +784,26 @@ pub(crate) fn fill_dynamic_rows(
     first_row: usize,
     dest: &mut [u32],
 ) {
+    // Chosen once per table, as in `fill_rows`.
+    if let Some((layout, index)) = layout.filter(|_| spec.highlight_overlaps) {
+        let widths = layout.marker_widths(index, size);
+        fill_marked(
+            spec,
+            slice,
+            warp,
+            size,
+            first_row,
+            dest,
+            0,
+            |[cx, cy], [rx, ry], edge| {
+                with_packed_marker(
+                    layout.dynamic_shape(index, cx, cy, spec.gamma, edge),
+                    u32::from(layout.marker_at(index, rx, ry, widths)),
+                )
+            },
+        );
+        return;
+    }
     fill_generic(
         spec,
         slice,
@@ -808,6 +933,7 @@ mod tests {
         SlicerSpec {
             layout: None,
             coverage_rects: Vec::new(),
+            highlight_overlaps: false,
             control_session: "test-session".into(),
             source: "canvas".into(),
             canvas_width: 12,
@@ -996,6 +1122,317 @@ mod tests {
             shared.outputs.iter().map(|o| o.index).collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
+    }
+
+    /// Two 24-pixel strips overlapping by 8 on a 40x8 canvas, each shown at
+    /// 24x8 so one output pixel is one canvas pixel and a marker line is two
+    /// canvas pixels. The overlap is wide enough for each of its ends to get
+    /// a distinct line; under two line widths the two lines of one ramp
+    /// overpaint and orange wins (see `Evaluator::marker_at`).
+    fn two_strips() -> SlicerSpec {
+        let mut spec = public_layout_fixture();
+        spec.canvas_width = 40;
+        spec.slices.truncate(2);
+        for (i, slice) in spec.slices.iter_mut().enumerate() {
+            slice.source = Rect {
+                x: i as i32 * 16,
+                y: 0,
+                width: 24,
+                height: 8,
+            };
+            slice.source_rect = Some([i as f64 * 16.0, 0.0, 24.0, 8.0]);
+        }
+        let layout = spec.layout.as_mut().unwrap();
+        layout.aspect = 40.0 / 8.0;
+        layout.participants.truncate(2);
+        for (i, p) in layout.participants.iter_mut().enumerate() {
+            let r = crate::model::CanvasRect {
+                x: i as f64 * 16.0 / 40.0,
+                y: 0.0,
+                width: 24.0 / 40.0,
+                height: 8.0 / 40.0,
+            };
+            p.source = r;
+            p.raster_footprint = r;
+        }
+        spec
+    }
+
+    /// The lineup aid is a pure addition, verified rather than asserted by
+    /// inspection: with it off no table entry carries a tag at all, and with
+    /// it on the tables differ from the off tables ONLY in the tag bits — in
+    /// both the fixed `(a, b)` and the packed dynamic representation. Both
+    /// colors really appear, and toggling it is a live table rebuild, never
+    /// a topology change.
+    #[test]
+    fn highlight_overlaps_only_adds_tags_and_is_a_no_op_when_off() {
+        use crate::projection::blend::{
+            gain_of, marker_of_gain, marker_of_packed, MARKER_BLUE, MARKER_ORANGE,
+        };
+        let off = two_strips();
+        let sizes = vec![(24, 8); 2];
+        let build_all = |spec: &SlicerSpec| {
+            build(
+                Request {
+                    generation: 0,
+                    keys: validate(spec, &sizes).unwrap(),
+                    spec: spec.clone(),
+                },
+                &sizes,
+                &[0, 1],
+                1,
+            )
+            .unwrap()
+        };
+        let mut on = off.clone();
+        on.highlight_overlaps = true;
+        assert!(same_topology(&off, &on));
+        assert_ne!(
+            validate(&off, &sizes).unwrap(),
+            validate(&on, &sizes).unwrap()
+        );
+
+        let (a, b) = (build_all(&off), build_all(&on));
+        let mut seen = [false; 3];
+        for (o, t) in a.outputs.iter().zip(&b.outputs) {
+            assert!(o.table.iter().all(|&(g, _)| marker_of_gain(g) == 0));
+            let stripped: Vec<_> = t.table.iter().map(|&(g, l)| (gain_of(g), l)).collect();
+            assert_eq!(o.table, stripped, "output {}", o.name);
+            for &(g, _) in &t.table {
+                seen[usize::from(marker_of_gain(g))] = true;
+            }
+        }
+        assert!(seen[usize::from(MARKER_ORANGE)] && seen[usize::from(MARKER_BLUE)]);
+
+        let mut dynamic_off = off.clone();
+        dynamic_off.black_lift = 0.1;
+        dynamic_off.adaptive_lift = Some(crate::model::AdaptiveBlackLift {
+            level: 0.1,
+            dark_threshold: 0.02,
+            bright_threshold: 0.2,
+            rise_ms: 1_000.0,
+            fall_ms: 250.0,
+            slew_per_second: 0.1,
+        });
+        let mut dynamic_on = dynamic_off.clone();
+        dynamic_on.highlight_overlaps = true;
+        let (a, b) = (build_all(&dynamic_off), build_all(&dynamic_on));
+        let mut tagged = 0;
+        for (o, t) in a.outputs.iter().zip(&b.outputs) {
+            let (o, t) = (
+                o.dynamic_table.as_ref().unwrap(),
+                t.dynamic_table.as_ref().unwrap(),
+            );
+            assert!(o.iter().all(|&v| marker_of_packed(v) == 0));
+            let stripped: Vec<_> = t.iter().map(|&v| v & !(0x3 << 28)).collect();
+            assert_eq!(o, &stripped);
+            tagged += t.iter().filter(|&&v| marker_of_packed(v) != 0).count();
+        }
+        assert!(tagged > 0);
+    }
+
+    /// Both renderers take their marker colors from `marker_palette` when a
+    /// spec is installed: a gamma change reaches them while the markers are
+    /// on, and changes nothing while they are off.
+    #[test]
+    fn a_gamma_change_reaches_the_marker_palette_only_while_markers_are_on() {
+        use crate::projection::blend::MarkerPalette;
+        let mut spec = two_strips();
+        spec.gamma = 2.2;
+        assert_eq!(spec.marker_palette(), None);
+        spec.gamma = 2.4;
+        assert_eq!(spec.marker_palette(), None);
+        spec.highlight_overlaps = true;
+        assert_eq!(spec.marker_palette(), Some(MarkerPalette::for_gamma(2.4)));
+        assert_eq!(spec.marker_palette().unwrap().green(), 191);
+        spec.gamma = 1.8;
+        assert_eq!(spec.marker_palette().unwrap().green(), 174);
+    }
+
+    /// Brain's 2x2 wall, end to end: the real canvas plan with corner-pin
+    /// correction, the real table build and the GPU packing. Every output
+    /// must carry both colors. Each output pixel here is about a quarter of
+    /// a canvas pixel, so a blue line (half a canvas pixel at the source's
+    /// own edge) lies entirely within the half-texel border that sampling
+    /// clamps positions into; the markers must be placed from the unclamped
+    /// position or blue disappears.
+    #[test]
+    fn brains_wall_carries_both_marker_colors_through_the_real_pipeline() {
+        use crate::model::{CanvasConfig, CanvasRect, Mode, OutputConfig, OutputGeometry};
+        use crate::projection::blend::{marker_of_packed, MARKER_BLUE, MARKER_NONE, MARKER_ORANGE};
+        let canvas = CanvasConfig {
+            aspect: 1.64,
+            render_width: 900,
+        };
+        let (w, h) = (0.52770, 0.29672);
+        let outputs = [
+            (
+                "DP-1",
+                0.0,
+                0.04303,
+                [[0.2551, 0.0707], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            ),
+            (
+                "DP-2",
+                0.47230,
+                0.04303,
+                [[0.0, 0.0], [0.97, 0.03], [1.0, 1.0], [0.0, 1.0]],
+            ),
+            (
+                "DP-3",
+                0.0,
+                0.27001,
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.02, 0.96]],
+            ),
+            (
+                "DP-4",
+                0.47230,
+                0.27001,
+                [[0.0, 0.0], [1.0, 0.0], [0.98, 0.97], [0.0, 1.0]],
+            ),
+        ];
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        };
+        let mut desired = crate::model::DesiredState::new();
+        let mut projection = crate::model::ProjectionConfig {
+            mode: crate::model::ProjectionMode::Simple,
+            canvas: Some(canvas),
+            blend: true,
+            ..Default::default()
+        };
+        projection.temporary.highlight_overlaps = true;
+        desired.projection = Some(projection);
+        let mut observed = Vec::new();
+        for (name, x, y, corners) in outputs {
+            let mut config = OutputConfig::new(crate::model::OutputMatch::by_name(name));
+            config.mode = Some(mode);
+            let source = CanvasRect {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            config.geometry = Some(OutputGeometry {
+                source,
+                corners,
+                center: [0.5, 0.5],
+                raster_footprint: source,
+            });
+            desired.outputs.push(config);
+            observed.push(crate::model::Output {
+                name: name.to_string(),
+                active: true,
+                make: None,
+                model: None,
+                serial: None,
+                current_mode: Some(mode),
+                modes: vec![mode],
+                rect: Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale: None,
+                transform: None,
+                adaptive_sync_status: None,
+            });
+        }
+        let plan =
+            super::super::layout::canvas_plan_with_correction(&desired, &observed, true).unwrap();
+        let mut spec = two_strips();
+        spec.canvas_width = plan.canvas_width;
+        spec.canvas_height = plan.canvas_height;
+        spec.layout = plan.layout;
+        spec.coverage_rects = plan.coverage_rects;
+        spec.slices = plan.slices;
+        spec.highlight_overlaps = true;
+        assert!(spec.slices.iter().all(|s| s.geometry.is_some()));
+        let sizes = vec![(1920, 1080); 4];
+        let build_all = |spec: &SlicerSpec| {
+            build(
+                Request {
+                    generation: 0,
+                    keys: validate(spec, &sizes).unwrap(),
+                    spec: spec.clone(),
+                },
+                &sizes,
+                &[0, 1, 2, 3],
+                4,
+            )
+            .unwrap()
+        };
+        let built = build_all(&spec);
+        let mut off = spec.clone();
+        off.highlight_overlaps = false;
+        let plain = build_all(&off);
+        for (output, plain) in built.outputs.iter().zip(&plain.outputs) {
+            // The marker walk samples exactly what the ordinary one does.
+            let stripped: Vec<_> = output
+                .table
+                .iter()
+                .map(|&(g, l)| (crate::projection::blend::gain_of(g), l))
+                .collect();
+            assert!(stripped == plain.table, "{}", output.name);
+            let mut counts = [0usize; 3];
+            for &(a, b) in &output.table {
+                let tag = marker_of_packed(crate::projection::gpu::pack_transfer(a, b));
+                counts[usize::from(tag)] += 1;
+            }
+            assert!(counts[usize::from(MARKER_NONE)] > 0);
+            assert!(
+                counts[usize::from(MARKER_ORANGE)] > 0 && counts[usize::from(MARKER_BLUE)] > 0,
+                "{}: orange {} blue {}",
+                output.name,
+                counts[usize::from(MARKER_ORANGE)],
+                counts[usize::from(MARKER_BLUE)]
+            );
+        }
+    }
+
+    /// A marker line is two pixels of the output's own raster, so an output
+    /// showing its source at half the canvas resolution gets lines two
+    /// canvas pixels wider, not the same two canvas pixels. Each strip is
+    /// 24 canvas pixels shown on a 12x4 output. Output 0's overlap is output
+    /// columns 8..12: orange at 8 and 9, blue at 10 and 11 (canvas 16..20
+    /// and 20..24). A two-canvas-pixel line would cover one column each.
+    #[test]
+    fn marker_lines_are_two_output_pixels_wide_at_any_scale() {
+        use crate::projection::blend::{marker_of_gain, MARKER_BLUE, MARKER_NONE, MARKER_ORANGE};
+        let mut spec = two_strips();
+        spec.highlight_overlaps = true;
+        for (i, slice) in spec.slices.iter_mut().enumerate() {
+            slice.source = Rect {
+                x: i as i32 * 8,
+                y: 0,
+                width: 12,
+                height: 4,
+            };
+        }
+        let sizes = vec![(12, 4); 2];
+        let built = build(
+            Request {
+                generation: 0,
+                keys: validate(&spec, &sizes).unwrap(),
+                spec: spec.clone(),
+            },
+            &sizes,
+            &[0, 1],
+            1,
+        )
+        .unwrap();
+        let table = &built.outputs[0].table;
+        for row in 0..4 {
+            let tags: Vec<u8> = table[row * 12..(row + 1) * 12]
+                .iter()
+                .map(|&(g, _)| marker_of_gain(g))
+                .collect();
+            let (n, o, b) = (MARKER_NONE, MARKER_ORANGE, MARKER_BLUE);
+            assert_eq!(tags, [n, n, n, n, n, n, n, n, o, o, b, b], "row {row}");
+        }
     }
 
     #[test]

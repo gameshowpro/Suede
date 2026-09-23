@@ -125,6 +125,10 @@ pub struct ProjectionConfig {
     /// still describes the document's sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrangement: Option<Arrangement>,
+    /// Ephemeral settings applied to the working copy like any other field,
+    /// but never persisted. See [`TemporarySettings`].
+    #[serde(default)]
+    pub temporary: TemporarySettings,
 }
 
 impl Default for ProjectionConfig {
@@ -139,8 +143,41 @@ impl Default for ProjectionConfig {
             free_run: false,
             renderer: Renderer::Auto,
             arrangement: None,
+            temporary: TemporarySettings::default(),
         }
     }
+}
+
+/// Ephemeral, never-persisted settings: applied to the working copy exactly
+/// like any other field, but reset to default wherever a document is about
+/// to reach disk.
+///
+/// That reset is structural, not a client convention: `commit_if` and
+/// `commit_literal_if` (`src/api/mod.rs`) reset this struct to its default,
+/// unconditionally, right before their `stage_replace_if` closures return —
+/// so it is categorically impossible for any caller, this UI or any future
+/// or API-direct one, to persist a non-default value here. The other reset
+/// points fall out of that same guarantee for free: cancel
+/// (`clear_preview_if` discards the whole preview, the only place this
+/// could be non-default), daemon startup/disk load (the persisted document
+/// can never contain a non-default value, per the commit-time reset), and
+/// an explicit toggle back off (an ordinary write like any other).
+///
+/// This is the intended home for future ephemeral, render-affecting
+/// toggles — debug overlays and the like — that only make sense on the live
+/// working copy. `test_pattern` above predates this struct and stays where
+/// it is (moving it would be a breaking rename of an established field); it
+/// is only *conventionally* non-persistent today, relying on a well-behaved
+/// client to strip it before every commit. New fields of this kind belong
+/// here instead, where the guarantee is enforced rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct TemporarySettings {
+    /// Overlay two-pixel orange/blue seam-boundary marker lines on every
+    /// projector output, to aid warp lineup. Off by default, and meaningful
+    /// only while edge blending (`blend`) is on.
+    #[serde(default)]
+    pub highlight_overlaps: bool,
 }
 
 /// Which pipeline the slicer uses to composite the canvas onto each output.

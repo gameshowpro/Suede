@@ -38,7 +38,8 @@ src/
 │   ├── warp_update.rs  Output-local transfer/geometry table builds
 │   ├── blend.rs        Canvas planning and blend-weight activation
 │   ├── seam_oracle.rs  Independent test-only cross-check for blend weights
-│   ├── gpu.rs          Vulkan capture/blend path, queue priority negotiation
+│   ├── gpu.rs          Vulkan capture/blend path, queue priority negotiation; builds the overlap-highlight shader variant only while it is on
+│   ├── shaders/        `blend.frag` and its overlap-highlight variant `blend_markers.frag` (the plain shader plus one block, test-guarded), compiled to checked-in `.spv` with naga
 │   ├── gpu_readback.rs `#[cfg(test)]` GPU readback harness, not production
 │   ├── adaptive.rs     Adaptive black-lift measurement and control
 │   ├── pattern.rs      Built-in test patterns (grid, warp-alignment, sync, …)

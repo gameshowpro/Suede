@@ -65,7 +65,7 @@ use serde_json::Value;
 
 use crate::model::{
     AppConfig, BackgroundPreset, DesiredState, OutputConfig, ProjectionConfig, Settings,
-    SCHEMA_VERSION,
+    TemporarySettings, SCHEMA_VERSION,
 };
 
 const FILE_NAME: &str = "state.json";
@@ -362,20 +362,38 @@ impl StateStore {
 
     /// Set or clear the working copy. The caller validates.
     pub fn set_preview(&self, preview: Option<DesiredState>) {
+        let mut documents = self.documents.write().unwrap();
+        // Compared under the same guard, so a save cannot land between
+        // reading the basis and flagging the working copy against it.
         let preview = preview.map(|mut document| {
-            // A working copy always reads back honestly: not committed, and
-            // carrying the revision of the saved document it shadows.
-            document.committed = false;
-            document.revision = self.revision();
+            // A working copy always reads back honestly: `committed` true
+            // only when it carries no real edit beyond `projection.temporary`
+            // (see `differs_beyond_temporary`), and the revision of the
+            // saved document it shadows.
+            document.revision = documents.current.revision;
+            document.committed = !differs_beyond_temporary(&document, &documents.current);
             document
         });
-        let mut documents = self.documents.write().unwrap();
         documents.preview = preview;
         documents.generation = documents.generation.saturating_add(1);
     }
 
     pub fn has_preview(&self) -> bool {
         self.documents.read().unwrap().preview.is_some()
+    }
+
+    /// Whether the working copy, if any, carries a real edit — one that
+    /// survives normalizing away `committed`, `revision` and
+    /// `projection.temporary`. This, not [`Self::has_preview`], is what
+    /// "unsaved edits" means: a preview that only turns an ephemeral toggle
+    /// like `highlightOverlaps` on or off is still stored (the renderer
+    /// reads it), but must not read back as dirty.
+    pub fn has_unsaved_edits(&self) -> bool {
+        let documents = self.documents.read().unwrap();
+        documents
+            .preview
+            .as_ref()
+            .is_some_and(|preview| differs_beyond_temporary(preview, &documents.current))
     }
 
     pub fn revision(&self) -> u64 {
@@ -488,8 +506,8 @@ impl StateStore {
             .unwrap_or(&documents.current)
             .clone();
         let mut preview = prepare(&effective).map_err(ConditionalWriteError::Rejected)?;
-        preview.committed = false;
         preview.revision = documents.current.revision;
+        preview.committed = !differs_beyond_temporary(&preview, &documents.current);
         documents.preview = Some(preview.clone());
         documents.generation = documents.generation.saturating_add(1);
         let version = self.version(&documents);
@@ -659,6 +677,25 @@ impl StateStore {
         }
         Ok(())
     }
+}
+
+/// Whether `preview` carries a real edit relative to `current` — one that
+/// survives normalizing away `committed` and `revision` (which a preview
+/// always overwrites relative to what the caller sent) and
+/// `projection.temporary` (never persisted; see [`TemporarySettings`]).
+/// A preview that only differs in one of those three is not "unsaved" in
+/// any way the operator would recognize.
+fn differs_beyond_temporary(preview: &DesiredState, current: &DesiredState) -> bool {
+    fn normalized(state: &DesiredState) -> DesiredState {
+        let mut state = state.clone();
+        state.committed = false;
+        state.revision = 0;
+        if let Some(projection) = state.projection.as_mut() {
+            projection.temporary = TemporarySettings::default();
+        }
+        state
+    }
+    normalized(preview) != normalized(current)
 }
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(0);

@@ -2083,6 +2083,263 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
 
+    /// A preview (uncommitted) working copy carries `highlightOverlaps`
+    /// exactly like any other field — it is not committed here, so slice 1's
+    /// structural reset (which only fires from `commit_if`/`commit_literal_if`)
+    /// must not touch it.
+    #[tokio::test]
+    async fn highlight_overlaps_previews_uncommitted() {
+        let harness = harness(None);
+        let mut previewed = harness.state.store.get();
+        previewed.committed = false;
+        previewed.projection = Some(ProjectionConfig::default());
+        previewed
+            .projection
+            .as_mut()
+            .unwrap()
+            .temporary
+            .highlight_overlaps = true;
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["committed"], false);
+        assert_eq!(body["projection"]["temporary"]["highlightOverlaps"], true);
+
+        // Visible from a plain read of the effective (working-copy) document too.
+        let (status, body) = call(&harness, "GET", "/api/v1/config", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["projection"]["temporary"]["highlightOverlaps"], true);
+    }
+
+    /// The structural half of the "temporary settings" guarantee: a document
+    /// committed with `highlightOverlaps: true` comes back — and is actually
+    /// written to disk — as `false`, regardless of what was asked for. Reads
+    /// back the persisted file through a fresh `StateStore` rather than
+    /// trusting only the in-memory return value, so a bug that reset the
+    /// return value but not what `flush()` wrote would still be caught.
+    #[tokio::test]
+    async fn highlight_overlaps_is_reset_to_false_on_commit_and_never_persisted() {
+        let harness = harness(None);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"temporary":{"highlightOverlaps":true}}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["projection"]["temporary"]["highlightOverlaps"], false,
+            "commit_if resets projection.temporary before the document is even returned"
+        );
+
+        let reloaded = crate::state::StateStore::load(harness._dir.path().to_path_buf()).unwrap();
+        assert!(
+            !reloaded
+                .get()
+                .projection
+                .unwrap()
+                .temporary
+                .highlight_overlaps,
+            "what actually reached disk must also be false, not just the response"
+        );
+    }
+
+    /// Slice 7: "unsaved edits" is server-driven off
+    /// `StateStore::has_unsaved_edits`, which ignores
+    /// `projection.temporary`. A preview that flips `highlightOverlaps` and
+    /// changes nothing else reads back `committed: true` — from the PUT's
+    /// own response and from `/api/v1/status` — even though the preview is
+    /// still stored, because the renderer reads it.
+    #[tokio::test]
+    async fn a_preview_that_only_toggles_highlight_overlaps_is_not_unsaved() {
+        let harness = harness(None);
+        // A projection section already on the saved document, so the
+        // preview below can differ from `current` in nothing but
+        // `temporary`.
+        harness
+            .state
+            .store
+            .update(|state| state.projection = Some(ProjectionConfig::default()))
+            .unwrap();
+
+        let mut previewed = harness.state.store.get();
+        previewed.committed = false;
+        previewed
+            .projection
+            .as_mut()
+            .unwrap()
+            .temporary
+            .highlight_overlaps = true;
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["committed"], true,
+            "only an ephemeral toggle changed; nothing is unsaved: {body}"
+        );
+        assert!(
+            harness.state.store.has_preview(),
+            "the preview is still stored — the renderer reads it"
+        );
+
+        let (status, status_body) = call(&harness, "GET", "/api/v1/status", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status_body["committed"], true, "{status_body}");
+    }
+
+    /// A real edit alongside the ephemeral toggle is still unsaved: the
+    /// helper compares the whole document, not just `temporary`.
+    #[tokio::test]
+    async fn a_real_edit_alongside_highlight_overlaps_is_still_unsaved() {
+        let harness = harness(None);
+        harness
+            .state
+            .store
+            .update(|state| state.projection = Some(ProjectionConfig::default()))
+            .unwrap();
+
+        let mut previewed = harness.state.store.get();
+        previewed.committed = false;
+        previewed
+            .projection
+            .as_mut()
+            .unwrap()
+            .temporary
+            .highlight_overlaps = true;
+        previewed.settings.hide_cursor = !previewed.settings.hide_cursor;
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["committed"], false,
+            "a real edit is present alongside the toggle: {body}"
+        );
+
+        let (status, status_body) = call(&harness, "GET", "/api/v1/status", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status_body["committed"], false, "{status_body}");
+    }
+
+    /// Undoing the real edit while leaving `highlightOverlaps` on reads back
+    /// `committed: true` again — the preview is re-evaluated against
+    /// `current` on every `set_preview_if`, not stuck at whatever the first
+    /// preview decided.
+    #[tokio::test]
+    async fn removing_the_real_edit_while_keeping_highlight_overlaps_on_reads_back_committed() {
+        let harness = harness(None);
+        harness
+            .state
+            .store
+            .update(|state| state.projection = Some(ProjectionConfig::default()))
+            .unwrap();
+
+        let mut previewed = harness.state.store.get();
+        previewed.committed = false;
+        previewed
+            .projection
+            .as_mut()
+            .unwrap()
+            .temporary
+            .highlight_overlaps = true;
+        previewed.settings.hide_cursor = !previewed.settings.hide_cursor;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert!(!harness.state.store.effective().committed);
+
+        let mut reverted = harness.state.store.effective();
+        reverted.committed = false;
+        reverted.settings.hide_cursor = !reverted.settings.hide_cursor;
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&reverted).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["committed"], true,
+            "the real edit is gone; only the ephemeral toggle remains: {body}"
+        );
+        assert_eq!(body["projection"]["temporary"]["highlightOverlaps"], true);
+    }
+
+    /// `POST /config/revert` still discards the whole preview, ephemeral
+    /// toggle included, even though the toggle alone no longer makes the
+    /// preview read as unsaved.
+    #[tokio::test]
+    async fn reverting_a_working_copy_still_clears_highlight_overlaps() {
+        let harness = harness(None);
+        harness
+            .state
+            .store
+            .update(|state| state.projection = Some(ProjectionConfig::default()))
+            .unwrap();
+
+        let mut previewed = harness.state.store.get();
+        previewed.committed = false;
+        previewed
+            .projection
+            .as_mut()
+            .unwrap()
+            .temporary
+            .highlight_overlaps = true;
+        call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&previewed).unwrap()),
+        )
+        .await;
+        assert!(
+            harness
+                .state
+                .store
+                .effective()
+                .projection
+                .unwrap()
+                .temporary
+                .highlight_overlaps,
+            "the preview carries the toggle before revert"
+        );
+
+        let (status, body) = call(&harness, "POST", "/api/v1/config/revert", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(!harness.state.store.has_preview());
+        assert!(
+            !harness
+                .state
+                .store
+                .get()
+                .projection
+                .unwrap()
+                .temporary
+                .highlight_overlaps,
+            "revert discards the whole preview, including the ephemeral toggle"
+        );
+    }
+
     #[tokio::test]
     async fn projection_black_lift_is_range_checked() {
         let harness = harness(None);

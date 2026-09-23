@@ -2224,6 +2224,17 @@
               }
             ]
           },
+          "temporary": {
+            "default": {
+              "highlightOverlaps": false
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TemporarySettings",
+                "description": "Ephemeral settings applied to the working copy like any other field,\nbut never persisted. See [`TemporarySettings`]."
+              }
+            ]
+          },
           "testPattern": {
             "default": null,
             "oneOf": [
@@ -3081,6 +3092,18 @@
           "webUiEnabled",
           "powerVerbs"
         ],
+        "type": "object"
+      },
+      "TemporarySettings": {
+        "additionalProperties": false,
+        "description": "Ephemeral, never-persisted settings: applied to the working copy exactly\nlike any other field, but reset to default wherever a document is about\nto reach disk.\n\nThat reset is structural, not a client convention: `commit_if` and\n`commit_literal_if` (`src/api/mod.rs`) reset this struct to its default,\nunconditionally, right before their `stage_replace_if` closures return —\nso it is categorically impossible for any caller, this UI or any future\nor API-direct one, to persist a non-default value here. The other reset\npoints fall out of that same guarantee for free: cancel\n(`clear_preview_if` discards the whole preview, the only place this\ncould be non-default), daemon startup/disk load (the persisted document\ncan never contain a non-default value, per the commit-time reset), and\nan explicit toggle back off (an ordinary write like any other).\n\nThis is the intended home for future ephemeral, render-affecting\ntoggles — debug overlays and the like — that only make sense on the live\nworking copy. `test_pattern` above predates this struct and stays where\nit is (moving it would be a breaking rename of an established field); it\nis only *conventionally* non-persistent today, relying on a well-behaved\nclient to strip it before every commit. New fields of this kind belong\nhere instead, where the guarantee is enforced rather than assumed.",
+        "properties": {
+          "highlightOverlaps": {
+            "default": false,
+            "description": "Overlay two-pixel orange/blue seam-boundary marker lines on every\nprojector output, to aid warp lineup. Off by default, and meaningful\nonly while edge blending (`blend`) is on.",
+            "type": "boolean"
+          }
+        },
         "type": "object"
       },
       "TestPattern": {

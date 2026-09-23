@@ -474,6 +474,8 @@ window.addEventListener("error", (event) => {
       <div class="fields">
         <div><label for="pj-blend">Edge blending</label>
           <input type="checkbox" role="switch" class="switch" id="pj-blend"></div>
+        <div id="pj-highlight-overlaps-row"><label for="pj-highlight-overlaps">Highlight overlaps</label>
+          <input type="checkbox" role="switch" class="switch" id="pj-highlight-overlaps"></div>
         <div><label for="pj-gamma">Projector gamma</label>
           <input id="pj-gamma" type="number" step="any" min="1" max="4" value="2.2"></div>
         <div><label for="pj-lift">Black-level compensation</label>
@@ -481,6 +483,11 @@ window.addEventListener("error", (event) => {
         <div><label for="pj-lift-mode">Compensation mode</label>
           <select id="pj-lift-mode"><option value="fixed">Fixed</option><option value="adaptive">Adaptive</option></select></div>
       </div>
+      <p class="hint" id="pj-highlight-overlaps-hint">Overlays two-pixel
+        lineup marks on every output while it is on: orange where this
+        output's own blend starts, blue at the far edge of the overlap.
+        Adjust warp until the two colors line up as white. Never saved —
+        it always comes back off.</p>
       <div id="pj-adaptive-fields" hidden><div class="fields">
         <div><label for="pj-dark">Dark luminance threshold</label><input id="pj-dark" type="number" min="0" max="1" step="any" value="0.02"></div>
         <div><label for="pj-bright">Bright luminance threshold</label><input id="pj-bright" type="number" min="0" max="1" step="any" value="0.2"></div>
@@ -1131,6 +1138,10 @@ function renderDirtyStatus() {
 function saveCommitted() {
   const next = structuredClone(config);
   if (next.projection) next.projection.testPattern = null;
+  // The server resets `temporary` structurally on every commit regardless
+  // (see TemporarySettings in src/model/desired.rs) — this is a courtesy
+  // that keeps the client's own view consistent with that guarantee.
+  if (next.projection) delete next.projection.temporary;
   return save("/config", { ...next, committed: true });
 }
 
@@ -2696,10 +2707,19 @@ function paintCapabilities(r) {
 // plainest possible setup — a single display that is showing nothing.
 function renderProjectionAvailability(overlaps) {
   const idle = overlaps === 0 && config?.projection?.mode !== "warp" && !config?.projection?.canvas;
-  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free"]) {
+  for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-highlight-overlaps"]) {
     $(id).disabled = idle;
   }
   $("pj-idle").hidden = !idle;
+  // Highlight overlaps only means something once blending is actually
+  // drawing ramps: disabled and hidden whenever pj-blend is off, on top of
+  // the idle gating every other field here shares. Re-checked on every
+  // call, including the one right after pj-blend's own input listener
+  // updates config, so toggling it takes effect immediately.
+  const blendOn = !!config?.projection && config.projection.blend !== false;
+  if (!blendOn) $("pj-highlight-overlaps").disabled = true;
+  $("pj-highlight-overlaps-row").hidden = idle || !blendOn;
+  $("pj-highlight-overlaps-hint").hidden = idle || !blendOn;
 }
 
 function renderProjection(force = false) {
@@ -2720,6 +2740,7 @@ function renderProjection(force = false) {
 
   const projection = config?.projection;
   $("pj-blend").checked = !!projection && projection.blend !== false;
+  $("pj-highlight-overlaps").checked = !!projection?.temporary?.highlightOverlaps;
   $("pj-gamma").value = editNumber(projection?.gamma ?? 2.2, 2);
   const lift = projection?.blackLift;
   $("pj-lift").value = editNumber(typeof lift === "object" && lift ? lift.level : (lift ?? 0), 3);
@@ -2744,6 +2765,7 @@ function updateProjectionField(field) {
     ...(typeof projection.blackLift === "object" ? projection.blackLift : {}) });
   if (field === "tp-pattern") projection.testPattern = $("tp-pattern").value || null;
   else if (field === "pj-blend") projection.blend = $("pj-blend").checked;
+  else if (field === "pj-highlight-overlaps") projection.temporary = { ...(projection.temporary ?? {}), highlightOverlaps: $("pj-highlight-overlaps").checked };
   else if (field === "pj-gamma") projection.gamma = Number($("pj-gamma").value);
   else if (field === "pj-free") projection.freeRun = $("pj-free").checked;
   else if (field === "pj-renderer") projection.renderer = $("pj-renderer").value || "auto";
@@ -3218,7 +3240,7 @@ function renderProjectionTiming() {
     `<td class="mono">${lagCell(o.lagFrames)}</td></tr>`).join("");
 }
 
-for (const id of ["pj-blend", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-renderer", "tp-pattern"]) {
+for (const id of ["pj-blend", "pj-highlight-overlaps", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-renderer", "tp-pattern"]) {
   $(id).addEventListener("input", () => {
     // Silently, not with a toast: a restored form value is not a user asking
     // for anything, and a complaint about it would be the same noise in a
@@ -3242,6 +3264,9 @@ $("pj-save").onclick = () => run(async () => {
   // call, and the pattern is presented as a live diagnostic rather than a
   // setting — so committing here also takes it down.
   if (config.projection) config.projection.testPattern = null;
+  // Courtesy strip to match saveCommitted()'s — the server enforces this
+  // structurally on commit either way (slice 1, TemporarySettings).
+  if (config.projection) delete config.projection.temporary;
   clearTimeout(previewTimer);
   await saveCommitted();
 }, "saved configuration");

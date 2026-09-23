@@ -27,7 +27,12 @@
 //! ```text
 //! naga --input-kind glsl --shader-stage vert blend.vert blend.vert.spv
 //! naga --input-kind glsl --shader-stage frag blend.frag blend.frag.spv
+//! naga --input-kind glsl --shader-stage frag blend_markers.frag blend_markers.frag.spv
 //! ```
+//!
+//! `blend_markers.frag` is `blend.frag` plus the seam-boundary marker
+//! override, and its pipeline exists only while `highlightOverlaps` is on —
+//! see [`Gpu::set_markers`].
 //!
 //! `blend.frag` declares the canvas texture and its sampler separately
 //! (rather than as a combined `sampler2D` uniform) because naga's GLSL
@@ -97,6 +102,7 @@ use ash::vk;
 
 const VERT_SPV: &[u8] = include_bytes!("shaders/blend.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("shaders/blend.frag.spv");
+const MARKER_FRAG_SPV: &[u8] = include_bytes!("shaders/blend_markers.frag.spv");
 const MEASURE_FRAG_SPV: &[u8] = include_bytes!("shaders/measure.frag.spv");
 
 // DRM fourccs this module understands, and their little-endian byte order —
@@ -334,7 +340,10 @@ pub struct TransferUpdate<'a> {
 /// legacy fixed `(a,b)` representation. Entries with high bit set are the
 /// adaptive representation: bits 0..15 are ramp UNORM16, 16..23 are border
 /// coverage UNORM8, 24..27 are configured-footprint coverage `n` (0..=8),
-/// and 28..30 are reserved zero. `n == 0` is outside-picture black.
+/// and bit 30 is reserved zero. `n == 0` is outside-picture black. In both
+/// representations bits 28..29 carry the seam-boundary marker tag, which
+/// overrides everything else about the pixel in `blend_markers.frag` — see
+/// `blend::MARKER_NONE`.
 pub struct PackedTransferUpdate<'a> {
     pub index: usize,
     pub width: u32,
@@ -740,6 +749,13 @@ pub struct Gpu {
     sampler: vk::Sampler,
     vert_module: vk::ShaderModule,
     frag_module: vk::ShaderModule,
+    /// `blend_markers.frag`, present only while the seam-boundary markers
+    /// are on. While it is `Some`, [`Self::pipeline`] is built from it
+    /// instead of `frag_module` — see [`Gpu::set_markers`].
+    marker_frag_module: Option<vk::ShaderModule>,
+    /// The palette `marker_frag_module` was built with; `Some` exactly when
+    /// it is.
+    marker_palette: Option<super::blend::MarkerPalette>,
     /// Built lazily, on the first `blend()` call, rather than in `new()`:
     /// dynamic rendering bakes the color attachment format into the
     /// pipeline at creation time, but that format (BGRA vs RGBA) is a
@@ -1096,6 +1112,8 @@ impl Gpu {
             sampler,
             vert_module,
             frag_module,
+            marker_frag_module: None,
+            marker_palette: None,
             pipeline: None,
             command_pool,
             command_buffer,
@@ -1873,7 +1891,11 @@ impl Gpu {
             if unchanged {
                 continue;
             }
-            if update.table.iter().any(|&(a, _)| a > 256) {
+            if update
+                .table
+                .iter()
+                .any(|&(a, _)| super::blend::gain_of(a) > 256)
+            {
                 bail!(
                     "replace_transfers: output {} has a gain outside 0..=256",
                     update.index
@@ -2331,6 +2353,54 @@ impl Gpu {
         Ok((image, view))
     }
 
+    /// Switch the blend pipeline between `blend.frag` and its seam-boundary
+    /// marker variant, `blend_markers.frag`. Called only when a new spec is
+    /// installed, so no frame ever chooses between them: the current
+    /// pipeline is dropped here and [`Self::ensure_pipeline`] rebuilds the
+    /// right one on the next blend. While markers are off, the marker module
+    /// and pipeline do not exist.
+    ///
+    /// Turn markers on before uploading tagged tables and off only after the
+    /// untagged ones are in. The plain shader reads a tagged fixed entry's
+    /// gain with the tag bits still attached, while the marker shader
+    /// renders an untagged table exactly as the plain one does.
+    ///
+    /// The palette's green is baked into the marker module (see
+    /// [`marker_spirv`]), so a gamma change while markers are on rebuilds
+    /// that module and its pipeline here, and nothing reads it per frame.
+    /// While markers stay off, a gamma change does nothing here.
+    pub fn set_markers(
+        &mut self,
+        palette: Option<super::blend::MarkerPalette>,
+    ) -> anyhow::Result<()> {
+        if palette == self.marker_palette {
+            return Ok(());
+        }
+        self.wait_for_pending_work()?;
+        let device = &self.device.device;
+        let module = match palette {
+            Some(palette) => Some(create_shader_module(
+                device,
+                &marker_spirv(palette.green())?,
+                "marker fragment",
+            )?),
+            None => None,
+        };
+        // Safety: the only submission that could reference either object
+        // has completed (`wait_for_pending_work` above), and both were
+        // created by this `Gpu` and are owned by it alone.
+        unsafe {
+            if let Some(pipeline) = self.pipeline.take() {
+                device.destroy_pipeline(pipeline.pipeline, None);
+            }
+            if let Some(old) = std::mem::replace(&mut self.marker_frag_module, module) {
+                device.destroy_shader_module(old, None);
+            }
+        }
+        self.marker_palette = palette;
+        Ok(())
+    }
+
     /// Build the graphics pipeline for `format`, the first time any target
     /// of that format is blended into. See the `pipeline` field's doc for
     /// why this is lazy instead of living in `new()`.
@@ -2353,7 +2423,7 @@ impl Gpu {
                 .name(entry_point),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(self.frag_module)
+                .module(self.marker_frag_module.unwrap_or(self.frag_module))
                 .name(entry_point),
         ];
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
@@ -3611,6 +3681,9 @@ impl Drop for Gpu {
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_shader_module(self.vert_module, None);
             device.destroy_shader_module(self.frag_module, None);
+            if let Some(module) = self.marker_frag_module.take() {
+                device.destroy_shader_module(module, None);
+            }
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             device.destroy_sampler(self.sampler, None);
@@ -3675,6 +3748,57 @@ impl Drop for Cleanup<'_> {
     }
 }
 
+/// The green `blend_markers.frag` is compiled with: its marker colors'
+/// `186.0 / 255.0`, which naga folds into a single float constant that both
+/// colors share.
+const MARKER_SPIRV_GREEN: u8 = 186;
+
+/// `blend_markers.frag.spv` with its marker green replaced by `green`.
+///
+/// This patches the one `OpConstant` word holding `186.0 / 255.0` instead of
+/// using a specialization constant, which naga's GLSL frontend cannot emit
+/// (see the shader's header), or a push constant, which the marker shader
+/// would read on every pixel of every frame. The plain pipeline, its layout
+/// and its descriptors are untouched. It fails rather than guessing if the
+/// shader no longer has exactly one such constant, and a test holds the
+/// checked-in `.spv` to that.
+fn marker_spirv(green: u8) -> anyhow::Result<Vec<u8>> {
+    const OP_TYPE_FLOAT: u32 = 22;
+    const OP_CONSTANT: u32 = 43;
+    let compiled = (f32::from(MARKER_SPIRV_GREEN) / 255.0).to_bits();
+    let wanted = (f32::from(green) / 255.0).to_bits();
+    let mut words = ash::util::read_spv(&mut Cursor::new(MARKER_FRAG_SPV))
+        .context("decoding embedded marker fragment SPIR-V")?;
+    let mut floats = Vec::new();
+    let mut found = Vec::new();
+    let mut at = 5;
+    while at < words.len() {
+        let count = (words[at] >> 16) as usize;
+        let opcode = words[at] & 0xffff;
+        if count == 0 || at + count > words.len() {
+            bail!("marker fragment SPIR-V: malformed instruction at word {at}");
+        }
+        if opcode == OP_TYPE_FLOAT && count == 3 && words[at + 2] == 32 {
+            floats.push(words[at + 1]);
+        } else if opcode == OP_CONSTANT
+            && count == 4
+            && floats.contains(&words[at + 1])
+            && words[at + 3] == compiled
+        {
+            found.push(at + 3);
+        }
+        at += count;
+    }
+    let [word] = found[..] else {
+        bail!(
+            "marker fragment SPIR-V: expected one marker green constant, found {}",
+            found.len()
+        );
+    };
+    words[word] = wanted;
+    Ok(words.iter().flat_map(|word| word.to_le_bytes()).collect())
+}
+
 fn create_shader_module(
     device: &ash::Device,
     spv: &[u8],
@@ -3721,17 +3845,29 @@ fn format_for_fourcc(fourcc: u32) -> anyhow::Result<vk::Format> {
 /// `(a, b)` packed as `a << 8 | b`, matching `blend.frag`'s unpacking
 /// (`ab >> 8`, `ab & 0xff`). `a` only ever needs 9 bits (`pixel_transfer` in
 /// blend.rs produces up to 256), so it never collides with `b`'s low byte.
-fn pack_transfer(a: u16, b: u8) -> u32 {
-    (u32::from(a) << 8) | u32::from(b)
+///
+/// The seam-boundary marker tag the CPU table carries in the gain's top two
+/// bits is *moved* here, to bits 28..29 — where the dynamic format keeps it
+/// too, so the shader has exactly one place to look whichever mode an entry
+/// is in. See `blend::MARKER_NONE` for why those bits are free in both.
+pub(crate) fn pack_transfer(a: u16, b: u8) -> u32 {
+    let marker = u32::from(super::blend::marker_of_gain(a));
+    super::blend::with_packed_marker(
+        (u32::from(super::blend::gain_of(a)) << 8) | u32::from(b),
+        marker,
+    )
 }
 
 fn validate_packed_transfer(entry: u32) -> anyhow::Result<()> {
+    // Bits 28..29 are the marker tag in both formats, so they are masked out
+    // of every reserved-range check below rather than being rejected.
+    let entry = entry & !(0x3 << super::blend::MARKER_PACKED_SHIFT);
     if entry & 0x8000_0000 == 0 {
         if entry >> 17 != 0 || ((entry >> 8) & 0x1ff) > 256 {
             bail!("packed fixed transfer has reserved bits or a gain outside 0..=256");
         }
-    } else if entry & 0x7000_0000 != 0 {
-        bail!("packed dynamic transfer has nonzero reserved bits 28..30");
+    } else if entry & 0x4000_0000 != 0 {
+        bail!("packed dynamic transfer has a nonzero reserved bit 30");
     } else if ((entry >> 24) & 0x0f) > 8 {
         bail!("packed dynamic transfer has coverage count outside 0..=8");
     }
@@ -4259,10 +4395,79 @@ mod tests {
     fn dynamic_transfer_tag_and_reserved_bits_are_unambiguous() {
         let dynamic = 0x8000_0000 | 0x0000_beef | (127 << 16) | (8 << 24);
         assert!(validate_packed_transfer(dynamic).is_ok());
-        assert!(validate_packed_transfer(dynamic | (1 << 28)).is_err());
+        // Bits 28..29 are the seam-boundary marker tag in both
+        // representations, so they are accepted rather than reserved; bit 30
+        // still is not.
+        assert!(validate_packed_transfer(dynamic | (1 << 28)).is_ok());
+        assert!(validate_packed_transfer(dynamic | (2 << 28)).is_ok());
+        assert!(validate_packed_transfer(dynamic | (1 << 30)).is_err());
         assert!(validate_packed_transfer(0x8000_0000 | (9 << 24)).is_err());
         assert!(validate_packed_transfer(pack_transfer(256, 255)).is_ok());
         assert!(validate_packed_transfer(257 << 8).is_err());
+        assert!(validate_packed_transfer(1 << 17).is_err());
+    }
+
+    /// `blend_markers.frag` must stay `blend.frag` plus the marker block and
+    /// nothing else, or the two renderers' shading would drift apart the
+    /// moment markers are turned on. Only the source is compared; the
+    /// checked-in `.spv` files are compared against a fresh naga build by
+    /// hand, as documented at the top of this module.
+    #[test]
+    fn marker_shader_is_the_plain_shader_plus_the_marker_block() {
+        let plain = include_str!("shaders/blend.frag");
+        let marked = include_str!("shaders/blend_markers.frag");
+        let (_, body) = marked
+            .split_once("// ---- end of variant header ----\n")
+            .expect("variant header");
+        let (before, rest) = body
+            .split_once("    // ---- begin markers ----\n")
+            .expect("marker block start");
+        let (block, after) = rest
+            .split_once("    // ---- end markers ----\n")
+            .expect("marker block end");
+        assert!(block.contains("(ab >> 28u) & 0x3u"));
+        assert_eq!(format!("{before}{after}"), plain);
+    }
+
+    /// The checked-in marker shader has exactly the one green constant
+    /// `marker_spirv` patches: at 2.2 the result is the file itself, and at
+    /// any other gamma exactly that word changes, to the new green.
+    #[test]
+    fn marker_spirv_patches_only_the_green_constant() {
+        use crate::projection::blend::marker_green;
+        assert_eq!(marker_spirv(marker_green(2.2)).unwrap(), MARKER_FRAG_SPV);
+        for gamma in [1.8, 2.4] {
+            let green = marker_green(gamma);
+            let patched = marker_spirv(green).unwrap();
+            assert_eq!(patched.len(), MARKER_FRAG_SPV.len());
+            let changed: Vec<_> = patched
+                .chunks_exact(4)
+                .zip(MARKER_FRAG_SPV.chunks_exact(4))
+                .filter(|(a, b)| a != b)
+                .map(|(a, _)| f32::from_le_bytes(a.try_into().unwrap()))
+                .collect();
+            assert_eq!(changed, [f32::from(green) / 255.0], "gamma {gamma}");
+            assert_eq!((changed[0] * 255.0).round() as u8, green);
+        }
+    }
+
+    /// A tagged `(a, b)` pair keeps its gain and lift intact and moves its
+    /// tag to the one place `blend_markers.frag` looks for it, bits 28..29,
+    /// the same place `pack_dynamic_shape` leaves it, so the shader needs no
+    /// per-mode branch to find it.
+    #[test]
+    fn packing_relocates_the_marker_tag_and_leaves_an_untagged_pair_alone() {
+        use crate::projection::blend::{with_marker, MARKER_BLUE, MARKER_ORANGE};
+        for (a, b) in [(0u16, 0u8), (256, 0), (137, 42), (0, 255)] {
+            assert_eq!(pack_transfer(a, b), (u32::from(a) << 8) | u32::from(b));
+            for tag in [MARKER_ORANGE, MARKER_BLUE] {
+                let (ta, tb) = with_marker((a, b), tag);
+                let packed = pack_transfer(ta, tb);
+                assert_eq!(packed & 0x0fff_ffff, pack_transfer(a, b));
+                assert_eq!((packed >> 28) & 0x3, u32::from(tag));
+                assert!(validate_packed_transfer(packed).is_ok());
+            }
+        }
     }
 
     #[test]

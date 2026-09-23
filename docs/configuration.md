@@ -984,6 +984,7 @@ Warp adds retained corner and center correction to the same content selection:
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
 | `blackLift` | number or object | `0.0` | Fixed compensation or optional adaptive compensation, with level 0-0.5; see below |
 | `testPattern` | string or null | null | `grid`, `warp-alignment`, `white`, `black`, `gamma`, `identify`, `sync` - or null for content |
+| `temporary` | object | `{ "highlightOverlaps": false }` | Temporary calibration aids that are never saved. `highlightOverlaps` draws the seam lineup lines; see [Highlighting overlaps](#highlight-overlaps) |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
 | `arrangement` | object or null | `null` | Optional. The resolved record of the last applied [grid arrangement](#grid-arrangement): `{ rows, columns, overlapX, overlapY, contentScale }`. A record of intent, not canonical geometry — a later manual geometry edit leaves it in place |
@@ -1343,8 +1344,11 @@ application, the background is already visible by the time the browser exits
 More than one client at a time, and what a client should do about it, is covered in [Multiple clients](multi-user.md).
 
 The document carries a truth flag, `committed`. Reads report it honestly:
-`true` for the saved document, `false` when a working copy is live. Writes
-use it to speak:
+`true` for the saved document, `false` when a working copy is live. The one
+exception is a working copy that differs from the saved document only in
+[`projection.temporary`](#highlight-overlaps). It reads `committed: true`,
+because saving it would change nothing. It is still live, and Save or Revert
+still clears it. Writes use the flag to speak:
 
 - `PUT /api/v1/config` with `"committed": true` validates and **persists** -
   the normal save.
@@ -1533,6 +1537,53 @@ The bottom-left clock is UTC time of day to the millisecond, sampled once per
 present cycle and therefore identical on every output of a frame; one legible
 frame of the clip is enough to line the whole clip up against the stats log
 and the journal, which are Unix time too.
+
+#### Highlighting overlaps {: #highlight-overlaps }
+
+**Highlight overlaps**, in the web UI's edge-blending panel, draws two
+lines on every output along each seam it blends across. Use it to line up
+warp geometry. In the API it is `projection.temporary.highlightOverlaps`.
+
+- **Orange** marks where this output's blend begins: the last pixel at full
+  strength and the first one that fades.
+- **Blue** marks the far edge of the same overlap, where this output has
+  faded out completely.
+
+Where a seam is lined up, one output's orange lands exactly on its
+neighbor's blue, and the pair adds up to a single **white** line. Adjust the
+corner and center pins until every pair turns white. A misaligned pair shows
+separate orange and blue lines, or orange and light-blue fringes about as
+wide as the error. A fringe of up to about half an output pixel is normal
+even at the best alignment, because neighboring projectors' pixel grids
+don't line up exactly.
+
+- **Width.** Each line is 2 pixels of the output's own resolution, measured
+  before the warp. A warp that stretches an output also stretches its lines.
+- **Color, and a gamma check.** The lines are drawn at full strength over
+  the blend, not faded by it. Their green channel comes from `gamma`: it is
+  `255 × 0.5^(1/gamma)`, 186 at the default 2.2, so each output contributes
+  exactly half the green light and the pair sums to white. When the lines
+  coincide but the result is tinted, `gamma` doesn't match the projectors.
+  Lilac means the projectors' real gamma is higher than the setting; greenish
+  means it is lower.
+- **What to show underneath.** Black content (or the `black` pattern) gives
+  the clearest reading: lined-up pairs are white lines on black, and
+  misaligned ones are separate colored lines.
+- **Where lines appear.** Lines appear only while `blend` is on and only at
+  real seams. Nothing is drawn on the wall's outer edges or on stacked
+  projectors. Where a horizontal and a vertical seam cross, orange wins.
+  An overlap narrower than about two output pixels shows only orange.
+- **Never saved.** Save and Revert both switch it off, and so does a daemon
+  restart. Turning it on doesn't count as an unsaved edit; see
+  [Working copies and the committed flag](#live-preview).
+- **No cost when off.** The GPU and CPU renderers switch to a line-drawing
+  variant only while it is on. With it off they run exactly the code they
+  would without the feature.
+
+`temporary` is the home for calibration aids like this one. Anything in it
+is reset whenever a document is saved, by the server itself, whichever
+client does the saving. `testPattern` predates it and is not reset this way:
+the web UI clears it before saving, but an API client has to do so itself.
 
 !!! warning "Keep an output at position 0,0"
     Sway anchors a spanned (`fullscreen global`) surface at the layout

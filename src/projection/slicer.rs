@@ -258,7 +258,7 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
 };
 
-use super::blend::{Coverage, OverlaySpec, SlicerSpec};
+use super::blend::{Coverage, MarkerPalette, OverlaySpec, SlicerSpec};
 use super::pattern::{SyncGroup, SyncRect};
 use super::{dmabuf, gpu};
 use crate::model::{
@@ -1463,6 +1463,50 @@ struct State {
     /// go through a writer thread instead of this (render) thread blocking
     /// on, or panicking from, `println!`. See `control::StdoutWriter`.
     stdout: super::control::StdoutWriter,
+    /// The CPU row painters, fixed from the spec this slicer started with.
+    cpu: CpuRenderers,
+}
+
+/// Which CPU row loops paint frames: the plain ones, or the variants that
+/// also paint the seam-boundary markers.
+///
+/// Chosen once, in [`run`], from `SlicerSpec::marker_palette`, so no frame,
+/// row or pixel ever tests the setting or recomputes the colors. That is
+/// sound because a CPU
+/// slicer's spec never changes under it: a CPU child has no live controller
+/// and the manager restarts it on any edit, including this toggle. The GPU
+/// path makes the same choice per installed spec instead, through
+/// `Gpu::set_markers`.
+#[derive(Clone, Copy)]
+struct CpuRenderers {
+    blend: fn(&Blend<'_>, &mut [u8], u32, u32, MarkerPalette),
+    sync: fn(&SyncPaint<'_>, &mut [u8], u32, u32, MarkerPalette),
+    /// Passed to every call; only the marker variants read it.
+    palette: MarkerPalette,
+}
+
+impl CpuRenderers {
+    fn new(markers: Option<MarkerPalette>) -> Self {
+        // Closures rather than the method paths themselves, which name one
+        // `Blend<'_>` lifetime and so do not coerce to these higher-ranked
+        // pointers.
+        match markers {
+            Some(palette) => CpuRenderers {
+                blend: |blend, dst, first, count, palette| {
+                    blend.marked_rows(dst, first, count, palette)
+                },
+                sync: |paint, dst, first, count, palette| {
+                    paint.marked_rows(dst, first, count, palette)
+                },
+                palette,
+            },
+            None => CpuRenderers {
+                blend: |blend, dst, first, count, _| blend.rows(dst, first, count),
+                sync: |paint, dst, first, count, _| paint.rows(dst, first, count),
+                palette: MarkerPalette::default(),
+            },
+        }
+    }
 }
 
 /// Kept across transfer-mode/settings changes so a static capture can be
@@ -2197,6 +2241,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         capture_measurement: None,
         measurement: super::adaptive::MeasurementSchedule::default(),
         stdout: super::control::StdoutWriter::spawn(),
+        cpu: CpuRenderers::new(spec.marker_palette()),
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
@@ -3057,34 +3102,46 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
             "warp_unavailable: negotiated pipeline does not support geometric correction"
         ))
     } else if let Some(gpu) = state.gpu.as_mut() {
-        if prepared.outputs.iter().any(|o| o.dynamic_table.is_some()) {
-            let updates: Vec<_> = prepared
-                .outputs
-                .iter()
-                .map(|o| gpu::PackedTransferUpdate {
-                    index: o.index,
-                    width: o.size.0,
-                    height: o.size.1,
-                    table: o
-                        .dynamic_table
-                        .as_deref()
-                        .expect("one transfer mode per generation"),
-                })
-                .collect();
-            gpu.replace_packed_transfers(&updates)
+        // Markers go on before tagged tables are uploaded and off only after
+        // untagged ones are; see `Gpu::set_markers`.
+        let markers = prepared.spec.marker_palette();
+        let before = if markers.is_some() {
+            gpu.set_markers(markers)
         } else {
-            let updates: Vec<_> = prepared
-                .outputs
-                .iter()
-                .map(|o| gpu::TransferUpdate {
-                    index: o.index,
-                    width: o.size.0,
-                    height: o.size.1,
-                    table: &o.table,
-                })
-                .collect();
-            gpu.replace_transfers(&updates)
-        }
+            Ok(())
+        };
+        before
+            .and_then(|()| {
+                if prepared.outputs.iter().any(|o| o.dynamic_table.is_some()) {
+                    let updates: Vec<_> = prepared
+                        .outputs
+                        .iter()
+                        .map(|o| gpu::PackedTransferUpdate {
+                            index: o.index,
+                            width: o.size.0,
+                            height: o.size.1,
+                            table: o
+                                .dynamic_table
+                                .as_deref()
+                                .expect("one transfer mode per generation"),
+                        })
+                        .collect();
+                    gpu.replace_packed_transfers(&updates)
+                } else {
+                    let updates: Vec<_> = prepared
+                        .outputs
+                        .iter()
+                        .map(|o| gpu::TransferUpdate {
+                            index: o.index,
+                            width: o.size.0,
+                            height: o.size.1,
+                            table: &o.table,
+                        })
+                        .collect();
+                    gpu.replace_transfers(&updates)
+                }
+            })
+            .and_then(|()| gpu.set_markers(markers))
     } else {
         Err(anyhow::anyhow!("GPU unavailable"))
     };
@@ -4293,8 +4350,10 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
         presentation,
         free_run,
         stats,
+        cpu,
         ..
     } = state;
+    let (rows, palette) = (cpu.blend, cpu.palette);
     // The snapshot, not the shared buffer: by now the compositor has been
     // given that buffer back and may already be drawing the next frame into
     // it. Blending from underneath it would tear.
@@ -4406,7 +4465,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
             let painted = &mut map[..height as usize * row_bytes];
             let workers = blend_workers(height);
             if workers <= 1 {
-                blend.rows(painted, 0, height);
+                rows(&blend, painted, 0, height, palette);
             } else {
                 // Rows are independent, so each worker owns a disjoint band of
                 // the destination and nothing needs synchronizing. Scoped
@@ -4419,7 +4478,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                         let blend = &blend;
                         let first = index as u32 * band;
                         let count = band.min(height - first);
-                        scope.spawn(move || blend.rows(chunk, first, count));
+                        scope.spawn(move || rows(blend, chunk, first, count, palette));
                     }
                 });
             }
@@ -4541,6 +4600,18 @@ impl Blend<'_> {
         (((a as u32 * value as u32) >> 8) + b as u32).min(255) as u8
     }
 
+    /// Paint one destination pixel a seam-boundary marker's flat palette
+    /// color — BGRA, opaque, like every other write here.
+    ///
+    /// This is the CPU half of the override `blend_markers.frag` applies near
+    /// the top of `main`, and it is an override rather than content for the reason
+    /// spelled out on [`super::blend::MARKER_NONE`]: the blue line marks
+    /// where this output's own blend weight is exactly zero, so a marker put
+    /// through `shade` would be multiplied away precisely where it is drawn.
+    fn write_marker(dst: &mut [u8], color: [u8; 3]) {
+        dst.copy_from_slice(&[color[2], color[1], color[0], 255]);
+    }
+
     fn write_black(dst: &mut [u8]) {
         dst.copy_from_slice(&[0, 0, 0, 255]);
     }
@@ -4626,6 +4697,50 @@ impl Blend<'_> {
                     .copied()
                     .unwrap_or((256, 0));
                 let out = &mut dst[dst_row + x * 4..dst_row + x * 4 + 4];
+                if a == 0 && b == 0 {
+                    Self::write_black(out);
+                    continue;
+                }
+                let Some(sample) = self.sample(x as u32, target) else {
+                    Self::write_black(out);
+                    continue;
+                };
+                // Presenters are always BGRA, opaque.
+                out[0] = Self::shade(a, b, sample[0]);
+                out[1] = Self::shade(a, b, sample[1]);
+                out[2] = Self::shade(a, b, sample[2]);
+                out[3] = 255;
+            }
+        }
+    }
+
+    /// [`Self::rows`] with the seam-boundary markers painted over it, used
+    /// instead of it while `highlightOverlaps` is on. Kept as a separate
+    /// loop so `rows` itself carries no marker test at all; which of the two
+    /// runs is fixed when the slicer starts (see [`CpuRenderers`]).
+    fn marked_rows(&self, dst: &mut [u8], first: u32, count: u32, palette: MarkerPalette) {
+        let row_bytes = self.width as usize * 4;
+        for y in 0..count {
+            let target = first + y;
+            let dst_row = y as usize * row_bytes;
+            let transfer_row = target as usize * self.width as usize;
+            for x in 0..self.width as usize {
+                let (gain, b) = self
+                    .transfer
+                    .get(transfer_row + x)
+                    .copied()
+                    .unwrap_or((256, 0));
+                let a = super::blend::gain_of(gain);
+                let out = &mut dst[dst_row + x * 4..dst_row + x * 4 + 4];
+                // The marker is the LAST word on this pixel, so it is read
+                // first and nothing below can undo it — including the black
+                // shortcut just after, which the blue line would otherwise
+                // always take (its own transfer really is (0, 0): that is
+                // what "the outside edge of the overlap" means).
+                if let Some(color) = palette.color(super::blend::marker_of_gain(gain)) {
+                    Self::write_marker(out, color);
+                    continue;
+                }
                 if a == 0 && b == 0 {
                     Self::write_black(out);
                     continue;
@@ -4729,7 +4844,13 @@ fn present_pattern(
         for pixel in map[..height as usize * row_bytes].chunks_exact_mut(4) {
             pixel.copy_from_slice(&[0, 0, 0, 255]);
         }
-        blend.rows(&mut map[..height as usize * row_bytes], 0, height);
+        (state.cpu.blend)(
+            &blend,
+            &mut map[..height as usize * row_bytes],
+            0,
+            height,
+            state.cpu.palette,
+        );
         let (buffer, _) = &presenter.buffers[0];
         presenter.surface.attach(Some(buffer), 0, 0);
         presenter
@@ -5072,8 +5193,10 @@ fn present_sync_cpu(
         presenters,
         timing,
         presentation,
+        cpu,
         ..
     } = state;
+    let (rows, palette) = (cpu.sync, cpu.palette);
     let snapshot_id = timing.snapshot_id;
     let mut committed_any = false;
     for d in &due {
@@ -5110,7 +5233,7 @@ fn present_sync_cpu(
             let painted = &mut map[..height as usize * row_bytes];
             let workers = blend_workers(height);
             if workers <= 1 {
-                paint.rows(painted, 0, height);
+                rows(&paint, painted, 0, height, palette);
             } else {
                 let band = height.div_ceil(workers);
                 std::thread::scope(|scope| {
@@ -5119,7 +5242,7 @@ fn present_sync_cpu(
                         let paint = &paint;
                         let first = index as u32 * band;
                         let count = band.min(height - first);
-                        scope.spawn(move || paint.rows(chunk, first, count));
+                        scope.spawn(move || rows(paint, chunk, first, count, palette));
                     }
                 });
             }
@@ -5289,6 +5412,56 @@ impl SyncPaint<'_> {
                         .unwrap_or((256, 0));
                     let v = (((u32::from(a) * 255) >> 8) + u32::from(b)).min(255) as u8;
                     dst[dst_row + x * 4..dst_row + x * 4 + 4].copy_from_slice(&[v, v, v, 255]);
+                }
+            }
+        }
+    }
+
+    /// [`Self::rows`] with the seam-boundary markers painted over it, used
+    /// instead of it while `highlightOverlaps` is on. Markers override the
+    /// pattern exactly as they override content, because
+    /// `blend_markers.frag` applies them before it knows which mode it is
+    /// in; painting them here keeps the two renderers producing the same
+    /// bytes.
+    fn marked_rows(&self, dst: &mut [u8], first: u32, count: u32, palette: MarkerPalette) {
+        let row_bytes = self.width as usize * 4;
+        for y in 0..count {
+            let target = first + y;
+            let dst_row = y as usize * row_bytes;
+            let transfer_row = target as usize * self.width as usize;
+            for x in 0..self.width as usize {
+                let (gain, b) = self
+                    .transfer
+                    .get(transfer_row + x)
+                    .copied()
+                    .unwrap_or((256, 0));
+                let pixel = match palette.color(super::blend::marker_of_gain(gain)) {
+                    Some(color) => [color[2], color[1], color[0], 255],
+                    None => [b, b, b, 255],
+                };
+                dst[dst_row + x * 4..dst_row + x * 4 + 4].copy_from_slice(&pixel);
+            }
+            for rect in self.rects {
+                if target < rect.y0 || target >= rect.y1 {
+                    continue;
+                }
+                let from = rect.x0 as usize;
+                let to = (rect.x1 as usize).min(self.width as usize);
+                for x in from..to {
+                    let (gain, b) = self
+                        .transfer
+                        .get(transfer_row + x)
+                        .copied()
+                        .unwrap_or((256, 0));
+                    let pixel = match palette.color(super::blend::marker_of_gain(gain)) {
+                        Some(color) => [color[2], color[1], color[0], 255],
+                        None => {
+                            let a = super::blend::gain_of(gain);
+                            let v = (((u32::from(a) * 255) >> 8) + u32::from(b)).min(255) as u8;
+                            [v, v, v, 255]
+                        }
+                    };
+                    dst[dst_row + x * 4..dst_row + x * 4 + 4].copy_from_slice(&pixel);
                 }
             }
         }
@@ -5758,6 +5931,74 @@ mod tests {
             width: 6,
             sample: None,
         }
+    }
+
+    /// A seam-boundary marker is the final word on its pixel: it paints its
+    /// flat palette color over whatever the transfer would have produced —
+    /// crucially including a `(0, 0)` transfer, which is exactly what the
+    /// blue line's own pixels carry (it marks where this output's weight is
+    /// zero) and which would otherwise take the black shortcut. Untagged
+    /// neighbors in the same row are shaded exactly as `rows` shades them.
+    #[test]
+    fn a_marker_overrides_the_transfer_instead_of_going_through_it() {
+        use super::super::blend::{with_marker, MARKER_BLUE, MARKER_ORANGE};
+        let palette = MarkerPalette::for_gamma(2.2);
+        let pixels = canvas(9, 40);
+        let mut transfer: Vec<(u16, u8)> = vec![(256, 0); 6 * 8];
+        transfer[0] = with_marker((0, 0), MARKER_BLUE);
+        transfer[1] = with_marker((128, 7), MARKER_ORANGE);
+        transfer[2] = (0, 0);
+        let untagged: Vec<(u16, u8)> = transfer
+            .iter()
+            .map(|&(a, b)| (super::super::blend::gain_of(a), b))
+            .collect();
+        let mut marked = vec![0u8; 6 * 4];
+        let mut plain = vec![0u8; 6 * 4];
+        let mut marked_untagged = vec![0u8; 6 * 4];
+        blend_for(&pixels, &transfer).marked_rows(&mut marked, 0, 1, palette);
+        blend_for(&pixels, &untagged).rows(&mut plain, 0, 1);
+        blend_for(&pixels, &untagged).marked_rows(&mut marked_untagged, 0, 1, palette);
+        // With nothing tagged, the marker loop is the plain loop.
+        assert_eq!(marked_untagged, plain);
+        // BGRA: blue #00baff, then orange #ffba00, both opaque.
+        assert_eq!(&marked[0..4], &[0xff, 0xba, 0x00, 255]);
+        assert_eq!(&marked[4..8], &[0x00, 0xba, 0xff, 255]);
+        // Without the tag the blue pixel really would have been black.
+        assert_eq!(&plain[0..4], &[0, 0, 0, 255]);
+        // Everything untagged is byte-identical either way.
+        assert_eq!(&marked[8..], &plain[8..]);
+    }
+
+    /// The CPU renderers paint with the palette they were chosen with, and
+    /// without markers they are the plain loop whatever the gamma.
+    #[test]
+    fn cpu_renderers_paint_the_palette_they_were_chosen_with() {
+        use super::super::blend::{gain_of, with_marker, MARKER_BLUE, MARKER_ORANGE};
+        let pixels = canvas(9, 40);
+        let mut transfer: Vec<(u16, u8)> = vec![(256, 0); 6 * 8];
+        transfer[0] = with_marker((0, 0), MARKER_BLUE);
+        transfer[1] = with_marker((128, 7), MARKER_ORANGE);
+        let untagged: Vec<(u16, u8)> = transfer.iter().map(|&(a, b)| (gain_of(a), b)).collect();
+        let paint = |renderers: CpuRenderers, transfer: &[(u16, u8)]| {
+            let mut out = vec![0u8; 6 * 4];
+            (renderers.blend)(
+                &blend_for(&pixels, transfer),
+                &mut out,
+                0,
+                1,
+                renderers.palette,
+            );
+            out
+        };
+        let marked = paint(
+            CpuRenderers::new(Some(MarkerPalette::for_gamma(2.4))),
+            &transfer,
+        );
+        assert_eq!(&marked[0..4], &[0xff, 191, 0x00, 255]);
+        assert_eq!(&marked[4..8], &[0x00, 191, 0xff, 255]);
+        let mut plain = vec![0u8; 6 * 4];
+        blend_for(&pixels, &untagged).rows(&mut plain, 0, 1);
+        assert_eq!(paint(CpuRenderers::new(None), &untagged), plain);
     }
 
     /// Splitting the work across workers must produce byte-identical output.
@@ -6482,6 +6723,7 @@ mod tests {
             capture_measurement: None,
             measurement: super::super::adaptive::MeasurementSchedule::default(),
             stdout: super::super::control::StdoutWriter::spawn(),
+            cpu: CpuRenderers::new(None),
         }
     }
 
@@ -7209,6 +7451,47 @@ mod tests {
             paint.rows(chunk, first, band.min(height - first));
         }
         assert_eq!(whole, banded);
+    }
+
+    /// The sync pattern's marker loop paints tagged pixels their palette
+    /// color, both on the black background and inside a lit rectangle, and
+    /// is otherwise byte-identical to the plain loop.
+    #[test]
+    fn sync_markers_override_the_pattern_and_leave_the_rest_alone() {
+        use super::super::blend::{gain_of, with_marker, MARKER_BLUE, MARKER_ORANGE};
+        let (width, height) = (8u32, 2u32);
+        let mut transfer = vec![(200u16, 3u8); (width * height) as usize];
+        transfer[1] = with_marker((0, 0), MARKER_BLUE);
+        transfer[5] = with_marker((128, 0), MARKER_ORANGE);
+        let untagged: Vec<(u16, u8)> = transfer.iter().map(|&(a, b)| (gain_of(a), b)).collect();
+        let rects = [SyncRect {
+            x0: 4,
+            y0: 0,
+            x1: 8,
+            y1: 1,
+        }];
+        let paint = |transfer| SyncPaint {
+            transfer,
+            rects: &rects,
+            width,
+        };
+        let palette = MarkerPalette::for_gamma(2.2);
+        let size = (width * height * 4) as usize;
+        let (mut marked, mut plain, mut marked_untagged) =
+            (vec![0u8; size], vec![0u8; size], vec![0u8; size]);
+        paint(&transfer).marked_rows(&mut marked, 0, height, palette);
+        paint(&untagged).rows(&mut plain, 0, height);
+        paint(&untagged).marked_rows(&mut marked_untagged, 0, height, palette);
+        assert_eq!(marked_untagged, plain);
+        // BGRA: blue on the background, orange inside the rectangle.
+        assert_eq!(&marked[4..8], &[0xff, 0xba, 0x00, 255]);
+        assert_eq!(&marked[20..24], &[0x00, 0xba, 0xff, 255]);
+        for pixel in (0..size / 4).filter(|&i| i != 1 && i != 5) {
+            assert_eq!(
+                &marked[pixel * 4..pixel * 4 + 4],
+                &plain[pixel * 4..pixel * 4 + 4]
+            );
+        }
     }
 
     #[test]
@@ -8035,6 +8318,7 @@ mod reconstruction {
             renderer: crate::model::Renderer::Cpu,
             layout: plan.layout,
             coverage_rects: plan.coverage_rects,
+            highlight_overlaps: projection.temporary.highlight_overlaps,
             slices: plan.slices,
         }
     }

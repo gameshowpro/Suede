@@ -29,6 +29,12 @@ the working copy if one exists, otherwise the saved one. Its `committed` field
 says which. The same flag appears in `GET /api/v1/status`, so a client that only
 watches status still knows whether the wall is showing something unsaved.
 
+A working copy that differs from the saved document only in `projection.temporary`
+reads `committed: true`. That section holds calibration aids such as
+[Highlight overlaps](configuration.md#highlight-overlaps), and saving never
+keeps them. The working copy is still live and still shared, so another
+client's Save or Revert switches the aid off for everyone.
+
 ## Every change is announced
 
 Every change to the effective document is published on the event stream

@@ -106,6 +106,12 @@ impl ApiState {
             .stage_replace_if(expected, |basis| {
                 let mut next = prepare(basis)?;
                 validate_configuration_against(&mut next, basis, &context)?;
+                // Structural, not a client convention: whatever `prepare` or
+                // validation left here is discarded unconditionally before
+                // this document can reach disk. See [`crate::model::TemporarySettings`].
+                if let Some(projection) = next.projection.as_mut() {
+                    projection.temporary = Default::default();
+                }
                 Ok(next)
             })
             .map_err(map_conditional_write_error)?;
@@ -162,6 +168,11 @@ impl ApiState {
             .stage_replace_if(expected, |basis| {
                 let mut next = prepare(basis)?;
                 validate_configuration_literal(&mut next, basis, &context)?;
+                // Structural, not a client convention: see the matching
+                // reset in `commit_if` above.
+                if let Some(projection) = next.projection.as_mut() {
+                    projection.temporary = Default::default();
+                }
                 Ok(next)
             })
             .map_err(map_conditional_write_error)?;

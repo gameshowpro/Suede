@@ -327,7 +327,7 @@ impl Reconciler {
             divergences: previous.divergences,
             last_reconciled: previous.last_reconciled,
             revision: desired.revision,
-            committed: !self.store.has_preview(),
+            committed: !self.store.has_unsaved_edits(),
             current_revision: self.store.revision(),
             // The reconciler holds no `CheckRunner` — checks shell out to
             // other programs, and a pass must stay cheap — so it cannot
@@ -598,7 +598,7 @@ impl Reconciler {
             // `revision` this pass actually applied, which is exactly the
             // "have you caught up with my last write" signal the field
             // exists for.
-            committed: !self.store.has_preview(),
+            committed: !self.store.has_unsaved_edits(),
             current_revision: self.store.revision(),
             checks: None,
             active_app: active_app_status(&self.supervisor, desired.active_app.as_deref()).await,
@@ -773,6 +773,7 @@ impl Reconciler {
                             pattern: projection.test_pattern,
                             free_run: projection.free_run,
                             renderer: projection.renderer,
+                            highlight_overlaps: projection.temporary.highlight_overlaps,
                             slices: plan.slices,
                         });
                     }
@@ -2403,6 +2404,12 @@ mod tests {
         assert_eq!(status.revision, 1);
     }
 
+    /// Was `..._from_the_store`, and used a preview identical to `current` to
+    /// prove `!committed` — that stopped being true once "unsaved" started
+    /// meaning "differs from `current`" rather than "a preview exists"
+    /// (`StateStore::has_unsaved_edits`, added for `TemporarySettings`). The
+    /// preview here now carries a real edit, which is what the renamed test
+    /// is actually about.
     #[tokio::test]
     async fn status_reports_committed_and_current_revision_from_the_store() {
         let harness = harness();
@@ -2412,11 +2419,13 @@ mod tests {
         // The reconciler holds no check runner, so it never claims to know.
         assert!(status.checks.is_none());
 
-        harness.store.set_preview(Some(harness.store.get()));
+        let mut edited = harness.store.get();
+        edited.settings.hide_cursor = !edited.settings.hide_cursor;
+        harness.store.set_preview(Some(edited));
         let status = harness.reconciler.reconcile().await;
         assert!(
             !status.committed,
-            "a live working copy is not what is saved on disk"
+            "a live working copy with a real edit is not what is saved on disk"
         );
 
         harness.store.set_preview(None);

@@ -381,6 +381,7 @@ mod tests {
         SlicerSpec {
             layout: None,
             coverage_rects: Vec::new(),
+            highlight_overlaps: false,
             control_session: String::new(),
             source: "canvas".into(),
             canvas_width: 8,

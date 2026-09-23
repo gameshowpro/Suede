@@ -581,6 +581,8 @@ Warp mode lets an operator fit each projector's picture to a physical surface us
 
 The [`warp-alignment` test pattern](configuration.md#projection-test-patterns) — 10% grid lines and a center alignment circle, drawn in canvas space — is the tool for lining up corner pins and the center remap before switching to real content. Every built-in pattern is a picture defined once in canvas space and sampled into each output through exactly the same source-rectangle, warp, and blend path real content takes — on both the GPU and CPU renderers, and at any Content scale — so a wall calibrated on a pattern merges the same way once you switch to real content; nothing about the alignment has to be re-checked after the swap.
 
+[Highlight overlaps](configuration.md#highlight-overlaps) is the finer tool for the seams themselves. It draws each output's blend boundaries as orange and blue lines taken from the same ramp tables the blend uses, so a lined-up pair is exactly where the blend really is. The lines are painted over the blend at full strength, not faded by it, because the blue line sits exactly where its own output has faded to nothing. Both renderers switch to their line-drawing variants only while it is on. The GPU's line color is fixed into its shader when the aid turns on or `gamma` changes, so nothing extra runs per frame.
+
 *(Implementation detail: The configuration schema also retains `geometry.rasterFootprint` in the background to track where a projector's physical light field lands on the canvas—including unlit black borders—allowing the engine to resolve multi-beam coverage independent of active picture pin adjustments.)*
 
 

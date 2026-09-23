@@ -292,6 +292,73 @@ fn build_edge_tables(
     (row_left, row_right, col_top, col_bottom)
 }
 
+/// How wide a seam-boundary marker line is, in pixels of the output that
+/// draws it: the source rectangle scaled to that output's resolution, before
+/// any warp. [`Evaluator::marker_widths`] converts this to canvas pixels.
+pub(crate) const MARKER_OUTPUT_PIXELS: f64 = 2.0;
+
+/// One marker line, as the half-open canvas-pixel band `[from, to)` it
+/// occupies along the axis it is measured across: a vertical line (constant
+/// canvas x) for an x-axis marker, a horizontal one for a y-axis marker.
+/// `tag` is one of [`super::blend::MARKER_ORANGE`] /
+/// [`super::blend::MARKER_BLUE`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MarkerBand {
+    pub tag: u8,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl MarkerBand {
+    fn contains(&self, along: f64) -> bool {
+        along >= self.from && along < self.to
+    }
+}
+
+/// The two markers one active ramp contributes, given the ramp's own extent
+/// `[low, high]` in canvas pixels, the band `width` in canvas pixels and the
+/// colors at each of its ends.
+///
+/// **Both bands lie INSIDE the ramp**, `[low, low + width)` and
+/// `[high - width, high)`. That is what makes the aid work rather than merely draw: the two
+/// sources meeting at a seam name the same two boundaries — one source's
+/// ramp start is the other's ramp end — so insetting both of them the same
+/// way is the only rule under which a correctly aligned pair's orange and
+/// blue land on exactly the same canvas pixels and sum to white. Insetting
+/// outward instead would put one source's blue line beyond its own rectangle
+/// (the blue boundary IS that rectangle's edge), where it has no pixels to
+/// draw it with, and would leave the pair reading as adjacent orange and
+/// blue stripes rather than one white one.
+fn ramp_bands(low: f64, high: f64, width: f64, low_tag: u8, high_tag: u8) -> [MarkerBand; 2] {
+    [
+        MarkerBand {
+            tag: low_tag,
+            from: low,
+            to: low + width,
+        },
+        MarkerBand {
+            tag: high_tag,
+            from: high - width,
+            to: high,
+        },
+    ]
+}
+
+/// The tag of the band containing `along`, preferring orange — see the
+/// precedence paragraph on [`Evaluator::marker_at`].
+fn band_hit(bands: &[Option<MarkerBand>; 4], along: f64) -> u8 {
+    let mut tag = super::blend::MARKER_NONE;
+    for band in bands.iter().flatten() {
+        if band.contains(along) {
+            if band.tag == super::blend::MARKER_ORANGE {
+                return super::blend::MARKER_ORANGE;
+            }
+            tag = band.tag;
+        }
+    }
+    tag
+}
+
 /// One edge's contribution to a raw weight: `clamp(distance / denominator,
 /// 0, 1)`, or `1` when no pair ramps from that edge (`denominator == 0.0`).
 fn edge_ramp(distance: f64, denominator: f64) -> f64 {
@@ -547,6 +614,191 @@ impl Evaluator {
             (edge * (1.0 - lift) * ramp * 256.0).round() as u16,
             (edge * lift * 255.0).round() as u8,
         )
+    }
+
+    /// The canvas-pixel widths `[x, y]` of source `index`'s marker lines when
+    /// it is shown on an output of `size`: [`MARKER_OUTPUT_PIXELS`] of that
+    /// output's pre-warp raster, per axis. The evaluator knows nothing about
+    /// outputs, so table builders compute this once per output and pass it
+    /// to [`Self::marker_at`].
+    pub fn marker_widths(&self, index: usize, size: (u32, u32)) -> [f64; 2] {
+        let r = &self.sources[index];
+        [
+            MARKER_OUTPUT_PIXELS * r.width * self.width / f64::from(size.0),
+            MARKER_OUTPUT_PIXELS * r.height * self.vertical_density / f64::from(size.1),
+        ]
+    }
+
+    /// The seam-boundary marker lines source `index` draws across canvas row
+    /// `row`, each `width` canvas pixels wide: vertical lines, banded in
+    /// canvas-pixel x. At most four — two
+    /// from each of this source's own left and right edges — in an array
+    /// rather than a `Vec` because [`Self::marker_at`] calls this once per
+    /// destination pixel and must not allocate.
+    ///
+    /// Derived from nothing but [`Self::row_left`] / [`Self::row_right`],
+    /// the same precomputed denominators [`Self::raw_weight`] ramps with, so
+    /// a marked boundary is *by construction* the boundary the render
+    /// actually uses on that row. That is why this reads the compacted
+    /// per-row table rather than rescanning [`seam_pairs`]: where more than
+    /// one neighbor ramps a row from the same edge, the table has already
+    /// collapsed them to the one denominator that wins, and the aid draws
+    /// the merged line the picture really has instead of one line per
+    /// neighbor. A calibration aid can never disagree with what it is
+    /// calibrating; being approximate about a rare multi-neighbor row is the
+    /// cheaper half of that trade.
+    ///
+    /// A sub-pixel ramp denominator — brain's 0.07-pixel row sliver, say —
+    /// still counts as a ramp here, exactly as it does in the tables, so its
+    /// two bands land within one band width of each other and overpaint. That is
+    /// honest: the configuration really does say those rectangles overlap,
+    /// and the aid reports the geometry rather than second-guessing it.
+    pub(crate) fn row_bands(
+        &self,
+        index: usize,
+        row: usize,
+        width: f64,
+    ) -> [Option<MarkerBand>; 4] {
+        let r = &self.sources[index];
+        self.bands(
+            self.row_left.get(row * self.sources.len() + index).copied(),
+            self.row_right
+                .get(row * self.sources.len() + index)
+                .copied(),
+            r.x * self.width,
+            right(r) * self.width,
+            self.width,
+            width,
+        )
+    }
+
+    /// The horizontal marker lines source `index` draws down canvas column
+    /// `col`, banded in canvas-pixel y — [`Self::row_bands`] in the other
+    /// axis, from [`Self::col_top`] / [`Self::col_bottom`].
+    pub(crate) fn column_bands(
+        &self,
+        index: usize,
+        col: usize,
+        width: f64,
+    ) -> [Option<MarkerBand>; 4] {
+        let r = &self.sources[index];
+        self.bands(
+            self.col_top.get(col * self.sources.len() + index).copied(),
+            self.col_bottom
+                .get(col * self.sources.len() + index)
+                .copied(),
+            r.y * self.vertical_density,
+            bottom(r) * self.vertical_density,
+            self.vertical_density,
+            width,
+        )
+    }
+
+    /// Shared body of [`Self::row_bands`] and [`Self::column_bands`].
+    ///
+    /// `low`/`high` are the ramp denominators from this source's own low and
+    /// high edge in canvas *units*; `low_edge`/`high_edge` are those two
+    /// edges in canvas *pixels*, and `density` converts between them.
+    /// `width` is each band's width in canvas pixels.
+    ///
+    /// The ramp from the low edge runs `[low_edge, low_edge + low]`: its low
+    /// end is where this source's weight is zero (blue, the outside edge of
+    /// the overlap) and its high end is where the gradient starts (orange).
+    /// The ramp from the high edge runs `[high_edge - high, high_edge]` with
+    /// the colors the other way round. Both are the rule's own definitions,
+    /// not a second opinion about where a seam is.
+    fn bands(
+        &self,
+        low: Option<f64>,
+        high: Option<f64>,
+        low_edge: f64,
+        high_edge: f64,
+        density: f64,
+        width: f64,
+    ) -> [Option<MarkerBand>; 4] {
+        let mut out = [None; 4];
+        // No ramp means no seam to line up against, and a layout that is not
+        // blending has no gradient for the orange line to mark the start of.
+        // Suppressing it there also keeps this method's dependencies inside
+        // what `Evaluator::key` already tracks: `LocalKey` records the
+        // neighbor rectangles a marker position depends on only while
+        // `blend && !stacked`, so drawing markers outside that could leave a
+        // stale table after a neighbor moved.
+        if !self.spec.blend || self.stacked {
+            return out;
+        }
+        if let Some(depth) = low.filter(|d| *d > 0.0) {
+            let [blue, orange] = ramp_bands(
+                low_edge,
+                low_edge + depth * density,
+                width,
+                super::blend::MARKER_BLUE,
+                super::blend::MARKER_ORANGE,
+            );
+            out[0] = Some(blue);
+            out[1] = Some(orange);
+        }
+        if let Some(depth) = high.filter(|d| *d > 0.0) {
+            let [orange, blue] = ramp_bands(
+                high_edge - depth * density,
+                high_edge,
+                width,
+                super::blend::MARKER_ORANGE,
+                super::blend::MARKER_BLUE,
+            );
+            out[2] = Some(orange);
+            out[3] = Some(blue);
+        }
+        out
+    }
+
+    /// The seam-boundary marker tag source `index` paints at canvas-pixel
+    /// point `(cx, cy)`: [`super::blend::MARKER_NONE`],
+    /// [`super::blend::MARKER_ORANGE`] or [`super::blend::MARKER_BLUE`].
+    /// `widths` are the `[x, y]` band widths from [`Self::marker_widths`].
+    ///
+    /// This is a pure geometry query — it says where the lines are, not what
+    /// they do to a pixel. The override itself is applied as the very last
+    /// step of both render paths (see [`super::blend::MARKER_NONE`]'s doc),
+    /// because the blue line sits exactly where this source's own blend
+    /// weight is zero and so would be multiplied away by the transfer it is
+    /// meant to be drawn over.
+    ///
+    /// Nothing is marked outside the canvas or outside `index`'s own source
+    /// rectangle — the same closed test [`Self::raw_weight`] applies — so a
+    /// marker can never light a destination pixel the transfer would have
+    /// left black for want of anything to show there.
+    ///
+    /// **Precedence.** Orange beats blue wherever both fall on one pixel
+    /// (only possible where a ramp is under two band widths deep, or where a
+    /// source ramps from both of its edges and the two meet at its center):
+    /// orange marks the boundary an operator is actively adjusting, blue
+    /// merely records where this output has already faded out. Across axes,
+    /// a vertical and a horizontal marker crossing at a grid corner
+    /// overpaint in a small patch; that is expected, and which color
+    /// wins there follows the same rule.
+    pub fn marker_at(&self, index: usize, cx: f64, cy: f64, widths: [f64; 2]) -> u8 {
+        if !self.spec.blend || self.stacked {
+            return super::blend::MARKER_NONE;
+        }
+        let (x, y) = (cx / self.width, cy / self.vertical_density);
+        if !(0.0..=1.0).contains(&x) || !(0.0..=1.0 / self.spec.aspect).contains(&y) {
+            return super::blend::MARKER_NONE;
+        }
+        let r = &self.sources[index];
+        if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
+            return super::blend::MARKER_NONE;
+        }
+        let (row, col) = self.cell(cx, cy);
+        let across = band_hit(&self.row_bands(index, row, widths[0]), cx);
+        if across == super::blend::MARKER_ORANGE {
+            return across;
+        }
+        let down = band_hit(&self.column_bands(index, col, widths[1]), cy);
+        if down != super::blend::MARKER_NONE {
+            return down;
+        }
+        across
     }
 
     /// Dynamic shape entry containing ramp, border coverage and physical
@@ -1533,6 +1785,275 @@ mod tests {
             assert_eq!(evaluator.transfer(1, cx, cy, 1.0, 0.0, 1.0).0, 0);
             assert_eq!(evaluator.transfer(0, cx, cy, 1.0, 0.0, 1.0).0, 256);
         }
+    }
+
+    /// Every marker band a source draws across one canvas row, in order.
+    fn row_marker_list(
+        evaluator: &Evaluator,
+        index: usize,
+        row: usize,
+        width: f64,
+    ) -> Vec<MarkerBand> {
+        evaluator
+            .row_bands(index, row, width)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// A marker line is two pixels of the output that draws it, not two
+    /// canvas pixels. On brain, a 0.5277 x 0.2967 source of a 900-pixel
+    /// canvas shown at 1920x1080 has about 4.04 output pixels per canvas
+    /// pixel, so each line is just under half a canvas pixel wide.
+    #[test]
+    fn marker_widths_are_two_pixels_of_the_scaled_output() {
+        let evaluator = Evaluator::new(&spec(&[rect(0.0, 0.0, 0.5277, 0.2967)]), 900, 900).unwrap();
+        let [x, y] = evaluator.marker_widths(0, (1920, 1080));
+        assert!((x - 2.0 * 0.5277 * 900.0 / 1920.0).abs() < 1e-12, "x {x}");
+        assert!((y - 2.0 * 0.2967 * 900.0 / 1080.0).abs() < 1e-12, "y {y}");
+        assert!((x - 0.4947).abs() < 1e-4 && (y - 0.4945).abs() < 1e-4);
+        // A 60x100-pixel source shown at 30x50 has two canvas pixels per
+        // output pixel in each axis, so its lines are four canvas pixels.
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let evaluator = Evaluator::new(&spec(&rects), 100, 100).unwrap();
+        assert_eq!(evaluator.marker_widths(0, (30, 50)), [4.0, 4.0]);
+        assert_eq!(evaluator.marker_widths(1, (120, 200)), [1.0, 1.0]);
+    }
+
+    /// Two strips overlapping by 20% of a 100-pixel canvas, so the overlap is
+    /// the band `x = 40..60`. Hand-computed, from the rule and nothing else:
+    ///
+    /// - source 0 spans `0..60` and ramps from its RIGHT edge over a
+    ///   denominator of 0.2 canvas units, so its ramp runs `40..60`. Orange
+    ///   (gradient start) is at 40, blue (weight zero) at its own edge, 60.
+    /// - source 1 spans `40..100` and ramps from its LEFT edge over the same
+    ///   denominator, so its ramp runs `40..60` too. Blue is at its own edge,
+    ///   40, and orange at 60.
+    ///
+    /// Both are shown at 30x50, so a line is four canvas pixels (two output
+    /// pixels) lying INSIDE the overlap at each boundary, `40..44` and
+    /// `56..60`. That is what puts the two sources' lines on the same pixels
+    /// rather than either side of them. See [`ramp_bands`].
+    #[test]
+    fn two_strips_mark_both_ends_of_the_overlap_they_actually_blend_across() {
+        use crate::projection::blend::{MARKER_BLUE, MARKER_NONE, MARKER_ORANGE};
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let evaluator = Evaluator::new(&spec(&rects), 100, 100).unwrap();
+        let widths = evaluator.marker_widths(0, (30, 50));
+        assert_eq!(widths, evaluator.marker_widths(1, (30, 50)));
+        let band = |tag, from, to| MarkerBand { tag, from, to };
+        // A vertical seam is the same at every row, the very first and last
+        // included: these are the seam rule's own per-row tables.
+        for row in [0, 1, 50, 98, 99] {
+            assert_eq!(
+                row_marker_list(&evaluator, 0, row, widths[0]),
+                vec![
+                    band(MARKER_ORANGE, 40.0, 44.0),
+                    band(MARKER_BLUE, 56.0, 60.0)
+                ],
+                "source 0, row {row}"
+            );
+            assert_eq!(
+                row_marker_list(&evaluator, 1, row, widths[0]),
+                vec![
+                    band(MARKER_BLUE, 40.0, 44.0),
+                    band(MARKER_ORANGE, 56.0, 60.0)
+                ],
+                "source 1, row {row}"
+            );
+            // A vertical seam draws no horizontal lines.
+            assert_eq!(evaluator.column_bands(0, row, widths[1]), [None; 4]);
+            assert_eq!(evaluator.column_bands(1, row, widths[1]), [None; 4]);
+        }
+        // And the per-pixel query agrees, pixel for pixel, along a row.
+        for x in 0..100 {
+            let cx = f64::from(x) + 0.5;
+            let expected = |low, high, outside| match x {
+                40..=43 => low,
+                56..=59 => high,
+                _ => outside,
+            };
+            assert_eq!(
+                evaluator.marker_at(0, cx, 50.0, widths),
+                expected(MARKER_ORANGE, MARKER_BLUE, MARKER_NONE),
+                "source 0 at x={x}"
+            );
+            // Source 1 covers nothing left of x = 40, so nothing is marked
+            // there however close the band comes.
+            assert_eq!(
+                evaluator.marker_at(1, cx, 50.0, widths),
+                expected(MARKER_BLUE, MARKER_ORANGE, MARKER_NONE),
+                "source 1 at x={x}"
+            );
+        }
+    }
+
+    /// With the two strips shown at different scales, each line is two
+    /// pixels of its own output: source 0 at 30x50 draws four-canvas-pixel
+    /// lines and source 1 at 60x100 draws two-canvas-pixel ones. Both stay
+    /// anchored at the same boundaries, inside the overlap.
+    #[test]
+    fn unequal_scales_give_each_output_its_own_two_pixel_lines() {
+        use crate::projection::blend::{MARKER_BLUE, MARKER_ORANGE};
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let evaluator = Evaluator::new(&spec(&rects), 100, 100).unwrap();
+        let band = |tag, from, to| MarkerBand { tag, from, to };
+        let coarse = evaluator.marker_widths(0, (30, 50));
+        let fine = evaluator.marker_widths(1, (60, 100));
+        assert_eq!((coarse[0], fine[0]), (4.0, 2.0));
+        assert_eq!(
+            row_marker_list(&evaluator, 0, 50, coarse[0]),
+            vec![
+                band(MARKER_ORANGE, 40.0, 44.0),
+                band(MARKER_BLUE, 56.0, 60.0)
+            ]
+        );
+        assert_eq!(
+            row_marker_list(&evaluator, 1, 50, fine[0]),
+            vec![
+                band(MARKER_BLUE, 40.0, 42.0),
+                band(MARKER_ORANGE, 58.0, 60.0)
+            ]
+        );
+    }
+
+    /// The design intent, asserted rather than assumed: at each of the two
+    /// boundaries of a correctly aligned overlap, one output paints orange
+    /// and the other paints blue over the very same canvas pixels, and the
+    /// two sum to white in light at each configured gamma — the wall adds
+    /// light, not signal, so the check decodes each channel first. A projector that is out of
+    /// line instead shows its orange beside its neighbor's blue, and the
+    /// operator sees a colored fringe where a white line should be.
+    #[test]
+    fn a_lined_up_pair_sums_its_two_marker_colors_to_white() {
+        use crate::projection::blend::{MarkerPalette, MARKER_BLUE, MARKER_NONE, MARKER_ORANGE};
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let evaluator = Evaluator::new(&spec(&rects), 100, 100).unwrap();
+        let widths = evaluator.marker_widths(0, (30, 50));
+        let mut coincidences = 0;
+        for x in 0..100 {
+            let cx = f64::from(x) + 0.5;
+            let near = evaluator.marker_at(0, cx, 50.0, widths);
+            let far = evaluator.marker_at(1, cx, 50.0, widths);
+            if near == MARKER_NONE && far == MARKER_NONE {
+                continue;
+            }
+            // Never the same color on one pixel: one output is starting its
+            // gradient exactly where the other has finished fading out.
+            assert_ne!(near, far, "both outputs painted the same color at x={x}");
+            assert!(near == MARKER_ORANGE || near == MARKER_BLUE);
+            assert!(far == MARKER_ORANGE || far == MARKER_BLUE);
+            for gamma in [1.8, 2.2, 2.4] {
+                let palette = MarkerPalette::for_gamma(gamma);
+                let a = palette.color(near).expect("a palette color");
+                let b = palette.color(far).expect("a palette color");
+                let light = |v: u8| (f64::from(v) / 255.0).powf(gamma);
+                for i in 0..3 {
+                    let sum = light(a[i]) + light(b[i]);
+                    assert!(
+                        (sum - 1.0).abs() < 0.01,
+                        "x={x} gamma {gamma} channel {i} summed to {sum} in light"
+                    );
+                }
+            }
+            coincidences += 1;
+        }
+        // Eight canvas pixels: a four-pixel line at each end of the overlap.
+        assert_eq!(coincidences, 8);
+    }
+
+    /// The inner-slice branch of the rule ramps a nested source from BOTH of
+    /// its own edges over half its own extent, so it gets two complete
+    /// marker pairs — blue at each of its edges, orange at each end of the
+    /// tent — where an ordinary seam gets one. No special case produces
+    /// this: the same two tables, read the same way.
+    ///
+    /// [`nested_rects`]'s inner slice spans `x = 0.3..0.5` and is spanned in
+    /// x by its host, so each of its ramps is half its own width, 0.1 canvas
+    /// units. On a 4000-pixel canvas that is `1200..1600` and `1600..2000`.
+    /// Shown at 400 pixels wide, its 800 canvas pixels make each line four
+    /// canvas pixels, and the two orange lines meet at the tent's peak as
+    /// one line twice that width — which is what a source fading in and out
+    /// looks like, not a defect.
+    #[test]
+    fn a_nested_slice_produces_two_marker_pairs_not_one() {
+        use crate::projection::blend::{MARKER_BLUE, MARKER_ORANGE};
+        const SPAN: i32 = 4000;
+        let evaluator = Evaluator::new(&spec(&nested_rects()), SPAN, SPAN).unwrap();
+        let widths = evaluator.marker_widths(1, (400, 1800));
+        assert_eq!(widths, [4.0, 4.0]);
+        // A row inside the band where the two rectangles really overlap.
+        let row = 1400usize;
+        let band = |tag, from, to| MarkerBand { tag, from, to };
+        assert_eq!(
+            row_marker_list(&evaluator, 1, row, widths[0]),
+            vec![
+                band(MARKER_BLUE, 1200.0, 1204.0),
+                band(MARKER_ORANGE, 1596.0, 1600.0),
+                band(MARKER_ORANGE, 1600.0, 1604.0),
+                band(MARKER_BLUE, 1996.0, 2000.0),
+            ]
+        );
+        // Two pairs: two blues at the slice's own edges, where its weight is
+        // zero, and two oranges meeting at its center, where it peaks.
+        assert_eq!(
+            row_marker_list(&evaluator, 1, row, widths[0])
+                .iter()
+                .filter(|b| b.tag == MARKER_BLUE)
+                .count(),
+            2
+        );
+        let cy = row as f64 + 0.5;
+        for x in [1200, 1203, 1996, 1999] {
+            assert_eq!(
+                evaluator.marker_at(1, f64::from(x) + 0.5, cy, widths),
+                MARKER_BLUE
+            );
+        }
+        for x in [1596, 1599, 1600, 1603] {
+            assert_eq!(
+                evaluator.marker_at(1, f64::from(x) + 0.5, cy, widths),
+                MARKER_ORANGE
+            );
+        }
+        // The host spans the inner slice, so no pair ramps it in x and it
+        // draws no vertical line of its own — the rule's "r spans q imposes
+        // nothing" case, reported faithfully.
+        assert_eq!(evaluator.row_bands(0, row, widths[0]), [None; 4]);
+    }
+
+    /// Markers are geometry, not decoration: nothing is marked outside the
+    /// source's own rectangle, and a layout that is not blending — `blend`
+    /// off, or a detected stack, where every covering source runs at full
+    /// weight and there is no gradient for a line to mark the start of — has
+    /// no markers at all.
+    #[test]
+    fn markers_stay_inside_their_own_source_and_need_a_blend_to_exist() {
+        use crate::projection::blend::MARKER_NONE;
+        let rects = [rect(0.0, 0.0, 0.6, 1.0), rect(0.4, 0.0, 0.6, 1.0)];
+        let evaluator = Evaluator::new(&spec(&rects), 100, 100).unwrap();
+        let widths = evaluator.marker_widths(0, (30, 50));
+        for (index, outside) in [(0usize, 70.0_f64), (1, 20.0)] {
+            assert_eq!(
+                evaluator.marker_at(index, outside, 50.0, widths),
+                MARKER_NONE
+            );
+        }
+        let mut unblended = spec(&rects);
+        unblended.blend = false;
+        let unblended = Evaluator::new(&unblended, 100, 100).unwrap();
+        for x in 0..100 {
+            for index in 0..2 {
+                assert_eq!(
+                    unblended.marker_at(index, f64::from(x) + 0.5, 50.0, widths),
+                    MARKER_NONE
+                );
+            }
+        }
+        assert_eq!(unblended.row_bands(0, 50, widths[0]), [None; 4]);
+        let stacked = Evaluator::new(&spec(&[rect(0.0, 0.0, 1.0, 1.0); 3]), 100, 100).unwrap();
+        assert!(stacked.stacked);
+        assert_eq!(stacked.marker_at(0, 50.0, 50.0, widths), MARKER_NONE);
     }
 
     /// A 2x2 wall that is slightly out of true, on brain's canvas: the

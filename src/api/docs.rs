@@ -190,6 +190,7 @@ impl Modify for SecurityAddon {
         super::projection::ResolutionLimits,
         crate::model::Renderer,
         crate::model::TestPattern,
+        crate::model::TemporarySettings,
         crate::model::Background,
         crate::model::BackgroundMode,
         crate::model::BackgroundPreset,
