@@ -121,8 +121,10 @@ check "projection null clears it" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config/projection" \
      -H 'content-type: application/json' -d 'null')"
 
-# An uncommitted write reaches the outputs but never the disk.
-check "uncommitted write applies" "200"   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config"      -H 'content-type: application/json'      -d "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;d=json.load(sys.stdin);d["committed"]=False;print(json.dumps(d))')")"
+# An uncommitted write reaches the outputs but never the disk. It must really
+# change something: a working copy identical to the saved document reads as
+# committed.
+check "uncommitted write applies" "200"   "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "${BASE}/api/v1/config"      -H 'content-type: application/json'      -d "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;d=json.load(sys.stdin);d["committed"]=False;s=d.setdefault("settings",{});s["hideCursor"]=not s.get("hideCursor",False);print(json.dumps(d))')")"
 check "the document now reads uncommitted" "False"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["committed"])')"
 check "the revision did not move" "3"   "$(curl -s "${BASE}/api/v1/config" | python3 -c 'import sys,json;print(json.load(sys.stdin)["revision"])')"
 # The server holds one shared working copy; anyone may revert it, named or
