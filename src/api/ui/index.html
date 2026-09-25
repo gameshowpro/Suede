@@ -3623,6 +3623,8 @@ function renderStatus() {
 function renderSystem(system) {
   systemInfo = system;
   $("version").textContent = "v" + system.suedeVersion;
+  // Several appliances open side by side are told apart by their tabs.
+  document.title = system.hostname ? `Suede - ${system.hostname}` : "Suede";
   const rows = [
     ["Sway", system.swayVersion ?? "not detected"],
     ["Tearing control", system.supportsTearing ? "available" : "unavailable"],
