@@ -598,6 +598,10 @@ window.addEventListener("error", (event) => {
             <span class="mono">PATH</span>, a path is used as given. Naming a
             snap is honored; Suede then puts the profile where a confined
             snap can write.</p></div>
+        <div id="a-grant-capture-row"><label for="a-grant-capture">Grant camera and microphone</label>
+          <input type="checkbox" role="switch" class="switch" id="a-grant-capture">
+          <p class="hint">Lets the page list capture devices by name and pick
+            one, without a permission prompt.</p></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div id="a-gain-row"><label for="a-gain">Level (dB)</label>
           <input id="a-gain" type="number" step="0.5" min="-100" max="0" value="0">
@@ -2460,6 +2464,7 @@ function editApp(app) {
   $("a-kind").value = app.launcher.kind;
   $("a-program").value = app.launcher.program ?? "";
   $("a-extra-args").value = (app.launcher.extraArgs ?? []).join("\n");
+  $("a-grant-capture").checked = app.launcher.grantCapture ?? true;
   updateProgramRow();
   $("a-uri").value = app.launcher.kind === "exec"
     ? [app.launcher.command, ...(app.launcher.args ?? [])].join(" ")
@@ -2483,6 +2488,7 @@ function clearAppForm() {
   for (const id of ["a-id", "a-uri", "a-ready-url", "a-ready-giveup", "a-env",
                     "a-program", "a-extra-args"]) $(id).value = "";
   $("a-heartbeat").checked = false;
+  $("a-grant-capture").checked = true;
   $("a-kind").value = "chromium-kiosk";
   updateProgramRow();
   $("a-audio").value = "";
@@ -2502,11 +2508,14 @@ function closeAppDialog() {
 }
 
 // An exec app names its own command, so there is nothing to override — and
-// nothing to point at a test page, so no capabilities to check either.
+// nothing to point at a test page, so no capabilities to check either. The
+// capture grant is a Chromium profile trick, so only chromium-kiosk offers it.
 function updateProgramRow() {
-  const isExec = $("a-kind").value === "exec";
+  const kind = $("a-kind").value;
+  const isExec = kind === "exec";
   $("a-program-row").classList.toggle("hidden", isExec);
   $("a-cap-fieldset").classList.toggle("hidden", isExec);
+  $("a-grant-capture-row").classList.toggle("hidden", kind !== "chromium-kiosk");
 }
 $("a-kind").addEventListener("change", updateProgramRow);
 
@@ -2527,7 +2536,8 @@ function appFromForm() {
     .map((line) => line.trim()).filter((line) => line && !line.startsWith("#"));
   const launcher = kind === "exec"
     ? { kind, command: value.split(" ")[0], args: value.split(" ").slice(1) }
-    : { kind, uri: value, extraArgs, ...(program ? { program } : {}) };
+    : { kind, uri: value, extraArgs, ...(program ? { program } : {}),
+        ...(kind === "chromium-kiosk" ? { grantCapture: $("a-grant-capture").checked } : {}) };
 
   const env = {};
   for (const line of $("a-env").value.split("\n")) {
@@ -2603,7 +2613,8 @@ function paintLaunchPreview(p) {
     : `<span class="none">none of these is installed: ${escape(p.searched.join(", "))}</span>`;
 
   $("a-preview-profile").textContent = p.profileDir
-    ? `Profile: ${p.profileDir}${p.wipeProfile ? " (emptied before each launch)" : ""}`
+    ? `Profile: ${p.profileDir}${p.wipeProfile ? " (emptied before each launch)" : ""}` +
+      (p.captureGrantOrigin ? ` · Camera and microphone granted to ${p.captureGrantOrigin}` : "")
     : "";
 
   const line = (items, render) => items.length
@@ -2616,7 +2627,7 @@ function paintLaunchPreview(p) {
 }
 
 $("a-audio").addEventListener("change", renderGainRow);
-for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-audio", "a-gain", "a-id"]) {
+for (const id of ["a-kind", "a-uri", "a-program", "a-extra-args", "a-env", "a-audio", "a-gain", "a-id", "a-grant-capture"]) {
   $(id).addEventListener("input", refreshLaunchPreview);
   $(id).addEventListener("change", refreshLaunchPreview);
 }

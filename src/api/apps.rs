@@ -46,6 +46,12 @@ pub struct LaunchPreview {
     pub profile_dir: Option<String>,
     /// Whether that directory is emptied before each launch.
     pub wipe_profile: bool,
+    /// The origin that will be granted persistent camera/microphone access
+    /// in the profile above, before launch. Present only when a grant will
+    /// actually be written — `grantCapture` is on and the URI has an
+    /// `http`/`https` origin — not merely when the launcher is chromium.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_grant_origin: Option<String>,
 }
 
 #[utoipa::path(
@@ -120,6 +126,7 @@ pub async fn preview_app(
         env,
         profile_dir: spec.profile_dir.map(|p| p.display().to_string()),
         wipe_profile: spec.wipe_profile,
+        capture_grant_origin: spec.grant_capture.then_some(spec.capture_origin).flatten(),
     })
 }
 

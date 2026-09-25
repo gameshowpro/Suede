@@ -36,10 +36,12 @@ const CHROMIUM_KIOSK_ARGS: &[&str] = &[
     // prompt on an appliance is a dialog nobody will ever click, so a page that
     // wants a camera or a microphone simply never gets one. The operator chose
     // what this machine runs; that is the consent the prompt exists to collect.
-    // Note what it does not do: it waves each request through without
-    // *persisting* a grant, and a page cannot read device labels or ids without
-    // one. Passing through the first input works; picking a named device does
-    // not, and needs the `VideoCaptureAllowedUrls` policy instead.
+    // This is the fallback for a page whose origin has no persistent grant —
+    // after navigating elsewhere, say — and on its own only waves each request
+    // through without *persisting* one, so a page cannot read device labels or
+    // ids from it alone. Picking a named device comes from `grantCapture`,
+    // which seeds that grant into the app's own profile before every launch
+    // (see `supervisor::profile::apply_capture_grant`).
     "--auto-accept-camera-and-microphone-capture",
     "--ozone-platform=wayland",
     // Vulkan is deliberately absent: Chromium rejects it under
@@ -89,6 +91,12 @@ pub struct LaunchSpec {
     /// Browser profile directory, wiped before launch unless the app opts out.
     pub profile_dir: Option<PathBuf>,
     pub wipe_profile: bool,
+    /// The chromium app's own origin, when it has one — see [`capture_origin`].
+    /// `None` for firefox and exec, and for a chromium URI with no HTTP(S) origin.
+    pub capture_origin: Option<String>,
+    /// Whether that origin should be granted camera and microphone access in
+    /// its profile. `false` for firefox and exec.
+    pub grant_capture: bool,
 }
 
 /// Deployment facts the launcher needs.
@@ -151,6 +159,56 @@ pub fn insecure_origin(uri: &str) -> Option<String> {
         return None;
     }
     Some(format!("http://{authority}"))
+}
+
+/// The origin to seed a persistent camera/microphone grant for, when the
+/// launcher asks for one — see [`crate::supervisor::profile::apply_capture_grant`].
+///
+/// Unlike [`insecure_origin`], loopback and HTTPS are included: a grant is
+/// about which origin gets device names and a stable id, not about whether the
+/// page is a secure context, so it is written for every `http`/`https` URI the
+/// launcher is actually pointed at. Chrome keys its own permission entries on
+/// `scheme://host:port` with the port always explicit (`:80`/`:443` filled in
+/// when the URI omits it), so the key built here matches byte for byte.
+///
+/// Returns `None` for anything else — `file:`, `data:`, an unparseable or
+/// empty authority — where there is no origin to grant.
+pub fn capture_origin(uri: &str) -> Option<String> {
+    let lower = uri.to_ascii_lowercase();
+    let (scheme, default_port, rest): (&str, u16, &str) =
+        if let Some(rest) = lower.strip_prefix("http://") {
+            ("http", 80, rest)
+        } else {
+            let rest = lower.strip_prefix("https://")?;
+            ("https", 443, rest)
+        };
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Userinfo (`user:pass@host`) is not part of the origin.
+    let authority = authority.rsplit('@').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+    if let Some(end) = authority.find(']') {
+        // `[::1]:8080` keeps its brackets and colons; the port, if any,
+        // follows them directly.
+        let host = authority.get(..=end)?;
+        let port = match authority.get(end + 1..) {
+            Some("") | None => default_port,
+            Some(stripped) => stripped.strip_prefix(':')?.parse().ok()?,
+        };
+        Some(format!("{scheme}://{host}:{port}"))
+    } else {
+        let mut parts = authority.splitn(2, ':');
+        let host = parts.next()?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = match parts.next() {
+            Some(port) => port.parse().ok()?,
+            None => default_port,
+        };
+        Some(format!("{scheme}://{host}:{port}"))
+    }
 }
 
 /// Hosts a browser already trusts without a certificate.
@@ -237,6 +295,7 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
             show_fps_counter,
             extra_args,
             program,
+            grant_capture,
         } => {
             let programs = program_list(program.as_deref(), CHROMIUM_PROGRAMS);
             // A snap only ever gets here because somebody named it, and it
@@ -265,10 +324,13 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
                 args.push("--show-fps-counter".to_string());
             }
             let address = expand_uri(uri, &app.id, context);
+            // Computed from the same expanded address the browser is actually
+            // pointed at, before it is moved into `args` below.
+            let origin = capture_origin(&address);
             // Before `extra_args`, so an operator can still override it.
-            if let Some(origin) = insecure_origin(&address) {
+            if let Some(insecure) = insecure_origin(&address) {
                 args.push(format!(
-                    "--unsafely-treat-insecure-origin-as-secure={origin}"
+                    "--unsafely-treat-insecure-origin-as-secure={insecure}"
                 ));
             }
             args.extend(extra_args.iter().cloned());
@@ -280,6 +342,8 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
                 env,
                 profile_dir: Some(profile_dir),
                 wipe_profile: !app.persist_profile,
+                capture_origin: origin,
+                grant_capture: *grant_capture,
             }
         }
         Launcher::FirefoxKiosk {
@@ -304,6 +368,8 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
                 env,
                 profile_dir: None,
                 wipe_profile: false,
+                capture_origin: None,
+                grant_capture: false,
             }
         }
         Launcher::Exec { command, args } => LaunchSpec {
@@ -315,6 +381,8 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
             env,
             profile_dir: None,
             wipe_profile: false,
+            capture_origin: None,
+            grant_capture: false,
         },
     }
 }
@@ -527,6 +595,7 @@ mod tests {
             show_fps_counter: false,
             extra_args: vec![],
             program: None,
+            grant_capture: true,
         }
     }
 
@@ -629,6 +698,7 @@ exec /opt/google/chrome/chrome \"$@\"
                 show_fps_counter: false,
                 extra_args: vec![],
                 program: Some("/opt/google/chrome/chrome".into()),
+                grant_capture: true,
             },
         );
         assert_eq!(
@@ -727,6 +797,62 @@ exec /opt/google/chrome/chrome \"$@\"
     }
 
     #[test]
+    fn build_sets_capture_origin_from_the_expanded_uri() {
+        let spec = build(
+            &app("renderer-3", chromium("http://host/r?id={appId}")),
+            &context(),
+            None,
+        );
+        // From the expanded URI, not the template — a literal `{appId}`
+        // would never match the origin the browser actually navigates to.
+        assert_eq!(spec.capture_origin, Some("http://host:80".to_string()));
+        assert!(spec.grant_capture);
+    }
+
+    #[test]
+    fn build_carries_grant_capture_false_through() {
+        let mut launcher = chromium("http://a");
+        if let Launcher::ChromiumKiosk { grant_capture, .. } = &mut launcher {
+            *grant_capture = false;
+        }
+        let spec = build(&app("r1", launcher), &context(), None);
+        assert_eq!(spec.capture_origin, Some("http://a:80".to_string()));
+        assert!(!spec.grant_capture);
+    }
+
+    #[test]
+    fn firefox_and_exec_leave_capture_origin_none() {
+        let firefox = build(
+            &app(
+                "r1",
+                Launcher::FirefoxKiosk {
+                    uri: "http://a".into(),
+                    extra_args: vec![],
+                    program: None,
+                },
+            ),
+            &context(),
+            None,
+        );
+        assert_eq!(firefox.capture_origin, None);
+        assert!(!firefox.grant_capture);
+
+        let exec = build(
+            &app(
+                "r1",
+                Launcher::Exec {
+                    command: "/usr/bin/mpv".into(),
+                    args: vec![],
+                },
+            ),
+            &context(),
+            None,
+        );
+        assert_eq!(exec.capture_origin, None);
+        assert!(!exec.grant_capture);
+    }
+
+    #[test]
     fn each_app_gets_its_own_profile() {
         let first = build(&app("r1", chromium("http://a")), &context(), None);
         let second = build(&app("r2", chromium("http://a")), &context(), None);
@@ -760,6 +886,7 @@ exec /opt/google/chrome/chrome \"$@\"
                     show_fps_counter: true,
                     extra_args: vec![],
                     program: None,
+                    grant_capture: true,
                 },
             ),
             &context(),
@@ -778,6 +905,7 @@ exec /opt/google/chrome/chrome \"$@\"
                     show_fps_counter: false,
                     extra_args: vec!["--mute-audio".into()],
                     program: None,
+                    grant_capture: true,
                 },
             ),
             &context(),
@@ -949,6 +1077,49 @@ exec /opt/google/chrome/chrome \"$@\"
             insecure_origin("http://display.local/page?a=1"),
             Some("http://display.local".to_string())
         );
+    }
+
+    #[test]
+    fn capture_origin_covers_ports_case_and_userinfo() {
+        // Unlike `insecure_origin`, loopback and https are included here, and
+        // the port is always spelled out — that is how Chrome writes its own
+        // permission entries, and the grant has to be keyed the same way.
+        assert_eq!(
+            capture_origin("http://10.0.0.5:8080/passthrough/"),
+            Some("http://10.0.0.5:8080".to_string())
+        );
+        assert_eq!(
+            capture_origin("http://10.0.0.5/x"),
+            Some("http://10.0.0.5:80".to_string())
+        );
+        assert_eq!(
+            capture_origin("https://10.0.0.5/x"),
+            Some("https://10.0.0.5:443".to_string())
+        );
+        assert_eq!(
+            capture_origin("HTTP://Display.Local:9000/x"),
+            Some("http://display.local:9000".to_string())
+        );
+        assert_eq!(
+            capture_origin("http://operator@10.0.0.5:8080/x"),
+            Some("http://10.0.0.5:8080".to_string())
+        );
+        assert_eq!(
+            capture_origin("http://[::1]:8080/x"),
+            Some("http://[::1]:8080".to_string())
+        );
+        assert_eq!(
+            capture_origin("http://[::1]/x"),
+            Some("http://[::1]:80".to_string())
+        );
+        assert_eq!(
+            capture_origin("http://localhost:8123/x"),
+            Some("http://localhost:8123".to_string())
+        );
+        assert_eq!(capture_origin("file:///tmp/page.html"), None);
+        assert_eq!(capture_origin("about:blank"), None);
+        assert_eq!(capture_origin(""), None);
+        assert_eq!(capture_origin("http://"), None);
     }
 
     #[test]

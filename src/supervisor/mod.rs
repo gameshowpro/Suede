@@ -5,6 +5,7 @@
 //! observation, restart policies, and per-app audio routing all depend on it.
 
 pub mod launcher;
+mod profile;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -697,6 +698,45 @@ impl Supervisor {
                 let _ = tokio::fs::remove_dir_all(profile).await;
             }
             tokio::fs::create_dir_all(profile).await?;
+
+            // After the wipe and the fresh directory, immediately before the
+            // browser is spawned, so a stale grant from a previous origin
+            // never lingers and a fresh one is always in place before
+            // Chromium reads its own Preferences. A failure here is never
+            // fatal to the launch: the fallback
+            // `--auto-accept-camera-and-microphone-capture` still lets the
+            // app get a camera, it just cannot pick one by name, and that is
+            // a worse experience, not a broken one.
+            if let Some(origin) = &spec.capture_origin {
+                let profile_for_task = profile.clone();
+                let profile_for_log = profile.clone();
+                let origin = origin.clone();
+                let grant = spec.grant_capture;
+                let app_id = managed.config.id.clone();
+                match tokio::task::spawn_blocking(move || {
+                    profile::apply_capture_grant(&profile_for_task, &origin, grant)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            app = %app_id,
+                            path = %profile_for_log.display(),
+                            %error,
+                            "failed to write capture grant; continuing without it"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            app = %app_id,
+                            path = %profile_for_log.display(),
+                            %error,
+                            "capture grant task panicked; continuing without it"
+                        );
+                    }
+                }
+            }
         }
 
         // Capture stderr to a file. Without it, a crash-looping app tells the
@@ -1789,6 +1829,7 @@ mod tests {
             show_fps_counter: false,
             extra_args: vec![],
             program: None,
+            grant_capture: true,
         };
         // Chromium is absent in CI, so the launch fails — but only after the
         // profile directory has been prepared, which is what we assert.

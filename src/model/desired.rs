@@ -1292,6 +1292,16 @@ pub enum Launcher {
         /// a bare name is looked up on `PATH`, a path is used as given.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         program: Option<String>,
+        /// Grant the page's own origin camera and microphone access in its
+        /// private profile, so it can enumerate capture devices and choose
+        /// one by name rather than only ever getting whatever device the
+        /// browser hands it first. On by default.
+        ///
+        /// As with the autoplay and capture-prompt bypass above, the operator
+        /// choosing what this machine runs is the consent a permission
+        /// prompt would otherwise collect.
+        #[serde(default = "default_true")]
+        grant_capture: bool,
     },
     /// Firefox with its kiosk argument set.
     #[serde(rename_all = "camelCase")]
@@ -2038,10 +2048,48 @@ mod tests {
             show_fps_counter: true,
             extra_args: vec!["--mute-audio".into()],
             program: None,
+            grant_capture: true,
         };
         let json = serde_json::to_value(&launcher).unwrap();
         assert_eq!(json["kind"], "chromium-kiosk");
         assert_eq!(json["showFpsCounter"], true);
+        let back: Launcher = serde_json::from_value(json).unwrap();
+        assert_eq!(back, launcher);
+    }
+
+    #[test]
+    fn grant_capture_defaults_to_true_when_absent() {
+        // A document written before this field existed, or one an operator
+        // wrote by hand without it, must still get the grant — it is meant to
+        // be on unless someone deliberately turns it off.
+        let json = serde_json::json!({
+            "kind": "chromium-kiosk",
+            "uri": "http://example.com",
+        });
+        let launcher: Launcher = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            launcher,
+            Launcher::ChromiumKiosk {
+                uri: "http://example.com".into(),
+                show_fps_counter: false,
+                extra_args: vec![],
+                program: None,
+                grant_capture: true,
+            }
+        );
+    }
+
+    #[test]
+    fn grant_capture_false_round_trips() {
+        let launcher = Launcher::ChromiumKiosk {
+            uri: "http://example.com".into(),
+            show_fps_counter: false,
+            extra_args: vec![],
+            program: None,
+            grant_capture: false,
+        };
+        let json = serde_json::to_value(&launcher).unwrap();
+        assert_eq!(json["grantCapture"], false);
         let back: Launcher = serde_json::from_value(json).unwrap();
         assert_eq!(back, launcher);
     }

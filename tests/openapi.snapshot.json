@@ -1347,6 +1347,13 @@
             },
             "type": "array"
           },
+          "captureGrantOrigin": {
+            "description": "The origin that will be granted persistent camera/microphone access\nin the profile above, before launch. Present only when a grant will\nactually be written — `grantCapture` is on and the URI has an\n`http`/`https` origin — not merely when the launcher is chromium.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "env": {
             "items": {
               "$ref": "#/components/schemas/PreviewItem"
@@ -1399,6 +1406,10 @@
                   "type": "string"
                 },
                 "type": "array"
+              },
+              "grantCapture": {
+                "description": "Grant the page's own origin camera and microphone access in its\nprivate profile, so it can enumerate capture devices and choose\none by name rather than only ever getting whatever device the\nbrowser hands it first. On by default.\n\nAs with the autoplay and capture-prompt bypass above, the operator\nchoosing what this machine runs is the consent a permission\nprompt would otherwise collect.",
+                "type": "boolean"
               },
               "kind": {
                 "enum": [

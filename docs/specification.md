@@ -185,6 +185,7 @@ The desired-state document:
         "kind": "chromium-kiosk",                   // chromium-kiosk | firefox-kiosk | exec
         "uri": "http://media-server.local/render/1",
         "showFpsCounter": false,
+        "grantCapture": true,
         "extraArgs": []                             // appended after the preset's arguments
       },
       "audio": { "output": "alsa_output.pci-0000_01_00.1.hdmi-stereo" },
@@ -207,7 +208,7 @@ Notes:
 - **URI placeholders.** Launcher URIs may contain the tokens `{appId}` and `{heartbeatUrl}` (a loopback URL to this app's heartbeat endpoint), substituted at launch. This is how rendered content learns where to post its watchdog heartbeats without hard-coding host details.
 - **Launcher presets.** `chromium-kiosk` expands to the battle-tested argument set from the prior .NET implementation (`--kiosk --password-store=basic --no-first-run --disable-infobars --disable-session-crashed-bubble --ozone-platform=wayland --force-device-scale-factor=1 --enable-features=VaapiVideoDecoder,… --ignore-gpu-blocklist --enable-zero-copy` etc.) plus the URI. `firefox-kiosk` expands to `--kiosk --new-instance --private-window <uri>`; note that it has never been run and cannot have its autoplay policy relaxed the way `chromium-kiosk` can. `exec` is fully generic: `{ "kind": "exec", "command": "...", "args": [...] }`.
 - **Browser resolution.** The kiosk presets search several names, because no single one is right everywhere: Debian and Arch ship `chromium`, Raspberry Pi OS and older Ubuntu `chromium-browser`, Google's own package `google-chrome-stable`. A snap is passed over as though absent — it updates itself on its own schedule and restarts the browser when it does, which on an appliance blanks the screens mid-show — and a machine carrying only a snap is reported as having no browser, naming the snap it declined. `launcher.program` overrides the search outright, including with a snap, in which case the profile is placed where a confined snap can write.
-- **Multiple Chromium instances.** Chromium refuses a second instance sharing a profile, so Suede automatically assigns each `chromium-kiosk` app a private `--user-data-dir` under its state directory (e.g. `…/suede/profiles/renderer-1`). Profiles are wiped on launch by default (kiosk sessions should be stateless); a `persistProfile: true` flag opts out.
+- **Multiple Chromium instances.** Chromium refuses a second instance sharing a profile, so Suede automatically assigns each `chromium-kiosk` app a private `--user-data-dir` under its state directory (e.g. `…/suede/profiles/renderer-1`). Profiles are wiped on launch by default (kiosk sessions should be stateless); a `persistProfile: true` flag opts out. After the wipe, the profile is seeded with a camera/microphone grant for the app's origin when `grantCapture` is enabled.
 - **Window placement.** After launch, Suede waits for a window whose `pid` matches the spawned process (timeout: 15 s, then the app is `crashed`) and places it to cover the whole canvas: `fullscreen enable global` across a tiled layout, or fullscreen on the headless canvas output when the layout overlaps and the slicer is driving the projectors. Placement is never a per-app setting.
 
 ## Daemon configuration

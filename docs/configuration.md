@@ -593,6 +593,7 @@ entirely yours.
       "kind": "chromium-kiosk",
       "uri": "http://control.local/render/1",
       "showFpsCounter": false,
+      "grantCapture": true,
       "extraArgs": [],
       "program": null
     }
@@ -604,6 +605,7 @@ entirely yours.
     |---|---|
     | `uri` | Page to load; `{appId}` and `{heartbeatUrl}` are expanded |
     | `showFpsCounter` | Chromium's frame-rate overlay, for diagnosing dropped frames |
+    | `grantCapture` | Grant the page's own origin camera and microphone access in its profile, so it can list devices by name and choose one; `false` leaves only per-request auto-accept |
     | `extraArgs` | Appended after the preset, before the URI |
     | `program` | Which binary to launch, overriding the search |
 
@@ -662,12 +664,12 @@ entirely yours.
     `--auto-accept-camera-and-microphone-capture`, on the same reasoning as
     autoplay: the operator chose what the machine runs.
 
-    Note what the flag does **not** do. It waves each request through without
-    *persisting* a grant, and without a persisted grant a page cannot read
-    device labels or ids at all — `enumerateDevices()` returns blank entries.
-    Passing through the first input works; asking for a device *by name* does
-    not, and needs a `VideoCaptureAllowedUrls` / `AudioCaptureAllowedUrls`
-    policy in `/etc/opt/chrome/policies/managed/` instead.
+    Note what the flag does **not** do: it waves each request through without
+    *persisting* a grant, and without one `enumerateDevices()` returns blank
+    labels and ids, so a page cannot choose a device by name. `grantCapture`
+    (on by default) writes a persistent grant for the app's own origin into its
+    private profile before every launch; the flag remains as the fallback for
+    any other origin the page ends up on.
 
     `getUserMedia` also exists only in a secure context. `https://` and
     anything on loopback qualify; a plain-HTTP page served from another host

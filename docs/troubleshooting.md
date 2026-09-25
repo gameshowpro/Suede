@@ -556,7 +556,7 @@ black rectangle, or `NotReadableError`, with no clue which one it was. The
 | Requirement | Symptom when missing | Fix |
 |---|---|---|
 | A secure context | `navigator.mediaDevices` is `undefined`; no prompt, no error | Serve over `https://` or from loopback. Suede otherwise passes `--unsafely-treat-insecure-origin-as-secure` for the app's own origin automatically |
-| Permission | `NotAllowedError`, or a prompt nobody can click | The kiosk preset passes `--auto-accept-camera-and-microphone-capture` |
+| Permission | `NotAllowedError`, or a prompt nobody can click | `grantCapture` (on by default) grants the app's origin; the kiosk preset's `--auto-accept-camera-and-microphone-capture` covers any other origin |
 | Access to the device node | `NotReadableError`, and an empty device list | Add the user to the `video` group |
 
 The `capture-devices` check counts `/dev/videoN` nodes rather than cameras,
@@ -581,12 +581,13 @@ until the appliance user logs in again — on an auto-login appliance, reboot.
     `--auto-accept-camera-and-microphone-capture` waves each request through
     without *persisting* a grant, and without a persisted grant
     `enumerateDevices()` returns entries whose `label` and `deviceId` are both
-    empty strings. Passing through the first input still works; selecting a
-    device *by name* cannot, because there is no name to match. For that, grant
-    the permission with a policy instead — a JSON file in
-    `/etc/opt/chrome/policies/managed/` (or `/etc/chromium/policies/managed/`)
-    setting `VideoCaptureAllowedUrls` and `AudioCaptureAllowedUrls` to the app's
-    origin. A live `MediaStreamTrack` always knows its own `label` either way.
+    empty strings, so a page cannot choose a device by name. `grantCapture` (on
+    by default) closes that gap: before every launch Suede writes a persistent
+    grant for the origin of the app's configured URI into its private profile.
+    Blank labels therefore mean either `grantCapture` is off, or the page is on
+    a different origin than the one configured — it redirected, or loads the
+    capture code in a frame from another host. A live `MediaStreamTrack` always
+    knows its own `label` either way.
 
 ## Configuration was lost
 
