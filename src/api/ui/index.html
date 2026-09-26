@@ -242,6 +242,16 @@ dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--li
 #arrange-dialog h2 { margin-top: 0; margin-bottom: 8px; }
 #arrange-dialog .fields { gap: 14px; margin-bottom: 12px; }
 #arrange-dialog .row { margin-top: 14px; }
+#arrange-dialog .row.arrange-mode-row { margin-top: 0; margin-bottom: 14px; }
+.arrange-order { list-style: none; margin: 0 0 12px; padding: 0; display: flex;
+  flex-direction: column; gap: 6px; max-height: 220px; overflow-y: auto; }
+.arrange-order-row { display: flex; align-items: center; gap: 10px;
+  padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--sunken); }
+.arrange-order-row.disabled { opacity: .6; }
+.arrange-order-pos { color: var(--muted); font-size: 12px; width: 1.4em; text-align: right; flex: none; }
+.arrange-order-name { flex: 1; font-size: 13px; min-width: 0; }
+.arrange-order-raster { color: var(--muted); font-size: 12px; font-family: ui-monospace, Consolas, monospace; flex: none; }
+.arrange-order-row button.action.ghost { padding: 2px 8px; font-size: 12px; flex: none; }
 .warp-matrix { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin: 14px 0; align-items: stretch; }
 @media (max-width: 760px) { .warp-matrix { grid-template-columns: 1fr 1fr; } }
 .warp-cell { background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
@@ -550,7 +560,14 @@ window.addEventListener("error", (event) => {
     <dialog id="arrange-dialog" aria-labelledby="arrange-title">
       <form method="dialog">
         <h2 id="arrange-title">Arrange outputs</h2>
-        <p class="hint">Enabled outputs are placed left to right, then top to bottom. The daemon does the arithmetic. Both overlaps are honored exactly: the content scale (100% = 1:1 pixel sampling) is the one that fills the canvas on whichever axis binds first, so the canvas may be left partly unused on the other axis — the line below says how much, and which canvas aspect would fill it. Setting the content scale instead derives both overlaps and fills the canvas on both axes.</p>
+        <p class="hint">Enabled outputs are placed left to right, then top to bottom, in the order listed below. The daemon does the arithmetic. Overlap sends the two overlaps you set below exactly — the daemon never adjusts either one — and derives the content scale (100% = 1:1 pixel sampling) that covers the canvas: the axis with less room to spare fills it exactly, and the other centers a black overhang past the canvas's edge — the line below says how much, and which canvas aspect would remove it — unless "Allow unused canvas pixels" below is checked, which instead fits the whole grid inside the canvas and leaves an uncovered band there rather than any overhang. An edge output whose slice would fall off the canvas entirely is refused outright, in either case. Scale sends the content scale instead and gets both overlaps back.</p>
+        <div class="row arrange-mode-row">
+          <div class="mode-toggle" role="group" aria-label="Arrange by">
+            <button type="button" id="arrange-mode-overlap" aria-pressed="true">Overlap</button>
+            <button type="button" id="arrange-mode-scale" aria-pressed="false">Scale</button>
+          </div>
+          <label for="arrange-allow-unused"><input type="checkbox" id="arrange-allow-unused"> Allow unused canvas pixels</label>
+        </div>
         <div class="fields">
           <div><label for="arrange-rows">Rows</label><input id="arrange-rows" type="number" min="1" step="1" value="1"></div>
           <div><label for="arrange-columns">Columns</label><input id="arrange-columns" type="number" min="1" step="1" value="1"></div>
@@ -558,6 +575,7 @@ window.addEventListener("error", (event) => {
           <div><label for="arrange-overlap-x">Overlap X (%)</label><input id="arrange-overlap-x" type="number" min="0" max="99" step="any" value="0"></div>
           <div><label for="arrange-overlap-y">Overlap Y (%)</label><input id="arrange-overlap-y" type="number" min="0" max="99" step="any" value="0"></div>
         </div>
+        <ol id="arrange-order" class="arrange-order" aria-label="Output order"></ol>
         <p class="hint" id="arrange-preview"></p>
         <div class="row"><button class="action" type="button" id="arrange-apply">Apply arrangement</button><button class="action ghost" id="arrange-cancel" value="cancel">Cancel</button></div>
       </form>
@@ -2196,10 +2214,54 @@ function ensureWarpGeometries() {
 // response and again as a `config_changed` event, like any remote edit.
 //
 // The two overlaps and the content scale are one relationship seen from two
-// ends, so whichever family was edited last is what gets sent; the other
-// field is filled in from the answer.
-let lastArrangeEdit = "overlap";
+// ends; the toggle below is which end the operator is holding, and only that
+// family is sent — the other is filled in from the answer.
 let arrangeSerial = 0, arrangeTimer = null;
+
+// A UI preference, not part of the document: never sent to the daemon, never
+// stored in `config`, just remembered per browser across dialog opens.
+function loadArrangeMode() {
+  try { return localStorage.getItem("suede.arrangeMode") === "scale" ? "scale" : "overlap"; }
+  catch { return "overlap"; }
+}
+function saveArrangeMode(mode) {
+  try { localStorage.setItem("suede.arrangeMode", mode); } catch {}
+}
+let arrangeMode = loadArrangeMode();
+
+// Same UI-preference pattern: never sent as part of `config`, just whether a
+// band left over on a seamless axis is acceptable or should refuse the dry
+// run (the daemon's default is also false, so an empty/unreadable store
+// matches the daemon's own default).
+function loadArrangeAllowUnused() {
+  try { return localStorage.getItem("suede.arrangeAllowUnused") === "true"; }
+  catch { return false; }
+}
+function saveArrangeAllowUnused(value) {
+  try { localStorage.setItem("suede.arrangeAllowUnused", String(value)); } catch {}
+}
+
+function setArrangeMode(mode) {
+  arrangeMode = mode;
+  saveArrangeMode(mode);
+  $("arrange-mode-overlap").setAttribute("aria-pressed", String(mode === "overlap"));
+  $("arrange-mode-scale").setAttribute("aria-pressed", String(mode === "scale"));
+  // The family not being sent is read-only here: renderArrangement() is its
+  // only writer, filling it in from the daemon's resolved answer.
+  $("arrange-overlap-x").disabled = mode !== "overlap";
+  $("arrange-overlap-y").disabled = mode !== "overlap";
+  $("arrange-scale").disabled = mode !== "scale";
+  scheduleArrangePreview();
+}
+$("arrange-mode-overlap").onclick = () => setArrangeMode("overlap");
+$("arrange-mode-scale").onclick = () => setArrangeMode("scale");
+setArrangeMode(arrangeMode);
+
+$("arrange-allow-unused").checked = loadArrangeAllowUnused();
+$("arrange-allow-unused").onchange = () => {
+  saveArrangeAllowUnused($("arrange-allow-unused").checked);
+  scheduleArrangePreview();
+};
 
 // Never repaint the control being typed into, exactly as the panel render
 // functions do not.
@@ -2215,10 +2277,14 @@ function arrangeRequest() {
   const rows = Number($("arrange-rows").value), columns = Number($("arrange-columns").value);
   if (!(Number.isInteger(rows) && Number.isInteger(columns) && rows >= 1 && columns >= 1))
     throw new Error("Choose a positive whole number of rows and columns.");
-  if (lastArrangeEdit === "scale") {
+  // Always sent, in both modes: it is a no-op in scale mode (which always
+  // fills both axes) but the daemon's default is false either way, so the
+  // dry run must say so explicitly rather than relying on that default.
+  const allowUnusedCanvas = $("arrange-allow-unused").checked;
+  if (arrangeMode === "scale") {
     const contentScale = Number($("arrange-scale").value) / 100;
     if (!(contentScale > 0 && Number.isFinite(contentScale))) throw new Error("Content scale must be positive.");
-    return { rows, columns, contentScale };
+    return { rows, columns, contentScale, allowUnusedCanvas };
   }
   const overlap = (id) => {
     const text = $(id).value.trim();
@@ -2226,7 +2292,7 @@ function arrangeRequest() {
     if (!(value >= 0 && value < 1)) throw new Error("Each overlap must be at least 0% and less than 100%.");
     return value;
   };
-  return { rows, columns, overlapX: overlap("arrange-overlap-x"), overlapY: overlap("arrange-overlap-y") };
+  return { rows, columns, overlapX: overlap("arrange-overlap-x"), overlapY: overlap("arrange-overlap-y"), allowUnusedCanvas };
 }
 
 // Latest wins: the serial retires whatever is already in flight or pending,
@@ -2239,7 +2305,10 @@ function scheduleArrangePreview() {
 }
 
 async function requestArrangement(serial) {
-  if (!config || serial !== arrangeSerial) return;
+  // Checked when the debounce fires, not when it is scheduled, so the open
+  // handler may schedule before showModal(). Restoring the toggle at page
+  // load also schedules; without the dialog there is nothing to preview.
+  if (!config || serial !== arrangeSerial || !$("arrange-dialog").open) return;
   let request;
   try { request = arrangeRequest(); }
   catch (error) { arrangeUnavailable(error.message); return; }
@@ -2265,7 +2334,7 @@ function arrangeUnavailable(message) {
 
 function renderArrangement(solution) {
   const resolved = solution.arrangement;
-  if (lastArrangeEdit === "scale") {
+  if (arrangeMode === "scale") {
     arrangeField("arrange-overlap-x", editNumber(resolved.overlapX * 100, 1));
     arrangeField("arrange-overlap-y", editNumber(resolved.overlapY * 100, 1));
   } else {
@@ -2275,13 +2344,20 @@ function renderArrangement(solution) {
   message += resolved.rows > 1 || resolved.columns > 1
     ? ` · Overlap: ${displayNumber(resolved.overlapX * 100, 1)}% H, ${displayNumber(resolved.overlapY * 100, 1)}% V`
     : " (single output fills canvas)";
-  // An exact pair of overlaps only fills one axis; the other is centered and
-  // the daemon reports the band it leaves, plus the canvas aspect that would
-  // close it (changing the aspect is the operator's call, never implicit).
+  // An exact pair of overlaps only fills one axis; the other either centers a
+  // black overhang past the canvas's edge (the default), or, with "Allow
+  // unused canvas pixels" checked, is left short and the daemon reports the
+  // band that leaves. Either way it also reports the canvas aspect that
+  // would close the gap (changing the aspect is the operator's call, never
+  // implicit). `overhang` is undefined against an older daemon that predates
+  // it, hence the fallback.
   const unused = solution.unusedCanvas ?? { x: 0, y: 0 };
+  const overhang = solution.overhang ?? { x: 0, y: 0 };
   const aspect = displayNumber(solution.impliedAspect, 3);
   if (unused.x > .001) message += ` · ${displayNumber(unused.x * 100, 1)}% of the canvas is unused horizontally; aspect ${aspect} would fill it.`;
   if (unused.y > .001) message += ` · ${displayNumber(unused.y * 100, 1)}% of the canvas is unused vertically; aspect ${aspect} would fill it.`;
+  if (overhang.x > .001) message += ` · ${displayNumber(overhang.x * 100, 1)}% of the grid overhangs the canvas horizontally (renders black); aspect ${aspect} would remove it.`;
+  if (overhang.y > .001) message += ` · ${displayNumber(overhang.y * 100, 1)}% of the grid overhangs the canvas vertically (renders black); aspect ${aspect} would remove it.`;
   for (const warning of solution.warnings ?? []) message += ` · ⚠ ${warning}`;
   $("arrange-preview").textContent = message;
   $("arrange-apply").disabled = false;
@@ -2316,19 +2392,70 @@ $("arrange-outputs").onclick = () => {
       if (!(Number.isFinite(value) && value >= 0 && value < 100)) $(id).value = "0";
     }
   }
-  lastArrangeEdit = "overlap";
+  setArrangeMode(loadArrangeMode());
+  $("arrange-allow-unused").checked = loadArrangeAllowUnused();
+  renderArrangeOutputs();
   $("arrange-preview").textContent = "Calculating…";
   $("arrange-apply").disabled = true;
   scheduleArrangePreview();
   $("arrange-dialog").showModal();
 };
 
-const arrangeEdited = (family) => () => { lastArrangeEdit = family; scheduleArrangePreview(); };
-$("arrange-overlap-x").onchange = arrangeEdited("overlap");
-$("arrange-overlap-y").onchange = arrangeEdited("overlap");
-$("arrange-scale").onchange = arrangeEdited("scale");
+$("arrange-overlap-x").onchange = () => scheduleArrangePreview();
+$("arrange-overlap-y").onchange = () => scheduleArrangePreview();
+$("arrange-scale").onchange = () => scheduleArrangePreview();
 $("arrange-rows").onchange = () => scheduleArrangePreview();
 $("arrange-columns").onchange = () => scheduleArrangePreview();
+
+// The order list is `config.outputs` order itself — the same order the
+// solver assigns left to right, then top to bottom — so this is the whole
+// mechanism behind "settable order": there is no separate arrangement-order
+// field anywhere. Disabled outputs stay in the list (reorderable, dimmed):
+// they take no grid slot, but where they sit still matters if re-enabled.
+function renderArrangeOutputs() {
+  const list = $("arrange-order");
+  const outputs = config?.outputs ?? [];
+  list.replaceChildren(...outputs.map((entry, index) => {
+    const name = entry.match?.name ?? "(unnamed)", disabled = entry.enable === false;
+    const raster = entry.mode ? `${entry.mode.width}×${entry.mode.height}` : "";
+    const row = document.createElement("li");
+    row.className = "arrange-order-row" + (disabled ? " disabled" : "");
+    const label = document.createElement("span");
+    label.className = "arrange-order-name";
+    label.textContent = disabled ? `${name} (disabled)` : name;
+    const rasterSpan = document.createElement("span");
+    rasterSpan.className = "arrange-order-raster";
+    rasterSpan.textContent = raster;
+    const up = document.createElement("button");
+    up.type = "button"; up.className = "action ghost"; up.textContent = "↑";
+    up.setAttribute("aria-label", `Move ${name} up`);
+    up.disabled = index === 0;
+    up.onclick = () => bumpArrangeOutput(index, -1);
+    const down = document.createElement("button");
+    down.type = "button"; down.className = "action ghost"; down.textContent = "↓";
+    down.setAttribute("aria-label", `Move ${name} down`);
+    down.disabled = index === outputs.length - 1;
+    down.onclick = () => bumpArrangeOutput(index, 1);
+    const pos = document.createElement("span");
+    pos.className = "arrange-order-pos";
+    pos.textContent = String(index + 1);
+    row.append(pos, label, rasterSpan, up, down);
+    return row;
+  }));
+}
+
+// An ordinary uncommitted edit to `config.outputs`, exactly like dragging a
+// field on the layout: pushPreview() is what "remembers" the new order in
+// the shared working copy, and the dry run re-solves against it because
+// scheduleArrangePreview() flushes previews before asking the daemon.
+function bumpArrangeOutput(index, direction) {
+  const outputs = config?.outputs, other = index + direction;
+  if (!outputs || other < 0 || other >= outputs.length) return;
+  [outputs[index], outputs[other]] = [outputs[other], outputs[index]];
+  renderArrangeOutputs();
+  pushPreview();
+  scheduleArrangePreview();
+}
 
 $("arrange-apply").onclick = async () => {
   if (!config) return;
@@ -3796,6 +3923,7 @@ function applyLoadedConfig(incoming) {
   setDisplayError(null);
   if (document.activeElement !== $("config-json")) $("config-json").value = JSON.stringify(config, null, 2);
   renderApps(); renderLayout(); renderBackgrounds(); renderWallpapers(); renderProjection(true);
+  renderArrangeOutputs();
   invalidateRecommendation();
   if (!selected) selected = layoutEntries()[0]?.known.name ?? null;
   if (selected) selectOutput(selected);

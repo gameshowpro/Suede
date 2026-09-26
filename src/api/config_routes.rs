@@ -14,8 +14,8 @@ use utoipa::IntoParams;
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    AppConfig, Arrangement, ArrangementRequest, BackgroundPreset, DesiredState, OutputConfig,
-    OutputMatch, ProjectionConfig, Settings,
+    AppConfig, Arrangement, ArrangementLimits, ArrangementRequest, BackgroundPreset, DesiredState,
+    OutputConfig, OutputMatch, ProjectionConfig, Settings,
 };
 use crate::state::{StatePrecondition, StateVersion};
 
@@ -769,6 +769,17 @@ pub async fn delete_projection_canvas(
 pub struct ArrangementStatus {
     pub arrangement: Option<Arrangement>,
     pub in_effect: bool,
+    /// Per-axis overlap limits for the recorded grid on the current canvas
+    /// and outputs, each holding the other axis at its recorded overlap —
+    /// what the dry run would report for an overlap request at the recorded
+    /// values, with `allowUnusedCanvas` at its default `false` (the record
+    /// does not keep it). Lets a client seed its overlap controls and their
+    /// ranges in one read. Omitted when there is no record, or when the
+    /// limits cannot be computed against the current document (no canvas,
+    /// a missing raster, too many enabled outputs for the recorded grid, and
+    /// so on); never a reason to fail this read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ArrangementLimits>,
 }
 
 #[utoipa::path(
@@ -776,8 +787,9 @@ pub struct ArrangementStatus {
     responses((
         status = 200,
         description = "The persisted grid-arrangement record from the effective \
-                       document, and whether re-solving it still reproduces the \
-                       current sources",
+                       document, whether re-solving it still reproduces the \
+                       current sources, and (when computable) the overlap \
+                       limits at the recorded values",
         body = ArrangementStatus,
         headers(
             ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
@@ -791,15 +803,28 @@ pub async fn get_projection_arrangement(
 ) -> VersionedSection<ArrangementStatus> {
     let (document, version) = state.store.effective_with_version();
     let raster = super::raster_lookup(&state.snapshot);
-    let in_effect = crate::model::in_effect(&document, raster);
+    let in_effect = crate::model::in_effect(&document, &raster);
     let arrangement = document
         .projection
         .as_ref()
         .and_then(|projection| projection.arrangement);
+    let limits = arrangement.and_then(|recorded| {
+        let request = ArrangementRequest {
+            rows: recorded.rows,
+            columns: recorded.columns,
+            overlap_x: Some(recorded.overlap_x),
+            overlap_y: Some(recorded.overlap_y),
+            content_scale: None,
+            allow_unused_canvas: false,
+            committed: false,
+        };
+        crate::model::limits_document(&document, &request, &raster).ok()
+    });
     VersionedSection::new(
         ArrangementStatus {
             arrangement,
             in_effect,
+            limits,
         },
         version,
     )
@@ -834,7 +859,9 @@ pub async fn get_projection_arrangement(
         (status = 409, description = "If-Match, If-Config-Generation, or If-Config-Epoch is stale"),
         (status = 422, description = "The grid does not fit the outputs, an output \
                        has no known raster, the request is over- or \
-                       under-determined, or the result fails document validation"),
+                       under-determined, an overlap is outside [0, 1), an edge \
+                       slice would fall entirely outside the canvas, or the \
+                       result fails document validation"),
     )
 )]
 pub async fn put_projection_arrangement(
@@ -2675,6 +2702,104 @@ mod tests {
             body["arrangement"]["rows"], 2,
             "the record survives the manual edit: {body}"
         );
+    }
+
+    /// With a record, the status read carries the overlap limits at the
+    /// recorded values, exactly as a dry run at those values would.
+    ///
+    /// 2x2 of 1920x1080 at (0.2, 0.2) on 16:9: two slices per axis put the
+    /// seam on the canvas's center line at every overlap, so no slice can
+    /// leave the canvas and each axis's range is the whole of `[0, 1)` — `0`
+    /// exactly, up to the bisected bound just below `1`.
+    #[tokio::test]
+    async fn arrangement_status_carries_limits_at_the_recorded_overlaps() {
+        let harness = arrangement_harness(4);
+        let (status, _) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(ARRANGE_2X2_20),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = call(
+            &harness,
+            "GET",
+            "/api/v1/config/projection/arrangement",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for axis in ["overlapX", "overlapY"] {
+            let limits = &body["limits"][axis];
+            assert_eq!(limits["hasSeam"], true, "{axis}: {body}");
+            assert_eq!(limits["min"].as_f64().unwrap(), 0.0, "{axis}: {body}");
+            let max = limits["max"].as_f64().unwrap();
+            assert!(max > 0.999 && max < 1.0, "{axis}: {body}");
+        }
+
+        let (dry_status, dry_body) = call(
+            &harness,
+            "GET",
+            "/api/v1/projection/arrangement?rows=2&columns=2&overlapX=0.2&overlapY=0.2",
+            None,
+        )
+        .await;
+        assert_eq!(dry_status, StatusCode::OK, "{dry_body}");
+        assert_eq!(body["limits"], dry_body["limits"], "{body} vs {dry_body}");
+    }
+
+    /// No record, no limits: the field is omitted rather than null, and the
+    /// read still succeeds.
+    #[tokio::test]
+    async fn arrangement_status_omits_limits_without_a_record() {
+        let harness = arrangement_harness(4);
+        let (status, body) = call(
+            &harness,
+            "GET",
+            "/api/v1/config/projection/arrangement",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["arrangement"].is_null(), "{body}");
+        assert_eq!(body["inEffect"], false, "{body}");
+        assert!(body.get("limits").is_none(), "{body}");
+    }
+
+    /// A record the current document can no longer honor — here a 1x1 grid
+    /// with four enabled outputs — still reads back, `inEffect` false; its
+    /// limits cannot be computed, so they are omitted rather than failing
+    /// the read.
+    #[tokio::test]
+    async fn arrangement_status_omits_limits_it_cannot_compute() {
+        let harness = arrangement_harness(4);
+        harness
+            .state
+            .store
+            .update(|document| {
+                document.projection.as_mut().unwrap().arrangement = Some(super::Arrangement {
+                    rows: 1,
+                    columns: 1,
+                    overlap_x: 0.2,
+                    overlap_y: 0.2,
+                    content_scale: 1.0,
+                });
+            })
+            .unwrap();
+
+        let (status, body) = call(
+            &harness,
+            "GET",
+            "/api/v1/config/projection/arrangement",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["arrangement"]["rows"], 1, "{body}");
+        assert_eq!(body["inEffect"], false, "{body}");
+        assert!(body.get("limits").is_none(), "{body}");
     }
 
     /// The smoothness claim in the plan's "Rapid change" section: a burst of

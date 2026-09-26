@@ -242,6 +242,7 @@ daemon restart from making a reset generation counter look current.
 | `maxRenderTimeMs` | number \| null | null | Frame render deadline; null means off |
 | `background` | object \| null | null | What the output shows when no window covers it |
 | `adopted` | object \| null | null | Read-only: what Suede pinned for a field left unset — see [Adopted values](#adopted-values) |
+| `arrangeOffset` | object \| null | null | `{x, y}` nudge added to this output's source by the grid arrangement solve only; see [Grid arrangement](#grid-arrangement) |
 
 `match` selects by connector name, which is the normal case:
 
@@ -1186,32 +1187,150 @@ committing to a value.
 
 Enabled outputs are placed in document order, `row = i / columns`,
 `column = i % columns`; the enabled count must not exceed `rows * columns`,
-or the request is `422`. Give either `overlapX` and `overlapY` together, or
+or the request is `422`. The order of `outputs[]` is therefore meaningful
+and settable: reordering the array changes which slot each output lands in
+(the reference UI's Arrange dialog does this with up/down controls on each
+row), and, being an ordinary part of the document, the order persists like
+any other config write. Give either `overlapX` and `overlapY` together, or
 `contentScale` alone — never both (`422`, "over-determined"), and never
 neither (overlaps then default to `0`).
 
-**Exact overlap, or exact scale — never both solved at once.** With
-`overlapX`/`overlapY`, each is honored exactly: the axis whose content just
-fills the canvas at that overlap is the *binding* axis, and the other axis is
-centered on the canvas, with `unusedCanvas` left on either side — reported as
-a fraction of the canvas, per axis. This is deliberate: with two independent
-overlap sliders, silently absorbing slack into whichever axis has room would
-make one slider inert, and would show a doubled seam where the projectors do
-not actually overlap. `impliedAspect` is the canvas aspect that would make
-`unusedCanvas` zero; apply it explicitly if you want the band gone, since the
-endpoint never changes the canvas aspect itself. With `contentScale` alone,
-the canvas fills exactly on both axes and `overlapX`/`overlapY` are derived
-from it; if the derived overlap would need to reach 100% or more — the
-content scale is too small for this grid to reach the canvas edges — the
-result is `422`, "content scale is too small for this grid".
+Connectivity plays no part in the solve: an enabled output whose display is
+currently disconnected still takes its grid slot and is laid out exactly as
+if it were attached. Its raster comes from `mode` (or a previously adopted
+one) before ever falling back to what is currently observed, so the solve
+does not depend on what happens to be plugged in at the moment it runs, and
+the attached screens around it receive the correct slices regardless. The
+disconnected output's own `geometry.source` is written and applied like
+everyone else's; the reconciler carries it through to the display the moment
+it appears. The only failure mode is an enabled output with no configured,
+adopted, *or* observed mode at all — nothing to size it by — which is the
+existing `422` naming it: "output X has no known raster size".
 
-The dry-run `GET` responds with the five resolved values (`rows`, `columns`,
+**Overlaps are exact: the daemon never grows one.** With `overlapX`/`overlapY`,
+each comes back in `arrangement` exactly as requested — the solver either
+honors both as given or refuses the request; it never adjusts either one to
+make the other fit. Full canvas coverage instead comes from the content
+scale: with per-axis fits `fitX = requestedW / canvasW` and
+`fitY = requestedH / canvasH` (the grid's raster extent at the requested
+overlaps, over the canvas's), the daemon picks
+`contentScale = min(fitX, fitY)` — the least-waste scale that still covers
+the whole canvas. The axis with the smaller fit fills the canvas exactly;
+the other **overhangs** it, centered, and the response reports how far as
+`overhang` (a fraction of the canvas extent on that axis, split evenly
+between both ends). Slice pixels that fall in the overhang render black —
+wasted slice pixels at the edge of the wall, which is acceptable, unlike an
+unused band of canvas that no projector shows. The rule needs no
+seamed/unseamed case analysis: an axis without a seam (a single row or
+single column) just has an inert overlap, and if it happens to be the axis
+with the larger fit, it overhangs exactly like a seamed one would.
+`impliedAspect` is the canvas aspect at which the *requested* overlaps would
+fill both axes exactly, with no overhang; apply it explicitly if you want
+the resolved overlaps to leave no overhang, since the endpoint never changes
+the canvas aspect itself. With `contentScale` alone, the canvas fills
+exactly on both axes and `overlapX`/`overlapY` are derived from it; if the
+derived overlap would need to reach 100% or more — the content scale is too
+small for this grid to reach the canvas edges — the result is `422`,
+"content scale is too small for this grid", regardless of
+`allowUnusedCanvas` below (a content-scale request already fills whenever a
+fill is possible at all).
+
+**An edge slice pushed entirely off the canvas is always a `422`, in every
+mode.** Under a large enough aspect mismatch — reachable with three or more
+rows or columns, since the overhang above splits between the grid's two ends
+— an edge slice can lose *all* of the canvas rather than merely some of it;
+that is refused rather than produced, naming the output: "output X's slice
+falls entirely outside the canvas at these overlaps; the canvas aspect that
+fits these overlaps exactly is {impliedAspect}". Because this can happen
+even at small overlaps once the aspect mismatch is extreme, and because
+whether a given overlap is safe depends on what the *other* axis is asked
+for, a client cannot always tell from the numbers alone whether a request
+will be refused — which is what `limits` (below) is for.
+
+**`allowUnusedCanvas` (default `false`) keeps its old meaning: whether a
+partial cover is acceptable, in exchange for never overhanging.** Set it to
+`true` and the daemon fits the whole grid *inside* the canvas instead, at
+`contentScale = max(fitX, fitY)`: the axis with the *larger* fit now fills
+exactly, and the other is left short rather than overhanging — any smaller
+scale would push a source outside the canvas, any larger would cover less on
+both axes. `unusedCanvas` reports whatever fraction is left uncovered on
+each axis, centered on the canvas exactly as `overhang` is. Left `false`
+(the default), an overlap request never leaves a band — see above, it
+overhangs instead, so most callers (Zelus's slider-driven Arrange dialog
+included) never need to send this flag at all; it exists for a caller that
+would rather see the wall's inner boundary sit inside the projected surfaces
+than see black slice pixels hanging off its edge. A content-scale solve that
+would leave a band on an unseamed axis at the asked-for scale (a single row
+or column shorter or narrower than the canvas at that scale) is still
+refused with a `422` naming the axis, the band as a percentage of the
+canvas, and the aspect that would close it — unless `allowUnusedCanvas: true`
+accepts it instead. The flag is accepted on both the `GET` dry run and the
+`PUT`, so a preview sees the same answer committing it would give.
+
+This is a **behavior change from the last released 0.1.14**: a request that
+used to succeed with a band left on the canvas (any single-row or
+single-column grid on a mismatched canvas aspect, for instance) now
+overhangs the canvas by default instead of leaving that band uncovered — set
+`allowUnusedCanvas: true` to get the old fit-inside answer and its band
+back. Anything driving arrangement against the old habit (a single-row
+wall, or a canvas aspect picked before the outputs' own proportions were
+final) will now see black at the wall's edge where it used to see an unused
+band; that is expected, and `allowUnusedCanvas: true` restores the old
+answer if the band is preferred.
+
+**`limits` lets a client clamp its controls instead of guessing.** The
+dry-run `GET`'s response also carries, for each axis, the closed range of
+overlaps that stays valid — under the `0 <= overlap < 1` bound and the
+off-canvas-slice rule above — while the *other* axis is held at the value
+the request just asked for; it is computed against the same document state
+the solve used. A slider-driven client (or a plain HTML range input) should
+set its min/max straight from `limits.overlapX`/`limits.overlapY` rather
+than allowing 0-100% and finding out from a `422` that a value near the
+extreme was never valid. `hasSeam: false` means the axis has no seam at
+all — a single row (for `overlapY`) or a single column (for `overlapX`) —
+so its overlap changes nothing; a client should disable that axis's control
+outright rather than let an inert value be edited. `limits` is omitted for
+a `contentScale` request, which has no overlaps to limit.
+
+`GET /api/v1/config/projection/arrangement` (the persisted record, below)
+also carries `limits`, computed against the *recorded* arrangement's
+rows/columns/overlaps together with the document's current canvas and
+outputs — so the one read that seeds a rearrangement dialog's starting
+position can seed its slider ranges too. It always computes those limits as
+if `allowUnusedCanvas` were `false`, since the record does not store that
+flag; a client that applied the recorded arrangement with the flag set
+should keep that in mind. `limits` is omitted there (never `null`, and
+never a reason to fail the read) whenever there is no record at all, or
+whenever it cannot be computed against the document as it stands now — a
+missing canvas, an output with no known raster, more enabled outputs than
+the recorded grid holds, and so on.
+
+The dry-run `GET` responds with the resolved values (`rows`, `columns`,
 `overlapX`, `overlapY`, `contentScale`) under `arrangement`, together with
-`unusedCanvas`, `impliedAspect`, each output's resulting `source` rectangle
-under `outputs`, any `warnings` (for example, an overlap above 80%), and the
-`revision` and `generation` of the document it was solved against. The `PUT`
-responds with the whole document, where the same five values are
-`projection.arrangement`.
+`unusedCanvas`, `overhang`, `impliedAspect`, `limits` (all above), each
+output's resulting `source` rectangle under `outputs`, any `warnings` (for
+example, an overlap above 80%), and the `revision` and `generation` of the
+document it was solved against. The `PUT` responds with the whole document
+as usual, where the same values are `projection.arrangement`; it carries no
+`limits` of its own — re-read either `GET` after a change to refresh them,
+since they reflect the document state the solve ran against.
+
+**`outputs[].arrangeOffset`** (`{x, y}`, normalized canvas units — the same
+space as `geometry.source` — default `{0, 0}`) nudges one output's placement
+after the solve, without moving anything else in the grid: the solver adds
+it to that output's computed `source.x`/`source.y` once placement is
+otherwise finished. `unusedCanvas`, `overhang`, the `allowUnusedCanvas` gate,
+and the off-canvas-slice gate above are all computed *before* offsets are
+applied, so a nonzero offset can deliberately uncover canvas pixels —
+nudging one projector to correct a mechanical misalignment, say — without
+ever being mistaken for the coverage failure `allowUnusedCanvas` guards
+against, or for a slice the solve would otherwise have refused.
+`GET /api/v1/config/projection/arrangement`'s
+`inEffect` applies the document's *current* offsets before comparing, so
+editing an offset after an arrangement has been applied turns `inEffect`
+`false`, exactly like any other manual geometry edit. The reference UI never
+sets this field — it is locked at `{0, 0}` there — but preserves it verbatim
+if a document already carries one, for a client that does set it.
 
 The resolved values are also kept as `projection.arrangement`: a record of
 intent, not canonical geometry. `source` rectangles stay the canonical stored
@@ -1221,7 +1340,21 @@ never overwritten or reverted — it simply leaves the record in place.
 `inEffect`, which is `true` only while re-solving it still reproduces the
 current sources; it turns `false` the moment any source is nudged by hand. A
 client can use the record to prefill a rearrangement dialog, or a slider's
-starting position, without tracking the grid itself.
+starting position, without tracking the grid itself. It also reports
+`limits` for the recorded values — see above — so the same read seeds a
+dialog's slider ranges as well as its starting position.
+
+Centering the overhang (above) changes what `inEffect` reports for one
+existing case: a document whose recorded arrangement is a *content-scale*
+one, on an unseamed axis (a single row or column) that overhung the canvas,
+used to have that overhang pinned to the canvas's first edge — origin `0` —
+rather than centered. Re-solving that record now centers the overhang
+instead, so `inEffect` reads `false` for such a record even though nothing
+in the document was touched by hand. This is rare — it only ever affected a
+content-scale arrangement whose one row or column already exceeded the
+canvas — and is accepted as correct: `inEffect` is answering "does the
+document still look like this record," and after this change it correctly
+no longer does.
 
 The `PUT` behaves like any other config write: `committed: false` (the
 default) replaces the shared working copy and applies immediately; `committed:

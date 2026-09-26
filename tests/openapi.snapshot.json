@@ -236,6 +236,25 @@
         ],
         "type": "object"
       },
+      "ArrangeOffset": {
+        "additionalProperties": false,
+        "description": "A per-output nudge the grid arrangement solve adds to this output's\ncomputed source, in normalized canvas units — the same space as\n[`super::geometry::OutputGeometry::source`].\n\nApplied only by [`crate::model::arrangement::solve`], after placement:\ncoverage (`unusedCanvas`) and the strict full-coverage gate are computed\non the *pre-offset* rectangles, since an offset is a deliberate shift\n(mechanical alignment, for instance) that may uncover canvas pixels on\npurpose rather than a coverage failure. [`crate::model::arrangement::in_effect`]\napplies the document's current offset before comparing, so editing the\noffset after an arrangement has been applied turns `inEffect` false, like\nany other manual geometry edit.",
+        "properties": {
+          "x": {
+            "format": "double",
+            "type": "number"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
       "ArrangedOutput": {
         "description": "One enabled output's placement.",
         "properties": {
@@ -256,7 +275,7 @@
       },
       "Arrangement": {
         "additionalProperties": false,
-        "description": "The resolved grid arrangement last applied to a document.\n\nAll five values are resolved: whichever of overlap or content scale the\nclient supplied, this records what the solver settled on. It is a record\nof *intent*, not canonical geometry — the source rectangles remain the\ntruth, and a later manual geometry edit leaves this in place. See\n[`in_effect`] for the test of whether it still describes the document.",
+        "description": "The resolved grid arrangement last applied to a document.\n\nAll five values are resolved: whichever of overlap or content scale the\nclient supplied, this records what the solver settled on. When overlaps\nwere requested they come back exactly as requested and only the content\nscale is derived; when a content scale was requested the overlaps are\nderived from it. It is a record of *intent*, not canonical geometry — the source\nrectangles remain the truth, and a later manual geometry edit leaves this\nin place. See [`in_effect`] for the test of whether it still describes the\ndocument.",
         "properties": {
           "columns": {
             "description": "Grid columns; at least 1.",
@@ -270,7 +289,7 @@
             "type": "number"
           },
           "overlapX": {
-            "description": "Fraction of the smaller of two adjacent columns' raster widths that\nthey share; `0 <= overlapX < 1`.",
+            "description": "Fraction of the smaller of two adjacent columns' raster widths that\nthey share; `0 <= overlapX < 1`. Exactly the requested value in\noverlap mode.",
             "format": "double",
             "type": "number"
           },
@@ -296,10 +315,11 @@
         "type": "object"
       },
       "ArrangementDryRun": {
-        "description": "A solved grid arrangement, without writing it: [`crate::model::ArrangementSolution`]'s\nfields, copied rather than `#[serde(flatten)]`'d — [`Arrangement`] denies\nunknown fields, and serde cannot combine that with `flatten` — plus the\ndocument identity it was solved against, so a client can tell whether its\nnext write should still expect to land cleanly.",
+        "description": "A solved grid arrangement, without writing it: [`crate::model::ArrangementSolution`]'s\nfields, copied rather than `#[serde(flatten)]`'d — [`Arrangement`] denies\nunknown fields, and serde cannot combine that with `flatten` — plus the\ndocument identity it was solved against, so a client can tell whether its\nnext write should still expect to land cleanly — and, for an overlap\nrequest, the overlap range each axis can take from here.",
         "properties": {
           "arrangement": {
-            "$ref": "#/components/schemas/Arrangement"
+            "$ref": "#/components/schemas/Arrangement",
+            "description": "The resolved five values. In overlap mode `overlapX` and `overlapY`\nare exactly the requested ones: the solver never changes an overlap."
           },
           "generation": {
             "format": "int64",
@@ -310,11 +330,25 @@
             "format": "double",
             "type": "number"
           },
+          "limits": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArrangementLimits",
+                "description": "Per-axis overlap limits for this grid on this canvas, each holding\nthe other axis at its requested value; see\n[`crate::model::limits`]. Computed against the same document the\nsolve used. Omitted for a `contentScale` request, which has no\noverlaps to limit."
+              }
+            ]
+          },
           "outputs": {
             "items": {
               "$ref": "#/components/schemas/ArrangedOutput"
             },
             "type": "array"
+          },
+          "overhang": {
+            "$ref": "#/components/schemas/Overhang"
           },
           "revision": {
             "format": "int64",
@@ -342,9 +376,29 @@
         ],
         "type": "object"
       },
-      "ArrangementRequest": {
-        "description": "What a client asks for: the grid, plus *either* the overlaps *or* the\ncontent scale.\n\nSupplying both is over-determined and is an error; supplying neither\nmeans both overlaps are zero.",
+      "ArrangementLimits": {
+        "description": "Per-axis overlap limits for one grid on one canvas; see [`limits`].",
         "properties": {
+          "overlapX": {
+            "$ref": "#/components/schemas/AxisLimits"
+          },
+          "overlapY": {
+            "$ref": "#/components/schemas/AxisLimits"
+          }
+        },
+        "required": [
+          "overlapX",
+          "overlapY"
+        ],
+        "type": "object"
+      },
+      "ArrangementRequest": {
+        "description": "What a client asks for: the grid, plus *either* the overlaps *or* the\ncontent scale.\n\nThe overlaps are exact: the solver either honors them as given, choosing\nthe content scale so the grid covers the whole canvas (overhanging it on\nthe axis whose fit is larger), or refuses the request. It never changes an\noverlap. Supplying both overlaps and a content scale is over-determined\nand is an error; supplying neither means both overlaps are zero.",
+        "properties": {
+          "allowUnusedCanvas": {
+            "description": "Accept a solution that leaves part of the canvas uncovered.\n\nDefault `false`: overlap requests cover the whole canvas, overhanging\nit on the axis whose fit is larger (`contentScale = min(fitX, fitY)`),\nso they never leave a band; a content-scale solve that would leave\none (an unseamed axis falling short of the canvas at the asked-for\nscale) is refused with a `422` naming the axis, the band as a\npercentage of the canvas, and the aspect that would close it. `true`\ninstead fits the whole grid *inside* the canvas at the requested\noverlaps — `contentScale = max(fitX, fitY)`, since a smaller scale\nwould push a source past the canvas edge and a larger one would cover\nless on both axes — and reports the band that leaves.\n\n**Behavior change from Suede 0.1.14**: a request that used to succeed\nwith a band left on the canvas (any single-row or single-column grid\non a mismatched canvas aspect, for instance) now overhangs the canvas\ninstead; set this to `true` to get the old fit-inside answer and its\nband back.",
+            "type": "boolean"
+          },
           "columns": {
             "format": "int32",
             "minimum": 0,
@@ -395,7 +449,7 @@
             "description": "The resolved five values, exactly as [`apply`] records them."
           },
           "impliedAspect": {
-            "description": "The canvas aspect at which both axes would fill exactly, leaving no\nunused band. Reported, never applied: changing the aspect resizes the\nheadless canvas and the browser, so it is the operator's decision.",
+            "description": "The canvas aspect at which the requested overlaps would fill both\naxes exactly, with no overhang and no band. Reported, never applied:\nchanging the aspect resizes the headless canvas and the browser, so\nit is the operator's decision.",
             "format": "double",
             "type": "number"
           },
@@ -406,9 +460,13 @@
             },
             "type": "array"
           },
+          "overhang": {
+            "$ref": "#/components/schemas/Overhang",
+            "description": "How far the grid overshoots the canvas on each axis, as a fraction of\nthe canvas extent; see [`Overhang`]."
+          },
           "unusedCanvas": {
             "$ref": "#/components/schemas/UnusedCanvas",
-            "description": "The uncovered fraction of the canvas on each axis."
+            "description": "The uncovered fraction of the canvas on each axis; see\n[`UnusedCanvas`] for when this is non-zero."
           },
           "warnings": {
             "description": "Advisory notes about the solution; never a reason to refuse it.",
@@ -442,6 +500,17 @@
           },
           "inEffect": {
             "type": "boolean"
+          },
+          "limits": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArrangementLimits",
+                "description": "Per-axis overlap limits for the recorded grid on the current canvas\nand outputs, each holding the other axis at its recorded overlap —\nwhat the dry run would report for an overlap request at the recorded\nvalues, with `allowUnusedCanvas` at its default `false` (the record\ndoes not keep it). Lets a client seed its overlap controls and their\nranges in one read. Omitted when there is no record, or when the\nlimits cannot be computed against the current document (no canvas,\na missing raster, too many enabled outputs for the recorded grid, and\nso on); never a reason to fail this read."
+              }
+            ]
           }
         },
         "required": [
@@ -569,6 +638,31 @@
           "audioOutputs",
           "audioInputs",
           "videoInputs"
+        ],
+        "type": "object"
+      },
+      "AxisLimits": {
+        "description": "The overlaps one axis can take, holding the other axis at its requested\nvalue; see [`limits`].",
+        "properties": {
+          "hasSeam": {
+            "description": "Whether the axis has a seam at all. `false` for a single row\n(`overlapY`) or a single column (`overlapX`): the overlap is then\ninert — it changes nothing — and a client should disable its control.\nAn inert axis reports the whole `[0, 1)` range.",
+            "type": "boolean"
+          },
+          "max": {
+            "description": "The largest valid overlap found. Always below `1`, since an overlap\nof `1` is never valid: the bound is exclusive, so this reports the\nlargest value that was actually checked and found valid.",
+            "format": "double",
+            "type": "number"
+          },
+          "min": {
+            "description": "The smallest valid overlap; `0` unless an edge slice would otherwise\nfall off the canvas.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "min",
+          "max",
+          "hasSeam"
         ],
         "type": "object"
       },
@@ -1624,6 +1718,17 @@
             "description": "Applied only when the detected Sway version supports it (≥ 1.10).",
             "type": "boolean"
           },
+          "arrangeOffset": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ArrangeOffset",
+                "description": "A per-output nudge applied only by the grid arrangement solve; see\n[`ArrangeOffset`]. Absent means `{0, 0}` — the common case, and the\nonly value the reference UI ever writes (it locks the field at zero\nbut preserves whatever a third party set here)."
+              }
+            ]
+          },
           "background": {
             "oneOf": [
               {
@@ -1840,6 +1945,24 @@
           "discarded",
           "zeroCopyPresented",
           "lagFrames"
+        ],
+        "type": "object"
+      },
+      "Overhang": {
+        "description": "The fraction of the canvas extent by which the grid overshoots the canvas\non each axis, measured before any\n[`super::desired::OutputConfig::arrange_offset`] is applied.\n\nThe total for the axis, split evenly between its two ends: the grid is\ncentered, so half of it hangs off before the canvas's first edge and half\npast its last. Slice pixels out there render black. In overlap mode this\nis non-zero on the axis whose fit is the larger (the other fills the\ncanvas exactly); in content-scale mode, on an unseamed axis whose single\nrow or column is taller or wider than the canvas at the asked-for scale.\nAdvisory: the only overhang [`solve`] refuses is one that pushes a whole\nslice off the canvas.",
+        "properties": {
+          "x": {
+            "format": "double",
+            "type": "number"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
         ],
         "type": "object"
       },
@@ -3145,7 +3268,7 @@
         "type": "string"
       },
       "UnusedCanvas": {
-        "description": "The fraction of the canvas left uncovered on each axis.\n\nAt most one of the two is non-zero: the binding axis fills the canvas\nexactly and the slack axis is centered, so half of its value is left\nbefore the first slot and half after the last.",
+        "description": "The fraction of the canvas left uncovered on each axis, measured before\nany [`super::desired::OutputConfig::arrange_offset`] is applied.\n\nZero in overlap mode unless [`ArrangementRequest::allow_unused_canvas`]\nasked for the fit-inside scale: the default `min`-of-fits scale fills the\naxis with the smaller fit exactly (up to float dust) and overhangs the\nother, so neither falls short. With `allowUnusedCanvas`, the\n`max`-of-fits scale fills the axis with the larger fit instead and leaves\nthe other short. In content-scale mode an axis without a seam (a single\nrow or column) can fall short at the asked-for scale, which [`solve`]\nrefuses unless `allowUnusedCanvas` says to accept it. Whichever axis is\nshort is centered on the canvas, so half of its value is left before the\nfirst slot and half after the last.",
         "properties": {
           "x": {
             "format": "double",
@@ -4723,7 +4846,7 @@
                 }
               }
             },
-            "description": "The persisted grid-arrangement record from the effective document, and whether re-solving it still reproduces the current sources",
+            "description": "The persisted grid-arrangement record from the effective document, whether re-solving it still reproduces the current sources, and (when computable) the overlap limits at the recorded values",
             "headers": {
               "ETag": {
                 "description": "Persisted document revision, quoted for If-Match",
@@ -4852,7 +4975,7 @@
             "description": "If-Match, If-Config-Generation, or If-Config-Epoch is stale"
           },
           "422": {
-            "description": "The grid does not fit the outputs, an output has no known raster, the request is over- or under-determined, or the result fails document validation"
+            "description": "The grid does not fit the outputs, an output has no known raster, the request is over- or under-determined, an overlap is outside [0, 1), an edge slice would fall entirely outside the canvas, or the result fails document validation"
           }
         },
         "summary": "Solve a grid arrangement and write it — each enabled output's\n`geometry.source`, and the resolved five values at\n`projection.arrangement` — exactly like any other config write:\n`committed: false` (the default) replaces the shared working copy and\napplies to the outputs; `committed: true` persists it. See\n[`crate::model::arrangement`] for the solver itself and\n`docs/configuration.md`'s \"Grid arrangement\" section for the contract.",
@@ -5209,6 +5332,15 @@
               "format": "double",
               "type": "number"
             }
+          },
+          {
+            "description": "As [`ArrangementRequest::allow_unused_canvas`]: default `false` means\noverlaps cover the whole canvas, overhanging it where they must, and\na content-scale band is a `422` here too, not just on the `PUT` that\nwould write it — a client previewing a rearrangement sees the same\nanswer or refusal it would get from committing it. `true` fits the\ngrid inside the canvas instead and reports the band.",
+            "in": "query",
+            "name": "allowUnusedCanvas",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -5223,10 +5355,10 @@
             "description": "The solved arrangement; nothing is written"
           },
           "422": {
-            "description": "The grid does not fit the outputs, an output has no known raster, the canvas is missing, or the request is over- or under-determined"
+            "description": "The grid does not fit the outputs, an output has no known raster, the canvas is missing, the request is over- or under-determined, an overlap is outside [0, 1), or an edge slice would fall entirely outside the canvas"
           }
         },
-        "summary": "`GET /api/v1/projection/arrangement` — solve a grid arrangement without\nwriting it, exactly like [`recommend_resolution`]: reads the effective\ndocument and changes nothing. Pure arithmetic over a handful of outputs,\nso unlike the recommendation endpoint this needs no `spawn_blocking`.",
+        "summary": "`GET /api/v1/projection/arrangement` — solve a grid arrangement without\nwriting it, exactly like [`recommend_resolution`]: reads the effective\ndocument and changes nothing. Pure arithmetic over a handful of outputs,\nso unlike the recommendation endpoint this needs no `spawn_blocking` —\nthe limits scan included, which re-runs the same placement a few hundred\ntimes at most.",
         "tags": [
           "projection"
         ]

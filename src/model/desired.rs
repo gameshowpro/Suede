@@ -536,6 +536,24 @@ impl DesiredState {
                 ));
             }
         }
+        // A per-output nudge applied only by the grid arrangement solve,
+        // validated beside the arrangement record it works alongside. `16`
+        // matches the `±16` canvas-span bound `geometry.source` is held to
+        // (`MAX_SOURCE_SPAN` in `geometry.rs`) — an offset need never be
+        // larger than a source rectangle is allowed to stray from the canvas.
+        for (index, output) in self.outputs.iter().enumerate() {
+            let Some(offset) = output.arrange_offset else {
+                continue;
+            };
+            for (axis, value) in [("x", offset.x), ("y", offset.y)] {
+                if !(value.is_finite() && value.abs() <= 16.0) {
+                    errors.push(format!(
+                        "outputs[{index}].arrangeOffset.{axis} must be finite and at most 16 in \
+                         magnitude, not {value}"
+                    ));
+                }
+            }
+        }
 
         // A shared canvas has one complete configured roster in either
         // pipeline, including disconnected enabled outputs.
@@ -993,6 +1011,31 @@ pub struct OutputConfig {
     /// Merged into one field, nothing could tell those two cases apart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adopted: Option<AdoptedOutput>,
+    /// A per-output nudge applied only by the grid arrangement solve; see
+    /// [`ArrangeOffset`]. Absent means `{0, 0}` — the common case, and the
+    /// only value the reference UI ever writes (it locks the field at zero
+    /// but preserves whatever a third party set here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrange_offset: Option<ArrangeOffset>,
+}
+
+/// A per-output nudge the grid arrangement solve adds to this output's
+/// computed source, in normalized canvas units — the same space as
+/// [`super::geometry::OutputGeometry::source`].
+///
+/// Applied only by [`crate::model::arrangement::solve`], after placement:
+/// coverage (`unusedCanvas`) and the strict full-coverage gate are computed
+/// on the *pre-offset* rectangles, since an offset is a deliberate shift
+/// (mechanical alignment, for instance) that may uncover canvas pixels on
+/// purpose rather than a coverage failure. [`crate::model::arrangement::in_effect`]
+/// applies the document's current offset before comparing, so editing the
+/// offset after an arrangement has been applied turns `inEffect` false, like
+/// any other manual geometry edit.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArrangeOffset {
+    pub x: f64,
+    pub y: f64,
 }
 
 /// How a wallpaper is scaled onto an output, matching `sway-output(5)`.
@@ -1202,6 +1245,7 @@ impl OutputConfig {
             max_render_time_ms: None,
             background: None,
             adopted: None,
+            arrange_offset: None,
         }
     }
 
@@ -1784,6 +1828,7 @@ mod tests {
             max_render_time_ms: None,
             background: None,
             adopted: None,
+            arrange_offset: None,
         }
     }
 

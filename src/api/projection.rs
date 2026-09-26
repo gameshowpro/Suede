@@ -14,8 +14,9 @@ use utoipa::{IntoParams, ToSchema};
 use crate::api::json::Json;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    validate_sources, ArrangedOutput, Arrangement, ArrangementRequest, CanvasConfig, CanvasRect,
-    OutputConfig, OutputGeometry, ProjectionMode, Transform, UnusedCanvas,
+    validate_sources, ArrangedOutput, Arrangement, ArrangementLimits, ArrangementRequest,
+    CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, Overhang, ProjectionMode, Transform,
+    UnusedCanvas,
 };
 
 /// One converted output, addressed by its stable configuration key.
@@ -266,7 +267,7 @@ pub async fn recommend_resolution(
 }
 
 /// Query form of [`ArrangementRequest`], for the read-only dry run: the same
-/// five fields minus `committed`, which has no meaning for a solve that never
+/// fields minus `committed`, which has no meaning for a solve that never
 /// writes.
 #[derive(Debug, Clone, Copy, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -280,6 +281,14 @@ pub struct ArrangementQuery {
     pub overlap_y: Option<f64>,
     #[serde(default)]
     pub content_scale: Option<f64>,
+    /// As [`ArrangementRequest::allow_unused_canvas`]: default `false` means
+    /// overlaps cover the whole canvas, overhanging it where they must, and
+    /// a content-scale band is a `422` here too, not just on the `PUT` that
+    /// would write it — a client previewing a rearrangement sees the same
+    /// answer or refusal it would get from committing it. `true` fits the
+    /// grid inside the canvas instead and reports the band.
+    #[serde(default)]
+    pub allow_unused_canvas: bool,
 }
 
 impl From<ArrangementQuery> for ArrangementRequest {
@@ -290,6 +299,7 @@ impl From<ArrangementQuery> for ArrangementRequest {
             overlap_x: query.overlap_x,
             overlap_y: query.overlap_y,
             content_scale: query.content_scale,
+            allow_unused_canvas: query.allow_unused_canvas,
             committed: false,
         }
     }
@@ -299,13 +309,25 @@ impl From<ArrangementQuery> for ArrangementRequest {
 /// fields, copied rather than `#[serde(flatten)]`'d — [`Arrangement`] denies
 /// unknown fields, and serde cannot combine that with `flatten` — plus the
 /// document identity it was solved against, so a client can tell whether its
-/// next write should still expect to land cleanly.
+/// next write should still expect to land cleanly — and, for an overlap
+/// request, the overlap range each axis can take from here.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArrangementDryRun {
+    /// The resolved five values. In overlap mode `overlapX` and `overlapY`
+    /// are exactly the requested ones: the solver never changes an overlap.
     pub arrangement: Arrangement,
     pub unused_canvas: UnusedCanvas,
+    #[serde(default)]
+    pub overhang: Overhang,
     pub implied_aspect: f64,
+    /// Per-axis overlap limits for this grid on this canvas, each holding
+    /// the other axis at its requested value; see
+    /// [`crate::model::limits`]. Computed against the same document the
+    /// solve used. Omitted for a `contentScale` request, which has no
+    /// overlaps to limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ArrangementLimits>,
     pub outputs: Vec<ArrangedOutput>,
     pub warnings: Vec<String>,
     pub revision: u64,
@@ -315,7 +337,9 @@ pub struct ArrangementDryRun {
 /// `GET /api/v1/projection/arrangement` — solve a grid arrangement without
 /// writing it, exactly like [`recommend_resolution`]: reads the effective
 /// document and changes nothing. Pure arithmetic over a handful of outputs,
-/// so unlike the recommendation endpoint this needs no `spawn_blocking`.
+/// so unlike the recommendation endpoint this needs no `spawn_blocking` —
+/// the limits scan included, which re-runs the same placement a few hundred
+/// times at most.
 #[utoipa::path(
     get,
     path = "/api/v1/projection/arrangement",
@@ -324,8 +348,10 @@ pub struct ArrangementDryRun {
     responses(
         (status = 200, description = "The solved arrangement; nothing is written", body = ArrangementDryRun),
         (status = 422, description = "The grid does not fit the outputs, an output \
-                       has no known raster, the canvas is missing, or the \
-                       request is over- or under-determined"),
+                       has no known raster, the canvas is missing, the \
+                       request is over- or under-determined, an overlap is \
+                       outside [0, 1), or an edge slice would fall entirely \
+                       outside the canvas"),
     )
 )]
 pub async fn get_arrangement(
@@ -336,11 +362,22 @@ pub async fn get_arrangement(
     let request: ArrangementRequest = query.into();
     let raster = crate::api::raster_lookup(&state.snapshot);
     let solution =
-        crate::model::solve_document(&document, &request, raster).map_err(ApiError::Validation)?;
+        crate::model::solve_document(&document, &request, &raster).map_err(ApiError::Validation)?;
+    // Only an overlap request has overlaps to limit. Once its solve has
+    // succeeded the limits cannot fail for any reason the solve did not
+    // already report, but they are advisory either way: a failure omits
+    // them rather than turning a good dry run into an error.
+    let limits = if request.content_scale.is_none() {
+        crate::model::limits_document(&document, &request, &raster).ok()
+    } else {
+        None
+    };
     Ok(Json(ArrangementDryRun {
         arrangement: solution.arrangement,
         unused_canvas: solution.unused_canvas,
+        overhang: solution.overhang,
         implied_aspect: solution.implied_aspect,
+        limits,
         outputs: solution.outputs,
         warnings: solution.warnings,
         revision: document.revision,
@@ -1323,6 +1360,214 @@ mod tests {
                 .contains("do not fit a 2x2 grid"),
             "{body}"
         );
+    }
+
+    /// A harness whose saved document is [`arrangement_document`]`(count)`.
+    fn arrangement_harness(count: usize) -> crate::api::test_support::Harness {
+        let harness = crate::api::test_support::harness(None);
+        harness
+            .state
+            .store
+            .update(|document| *document = arrangement_document(count))
+            .unwrap();
+        harness
+    }
+
+    /// `GET` `uri` on the harness's router: the status and the JSON body.
+    async fn get_json(
+        harness: &crate::api::test_support::Harness,
+        uri: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// A single row has no vertical seam, and on 16:9 its fits differ, so
+    /// the default overlap-mode solve overhangs rather than leaving a band:
+    /// 1x2 of 1920x1080 at (0.2, 0.2) on 3840x2160 has fit_x = (3840 −
+    /// 0.2·1920)/3840 = 3456/3840 = 0.9 and fit_y = 1080/2160 = 0.5, so
+    /// scale = min = 0.5. Y fills exactly; X spans 3456/0.5 = 6912 px
+    /// against 3840, an overhang of 6912/3840 − 1 = 0.8. Each column is
+    /// 1920/0.5 = 3840 px, the first starting at (3840 − 6912)/2 = −1536 and
+    /// ending at 2304, so it is still on the canvas and the solve succeeds.
+    ///
+    /// With `allowUnusedCanvas=true` the fit-inside scale is max = 0.9
+    /// instead: X fills exactly, Y spans 1080/0.9 = 1200 px of 2160, leaving
+    /// a band of 1 − 1200/2160 = 4/9 and no overhang.
+    #[tokio::test]
+    async fn dry_run_overhangs_a_single_row_unless_allow_unused_canvas_asks_for_a_band() {
+        let harness = arrangement_harness(2);
+
+        let (status, body) = get_json(
+            &harness,
+            "/api/v1/projection/arrangement?rows=1&columns=2&overlapX=0.2&overlapY=0.2",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        let close = |value: &serde_json::Value, expected: f64| {
+            (value.as_f64().unwrap() - expected).abs() < 1e-9
+        };
+        assert!(close(&body["arrangement"]["contentScale"], 0.5), "{body}");
+        assert!(close(&body["overhang"]["x"], 0.8), "{body}");
+        assert!(close(&body["overhang"]["y"], 0.0), "{body}");
+        assert!(close(&body["unusedCanvas"]["x"], 0.0), "{body}");
+        assert!(close(&body["unusedCanvas"]["y"], 0.0), "{body}");
+
+        let (status, body) = get_json(
+            &harness,
+            "/api/v1/projection/arrangement?rows=1&columns=2&overlapX=0.2&overlapY=0.2&allowUnusedCanvas=true",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(close(&body["arrangement"]["contentScale"], 0.9), "{body}");
+        assert!(close(&body["unusedCanvas"]["x"], 0.0), "{body}");
+        assert!(close(&body["unusedCanvas"]["y"], 4.0 / 9.0), "{body}");
+        assert!(close(&body["overhang"]["x"], 0.0), "{body}");
+        assert!(close(&body["overhang"]["y"], 0.0), "{body}");
+    }
+
+    /// The overlaps in the answer are the overlaps in the query, bit for
+    /// bit — including an inert one on an axis with no seam — so a client
+    /// that adopts the echo never sees its own slider move.
+    #[tokio::test]
+    async fn dry_run_echoes_the_requested_overlaps_exactly() {
+        for (count, rows, columns, overlap_x, overlap_y) in [
+            (4, 2, 2, 0.137_f64, 0.0421_f64),
+            (4, 2, 2, 0.0, 0.3333333333333333),
+            // One row: overlapY is inert, and still echoed as sent.
+            (2, 1, 2, 0.2718281828, 0.61),
+        ] {
+            let harness = arrangement_harness(count);
+            let (status, body) = get_json(
+                &harness,
+                &format!(
+                    "/api/v1/projection/arrangement?rows={rows}&columns={columns}&overlapX={overlap_x}&overlapY={overlap_y}"
+                ),
+            )
+            .await;
+            assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+            assert_eq!(
+                body["arrangement"]["overlapX"].as_f64().unwrap(),
+                overlap_x,
+                "{body}"
+            );
+            assert_eq!(
+                body["arrangement"]["overlapY"].as_f64().unwrap(),
+                overlap_y,
+                "{body}"
+            );
+        }
+    }
+
+    /// An overlap dry run carries `overhang` and per-axis `limits`.
+    ///
+    /// 2x2 of 1920x1080 at (0.2, 0.2) on 16:9: fit_x = 3456/3840 = 0.9 and
+    /// fit_y = 1944/2160 = 0.9, so both axes fill exactly and neither
+    /// overhangs. With two slices per axis the seam sits on the canvas's
+    /// center line at every overlap, so no slice can leave the canvas and
+    /// each axis's range is the whole of `[0, 1)`: `0` exactly (the scan
+    /// reaches it with everything valid) up to the bisected bound just
+    /// below `1`.
+    ///
+    /// 1x2 on the same canvas: `overlapY` has no seam (one row), so it
+    /// reports `hasSeam: false` and the whole range; `overlapX` is `[0, 1)`
+    /// too — scale stays at fit_y = 0.5 (fit_x = 1 − overlapX/2 ≥ 0.5), each
+    /// column is the canvas's full width, and the first one ends at
+    /// 1920·(1 + overlapX) > 0 px, always on the canvas.
+    #[tokio::test]
+    async fn dry_run_reports_overhang_and_limits_for_an_overlap_request() {
+        let harness = arrangement_harness(4);
+        let (status, body) = get_json(
+            &harness,
+            "/api/v1/projection/arrangement?rows=2&columns=2&overlapX=0.2&overlapY=0.2",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(
+            body["overhang"]["x"].as_f64().unwrap().abs() < 1e-9,
+            "{body}"
+        );
+        assert!(
+            body["overhang"]["y"].as_f64().unwrap().abs() < 1e-9,
+            "{body}"
+        );
+        for axis in ["overlapX", "overlapY"] {
+            let limits = &body["limits"][axis];
+            assert_eq!(limits["hasSeam"], true, "{axis}: {body}");
+            assert_eq!(limits["min"].as_f64().unwrap(), 0.0, "{axis}: {body}");
+            let max = limits["max"].as_f64().unwrap();
+            assert!(max > 0.999 && max < 1.0, "{axis}: {body}");
+        }
+
+        let harness = arrangement_harness(2);
+        let (status, body) = get_json(
+            &harness,
+            "/api/v1/projection/arrangement?rows=1&columns=2&overlapX=0.2&overlapY=0.2",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(body["limits"]["overlapX"]["hasSeam"], true, "{body}");
+        assert_eq!(body["limits"]["overlapY"]["hasSeam"], false, "{body}");
+        for axis in ["overlapX", "overlapY"] {
+            let limits = &body["limits"][axis];
+            assert_eq!(limits["min"].as_f64().unwrap(), 0.0, "{axis}: {body}");
+            let max = limits["max"].as_f64().unwrap();
+            assert!(max > 0.999 && max < 1.0, "{axis}: {body}");
+        }
+    }
+
+    /// A content-scale request has no overlaps to limit, so its dry run
+    /// omits `limits` altogether; `overhang` is still reported.
+    #[tokio::test]
+    async fn dry_run_omits_limits_for_a_content_scale_request() {
+        let harness = arrangement_harness(4);
+        let (status, body) = get_json(
+            &harness,
+            "/api/v1/projection/arrangement?rows=2&columns=2&contentScale=0.9",
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert!(body.get("limits").is_none(), "{body}");
+        assert!(body["overhang"].is_object(), "{body}");
+    }
+
+    /// The off-canvas gate reaches the client as an ordinary `422` problem,
+    /// with no limits attached.
+    ///
+    /// One row of three 1920x1080 at no overlap on 16:9: fit_x = 5760/3840
+    /// = 1.5, fit_y = 1080/2160 = 0.5, scale = 0.5, so each column is the
+    /// canvas's full 3840 px width and X spans 11520 px: the first column
+    /// runs from −3840 to exactly 0, touching the canvas's left edge and
+    /// showing none of it. impliedAspect = 5760/1080 = 5.3333….
+    #[tokio::test]
+    async fn dry_run_refuses_a_slice_pushed_off_the_canvas_with_a_422() {
+        let harness = arrangement_harness(3);
+        let (status, body) = get_json(
+            &harness,
+            "/api/v1/projection/arrangement?rows=1&columns=3&overlapX=0&overlapY=0",
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}"
+        );
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("output HDMI-1's slice falls entirely outside the canvas"),
+            "{detail}"
+        );
+        assert!(detail.contains("5.3333"), "{detail}");
+        assert!(body.get("limits").is_none(), "{body}");
     }
 
     #[tokio::test]

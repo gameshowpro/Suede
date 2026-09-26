@@ -101,7 +101,9 @@ fn set_exception(doc: &mut Value, map_name: &str, key: &str) -> io::Result<()> {
 /// error here — there is simply nothing to remove — but one present and not
 /// an object still is, the same as for [`set_exception`].
 fn remove_exception(doc: &mut Value, map_name: &str, key: &str) -> io::Result<bool> {
-    let root = doc.as_object_mut().expect("doc is an object; see parse_object");
+    let root = doc
+        .as_object_mut()
+        .expect("doc is an object; see parse_object");
     let Some(profile) = optional_child(root, "profile")? else {
         return Ok(false);
     };
@@ -119,8 +121,13 @@ fn remove_exception(doc: &mut Value, map_name: &str, key: &str) -> io::Result<bo
 
 /// `doc.profile.content_settings.exceptions[map_name]`, creating every
 /// missing object along the way.
-fn exceptions_map<'a>(doc: &'a mut Value, map_name: &str) -> io::Result<&'a mut Map<String, Value>> {
-    let root = doc.as_object_mut().expect("doc is an object; see parse_object");
+fn exceptions_map<'a>(
+    doc: &'a mut Value,
+    map_name: &str,
+) -> io::Result<&'a mut Map<String, Value>> {
+    let root = doc
+        .as_object_mut()
+        .expect("doc is an object; see parse_object");
     let profile = required_child(root, "profile")?;
     let content_settings = required_child(profile, "content_settings")?;
     let exceptions = required_child(content_settings, "exceptions")?;
@@ -215,8 +222,7 @@ mod tests {
             1
         );
         assert_eq!(
-            prefs["profile"]["content_settings"]["exceptions"]["media_stream_mic"][key]
-                ["setting"],
+            prefs["profile"]["content_settings"]["exceptions"]["media_stream_mic"][key]["setting"],
             1
         );
     }
@@ -258,8 +264,8 @@ mod tests {
         assert_eq!(camera["http://other.example,*"]["setting"], 1);
         assert_eq!(camera["http://10.0.0.5:8080,*"]["setting"], 1);
         assert_eq!(
-            prefs["profile"]["content_settings"]["exceptions"]["cookies"]
-                ["http://other.example,*"]["setting"],
+            prefs["profile"]["content_settings"]["exceptions"]["cookies"]["http://other.example,*"]
+                ["setting"],
             1
         );
     }

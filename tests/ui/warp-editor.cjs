@@ -5,15 +5,27 @@ const assert = require('node:assert/strict');
 const fixture = JSON.parse(fs.readFileSync('docs/examples/four-output-warp.json'));
 const html = fs.readFileSync('src/api/ui/index.html', 'utf8');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// For state that lives in this file's own route handler (the fixture), not
+// in the page: polling here, rather than page.waitForFunction, since that
+// state is never exposed to the page.
+const waitFor = async (predicate, timeoutMs = 3000) => {
+  const start = Date.now();
+  while (!predicate()) {
+    if (Date.now() - start > timeoutMs) throw new Error('timed out waiting for condition');
+    await sleep(20);
+  }
+};
 
 // The grid solver lives in the daemon and is proven by Rust tests, so this
 // fixture only answers the two arrangement endpoints the way the daemon
 // would; the browser check proves the wiring, not the arithmetic. The canned
 // numbers are a real solve of the fixture's four 1920x1080 outputs as a 2x2
 // at 10%/10% overlap against the canvas the scenario has by then (4000 wide,
-// aspect 1.6, so 4000x2500 with a y density of 4000): X binds at content
-// scale 0.912, and the vertically centered grid leaves a tenth of the canvas
-// unused, which a 16:9 canvas would fill.
+// aspect 1.6, so 4000x2500 with a y density of 4000). This first set is
+// specifically the allowUnusedCanvas:true request (fit the grid inside the
+// canvas, scale = max(fitX, fitY)): X binds at content scale 0.912, and the
+// vertically centered grid leaves a tenth of the canvas unused, which a
+// 16:9 canvas would fill.
 const ARRANGED_SCALE = 0.912;
 const arrangedOrigins = { x: [0, (1920 - 192) / ARRANGED_SCALE], y: [125, 125 + (1080 - 108) / ARRANGED_SCALE] };
 const arrangedSources = [0, 1, 2, 3].map(index => ({
@@ -22,13 +34,37 @@ const arrangedSources = [0, 1, 2, 3].map(index => ({
   width: 1920 / (ARRANGED_SCALE * 4000),
   height: 1080 / (ARRANGED_SCALE * 4000),
 }));
+// Same four outputs, same 10%/10% overlap, but with allowUnusedCanvas left
+// false (the exact+overfill solver's default, and the only kind of answer an
+// overlap request without the flag ever gets now): the grid instead covers
+// its tighter axis exactly and overhangs the other, centered
+// (scale = min(fitX, fitY)). fitX = (1920*2 - 192)/4000 = 0.912 (same fit as
+// above); fitY = (1080*2 - 108)/2500 = 0.8208. Y is tighter, so it binds
+// (no unused/overhang on Y) and X overhangs by fitX/scale - 1 =
+// 0.912/0.8208 - 1 = 1/9. The overhang is centered, so each column's
+// canvas-pixel origin is shifted left by half of it, in the same
+// 4000-wide-canvas pixel density arrangedOrigins uses:
+// margin = -(4000 * 1/9) / 2 = -2000/9.
+const OVERHANG_SCALE = (1080 * 2 - 108) / 2500;
+const OVERHANG_X = (1920 * 2 - 192) / 4000 / OVERHANG_SCALE - 1;
+const overhangMarginX = -(4000 * OVERHANG_X) / 2;
+const overhangOrigins = {
+  x: [0 + overhangMarginX, (1920 - 192) / OVERHANG_SCALE + overhangMarginX],
+  y: [0, (1080 - 108) / OVERHANG_SCALE],
+};
+const overhangSources = [0, 1, 2, 3].map(index => ({
+  x: overhangOrigins.x[index % 2] / 4000,
+  y: overhangOrigins.y[Math.floor(index / 2)] / 4000,
+  width: 1920 / (OVERHANG_SCALE * 4000),
+  height: 1080 / (OVERHANG_SCALE * 4000),
+}));
 const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely cover each other.';
 
 (async () => {
   const browser = await chromium.launch({ headless: true });
   let current = structuredClone(fixture), committed = structuredClone(fixture), generation = 0;
   let recommendationCalls = 0, recommendationDelay = 0, inFlight = 0, maxFlight = 0;
-  const arrangeQueries = [], arrangePuts = [];
+  const arrangeQueries = [], arrangePuts = [], arrangeQueryOutputOrders = [];
   const context = await browser.newContext({ viewport: { width: 1280, height: 1000 } });
   await context.route('**/*', async route => {
     const request = route.request(), url = new URL(request.url()), path = url.pathname.replace('/api/v1', '');
@@ -42,15 +78,27 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
       rows, columns, overlapX: 0, overlapY: 0, contentScale: ARRANGED_SCALE,
       ...Object.fromEntries(Object.entries(values).filter(([, value]) => value !== undefined)),
     });
-    const solution = (rows, columns, values, warnings) => ({
+    // `geometry` defaults to the allowUnusedCanvas:true/band case above
+    // (ARRANGED_SCALE, unusedCanvas.y = 0.1); the overhang case below passes
+    // its own unusedCanvas/overhang/sources instead. `limits` is omitted
+    // here as it is against an older daemon: the reference UI doesn't
+    // consume it yet either (a deliberately deferred follow-up, per the
+    // plan), so nothing exercises it and a hand-derived value would just be
+    // unverified noise.
+    const solution = (rows, columns, values, warnings,
+      geometry = { unusedCanvas: { x: 0, y: 0.1 }, overhang: { x: 0, y: 0 }, sources: arrangedSources }) => ({
       arrangement: resolved(rows, columns, values),
-      unusedCanvas: { x: 0, y: 0.1 }, impliedAspect: 16 / 9,
-      outputs: arrangedSources.map((source, index) => ({ key: current.outputs[index].match.name, source })),
+      unusedCanvas: geometry.unusedCanvas, overhang: geometry.overhang, impliedAspect: 16 / 9,
+      outputs: geometry.sources.map((source, index) => ({ key: current.outputs[index].match.name, source })),
       warnings, revision: current.revision, generation,
     });
     if (path === '/projection/arrangement' && request.method() === 'GET') {
       const query = Object.fromEntries(url.searchParams);
       arrangeQueries.push(query);
+      // Proves `requestArrangement`'s own contract (it flushes previews
+      // before asking the daemon): the order the solver sees at request time
+      // must already be whatever config.outputs held when this fired.
+      arrangeQueryOutputOrders.push(current.outputs.map(output => output.match?.name));
       const rows = Number(query.rows), columns = Number(query.columns);
       if (query.contentScale !== undefined) {
         // Too coarse for the grid to reach the canvas edges at all.
@@ -62,6 +110,19 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
           { contentScale: Number(query.contentScale), overlapX: 0.9, overlapY: 0.86 }, [veryHighOverlap]));
       }
       const overlapX = Number(query.overlapX ?? 0), overlapY = Number(query.overlapY ?? 0);
+      // The 10%/10% case is this fixture's one canned pair of overlap
+      // answers (see OVERHANG_SCALE/ARRANGED_SCALE above): with
+      // allowUnusedCanvas left false (the daemon's own default and the
+      // exact+overfill solver's only overlap-mode answer now) the grid
+      // overhangs X instead of refusing — the old floors-era 422 for this
+      // combination is gone, since a plain band is no longer a refusal
+      // reason. Ticking the box resends the same numbers with the flag true
+      // and fits the grid inside the canvas instead, trading the overhang
+      // for the band.
+      if (overlapX === 0.1 && overlapY === 0.1 && query.allowUnusedCanvas !== 'true') {
+        return reply(solution(rows, columns, { overlapX, overlapY, contentScale: OVERHANG_SCALE }, [],
+          { unusedCanvas: { x: 0, y: 0 }, overhang: { x: OVERHANG_X, y: 0 }, sources: overhangSources }));
+      }
       return reply(solution(rows, columns, { overlapX, overlapY },
         overlapX > 0.8 || overlapY > 0.8 ? [veryHighOverlap] : []));
     }
@@ -145,36 +206,109 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
     expected => document.getElementById('arrange-preview').textContent.includes(expected), text);
   await page.locator('#arrange-outputs').click();
   await page.locator('#arrange-rows').fill('2'); await page.locator('#arrange-columns').fill('2');
-  // Scale 50 is answered with derived overlaps and a warning, and a scale
-  // edit is what fills both overlap fields.
+
+  // Unchecked by default, and sent on every dry run either way (a no-op in
+  // scale mode, but the daemon's own default is also false).
+  assert.equal(await page.locator('#arrange-allow-unused').isChecked(), false);
+
+  // The order list is config.outputs order itself, one row per configured
+  // output, position first. Bumping the second row above the first is an
+  // ordinary preview edit to config.outputs — not something the dialog
+  // computes — so it shows up in the fixture's own document once flushed.
+  assert.deepEqual(await page.locator('#arrange-order .arrange-order-name').allTextContents(),
+    ['HDMI-A-1', 'HDMI-A-2', 'HDMI-A-3', 'HDMI-A-4']);
+  const reordered = ['HDMI-A-2', 'HDMI-A-1', 'HDMI-A-3', 'HDMI-A-4'];
+  await page.locator('#arrange-order li').nth(1).getByRole('button', { name: 'Move HDMI-A-2 up' }).click();
+  await settle();
+  assert.deepEqual(await page.locator('#arrange-order .arrange-order-name').allTextContents(), reordered);
+  // flushPreviews() inside settle() only resolves once the fixture's own
+  // document has the swap, so this is not a race.
+  assert.deepEqual(current.outputs.map(output => output.match.name), reordered);
+  // The next dry run — fired off the debounce the bump (re)armed — solves
+  // against the reordered document, because requestArrangement() flushes
+  // previews before asking the daemon.
+  await waitFor(() => arrangeQueryOutputOrders.at(-1)?.join() === reordered.join());
+  assert.equal(arrangeQueries.at(-1).allowUnusedCanvas, 'false');
+
+  // Overlap is the default mode: overlap inputs live, scale is the daemon's
+  // to fill in. Only the selected family is ever sent (see the query/PUT
+  // assertions below).
+  assert.equal(await page.locator('#arrange-mode-overlap').getAttribute('aria-pressed'), 'true');
+  assert.equal(await page.locator('#arrange-mode-scale').getAttribute('aria-pressed'), 'false');
+  assert.equal(await page.locator('#arrange-overlap-x').isDisabled(), false);
+  assert.equal(await page.locator('#arrange-overlap-y').isDisabled(), false);
+  assert.equal(await page.locator('#arrange-scale').isDisabled(), true);
+
+  // Switching to Scale flips which family is live; a scale edit is what
+  // fills both overlap fields, since they are the daemon's to write now.
+  await page.locator('#arrange-mode-scale').click();
+  assert.equal(await page.locator('#arrange-mode-overlap').getAttribute('aria-pressed'), 'false');
+  assert.equal(await page.locator('#arrange-mode-scale').getAttribute('aria-pressed'), 'true');
+  assert.equal(await page.locator('#arrange-scale').isDisabled(), false);
+  assert.equal(await page.locator('#arrange-overlap-x').isDisabled(), true);
+  assert.equal(await page.locator('#arrange-overlap-y').isDisabled(), true);
+  // Scale 50 is answered with derived overlaps and a warning.
   await page.locator('#arrange-scale').fill('50'); await page.locator('#arrange-scale').dispatchEvent('change');
   await arrangeSays('Overlap is very high');
   assert.equal(await page.locator('#arrange-overlap-x').inputValue(), '90');
   assert.equal(await page.locator('#arrange-overlap-y').inputValue(), '86');
+  assert.deepEqual(arrangeQueries.at(-1), { rows: '2', columns: '2', contentScale: '0.5', allowUnusedCanvas: 'false' });
   // A refused solve shows the daemon's detail and disables Apply
   await page.locator('#arrange-scale').fill('20'); await page.locator('#arrange-scale').dispatchEvent('change');
   await arrangeSays('too small');
   assert.equal(await page.locator('#arrange-apply').isDisabled(), true);
-  // 10% on each axis: both are sent, Content scale comes back from the
-  // answer, and the band the exact overlaps leave is reported
+
+  // Back to Overlap: 10% on each axis, both are sent, Content scale comes
+  // back from the answer, and — with allowUnusedCanvas left unchecked, the
+  // default — the exact+overfill solver's overhang on the tighter axis is
+  // reported instead of the retired floors-era band refusal.
+  await page.locator('#arrange-mode-overlap').click();
+  assert.equal(await page.locator('#arrange-overlap-x').isDisabled(), false);
+  assert.equal(await page.locator('#arrange-scale').isDisabled(), true);
   await page.locator('#arrange-overlap-x').fill('10'); await page.locator('#arrange-overlap-x').dispatchEvent('change');
   await page.locator('#arrange-overlap-y').fill('10'); await page.locator('#arrange-overlap-y').dispatchEvent('change');
-  await arrangeSays('Overlap: 10% H, 10% V');
+  // Unchecked (the default): the daemon no longer refuses this combination —
+  // it covers Y exactly and overhangs X by 1/9 (11.1%, see OVERHANG_X above)
+  // instead, so Apply stays enabled.
+  await arrangeSays('overhangs the canvas horizontally');
+  assert.equal(await page.locator('#arrange-scale').inputValue(), '82.08');
+  assert.equal(await page.locator('#arrange-apply').isDisabled(), false);
+  assert.deepEqual(arrangeQueries.at(-1),
+    { rows: '2', columns: '2', overlapX: '0.1', overlapY: '0.1', allowUnusedCanvas: 'false' });
+
+  // Ticking the box resends the same numbers with the flag true; the daemon
+  // now fits the grid inside the canvas instead (the band case), trading
+  // the horizontal overhang for a vertical band. "Overlap: 10% H, 10% V"
+  // is already on screen from the overhang answer above, so "unused
+  // vertically" (only ever true for the band answer) is the wait that
+  // actually proves the new response landed.
+  await page.locator('#arrange-allow-unused').check();
   await arrangeSays('unused vertically');
   assert.equal(await page.locator('#arrange-scale').inputValue(), '91.2');
   assert.equal(await page.locator('#arrange-apply').isDisabled(), false);
-  assert.deepEqual(arrangeQueries.at(-1), { rows: '2', columns: '2', overlapX: '0.1', overlapY: '0.1' });
+  assert.deepEqual(arrangeQueries.at(-1),
+    { rows: '2', columns: '2', overlapX: '0.1', overlapY: '0.1', allowUnusedCanvas: 'true' });
   await page.locator('#arrange-apply').click();
   await page.waitForFunction(() => !document.getElementById('arrange-dialog').open);
   await settle();
   edited = await read();
-  assert.deepEqual(arrangePuts.at(-1), { rows: 2, columns: 2, overlapX: 0.1, overlapY: 0.1, committed: false });
+  assert.deepEqual(arrangePuts.at(-1),
+    { rows: 2, columns: 2, overlapX: 0.1, overlapY: 0.1, allowUnusedCanvas: true, committed: false });
   // The page adopts the daemon's document rather than arranging anything
-  // itself, so the sources are exactly the ones it was sent.
+  // itself, so the sources are exactly the ones it was sent, in the bumped
+  // order the dialog now shows.
   assert.deepEqual(edited.outputs.map(output => output.geometry.source), arrangedSources);
+  assert.deepEqual(edited.outputs.map(output => output.match.name),
+    ['HDMI-A-2', 'HDMI-A-1', 'HDMI-A-3', 'HDMI-A-4']);
   assert.deepEqual(edited.projection.arrangement,
     { rows: 2, columns: 2, overlapX: 0.1, overlapY: 0.1, contentScale: ARRANGED_SCALE });
-  assert.deepEqual(edited.outputs[1].geometry.corners, before.outputs[1].geometry.corners);
+  assert.deepEqual(edited.outputs.find(output => output.match.name === 'HDMI-A-2').geometry.corners,
+    before.outputs[1].geometry.corners);
+
+  // Reopening the dialog remembers the checkbox choice, same as the mode.
+  await page.locator('#arrange-outputs').click();
+  assert.equal(await page.locator('#arrange-allow-unused').isChecked(), true);
+  await page.locator('#arrange-cancel').click();
 
   await page.evaluate(() => { projectionStats.geometry.warpAvailable = false; renderWarpEditor(); });
   assert.equal(await page.locator('#mode-simple').getAttribute('aria-pressed'), 'true');

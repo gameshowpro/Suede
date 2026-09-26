@@ -145,6 +145,11 @@ mod tests {
                 "adopted",
                 "read-only: Suede's own pin of what settled, shown beside each field rather than edited",
             ),
+            (
+                "arrangeOffset",
+                "locked at {0, 0}: a per-output nudge for a client driving the grid \
+                 arrangement solve directly, not a manual geometry control",
+            ),
         ];
 
         let document: serde_json::Value =
