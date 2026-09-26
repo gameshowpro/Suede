@@ -5,6 +5,16 @@ const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const fixture = JSON.parse(fs.readFileSync('docs/examples/four-output-warp.json'));
+// The example document on disk still uses the pre-rename field name
+// (`geometry.source`); the page's rename to `geometry.slice` is proven here
+// independently of the parallel Rust/doc renames, so translate the fixture's
+// own in-memory copy rather than touching the shared example file.
+for (const output of fixture.outputs ?? []) {
+  if (output.geometry && Object.prototype.hasOwnProperty.call(output.geometry, 'source')) {
+    output.geometry.slice = output.geometry.source;
+    delete output.geometry.source;
+  }
+}
 const html = fs.readFileSync('src/api/ui/index.html','utf8');
 const sleep = ms => new Promise(r=>setTimeout(r,ms));
 (async()=>{
@@ -70,9 +80,9 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   await page.mouse.move(p.x+25,p.y+20,{steps:8}); await page.mouse.up(); await settle();
   let edited=await read(); assert(edited.outputs[0].geometry.corners[0][0]>0);
   assert.deepEqual(edited.projection.canvas,original.projection.canvas);
-  assert.deepEqual(edited.outputs[0].geometry.source,original.outputs[0].geometry.source);
+  assert.deepEqual(edited.outputs[0].geometry.slice,original.outputs[0].geometry.slice);
   assert.deepEqual(edited.outputs.slice(1),original.outputs.slice(1));
-  mark('real corner pointer drag preserves source, canvas, and neighbors');
+  mark('real corner pointer drag preserves slice, canvas, and neighbors');
   const priorRequests=history.length;
   await page.evaluate(()=>moveHandle(0,structuredClone(warpOutput().geometry.corners[0])));await settle();
   assert.equal(history.length,priorRequests);mark('repeated final coordinates do not dispatch a redundant preview');
@@ -126,10 +136,10 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   await page.evaluate(()=>{projectionStats.geometry.warpAvailable=false;projectionStats.geometry.effectiveMode='simple';projectionStats.geometry.reason='CPU fallback';renderWarpEditor();});
   assert(await page.locator('#mode-warp').isDisabled());
   assert.equal(await page.locator('#mode-simple').getAttribute('aria-pressed'),'true');
-  const fallbackCrop=structuredClone(current.outputs[0].geometry.source);
-  await page.locator('#source-x').fill('12');await page.locator('#source-x').press('Tab');await settle();
+  const fallbackCrop=structuredClone(current.outputs[0].geometry.slice);
+  await page.locator('#slice-x').fill('12');await page.locator('#slice-x').press('Tab');await settle();
   assert.deepEqual(current.outputs[0].geometry.corners,beforePattern.corners);
-  assert.notDeepEqual(current.outputs[0].geometry.source,fallbackCrop);
+  assert.notDeepEqual(current.outputs[0].geometry.slice,fallbackCrop);
   assert.equal(current.projection.mode,'warp');
   await page.evaluate(()=>{projectionStats.geometry.warpAvailable=true;projectionStats.geometry.effectiveMode='warp';renderWarpEditor();});
   assert.deepEqual(current.outputs[0].geometry.corners,beforePattern.corners);mark('CPU fallback keeps shared crop editable and preserves requested Warp/correction');

@@ -64,7 +64,7 @@ pub fn status(
 }
 
 /// Preserve omitted calibration for Simple clients, without overwriting explicit
-/// shared canvas or source edits. Explicit output deletion remains deletion.
+/// shared canvas or slice edits. Explicit output deletion remains deletion.
 pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
     let simple = next
         .projection
@@ -110,7 +110,7 @@ pub fn validate_activation(
         .as_ref()
         .map(|p| p.mode)
         .unwrap_or_default();
-    // Shared source selection and resolution remain editable during fallback.
+    // Shared slice selection and resolution remain editable during fallback.
     // Only activation or changes to retained correction require verified Warp.
     let correction_changed = next.outputs.iter().any(|o| {
         let old = previous
@@ -168,7 +168,7 @@ mod tests {
             height: 1.0,
         };
         output.geometry = Some(OutputGeometry {
-            source: r,
+            slice: r,
             raster_footprint: r,
             corners: [[0.1, 0.1], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             center: [0.4, 0.6],
@@ -207,7 +207,7 @@ mod tests {
             .unwrap()
             .render_width = 75;
         next.outputs[0].position = None;
-        next.outputs[0].geometry.as_mut().unwrap().source.x = -0.125;
+        next.outputs[0].geometry.as_mut().unwrap().slice.x = -0.125;
         preserve_retained(&mut next, &before);
         assert_eq!(
             next.projection
@@ -220,7 +220,7 @@ mod tests {
         );
         let geometry = next.outputs[0].geometry.as_ref().unwrap();
         let old = before.outputs[0].geometry.as_ref().unwrap();
-        assert_eq!(geometry.source.x, -0.125);
+        assert_eq!(geometry.slice.x, -0.125);
         assert_eq!(geometry.corners, old.corners);
         assert_eq!(geometry.center, old.center);
         assert_eq!(geometry.raster_footprint, old.raster_footprint);
@@ -238,7 +238,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .render_width = 50;
-        next.outputs[0].geometry.as_mut().unwrap().source.x = 0.125;
+        next.outputs[0].geometry.as_mut().unwrap().slice.x = 0.125;
         let cpu = ProjectionControlStatus {
             requested_renderer: Some(Renderer::Auto),
             effective_renderer: Some(Renderer::Cpu),
@@ -258,12 +258,12 @@ mod tests {
         let mut second = next.outputs[0].clone();
         second.r#match = OutputMatch::by_name("B");
         second.position = Some(crate::model::Position { x: 10000, y: 10000 });
-        second.geometry.as_mut().unwrap().source.x = 0.5;
-        next.outputs[0].geometry.as_mut().unwrap().source.width = 0.5;
-        second.geometry.as_mut().unwrap().source.width = 0.5;
+        second.geometry.as_mut().unwrap().slice.x = 0.5;
+        next.outputs[0].geometry.as_mut().unwrap().slice.width = 0.5;
+        second.geometry.as_mut().unwrap().slice.width = 0.5;
         next.outputs.push(second);
         assert!(next.validate(true).is_ok());
-        next.outputs[1].geometry.as_mut().unwrap().source.x = 0.6;
+        next.outputs[1].geometry.as_mut().unwrap().slice.x = 0.6;
         assert!(next
             .validate(true)
             .unwrap_err()
@@ -504,7 +504,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .render_width = 75;
-        fallback.outputs[0].geometry.as_mut().unwrap().source.x = -0.125;
+        fallback.outputs[0].geometry.as_mut().unwrap().slice.x = -0.125;
         assert_eq!(
             app.clone().oneshot(put(&fallback)).await.unwrap().status(),
             200
@@ -520,7 +520,7 @@ mod tests {
             accepted.0.outputs[0].geometry.as_ref().unwrap().corners,
             baseline.outputs[0].geometry.as_ref().unwrap().corners
         );
-        fallback.outputs[0].geometry.as_mut().unwrap().source.x = 2.0;
+        fallback.outputs[0].geometry.as_mut().unwrap().slice.x = 2.0;
         assert_eq!(app.oneshot(put(&fallback)).await.unwrap().status(), 422);
         assert_eq!(h.state.store.effective_with_generation(), accepted);
     }

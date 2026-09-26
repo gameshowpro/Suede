@@ -218,7 +218,7 @@ mod tests {
         // `the_page_covers_every_configurable_field` above deliberately
         // checks a raw field name anywhere in the file — necessary because it
         // is generated from the whole schema and most of those names (mode,
-        // scale, source, width...) are common English/CSS words that appear
+        // scale, slice, width...) are common English/CSS words that appear
         // constantly outside any form control, so a whole-file substring
         // match there proves nothing beyond "this word exists somewhere".
         //
@@ -234,7 +234,7 @@ mod tests {
             "scale",
             "transform",
             "background",
-            "source",
+            "slice",
             "corners",
             "center",
             "aspect",

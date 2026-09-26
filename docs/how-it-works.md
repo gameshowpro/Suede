@@ -2,7 +2,7 @@
 
 Suede's projection path has more moving parts than any one field in the
 configuration document can explain: a browser renders once into a headless
-canvas, a slicer cuts that canvas into one buffer per projector and blends
+canvas, a slicer cuts that canvas into one buffer per output and blends
 the seams, and the compositor puts each buffer on the glass. This page is
 the explanation — where a frame comes from and what paces it, where the
 blend is actually computed and what it costs, how the displays are kept
@@ -19,6 +19,24 @@ full path. A single output at identity, or a tiling appliance whose layout
 does not overlap, skips all of it: sway tiles the layout directly and no
 frame takes this path.
 
+## Vocabulary {: #vocabulary }
+
+Suede's pipeline vocabulary is **canvas -> slice -> warp -> output ->
+display**, and each term below is owned by exactly one stage:
+
+| Term | Pipeline stage | Coordinate space | Where it appears |
+|---|---|---|---|
+| canvas | shared content surface every output samples | normalized units: x 0..1, y 0..1/aspect | `projection.canvas` |
+| slice | the canvas region one output samples | canvas units | `geometry.slice` (formerly `source`) |
+| warp | projective correction applied to a slice | destination pins on the output | `geometry.corners`, `geometry.center`, `projection.mode: warp` |
+| output | the connector the compositor drives | raster pixels | `outputs[]`, `match` |
+| display | the physical device attached to an output | physical | observed state (`/outputs`), divergences |
+
+"Display" is the canonical neutral term for the physical device; "projector"
+appears only in prose about projector-specific workflows (warp, blending,
+stacked or superimposed projection, projector walls) — elsewhere, a display
+is any attached device.
+
 ## The path of a frame {: #the-path-of-a-frame }
 
 Sway never sees the overlaps. It is always handed a plain edge-to-edge
@@ -32,7 +50,7 @@ region, measured on hardware). Instead:
    `renderWidth × round(renderWidth / aspect)` — see [Canvas and warp
    geometry](configuration.md#projection-geometry).
 2. The **slicer** (`suede slice`, one process per installation) captures the
-   canvas each frame and, for each output, resamples its configured source
+   canvas each frame and, for each output, resamples its configured slice
    rectangle — an inverse-homography lookup when Warp correction is
    non-identity, a plain crop otherwise — into that output's raster; a
    region covered by more than one output is resampled into *every* one of
@@ -43,7 +61,7 @@ region, measured on hardware). Instead:
 Superimposed on the surface, every point's covering copies sum to constant
 luminance, whether one seam covers it twice or a corner covers it three or
 four times (measured: worst deviation 0.008 across a 160 px two-way seam).
-One rule computes every source's share — see [Pairwise
+One rule computes every slice's share — see [Pairwise
 Edge Blending](#normalized-minimum-distance-edge-blending) — and the
 [`blend`, `gamma` and `blackLift`](configuration.md#projection-edge-blending)
 fields shape those ramps; [Where the blend runs](#where-the-blend-runs) is
@@ -96,7 +114,7 @@ flowchart TB
         DS -- "yes (direct_scanout)" --> KMS
     end
 
-    subgraph hw ["display controller and projector (N of these)"]
+    subgraph hw ["display controller and display (N of these)"]
         FLIP["Page flip at the driver's deadline<br/>before vblank"]:::hw
         VB["Vblank 59.95 Hz, own clock per head,<br/>phase fixed at mode-set"]:::hw
         FLIP --> VB
@@ -120,15 +138,15 @@ something, without which nothing upstream of the gate runs at all.
 ### One branch per head {: #one-branch-per-head }
 
 The two right-hand boxes are drawn once but happen *N* times, once per
-projector, and this is the part of the picture most often imagined wrongly.
+output, and this is the part of the picture most often imagined wrongly.
 There is no stage anywhere that reassembles the slices into a single image of
 the whole wall. There is no such image, and there is no hardware that could
 scan one out.
 
-A display controller drives one head from one framebuffer. Four projectors
+A display controller drives one head from one framebuffer. Four outputs
 means four CRTCs, four framebuffers, four independently queued page flips and
 four vblanks running off four clocks that nothing in software can lock
-together. So the slicer's per-projector buffers are not an intermediate
+together. So the slicer's per-output buffers are not an intermediate
 representation that gets flattened downstream — **they are the final scanout
 buffers**, and there are as many of them as there are heads because the
 hardware takes exactly one each.
@@ -139,7 +157,7 @@ each head's finished pixels — ramp, black lift and all — straight into a
 buffer allocated from the DRM format modifiers the compositor flagged as
 scanout-capable, and commits it to a fullscreen, opaque, exactly-output-sized
 layer surface. Composited, sway then runs a render pass over an image that is
-already a pixel-exact picture of what that projector should show, to produce
+already a pixel-exact picture of what that output should show, to produce
 another one. Scanned out, it flips the slicer's buffer to the CRTC plane and
 that pass does not happen. `zeroCopyPresented` equalling `presented` is the
 compositor's own confirmation that nothing touched those pixels between the
@@ -183,7 +201,7 @@ heads repeat a frame. Prefer a repeat over a mismatch is the whole rule.
 
 **Where it can stall, and how each looks in the stats.** The cheapest
 diagnosis is `presentedFps` against `canvasFps`: equal means every frame the
-page made reached every projector, and the question is only whether the
+page made reached every output, and the question is only whether the
 page made enough. From there:
 
 | Bottleneck | When it applies | What the stats show | What helps |
@@ -195,7 +213,7 @@ page made enough. From there:
 | **Blend fence** — the slicer waiting for its turn on a GPU the page is saturating | Any GPU-heavy page, sharing one GPU with the slicer | `perFrameMs.gpu` growing with load (3 ms idle, 5 to 8 ms under a saturating page on the A1000, 40 ms without `CAP_SYS_NICE`). On NVIDIA the wait is not a sleep: the kernel module spins, so the slicer shows 6 % of a core on the sync pattern and 18 % under a saturating page, nearly all of it inside the driver | Realtime queue priority (the package grants it); otherwise the same fix as the first row. Handing the fence to the compositor as an explicit-sync point would move the spin, not remove it |
 | **Gate hold** — a head's flip landed late, or the heads are out of phase | After a sway restart on NVIDIA the heads can sit 7 ms apart; a driver that queues a flip late | `gateHolds` and `framesSuperseded` non-zero, `presentedFps` below `canvasFps`, one output's `lagFrames.one` | The `output-phase` fix aligns the heads; a residual hold or two per 600 frames is the gate working |
 | **Driver deadline** — commit lands too close to vblank | The blend fence plus commit does not fit inside one refresh after the previous flip | `presentedFps` stepping to half the refresh while `canvasFps` stays higher | Reduce the fence (rows 1 and 5); the gate already commits as early as a flip allows |
-| **Per-output compositing** — sway rendering each projector's slice again | The composited arm (`direct_scanout = false`, or the variable set) | `zeroCopyPresented` 0; sway GPU time per output; CPU 1 to 5 % | [`direct_scanout = true`](configuration.md#direct-scanout) on the slicer path removes the pass |
+| **Per-output compositing** — sway rendering each output's slice again | The composited arm (`direct_scanout = false`, or the variable set) | `zeroCopyPresented` 0; sway GPU time per output; CPU 1 to 5 % | [`direct_scanout = true`](configuration.md#direct-scanout) on the slicer path removes the pass |
 | **Compositor CPU spin** — NVIDIA's EGL library busy-waiting inside sway | GPU-heavy pages on NVIDIA, worse with direct scanout on | sway at 30 to 70 % of a core in `top`, in `libnvidia-eglcore` under `perf`; does not by itself lower fps | Under investigation; a sway renderer other than GLES is the obvious A/B |
 | **Head phase and genlock** — the heads' vblanks are not aligned, or not locked | Always, to some degree, without genlock hardware | `phaseMs` non-zero and, if it wanders, `phaseSpreadMs` | A batched mode-set (`output-phase` fix) aligns heads on NVIDIA; nothing in software locks their clocks |
 
@@ -221,7 +239,7 @@ two milliseconds of GPU time once the passes' own overheads are counted.
 
 They cannot simply be skipped. No Wayland protocol lets one client read
 another client's buffer; a compositor that allowed it would have no way to
-distinguish a projection system from a screen-scraper. Screencopy of an
+distinguish a projection system from a naive frame-grabber. Screencopy of an
 output is the sanctioned mechanism, and it is a copy by construction.
 
 Whether removing them would help is a separate question from whether they
@@ -253,7 +271,7 @@ framebuffer would be ours to read, and the blend shader could sample it
 directly: no headless canvas output, no composite of it, no screencopy, no
 capture slots, no `ready` event to trust without a fence.
 
-The mechanism exists. The Chromium Embedded Framework's off-screen rendering
+The mechanism exists. The Chromium Embedded Framework's offscreen rendering
 mode has an accelerated path whose paint callback hands back a shared texture
 rather than a CPU bitmap, and on Linux that arrives as dmabuf plane file
 descriptors plus a DRM format modifier — precisely the shape the slicer
@@ -531,7 +549,7 @@ so the measurement is of the presentation path alone, let it settle, then read
 | `zeroCopyPresented` vs `presented`, per output | every frame, or the buffers are not being flipped at all | zero, always |
 | `straddles` | outputs showing one frame on different refreshes | same — a difference here is the flip's timing, not the blend |
 | `lagFrames`, per output | which display is behind, and by how many whole frames | same, and a lag that survives both arms is the display, not Suede |
-| compositor CPU (`ps -o %cpu` on sway) | one full-screen pass per output per frame less — in principle | the baseline to beat |
+| compositor CPU (`ps -o %cpu` on sway) | one fullscreen pass per output per frame less — in principle | the baseline to beat |
 
 A `zeroCopyPresented` of zero while `direct_scanout` is true means the
 compositor refused to flip: the buffer is the wrong size or format for the
@@ -549,7 +567,7 @@ Suede provides two distinct projection display modes: **Simple mode** and **Warp
 
 | Capability / Aspect | Simple Mode | Warp Mode |
 |---|---|---|
-| **Primary Use Case** | Flat screens, LED walls, planar multi-display arrays, zero-distortion setups | Projectors on curved, tilted, or angled physical surfaces; multi-projector blended arrays |
+| **Primary Use Case** | Flat displays, LED walls, planar multi-display arrays, zero-distortion setups | Projectors on curved, tilted, or angled physical surfaces; multi-projector blended arrays |
 | **Mapping Geometry** | Pure rectangular crop and scale | Non-linear 4-corner destination pinning and 2-fraction optical center remap |
 | **Edge Blending & Seams** | Pairwise blending ramps, one per seam, with gamma-shaped falloff, same as Warp (`blend: true` by default; `blend: false` still duplicates overlapping regions without ramps) | Pairwise blending ramps, one per seam, with gamma-shaped falloff |
 | **Border Anti-Aliasing** | Not applicable (aligned to raster) | Continuous sub-pixel border coverage attenuating gain and black lift |
@@ -559,7 +577,7 @@ Suede provides two distinct projection display modes: **Simple mode** and **Warp
 | **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity; bilinear interpolation on non-identity pins |
 
 #### The Shared Virtual Canvas Architecture
-In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Simple and Warp share one virtual canvas and identical output source crops (`geometry.source`)**:
+In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Simple and Warp share one virtual canvas and identical output slice crops (`geometry.slice`)**:
 - The headless browser renders to an isotropic continuous canvas `[0, 1] × [0, 1/aspect]`.
 - Each output display selects its rectangular content region in normalized canvas units.
 - In **Simple mode**, that content rectangle is mapped directly to the output raster.
@@ -577,9 +595,9 @@ Warp mode requires `allow_overlaps = true`, the GPU renderer (`auto` or `gpu`, n
 
 ### Warping Features & Pipeline Architecture
 
-Warp mode lets an operator fit each projector's picture to a physical surface using four destination corner pins (`geometry.corners`) and two optical center fractions (`geometry.center`). Content selection (`geometry.source`) is kept strictly decoupled from output pin positioning: dragging a corner pin adjusts physical alignment and keystone correction within the projector's output raster without altering the shared browser canvas, resizing neighboring crops, or affecting content selection.
+Warp mode lets an operator fit each projector's picture to a physical surface using four destination corner pins (`geometry.corners`) and two optical center fractions (`geometry.center`). Content selection (`geometry.slice`) is kept strictly decoupled from output pin positioning: dragging a corner pin adjusts physical alignment and keystone correction within the projector's output raster without altering the shared browser canvas, resizing neighboring crops, or affecting content selection.
 
-The [`warp-alignment` test pattern](configuration.md#projection-test-patterns) — 10% grid lines and a center alignment circle, drawn in canvas space — is the tool for lining up corner pins and the center remap before switching to real content. Every built-in pattern is a picture defined once in canvas space and sampled into each output through exactly the same source-rectangle, warp, and blend path real content takes — on both the GPU and CPU renderers, and at any Content scale — so a wall calibrated on a pattern merges the same way once you switch to real content; nothing about the alignment has to be re-checked after the swap.
+The [`warp-alignment` test pattern](configuration.md#projection-test-patterns) — 10% grid lines and a center alignment circle, drawn in canvas space — is the tool for lining up corner pins and the center remap before switching to real content. Every built-in pattern is a picture defined once in canvas space and sampled into each output through exactly the same slice-rectangle, warp, and blend path real content takes — on both the GPU and CPU renderers, and at any Content scale — so a wall calibrated on a pattern merges the same way once you switch to real content; nothing about the alignment has to be re-checked after the swap.
 
 [Highlight overlaps](configuration.md#highlight-overlaps) is the finer tool for the seams themselves. It draws each output's blend boundaries as orange and blue lines taken from the same ramp tables the blend uses, so a lined-up pair is exactly where the blend really is. The lines are painted over the blend at full strength, not faded by it, because the blue line sits exactly where its own output has faded to nothing. Both renderers switch to their line-drawing variants only while it is on. The GPU's line color is fixed into its shader when the aid turns on or `gamma` changes, so nothing extra runs per frame.
 
@@ -589,18 +607,18 @@ The [`warp-alignment` test pattern](configuration.md#projection-test-patterns) �
 #### 1. Canvas Dimensions and Coordinate Mapping
 The canvas occupies `[0, 1] × [0, 1/aspect]`. With authoritative `renderWidth = W`, Suede computes:
 $$H = \max(1, \text{round}(W / \text{aspect}))$$
-Source rectangles convert to pixel boundaries with x-density $W$ and y-density $\text{aspect} \cdot H$; rounding $H$ is preserved rather than silently resizing the operator's chosen width. Canvas and output dimensions must both stay within 32,768 pixels per axis; the canvas is further limited to 64 megapixels and each output to 32 megapixels.
+Slice rectangles convert to pixel boundaries with x-density $W$ and y-density $\text{aspect} \cdot H$; rounding $H$ is preserved rather than silently resizing the operator's chosen width. Canvas and output dimensions must both stay within 32,768 pixels per axis; the canvas is further limited to 64 megapixels and each output to 32 megapixels.
 
 #### 2. Roster and Topology Constraints
-The configured source roster contains one to eight enabled participants, including outputs without a connected physical display:
-- Each source rectangle is finite, positive, visible after clipping to the canvas, and bounded within $\pm 16$ times the larger canvas span.
+The configured slice roster contains one to eight enabled participants, including outputs without a connected physical display:
+- Each slice rectangle is finite, positive, visible after clipping to the canvas, and bounded within $\pm 16$ times the larger canvas span.
 - The clipped graph must connect through positive-area overlap or a shared edge segment (isolated point contacts and gaps are rejected).
-- Sources that overlap by at least 80% of the smaller area form a pure multi-projector stack only when every pair meets that threshold; mixed stack/seam layouts are invalid.
-- These source rules drive the pairwise seam weights; destination pin edits do not alter the topological seam weights.
+- Slices that overlap by at least 80% of the smaller area form a pure multi-projector stack only when every pair meets that threshold; mixed stack/seam layouts are invalid.
+- These slice rules drive the pairwise seam weights; destination pin edits do not alter the topological seam weights.
 
 #### 3. Two-Fraction Center Remap
 In addition to corner pins, each output supports a horizontal and vertical center fraction (`geometry.center`, default `[0.5, 0.5]`):
-- There is one homography per output, not a per-quadrant one. The center remap is a separable, two-piece piecewise-linear remap applied independently to each axis of the source coordinate before the homography: values below the center fraction map to one linear segment, values above it to another.
+- There is one homography per output, not a per-quadrant one. The center remap is a separable, two-piece piecewise-linear remap applied independently to each axis of the slice coordinate before the homography: values below the center fraction map to one linear segment, values above it to another.
 - Compensates for non-linear optical distortion or off-axis lens shift where a single planar homography would bend straight lines across the center.
 - The two segments meet exactly at the center fraction, so the remap stays continuous there.
 
@@ -611,7 +629,7 @@ In overlapping projection areas, Suede computes smooth blend ramps with one rule
 - A slice's raw weight is the product of its tightest column-seam ramp and its tightest row-seam ramp, or 1 where it has no seam; a point's normalized weight for each covering slice is its raw weight divided by the sum of every covering slice's raw weight there, so any number of overlapping projectors sum to exactly one.
 - Two strips, or a grid of rows and columns, come out exact, and a small offset between neighbors does not tilt a seam: each seam stays a straight ramp across its own overlap, constant along its length. Rows that merely touch, or overlap by a fraction of a pixel, contribute nothing to the seams that cross them. Where a slice's picture ends partway through a neighbor on the other axis, its light stops there; the sum stays constant, so matched projectors show no edge.
 - Applies gamma-shaped falloff ramps (using configured `projection.gamma`, default 2.2) to equalize light output across seams, eliminating bright bands.
-- The gate that gives a source a plain (unramped) weight of `1` is `!blend || stacked`: `blend: false`, or that source being one side of a near-total (≥80%) overlap stack — not merely having identity pins.
+- The gate that gives a slice a plain (unramped) weight of `1` is `!blend || stacked`: `blend: false`, or that slice being one side of a near-total (≥80%) overlap stack — not merely having identity pins.
 
 #### 5. Sub-Pixel Border Anti-Aliasing
 When destination pins rotate or keystone a picture within the output raster, the active picture edges cut across the display panel's pixel grid:
@@ -621,8 +639,8 @@ When destination pins rotate or keystone a picture within the output raster, the
 
 #### 6. Sampling Precision & Pipeline Execution
 For each output pixel, the GPU fragment shader:
-1. Inverse-maps output raster coordinates $(x_{\text{out}}, y_{\text{out}})$ into continuous source canvas coordinates $(u, v)$ via inverse homography and center remap.
-2. Samples the source canvas:
+1. Inverse-maps output raster coordinates $(x_{\text{out}}, y_{\text{out}})$ into continuous canvas coordinates $(u, v)$ via inverse homography and center remap.
+2. Samples the canvas:
    - **Identity geometry**: Retains an exact integer texel sampling path for 1:1 pixel-perfect rendering.
    - **Non-identity geometry**: Uses hardware bilinear texture filtering (which can slightly soften fine text, recommending a modest increase in UI font scale or render resolution).
 3. Evaluates precomputed transfer tables, indexed in **output raster space** (not canvas space), combining edge-blend ramps, border antialiasing coverage, and black lift.
@@ -630,7 +648,7 @@ For each output pixel, the GPU fragment shader:
 #### 7. Interactive Low-Overhead Repainting
 Dragging corner pins or adjusting center fractions is not all GPU work:
 - The transformation matrices and transfer tables are rebuilt on builder threads, off the render thread, so a drag does not stall presentation — but the rebuild itself is CPU work, not a GPU control-path operation.
-- Only affected outputs are updated, unless the edit changes the source topology (which output overlaps which), in which case the slicer restarts.
+- Only affected outputs are updated, unless the edit changes the slice topology (which output overlaps which), in which case the slicer restarts.
 - On static web pages, the retained browser canvas texture is immediately repainted at compositor refresh rates once the rebuilt table installs, without triggering DOM relayouts or Chromium re-renders.
 
 ---

@@ -3,6 +3,16 @@ const { chromium } = require('playwright');
 const fs = require('node:fs');
 const assert = require('node:assert/strict');
 const fixture = JSON.parse(fs.readFileSync('docs/examples/four-output-warp.json'));
+// The example document on disk still uses the pre-rename field name
+// (`geometry.source`); the page's rename to `geometry.slice` is proven here
+// independently of the parallel Rust/doc renames, so translate the fixture's
+// own in-memory copy rather than touching the shared example file.
+for (const output of fixture.outputs ?? []) {
+  if (output.geometry && Object.prototype.hasOwnProperty.call(output.geometry, 'source')) {
+    output.geometry.slice = output.geometry.source;
+    delete output.geometry.source;
+  }
+}
 const html = fs.readFileSync('src/api/ui/index.html', 'utf8');
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 // For state that lives in this file's own route handler (the fixture), not
@@ -80,16 +90,16 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
     });
     // `geometry` defaults to the allowUnusedCanvas:true/band case above
     // (ARRANGED_SCALE, unusedCanvas.y = 0.1); the overhang case below passes
-    // its own unusedCanvas/overhang/sources instead. `limits` is omitted
+    // its own unusedCanvas/overhang/slices instead. `limits` is omitted
     // here as it is against an older daemon: the reference UI doesn't
     // consume it yet either (a deliberately deferred follow-up, per the
     // plan), so nothing exercises it and a hand-derived value would just be
     // unverified noise.
     const solution = (rows, columns, values, warnings,
-      geometry = { unusedCanvas: { x: 0, y: 0.1 }, overhang: { x: 0, y: 0 }, sources: arrangedSources }) => ({
+      geometry = { unusedCanvas: { x: 0, y: 0.1 }, overhang: { x: 0, y: 0 }, slices: arrangedSources }) => ({
       arrangement: resolved(rows, columns, values),
       unusedCanvas: geometry.unusedCanvas, overhang: geometry.overhang, impliedAspect: 16 / 9,
-      outputs: geometry.sources.map((source, index) => ({ key: current.outputs[index].match.name, source })),
+      outputs: geometry.slices.map((slice, index) => ({ key: current.outputs[index].match.name, slice })),
       warnings, revision: current.revision, generation,
     });
     if (path === '/projection/arrangement' && request.method() === 'GET') {
@@ -121,20 +131,20 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
       // for the band.
       if (overlapX === 0.1 && overlapY === 0.1 && query.allowUnusedCanvas !== 'true') {
         return reply(solution(rows, columns, { overlapX, overlapY, contentScale: OVERHANG_SCALE }, [],
-          { unusedCanvas: { x: 0, y: 0 }, overhang: { x: OVERHANG_X, y: 0 }, sources: overhangSources }));
+          { unusedCanvas: { x: 0, y: 0 }, overhang: { x: OVERHANG_X, y: 0 }, slices: overhangSources }));
       }
       return reply(solution(rows, columns, { overlapX, overlapY },
         overlapX > 0.8 || overlapY > 0.8 ? [veryHighOverlap] : []));
     }
     if (path === '/config/projection/arrangement' && request.method() === 'PUT') {
-      // Applying replaces every enabled output's source and records the
+      // Applying replaces every enabled output's slice and records the
       // resolved arrangement, exactly like the daemon; the page is loaded
       // with ?nosse, so there is no event stream to publish config_changed
       // on and the response is the whole story.
       const data = request.postDataJSON();
       arrangePuts.push(data);
       current = structuredClone(current);
-      current.outputs.forEach((output, index) => { output.geometry.source = structuredClone(arrangedSources[index]); });
+      current.outputs.forEach((output, index) => { output.geometry.slice = structuredClone(arrangedSources[index]); });
       current.projection.arrangement = resolved(data.rows, data.columns,
         { overlapX: data.overlapX, overlapY: data.overlapY, contentScale: data.contentScale ?? ARRANGED_SCALE });
       current.committed = Boolean(data.committed);
@@ -174,22 +184,22 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
   await page.locator('#output-table tbody tr').nth(1).click();
   assert.equal(await page.locator('#output-name').textContent(), 'HDMI-A-2');
   const before = await read();
-  await page.locator('#source-x').fill('2100.25'); await page.locator('#source-x').press('Tab'); await settle();
+  await page.locator('#slice-x').fill('2100.25'); await page.locator('#slice-x').press('Tab'); await settle();
   let edited = await read();
-  assert.equal(edited.outputs[1].geometry.source.x, 2100.25 / before.projection.canvas.renderWidth);
+  assert.equal(edited.outputs[1].geometry.slice.x, 2100.25 / before.projection.canvas.renderWidth);
   assert.deepEqual(edited.outputs[1].geometry.corners, before.outputs[1].geometry.corners);
   assert.deepEqual(edited.outputs[1].geometry.rasterFootprint, before.outputs[1].geometry.rasterFootprint);
 
-  const normalized = structuredClone(edited.outputs[1].geometry.source);
+  const normalized = structuredClone(edited.outputs[1].geometry.slice);
   await page.locator('#canvas-width').fill('4000'); await page.locator('#canvas-width').press('Tab'); await settle();
-  edited = await read(); assert.deepEqual(edited.outputs[1].geometry.source, normalized);
-  const oldCanvas = structuredClone(edited.projection.canvas), oldSource = structuredClone(edited.outputs[1].geometry.source);
+  edited = await read(); assert.deepEqual(edited.outputs[1].geometry.slice, normalized);
+  const oldCanvas = structuredClone(edited.projection.canvas), oldSlice = structuredClone(edited.outputs[1].geometry.slice);
   await page.locator('#canvas-aspect').fill('1.6'); await page.locator('#canvas-aspect').press('Tab'); await settle();
   edited = await read();
   const oldY = oldCanvas.aspect * Math.round(oldCanvas.renderWidth / oldCanvas.aspect);
   const newY = edited.projection.canvas.aspect * Math.round(edited.projection.canvas.renderWidth / edited.projection.canvas.aspect);
-  assert(Math.abs(edited.outputs[1].geometry.source.y * newY - oldSource.y * oldY) < 1e-9);
-  assert(Math.abs(edited.outputs[1].geometry.source.height * newY - oldSource.height * oldY) < 1e-9);
+  assert(Math.abs(edited.outputs[1].geometry.slice.y * newY - oldSlice.y * oldY) < 1e-9);
+  assert(Math.abs(edited.outputs[1].geometry.slice.height * newY - oldSlice.height * oldY) < 1e-9);
 
   await page.locator('#canvas-width').focus(); await page.waitForSelector('#canvas-presets:not([hidden]) button');
   assert.equal(await page.locator('#canvas-presets button').count(), 4);
@@ -295,9 +305,9 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
   assert.deepEqual(arrangePuts.at(-1),
     { rows: 2, columns: 2, overlapX: 0.1, overlapY: 0.1, allowUnusedCanvas: true, committed: false });
   // The page adopts the daemon's document rather than arranging anything
-  // itself, so the sources are exactly the ones it was sent, in the bumped
+  // itself, so the slices are exactly the ones it was sent, in the bumped
   // order the dialog now shows.
-  assert.deepEqual(edited.outputs.map(output => output.geometry.source), arrangedSources);
+  assert.deepEqual(edited.outputs.map(output => output.geometry.slice), arrangedSources);
   assert.deepEqual(edited.outputs.map(output => output.match.name),
     ['HDMI-A-2', 'HDMI-A-1', 'HDMI-A-3', 'HDMI-A-4']);
   assert.deepEqual(edited.projection.arrangement,
@@ -316,12 +326,12 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
   assert.equal((await read()).projection.mode, 'warp');
   await page.locator('#pj-save').click(); await page.waitForFunction(() => !configBusy);
   assert.equal(current.committed, true);
-  const savedSourceX = (await read()).outputs[1].geometry.source.x;
-  await page.locator('#source-x').fill('5'); await page.locator('#source-x').press('Tab'); await settle();
+  const savedSliceX = (await read()).outputs[1].geometry.slice.x;
+  await page.locator('#slice-x').fill('5'); await page.locator('#slice-x').press('Tab'); await settle();
   await page.locator('#pj-cancel').click(); await page.waitForFunction(() => !configBusy);
   // Cancel must restore the exact saved value, not merely land on something
   // other than the discarded edit.
-  assert.equal((await read()).outputs[1].geometry.source.x, savedSourceX);
+  assert.equal((await read()).outputs[1].geometry.slice.x, savedSliceX);
   assert.deepEqual(failures, []);
   if (process.env.UI_EVIDENCE) {
     fs.mkdirSync(process.env.UI_EVIDENCE, { recursive: true });

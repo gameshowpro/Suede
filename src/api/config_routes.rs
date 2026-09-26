@@ -760,7 +760,7 @@ pub async fn delete_projection_canvas(
 }
 
 /// The persisted grid-arrangement record from the effective document, and
-/// whether re-solving it still reproduces the current sources. See
+/// whether re-solving it still reproduces the current slices. See
 /// [`crate::model::in_effect`]: the record is intent, not canonical geometry,
 /// so a later manual geometry edit leaves it in place and turns `inEffect`
 /// false rather than reverting or dropping it.
@@ -788,7 +788,7 @@ pub struct ArrangementStatus {
         status = 200,
         description = "The persisted grid-arrangement record from the effective \
                        document, whether re-solving it still reproduces the \
-                       current sources, and (when computable) the overlap \
+                       current slices, and (when computable) the overlap \
                        limits at the recorded values",
         body = ArrangementStatus,
         headers(
@@ -831,7 +831,7 @@ pub async fn get_projection_arrangement(
 }
 
 /// Solve a grid arrangement and write it — each enabled output's
-/// `geometry.source`, and the resolved five values at
+/// `geometry.slice`, and the resolved five values at
 /// `projection.arrangement` — exactly like any other config write:
 /// `committed: false` (the default) replaces the shared working copy and
 /// applies to the outputs; `committed: true` persists it. See
@@ -849,7 +849,7 @@ pub async fn get_projection_arrangement(
         (status = 200,
         description = "The accepted document; the resolved five values are at \
                        `projection.arrangement` and every enabled output's \
-                       `geometry.source` reflects the solve",
+                       `geometry.slice` reflects the solve",
         body = DesiredState,
         headers(
             ("ETag" = String, description = "Persisted document revision, quoted for If-Match"),
@@ -1312,7 +1312,7 @@ mod tests {
 
     const OUTPUT_WITH_GEOMETRY: &str = r#"{"match":{"name":"HDMI-A-1"},"enable":true,
         "mode":{"width":1920,"height":1080,"refreshHz":60},"position":{"x":0,"y":0},
-        "geometry":{"source":{"x":0,"y":0,"width":1,"height":1},
+        "geometry":{"slice":{"x":0,"y":0,"width":1,"height":1},
             "corners":[[0,0],[1,0],[1,1],[0,1]],
             "rasterFootprint":{"x":0,"y":0,"width":1,"height":1}}}"#;
 
@@ -1414,7 +1414,7 @@ mod tests {
             &harness,
             "PUT",
             "/api/v1/config/projection",
-            // Aspect 1.0 to match OUTPUT_WITH_GEOMETRY's unit-square source.
+            // Aspect 1.0 to match OUTPUT_WITH_GEOMETRY's unit-square slice.
             Some(r#"{"canvas":{"aspect":1.0,"renderWidth":1600}}"#),
         )
         .await;
@@ -2496,7 +2496,7 @@ mod tests {
             "{body}"
         );
 
-        // Every enabled output's source matches the dry run's.
+        // Every enabled output's slice matches the dry run's.
         let (dry_status, dry_body) = call(
             &harness,
             "GET",
@@ -2508,8 +2508,13 @@ mod tests {
         let dry_outputs = dry_body["outputs"].as_array().unwrap();
         assert_eq!(dry_outputs.len(), 4);
         for (index, arranged) in dry_outputs.iter().enumerate() {
+            assert_ne!(
+                arranged["slice"],
+                serde_json::Value::Null,
+                "output {index}: {dry_body}"
+            );
             assert_eq!(
-                body["outputs"][index]["geometry"]["source"], arranged["source"],
+                body["outputs"][index]["geometry"]["slice"], arranged["slice"],
                 "output {index}: {body}"
             );
         }
@@ -2654,7 +2659,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn arrangement_status_reports_in_effect_until_a_source_is_moved_by_hand() {
+    async fn arrangement_status_reports_in_effect_until_a_slice_is_moved_by_hand() {
         let harness = arrangement_harness(4);
         let (status, _) = call(
             &harness,
@@ -2676,10 +2681,10 @@ mod tests {
         assert_eq!(body["inEffect"], true, "{body}");
         assert_eq!(body["arrangement"]["rows"], 2);
 
-        // Move one source by hand, well beyond the solver's own 1e-9
+        // Move one slice by hand, well beyond the solver's own 1e-9
         // tolerance but too small to change the layout's topology.
         let mut moved = harness.state.store.effective();
-        moved.outputs[0].geometry.as_mut().unwrap().source.x += 1.0e-6;
+        moved.outputs[0].geometry.as_mut().unwrap().slice.x += 1.0e-6;
         moved.committed = false;
         let (status, _) = call(
             &harness,

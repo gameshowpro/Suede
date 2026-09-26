@@ -155,20 +155,20 @@ legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
    rectangle readable; this is only what it looks like before that runs. */
 #layout { position: relative; background: var(--sunken); border: 1px dashed var(--line);
   border-radius: 8px; height: 230px; overflow: hidden; margin-bottom: 14px; }
-.screen { position: absolute; border: 2px solid var(--accent); border-radius: 4px;
+.display-box { position: absolute; border: 2px solid var(--accent); border-radius: 4px;
   background: color-mix(in srgb, var(--accent) 12%, transparent); display: flex; flex-direction: column;
   align-items: center; justify-content: center; font-size: 12px; cursor: grab; overflow: hidden;
   padding: 4px; text-align: center; user-select: none; touch-action: none;
   transition: box-shadow .15s ease, outline-color .15s ease; }
-.screen:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
-.screen.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
-.screen.offline { border-color: var(--warn); border-style: dashed;
+.display-box:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
+.display-box.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
+.display-box.offline { border-color: var(--warn); border-style: dashed;
   background: color-mix(in srgb, var(--warn) 8%, transparent); }
-.screen.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
-.screen.dragging { cursor: grabbing; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
+.display-box.selected { outline: 2px solid var(--accent); outline-offset: 2px; }
+.display-box.dragging { cursor: grabbing; z-index: 10; box-shadow: 0 4px 16px rgba(0,0,0,.25); }
 .canvas-frame { position: absolute; border: 1px dashed var(--muted); pointer-events: none; box-sizing: border-box; }
-.screen b { font-size: 13px; }
-.screen .offline-mark { color: var(--warn); font-weight: 600; cursor: help; }
+.display-box b { font-size: 13px; }
+.display-box .offline-mark { color: var(--warn); font-weight: 600; cursor: help; }
 .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 14px; }
 .card { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; background: var(--sunken); }
 .card img { width: 100%; height: 108px; object-fit: cover; display: block; background: #0b1020; }
@@ -393,7 +393,7 @@ window.addEventListener("error", (event) => {
         <p class="hint">Shown immediately on every display in the layout;
           choose <strong>None</strong> to put the content back. It is never
           written to disk, so a restart clears it too. The grid names each
-          output on screen, so a photo of the wall says exactly which
+          output visibly, so a photo of the wall says exactly which
           connector drives which display.</p>
       </div>
     </div>
@@ -408,7 +408,7 @@ window.addEventListener("error", (event) => {
           <span class="hint" id="o-mode-hint"></span></div>
         <div><label for="o-scale">Display scale (HiDPI) <button class="action ghost pin-toggle" type="button" id="pin-output-scale" aria-pressed="false" aria-label="Pin display scale" title="Pin display scale"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><input id="o-scale" type="number" step="any" min="0.25" data-config-field="scale">
           <span class="hint" id="o-scale-hint"></span>
-          <span class="hint">Compositor/OS display scaling (typically 1.0 for projectors; 2.0 for 4K). Not content scale.</span></div>
+          <span class="hint">Compositor/OS display scaling (typically 1.0 for most displays; 2.0 for 4K). Not content scale.</span></div>
         <div><label for="o-transform">Transform <button class="action ghost pin-toggle" type="button" id="pin-transform" aria-pressed="false" aria-label="Pin transform" title="Pin transform"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-transform" data-config-field="transform">
           <option value="">Leave to sway</option>
           <option>normal</option><option>90</option><option>180</option><option>270</option>
@@ -419,18 +419,18 @@ window.addEventListener("error", (event) => {
 
       <fieldset id="shared-content">
         <legend>Shared content selection</legend>
-        <p class="hint">Simple and Warp use this same source crop and content scale (100% = 1:1 pixel sampling). Destination pins remain Warp calibration.</p>
+        <p class="hint">Simple and Warp use this same slice crop and content scale (100% = 1:1 pixel sampling). Destination pins remain Warp calibration.</p>
         <div class="fields">
-          <div><label for="source-x">Crop X (source px)</label><input id="source-x" type="number" step="any" data-config-field="source"></div>
-          <div><label for="source-y">Crop Y (source px)</label><input id="source-y" type="number" step="any" data-config-field="source"></div>
-          <div><label for="content-scale">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="source"><span class="hint" id="source-size"></span></div>
+          <div><label for="slice-x">Crop X (canvas px)</label><input id="slice-x" type="number" step="any" data-config-field="slice"></div>
+          <div><label for="slice-y">Crop Y (canvas px)</label><input id="slice-y" type="number" step="any" data-config-field="slice"></div>
+          <div><label for="content-scale">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="slice"><span class="hint" id="source-size"></span></div>
         </div>
       </fieldset>
 
       <fieldset id="output-warp" hidden>
         <legend>Warp &amp; geometry</legend>
         <div id="warp-controls" hidden>
-          <p class="hint">Destination pins move the picture within this output. Drag a handle or focus it and use arrow keys (0.001; Shift: 0.01). The two ends of each center line share one fraction. Pin edits keep source placement and browser dimensions fixed.</p>
+          <p class="hint">Destination pins move the picture within this output. Drag a handle or focus it and use arrow keys (0.001; Shift: 0.01). The two ends of each center line share one fraction. Pin edits keep slice placement and browser dimensions fixed.</p>
           <svg id="warp-editor" viewBox="-0.2 -0.2 1.4 1.4" preserveAspectRatio="none" role="group" aria-label="Destination geometry editor">
             <rect x="0" y="0" width="1" height="1" class="warp-raster"/>
             <polygon id="warp-quad"/>
@@ -711,7 +711,7 @@ window.addEventListener("error", (event) => {
       <h2>Backgrounds</h2>
       <p class="hint">A background bundles an image, how it is scaled, and the
         color behind it. Define one here, then pick it by name on the Displays
-        tab — so every screen shares one definition instead of four copies
+        tab — so every display shares one definition instead of four copies
         that drift apart.</p>
       <table id="backgrounds"><thead><tr>
         <th></th><th>Name</th><th>Image</th><th>Scaling</th><th>Color</th><th>Used by</th><th></th>
@@ -889,7 +889,7 @@ let outputs = [], config = null, apps = [], sinks = [], checks = [], status = nu
     // frame loop never runs); `running` is what tells those two apart.
     projectionStats = null;
 
-// Every screen's background comes from here, so the lookup is shared.
+// Every display's background comes from here, so the lookup is shared.
 const presets = () => config?.backgrounds ?? [];
 const presetById = (id) => presets().find((p) => p.id === id);
 
@@ -1065,7 +1065,7 @@ function recommendationSignature() {
   const canvas = config?.projection?.canvas;
   return JSON.stringify({ canvas: canvas && { aspect: canvas.aspect, renderWidth: canvas.renderWidth }, mode: config?.projection?.mode,
     outputs: (config?.outputs ?? []).filter(o => o.enable !== false).map(o => ({ key: outputKey(o), mode: o.mode, transform: o.transform,
-      source: o.geometry?.source, corners: o.geometry?.corners, center: o.geometry?.center })) });
+      slice: o.geometry?.slice, corners: o.geometry?.corners, center: o.geometry?.center })) });
 }
 function schedulePreview() {
   clearTimeout(previewTimer);
@@ -1370,7 +1370,7 @@ const COMMON_MODES = [
 // attached: the graphics card's connectors, whatever sway currently reports,
 // and anything the configuration names. Keyed by connector name, which is a
 // property of the socket rather than of the display plugged into it — so a
-// projector moved to another port picks up that port's configuration.
+// display moved to another port picks up that port's configuration.
 function knownOutputs() {
   const known = new Map();
   const add = (name, fields) => {
@@ -1392,18 +1392,18 @@ function configEntry(name) {
 // an output that is both attached and unpinned falls back to what it runs.
 // A slice's size in canvas pixels, at the precision that matters for it.
 function sizeLabel(r) {
-  const digits = r.configured?.geometry?.source ? cropDigits(r.configured, r.configured.geometry.source) : 0;
+  const digits = r.configured?.geometry?.slice ? cropDigits(r.configured, r.configured.geometry.slice) : 0;
   return `${editNumber(r.width, digits)}×${editNumber(r.height, digits)}`;
 }
 function canvasRect(known) {
   const configured = configEntry(known.name);
   const rect = known.output?.rect;
-  const source = configured?.geometry?.source, canvas = canvasPixels();
-  if (source && canvas) return {
-    x: source.x * canvas.width,
-    y: source.y * canvas.yDensity,
-    width: source.width * canvas.width,
-    height: source.height * canvas.yDensity,
+  const slice = configured?.geometry?.slice, canvas = canvasPixels();
+  if (slice && canvas) return {
+    x: slice.x * canvas.width,
+    y: slice.y * canvas.yDensity,
+    width: slice.width * canvas.width,
+    height: slice.height * canvas.yDensity,
     configured,
   };
   return {
@@ -1434,13 +1434,13 @@ function addToLayout(name) {
   const known = knownOutputs().find((k) => k.name === name);
   const mode = known?.output?.currentMode ?? COMMON_MODES[0];
   const canvas = canvasPixels();
-  const source = canvas ? { x: 0, y: 0, width: mode.width / canvas.width, height: mode.height / canvas.yDensity } :
+  const slice = canvas ? { x: 0, y: 0, width: mode.width / canvas.width, height: mode.height / canvas.yDensity } :
     { x: 0, y: 0, width: 1, height: 1 };
   (config.outputs ??= []).push({
     match: { name },
     enable: true,
     mode: { width: mode.width, height: mode.height, refreshHz: mode.refreshHz },
-    geometry: identityGeometry(source),
+    geometry: identityGeometry(slice),
     scale: 1,
     transform: "normal",
     adaptiveSync: false,
@@ -1555,7 +1555,7 @@ function renderLayout() {
   entries.forEach(({ known, r }, index) => {
     const enabled = r.configured?.enable ?? true;
     const el = document.createElement("div");
-    el.className = "screen" + (enabled ? "" : " inactive")
+    el.className = "display-box" + (enabled ? "" : " inactive")
                  + (known.connected ? "" : " offline")
                  + (selected === known.name ? " selected" : "");
     el.dataset.name = known.name;
@@ -1596,13 +1596,13 @@ function renderLayout() {
         } catch (_) {}
         layoutDrag = {
           pointerId: event.pointerId,
-          screen: el,
+          display: el,
           name: known.name,
           startX: event.clientX,
           startY: event.clientY,
           initialLeft: parseFloat(el.style.left) || 10,
           initialTop: parseFloat(el.style.top) || 10,
-          initialSource: currentConfig.geometry?.source ? structuredClone(currentConfig.geometry.source) : null,
+          initialSlice: currentConfig.geometry?.slice ? structuredClone(currentConfig.geometry.slice) : null,
           initialPosition: currentConfig.position ? structuredClone(currentConfig.position) : null,
           scale: currentScale,
           moved: false,
@@ -1622,21 +1622,21 @@ function renderLayout() {
 
         const pixels = canvasPixels();
         if (pixels) {
-          layoutDrag.initialSource ??= {
+          layoutDrag.initialSlice ??= {
             x: r.x / pixels.width,
             y: r.y / pixels.yDensity,
             width: r.width / pixels.width,
             height: r.height / pixels.yDensity,
           };
-          output.geometry ??= identityGeometry(layoutDrag.initialSource);
-          output.geometry.source = {
-            x: layoutDrag.initialSource.x + dx / (layoutDrag.scale * pixels.width),
-            y: layoutDrag.initialSource.y + dy / (layoutDrag.scale * pixels.yDensity),
-            width: layoutDrag.initialSource.width,
-            height: layoutDrag.initialSource.height,
+          output.geometry ??= identityGeometry(layoutDrag.initialSlice);
+          output.geometry.slice = {
+            x: layoutDrag.initialSlice.x + dx / (layoutDrag.scale * pixels.width),
+            y: layoutDrag.initialSlice.y + dy / (layoutDrag.scale * pixels.yDensity),
+            width: layoutDrag.initialSlice.width,
+            height: layoutDrag.initialSlice.height,
           };
         }
-        // With a canvas present, geometry.source above is the one layout
+        // With a canvas present, geometry.slice above is the one layout
         // representation; legacy position is written only when there is no
         // canvas to normalize against, so it never goes stale alongside it.
         if (!pixels) {
@@ -1703,7 +1703,7 @@ function renderLayout() {
 
   // Everything the hardware has that the layout does not use yet, including
   // sockets with nothing plugged in — that is the whole point: a rig can be
-  // configured from a desk before the projectors are unpacked.
+  // configured from a desk before the displays are unpacked.
   const unused = unusedOutputs();
   $("unused-outputs").classList.toggle("hidden", unused.length === 0);
   const spare = $("unused-buttons");
@@ -1739,7 +1739,7 @@ function renderLayoutSize() {
   const el = $("layout-size");
   // Exactly what the daemon plans from: enabled configured entries, whether
   // or not anything is attached. That is why the canvas never changes size
-  // when a projector is unplugged.
+  // when a display is unplugged.
   const entries = layoutEntries()
     .filter(({ r }) => r.width > 0 && (r.configured?.enable ?? true));
 
@@ -1812,11 +1812,11 @@ window.addEventListener("keydown", (event) => {
       width: r.width / pixels.width,
       height: r.height / pixels.yDensity,
     });
-    output.geometry.source.x += dxPx / pixels.width;
-    output.geometry.source.y += dyPx / pixels.yDensity;
+    output.geometry.slice.x += dxPx / pixels.width;
+    output.geometry.slice.y += dyPx / pixels.yDensity;
   }
   // As the drag handler above: legacy position is written only when there
-  // is no canvas, so geometry.source stays the one representation once one
+  // is no canvas, so geometry.slice stays the one representation once one
   // exists.
   if (!pixels) {
     output.position = {
@@ -1825,11 +1825,11 @@ window.addEventListener("keydown", (event) => {
     };
   }
 
-  const wasScreenFocused = active?.classList?.contains("screen");
+  const wasDisplayFocused = active?.classList?.contains("display-box");
   renderLayout();
-  if (wasScreenFocused) {
-    const screen = $("layout").querySelector(`.screen[data-name="${selected}"]`);
-    screen?.focus();
+  if (wasDisplayFocused) {
+    const display = $("layout").querySelector(`.display-box[data-name="${selected}"]`);
+    display?.focus();
   }
   renderSharedContent();
   renderLayoutSize();
@@ -1839,10 +1839,10 @@ window.addEventListener("keydown", (event) => {
 
 window.addEventListener("blur", () => {
   if (layoutDrag) {
-    if (layoutDrag.screen.hasPointerCapture(layoutDrag.pointerId)) {
-      layoutDrag.screen.releasePointerCapture(layoutDrag.pointerId);
+    if (layoutDrag.display.hasPointerCapture(layoutDrag.pointerId)) {
+      layoutDrag.display.releasePointerCapture(layoutDrag.pointerId);
     }
-    layoutDrag.screen.classList.remove("dragging");
+    layoutDrag.display.classList.remove("dragging");
     layoutDrag = null;
     renderLayout();
   }
@@ -1903,8 +1903,8 @@ function selectOutput(name, redrawLayout = true) {
   if (redrawLayout) {
     renderLayout();
   } else {
-    for (const screen of $("layout").querySelectorAll(".screen")) {
-      screen.classList.toggle("selected", screen.dataset.name === name);
+    for (const display of $("layout").querySelectorAll(".display-box")) {
+      display.classList.toggle("selected", display.dataset.name === name);
     }
     for (const row of $("output-table").querySelectorAll("tbody tr")) {
       row.classList.toggle("selected", row.firstElementChild?.textContent === name);
@@ -2061,17 +2061,17 @@ function outputEdited(field = document.activeElement?.id) {
   else if (field === "o-bg") entry.background = $("o-bg").value || null;
   else return;
   // A deliberate output-mode change keeps the viewed content anchored in
-  // source pixels and retains the prior scalar enlargement. The normalized
+  // canvas pixels and retains the prior scalar enlargement. The normalized
   // rectangle is intentionally untouched for a render-width-only edit.
-  if (field === "o-mode" && previous?.geometry?.source && previous.mode && entry.mode) {
-    const pixels = canvasPixels(), source = previous.geometry.source;
+  if (field === "o-mode" && previous?.geometry?.slice && previous.mode && entry.mode) {
+    const pixels = canvasPixels(), slice = previous.geometry.slice;
     if (pixels) {
       const oldRaster = rasterDimensions(previous), newRaster = rasterDimensions(entry);
-      const scale = oldRaster.width / (source.width * pixels.width);
+      const scale = oldRaster.width / (slice.width * pixels.width);
       entry.geometry = structuredClone(previous.geometry);
-      entry.geometry.source = {
-        x: source.x,
-        y: source.y,
+      entry.geometry.slice = {
+        x: slice.x,
+        y: slice.y,
         width: newRaster.width / (scale * pixels.width),
         height: newRaster.height / (scale * pixels.yDensity),
       };
@@ -2134,43 +2134,43 @@ function renderSharedContent() {
   const container = $("shared-content");
   container.hidden = !geometry || !mode || !pixels;
   if (container.hidden || container.contains(document.activeElement)) return;
-  const source = geometry.source;
-  const scale = mode.width / (source.width * pixels.width);
-  const digits = cropDigits(configEntry(selected), source, pixels);
+  const slice = geometry.slice;
+  const scale = mode.width / (slice.width * pixels.width);
+  const digits = cropDigits(configEntry(selected), slice, pixels);
   // One percent of content scale moves the far edge by raster/100 pixels.
   const scaleDigits = detectableDigits(mode.width / 100);
-  $("source-x").value = editNumber(source.x * pixels.width, digits);
-  $("source-y").value = editNumber(source.y * pixels.yDensity, digits);
+  $("slice-x").value = editNumber(slice.x * pixels.width, digits);
+  $("slice-y").value = editNumber(slice.y * pixels.yDensity, digits);
   $("content-scale").value = editNumber(scale * 100, scaleDigits);
-  const heightScale = mode.height / (source.height * pixels.yDensity);
-  $("source-size").textContent = `Crop ${editNumber(source.width * pixels.width, digits)} × ${editNumber(source.height * pixels.yDensity, digits)} px; ` +
+  const heightScale = mode.height / (slice.height * pixels.yDensity);
+  $("source-size").textContent = `Crop ${editNumber(slice.width * pixels.width, digits)} × ${editNumber(slice.height * pixels.yDensity, digits)} px; ` +
     (Math.abs(scale - heightScale) < 1e-8 ? "uniform" : `vertical density ${displayNumber(heightScale * 100, 2)}%`);
 }
 function editSharedContent(change) {
   const output = configEntry(selected), pixels = canvasPixels();
   if (!output?.geometry || !pixels) return;
-  const source = structuredClone(output.geometry.source);
+  const slice = structuredClone(output.geometry.slice);
   try {
-    change(source, pixels, rasterDimensions(output));
-    if (![source.x, source.y, source.width, source.height].every(Number.isFinite) || source.width <= 0 || source.height <= 0)
+    change(slice, pixels, rasterDimensions(output));
+    if (![slice.x, slice.y, slice.width, slice.height].every(Number.isFinite) || slice.width <= 0 || slice.height <= 0)
       throw new Error("Crop values must be finite and the crop size must be positive.");
-    output.geometry.source = source;
+    output.geometry.slice = slice;
     setDisplayError("");
     pushPreview(true); renderSharedContent(); renderCanvas(); renderLayout(); renderLayoutSize();
   } catch (error) { setDisplayError(error.message); }
 }
-$("source-x").onchange = event => editSharedContent((source, pixels) => { source.x = Number(event.target.value) / pixels.width; });
-$("source-y").onchange = event => editSharedContent((source, pixels) => { source.y = Number(event.target.value) / pixels.yDensity; });
-$("content-scale").onchange = event => editSharedContent((source, pixels, mode) => {
+$("slice-x").onchange = event => editSharedContent((slice, pixels) => { slice.x = Number(event.target.value) / pixels.width; });
+$("slice-y").onchange = event => editSharedContent((slice, pixels) => { slice.y = Number(event.target.value) / pixels.yDensity; });
+$("content-scale").onchange = event => editSharedContent((slice, pixels, mode) => {
   const scale = Number(event.target.value) / 100;
   if (!(scale > 0)) throw new Error("Content scale must be positive.");
-  source.width = mode.width / (scale * pixels.width);
-  source.height = mode.height / (scale * pixels.yDensity);
+  slice.width = mode.width / (scale * pixels.width);
+  slice.height = mode.height / (scale * pixels.yDensity);
 });
 
 const unitPins = [[0,0],[1,0],[1,1],[0,1]];
-function identityGeometry(source) {
-  return { source: structuredClone(source), corners: structuredClone(unitPins), center: [.5, .5], rasterFootprint: structuredClone(source) };
+function identityGeometry(slice) {
+  return { slice: structuredClone(slice), corners: structuredClone(unitPins), center: [.5, .5], rasterFootprint: structuredClone(slice) };
 }
 // Seed identity geometry for enabled outputs that do not have one yet, using
 // the same canvas-pixel normalization every other seeding site uses
@@ -2270,7 +2270,7 @@ const arrangeField = (id, value) => {
   if (document.activeElement !== element) element.value = value;
 };
 
-// Throws with the message to show when the numbers on screen cannot make a
+// Throws with the message to show when the entered numbers cannot make a
 // request at all; anything the daemon can judge (too many outputs for the
 // grid, a content scale too small, an unknown raster) is left to it.
 function arrangeRequest() {
@@ -2484,7 +2484,7 @@ $("arrange-apply").onclick = async () => {
     $("arrange-dialog").close();
     renderLayout(); renderSharedContent(); renderWarpEditor();
     renderWarpStatus(); renderDirtyStatus();
-    // Sources moved, so any canvas recommendation on screen was computed
+    // Slices moved, so any canvas recommendation shown was computed
     // against the old ones (what pushPreview(true) did for the old dialog).
     invalidateRecommendation();
   } catch (error) {
@@ -2990,7 +2990,7 @@ function validatePins(g) {
   for (const [h, domain] of [[homography(unitPins,g.corners),unitPins], [homography(g.corners,unitPins),unitPins]]) {
     const denominators = domain.map(([x,y]) => h[6]*x+h[7]*y+h[8]);
     if (!denominators.every(d => d > 1e-8) && !denominators.every(d => d < -1e-8))
-      throw new Error("Perspective map crosses a pole inside the source or output.");
+      throw new Error("Perspective map crosses a pole inside the slice or output.");
   }
 }
 function handlePoints(g) {
@@ -3006,8 +3006,8 @@ function editGeometry(change, handle = null) {
     // Pointer-up often repeats the final move. Its state is already accepted,
     // in flight, or in the newest queued slot; do not create a second preview.
     if (JSON.stringify(next) === JSON.stringify(warpOutput().geometry)) { drawWarp(); return; }
-    const material = JSON.stringify({ source: next.source, corners: next.corners, center: next.center }) !==
-      JSON.stringify({ source: warpOutput().geometry.source, corners: warpOutput().geometry.corners, center: warpOutput().geometry.center });
+    const material = JSON.stringify({ slice: next.slice, corners: next.corners, center: next.center }) !==
+      JSON.stringify({ slice: warpOutput().geometry.slice, corners: warpOutput().geometry.corners, center: warpOutput().geometry.center });
     warpOutput().geometry = next;
     pushPreview(material); drawWarp(); renderCanvas();
     if (!warpDrag) renderWarpNumbers();
@@ -3054,10 +3054,10 @@ function detectableDigits(effect) {
 }
 // Crop position and size are in canvas pixels; one canvas pixel moves the
 // output by (raster / crop) pixels, so at 100% content scale integers suffice.
-function cropDigits(output, source = output?.geometry?.source, pixels = canvasPixels()) {
+function cropDigits(output, slice = output?.geometry?.slice, pixels = canvasPixels()) {
   const raster = rasterDimensions(output);
-  if (!raster || !source || !pixels) return 1;
-  return detectableDigits(raster.width / (source.width * pixels.width));
+  if (!raster || !slice || !pixels) return 1;
+  return detectableDigits(raster.width / (slice.width * pixels.width));
 }
 function warpPinPrecision(axis) {
   const raster = rasterDimensions(warpOutput());
@@ -3159,11 +3159,11 @@ function oneToOneStatus() {
   const g = warpOutput()?.geometry, mode = warpOutput()?.mode, c = config?.projection?.canvas;
   if (!g || !mode || !c) return "One-to-one status unavailable.";
   const h = Math.max(1, Math.round(c.renderWidth / c.aspect));
-  const source = [g.source.x*c.renderWidth, g.source.y*c.aspect*h,
-    g.source.width*c.renderWidth, g.source.height*c.aspect*h];
+  const slice = [g.slice.x*c.renderWidth, g.slice.y*c.aspect*h,
+    g.slice.width*c.renderWidth, g.slice.height*c.aspect*h];
   const exact = g.center.every(v=>v===.5) &&
     g.corners.every((p,i)=>p.every((v,a)=>v===unitPins[i][a])) &&
-    source.every(Number.isInteger) && source[2]===mode.width && source[3]===mode.height;
+    slice.every(Number.isInteger) && slice[2]===mode.width && slice[3]===mode.height;
   return exact ? "Selected output: one-to-one sampling." : "Selected output: resampled (not one-to-one).";
 }
 function renderCanvas() {
@@ -3245,10 +3245,10 @@ function adoptCanvas(aspect, width, preserveAspectPixels = false) {
     throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP.");
   const old = canvasPixels(config.projection.canvas);
   if (preserveAspectPixels && old) for (const output of config.outputs ?? []) {
-    const source = output.geometry?.source;
-    if (!source) continue;
-    source.y = source.y * old.yDensity / (aspect * height);
-    source.height = source.height * old.yDensity / (aspect * height);
+    const slice = output.geometry?.slice;
+    if (!slice) continue;
+    slice.y = slice.y * old.yDensity / (aspect * height);
+    slice.height = slice.height * old.yDensity / (aspect * height);
   }
   config.projection.canvas = { ...(config.projection.canvas ?? {}), aspect, renderWidth: width };
   ensureWarpGeometries();
@@ -3481,7 +3481,7 @@ function renderBackgrounds() {
     remove.className = "action danger";
     remove.style.marginLeft = "6px";
     remove.textContent = "Delete";
-    // Mirrors the API, which refuses rather than blanking those screens.
+    // Mirrors the API, which refuses rather than blanking those displays.
     remove.disabled = users.length > 0;
     remove.title = users.length
       ? `Used by ${users.join(", ")}; change those displays first` : "";
@@ -3522,12 +3522,12 @@ function backgroundFromForm() {
 function refreshBackgroundPreview() {
   const background = backgroundFromForm();
   paintPreview($("bg-preview"), background, "Preview");
-  // A color behind an image that covers the whole screen can never be seen.
+  // A color behind an image that covers the whole display can never be seen.
   // Without saying so, picking one looks exactly like a broken control.
   const covered = background.wallpaper &&
     (background.mode === "fill" || background.mode === "stretch");
   $("bg-color-note").textContent = covered
-    ? "This image covers the whole screen, so the color will not show. " +
+    ? "This image covers the whole display, so the color will not show. " +
       "Choose fit, center or tile to see it."
     : "";
 }

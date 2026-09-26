@@ -71,6 +71,9 @@ Then open `http://<machine>:9088/` from another computer. The bundled web UI wal
 [Configuration reference :material-arrow-right:](configuration.md){ .md-button }
 [How it works :material-arrow-right:](how-it-works.md){ .md-button }
 
+The rest of the docs use one fixed vocabulary — canvas, slice, warp, output,
+display — defined in full in [How it works](how-it-works.md#vocabulary).
+
 ## Where it came from
 
-Suede generalizes a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket. That service worked, but it was welded to one application. Suede is the same idea with the specifics removed: a documented API, persisted state, and no assumptions about what you are putting on the screens.
+Suede generalizes a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket. That service worked, but it was welded to one application. Suede is the same idea with the specifics removed: a documented API, persisted state, and no assumptions about what you are putting on the displays.

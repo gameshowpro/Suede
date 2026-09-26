@@ -5,6 +5,9 @@ There are two kinds of configuration, and the split is a hard rule:
 - **Bootstrap configuration** is anything that must be known before the API can serve — the bind address, the token, the state directory. It lives in a file, is read once at startup, and is never written by Suede.
 - **Desired state** is everything else: outputs, applications, audio routing, daemon settings. It is owned by the API, persisted by Suede, and reconciled continuously.
 
+Terms below — canvas, slice, warp, output, display — are used exactly as
+defined in the [pipeline vocabulary](how-it-works.md#vocabulary).
+
 ## Bootstrap configuration
 
 Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps` and `direct_scanout` can be overridden by an environment variable, which wins — those two describe how the compositor was started, which a variable on Suede's own process cannot change. A missing file means all defaults.
@@ -145,7 +148,7 @@ the API would only be claiming an environment that is already fixed.
 
     The compositor must run with `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1`, or
     that one spanning window is handed straight to each display controller
-    and every screen shows the same part of it. `provision.sh` exports it,
+    and every display shows the same part of it. `provision.sh` exports it,
     and the `direct-scanout` health check warns when it is missing.
 
     `direct_scanout` means nothing here, and writing `direct_scanout = true`
@@ -166,7 +169,7 @@ the API would only be claiming an environment that is already fixed.
     With `direct_scanout` at its default `true`, the compositor must run
     **without** `WLR_SCENE_DISABLE_DIRECT_SCANOUT`: no client ever spans the
     physical outputs, so the mirroring bug cannot happen, and the variable
-    costs a full-screen compositor pass per output per frame for nothing.
+    costs a fullscreen compositor pass per output per frame for nothing.
     The `direct-scanout` check inverts to match — it warns while the variable
     is set, and its fix removes the drop-in that sets it.
 
@@ -178,7 +181,7 @@ the API would only be claiming an environment that is already fixed.
     rather than removing it.
 
     This is the comparison arm, not a lesser mode. Direct scanout removes one
-    full-screen compositor pass per output per frame, but it also changes how
+    fullscreen compositor pass per output per frame, but it also changes how
     long the compositor holds each buffer and when the flip happens, and on
     one machine it cost more compositor CPU than it saved. The key exists so
     that is measurable on the machine in front of you rather than argued
@@ -234,7 +237,7 @@ daemon restart from making a reset generation counter look current.
 | `enable` | bool | `true` | `false` actively disables the output |
 | `mode` | object \| null | null | `{width, height, refreshHz}`; null leaves Sway's preferred mode, which Suede then pins — see [Adopted values](#adopted-values). A requested `refreshHz` is resolved to the nearest advertised rate within 1 Hz — see [Refresh rates](#refresh-rates) |
 | `position` | object \| null | null | `{x, y}` in the global layout |
-| `geometry` | object \| null | null | Shared canvas source crop plus retained Warp correction; see [Canvas and warp geometry](#projection-geometry) |
+| `geometry` | object \| null | null | Shared canvas slice crop plus retained Warp correction; see [Canvas and warp geometry](#projection-geometry) |
 | `scale` | number \| null | null | Output scale factor |
 | `transform` | string \| null | null | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`… |
 | `adaptiveSync` | bool | `false` | Variable refresh rate |
@@ -242,7 +245,7 @@ daemon restart from making a reset generation counter look current.
 | `maxRenderTimeMs` | number \| null | null | Frame render deadline; null means off |
 | `background` | object \| null | null | What the output shows when no window covers it |
 | `adopted` | object \| null | null | Read-only: what Suede pinned for a field left unset — see [Adopted values](#adopted-values) |
-| `arrangeOffset` | object \| null | null | `{x, y}` nudge added to this output's source by the grid arrangement solve only; see [Grid arrangement](#grid-arrangement) |
+| `arrangeOffset` | object \| null | null | `{x, y}` nudge added to this output's slice by the grid arrangement solve only; see [Grid arrangement](#grid-arrangement) |
 
 `match` selects by connector name, which is the normal case:
 
@@ -404,7 +407,7 @@ afresh on its next settled pass. None of the three buttons touch `position`.
 
 ### Backgrounds and wallpapers
 
-A blank screen looks broken even when it is only a browser restarting. A
+A blank display looks broken even when it is only a browser restarting. A
 background gives an output something deliberate to show whenever no window
 covers it — during a relaunch, or before the first app starts.
 
@@ -417,13 +420,13 @@ A background has three properties, all optional:
 | `mode` | string | `fill` | `fill`, `fit`, `stretch`, `center`, `tile` |
 
 The color is never left unstated. Every mode except `fill` and `stretch`
-leaves part of the screen uncovered, and an unpainted region shows whatever the
+leaves part of the display uncovered, and an unpainted region shows whatever the
 compositor last left there — usually a stale frame of the previous app.
 
 #### Named backgrounds {: #named-backgrounds }
 
 Define a background once and let any number of outputs name it. A multi-display installation
-normally wants one look across every screen, and repeating the same three
+normally wants one look across every display, and repeating the same three
 properties per output guarantees they drift apart the first time somebody edits
 only three of four.
 
@@ -453,13 +456,13 @@ An output's `background` accepts either form:
 
 A bare string names a preset; an object spells the properties out. Both exist
 because they serve different callers: the web UI wants one dropdown across every
-screen, while a script driving the API directly should not have to create a
+display, while a script driving the API directly should not have to create a
 preset to paint a single output.
 
 Naming a preset that does not exist is rejected at the write, not at reconcile
 time — a typo is a mistake in the request, and the writer is the only one who
 can still fix it cheaply. Deleting a preset an output still names is refused
-with `409`, because cascading would blank those screens.
+with `409`, because cascading would blank those displays.
 
 ```bash
 curl -X PUT -H 'content-type: application/json' \
@@ -491,7 +494,7 @@ per display from the dropdown on the **Displays** tab.
 
 !!! warning "Backgrounds need swaybg"
     Sway draws them by running `swaybg`. Without it the command *succeeds* and
-    nothing appears — a black screen with no error anywhere. The `swaybg`
+    nothing appears — a black display with no error anywhere. The `swaybg`
     health check fails whenever an output configures a background and the
     program is missing.
 
@@ -619,7 +622,7 @@ entirely yours.
     Ubuntu's `chromium` package is a shim for a snap, and Suede's search
     passes over it as though it were not there. A snap updates itself on its
     own schedule and restarts the browser when it does, which on an appliance
-    means the screens go blank in the middle of a show — so it does not meet
+    means the displays go blank in the middle of a show — so it does not meet
     the point of the exercise, and a machine with only a snap is reported as
     having no browser at all:
 
@@ -968,7 +971,7 @@ to composite the slices instead.
 }
 ```
 
-Simple and Warp share one canvas and each output's `geometry.source` crop.
+Simple and Warp share one canvas and each output's `geometry.slice` crop.
 Warp adds retained corner and center correction to the same content selection:
 
 ```json
@@ -981,7 +984,7 @@ Warp adds retained corner and center correction to the same content selection:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | string | `simple` | `simple` crops and scales the shared source; `warp` adds retained geometric correction |
+| `mode` | string | `simple` | `simple` crops and scales the shared canvas; `warp` adds retained geometric correction |
 | `canvas` | object or null | `null` | Shared `aspect` and authoritative `renderWidth`. Required for Warp; when absent, Simple uses integer output positions. `scale` is deprecated metadata and has no rendering effect |
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
@@ -1074,21 +1077,28 @@ Shared canvas rendering has explicit canvas and per-output geometry:
 |---|---|---|
 | `canvas.aspect` | positive number | Canvas width divided by height in isotropic canvas units |
 | `canvas.renderWidth` | integer | Chosen canvas width. It is authoritative; height is `round(renderWidth / aspect)`, at least one pixel |
-| `geometry.source` | rectangle | The content rectangle in canvas units (`x`, `y`, `width`, `height`) |
+| `geometry.slice` | rectangle | The content rectangle in canvas units (`x`, `y`, `width`, `height`) |
 | `geometry.corners` | four pairs | Destination pins in output-local normalized coordinates, ordered TL, TR, BR, BL. Identity is `[[0,0],[1,0],[1,1],[0,1]]` |
 | `geometry.center` | pair | Horizontal and vertical center fractions, normally `[0.5,0.5]`, each constrained to `0.01..=0.99` |
-| `geometry.rasterFootprint` | rectangle | The calibrated light footprint in canvas units, independent of source placement and pin edits |
+| `geometry.rasterFootprint` | rectangle | The calibrated light footprint in canvas units, independent of slice placement and pin edits |
 
-Source rectangles and destination pins answer different questions. The source
+!!! warning "Alpha-breaking rename: `source` is now `slice`"
+    The field was named `geometry.source` before this release. Every response
+    and every saved document now calls it `geometry.slice`; a `PUT` still
+    accepts `source` as an alias so existing saved documents and older
+    clients' writes keep working, but a client reading responses should look
+    for `slice`.
+
+Slice rectangles and destination pins answer different questions. The slice
 selects which browser content an output shows; the pins move that picture in
 the output raster. The footprint describes where the projector's full raster
 lands, including black pixels outside a pinned picture. Pin edits never resize
-the browser or change a neighbor's source coverage.
+the browser or change a neighbor's slice coverage.
 
 Canvas coordinates use `[0,1] × [0,1/aspect]`. If `renderWidth` is `W`, the
 canvas height is `H = max(1, round(W/aspect))`, with positive half-way values
 rounded up; `renderWidth` is the chosen allocation, with no separate scale
-field. A source rectangle's
+field. A slice rectangle's
 continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`.
 Corners are normalized to the output raster and are ordered top-left,
 top-right, bottom-right, bottom-left. A shared canvas requires each enabled
@@ -1100,14 +1110,14 @@ The roster has one to eight enabled participants, the
 canvas must be complete, and the appliance must set `allow_overlaps = true`.
 
 Every retained geometry is numerically validated even in Simple. With a shared
-canvas in either mode, each source must have finite positive dimensions, visible canvas area,
-and coordinates bounded by ±16 times `max(1, 1/aspect)`. The clipped source
+canvas in either mode, each slice must have finite positive dimensions, visible canvas area,
+and coordinates bounded by ±16 times `max(1, 1/aspect)`. The clipped slice
 graph must be connected through positive-area overlap or a shared edge
 segment; point contacts and gaps do not connect it. A pair whose original
 rectangles overlap by at least 80% of the smaller rectangle is a near-total
 stack. Stacks are accepted only when every pair is a stack; mixed stack/seam
 layouts are rejected. `rasterFootprint` is separate physical calibration and
-is initially copied from `source` by conversion.
+is initially copied from `slice` by conversion.
 
 #### Retaining and clearing calibration {: #retaining-calibration }
 
@@ -1129,7 +1139,7 @@ To clear calibration explicitly regardless of mode, use the dedicated
 routes instead of a `PUT`:
 
 - `DELETE /api/v1/config/outputs/{key}/geometry` clears one output's
-  `geometry` (source crop, pins, center, and raster footprint).
+  `geometry` (slice crop, pins, center, and raster footprint).
 - `DELETE /api/v1/config/projection/canvas` clears the shared `canvas`.
 
 Both take the same preconditions as any other write, return the persisted
@@ -1150,7 +1160,7 @@ admissible allocation limit is reported separately; an impossible preset is
 disabled. Simple uses rectangular mapping and Warp uses retained intended
 correction even during temporary capability fallback. The normalized density
 baseline stays stable across width-only edits. Recommendations never change
-`renderWidth`, source dimensions, or configuration.
+`renderWidth`, slice dimensions, or configuration.
 
 The known planning limits are a 32,768-pixel maximum dimension, 64 megapixels
 for the canvas, and 32 megapixels per output. Driver and compositor allocation
@@ -1172,7 +1182,7 @@ a projector wall — is arithmetic the daemon can do for you, so that every
 client driving the same wall (the reference UI's **Arrange automatically**
 dialog, a show controller with sliders) gets the same answer.
 `PUT /api/v1/config/projection/arrangement` solves the grid and writes each
-enabled output's `geometry.source`; `GET /api/v1/projection/arrangement` runs
+enabled output's `geometry.slice`; `GET /api/v1/projection/arrangement` runs
 the same solve without writing anything, so a client can preview before
 committing to a value.
 
@@ -1200,8 +1210,8 @@ currently disconnected still takes its grid slot and is laid out exactly as
 if it were attached. Its raster comes from `mode` (or a previously adopted
 one) before ever falling back to what is currently observed, so the solve
 does not depend on what happens to be plugged in at the moment it runs, and
-the attached screens around it receive the correct slices regardless. The
-disconnected output's own `geometry.source` is written and applied like
+the attached displays around it receive the correct slices regardless. The
+disconnected output's own `geometry.slice` is written and applied like
 everyone else's; the reconciler carries it through to the display the moment
 it appears. The only failure mode is an enabled output with no configured,
 adopted, *or* observed mode at all — nothing to size it by — which is the
@@ -1252,7 +1262,7 @@ partial cover is acceptable, in exchange for never overhanging.** Set it to
 `true` and the daemon fits the whole grid *inside* the canvas instead, at
 `contentScale = max(fitX, fitY)`: the axis with the *larger* fit now fills
 exactly, and the other is left short rather than overhanging — any smaller
-scale would push a source outside the canvas, any larger would cover less on
+scale would push a slice outside the canvas, any larger would cover less on
 both axes. `unusedCanvas` reports whatever fraction is left uncovered on
 each axis, centered on the canvas exactly as `overhang` is. Left `false`
 (the default), an overlap request never leaves a band — see above, it
@@ -1308,7 +1318,7 @@ the recorded grid holds, and so on.
 The dry-run `GET` responds with the resolved values (`rows`, `columns`,
 `overlapX`, `overlapY`, `contentScale`) under `arrangement`, together with
 `unusedCanvas`, `overhang`, `impliedAspect`, `limits` (all above), each
-output's resulting `source` rectangle under `outputs`, any `warnings` (for
+output's resulting `slice` rectangle under `outputs`, any `warnings` (for
 example, an overlap above 80%), and the `revision` and `generation` of the
 document it was solved against. The `PUT` responds with the whole document
 as usual, where the same values are `projection.arrangement`; it carries no
@@ -1316,9 +1326,9 @@ as usual, where the same values are `projection.arrangement`; it carries no
 since they reflect the document state the solve ran against.
 
 **`outputs[].arrangeOffset`** (`{x, y}`, normalized canvas units — the same
-space as `geometry.source` — default `{0, 0}`) nudges one output's placement
+space as `geometry.slice` — default `{0, 0}`) nudges one output's placement
 after the solve, without moving anything else in the grid: the solver adds
-it to that output's computed `source.x`/`source.y` once placement is
+it to that output's computed `slice.x`/`slice.y` once placement is
 otherwise finished. `unusedCanvas`, `overhang`, the `allowUnusedCanvas` gate,
 and the off-canvas-slice gate above are all computed *before* offsets are
 applied, so a nonzero offset can deliberately uncover canvas pixels —
@@ -1333,12 +1343,12 @@ sets this field — it is locked at `{0, 0}` there — but preserves it verbatim
 if a document already carries one, for a client that does set it.
 
 The resolved values are also kept as `projection.arrangement`: a record of
-intent, not canonical geometry. `source` rectangles stay the canonical stored
+intent, not canonical geometry. `slice` rectangles stay the canonical stored
 form, exactly like a hand-edited grid, so a later manual geometry tweak is
 never overwritten or reverted — it simply leaves the record in place.
 `GET /api/v1/config/projection/arrangement` reports that record together with
 `inEffect`, which is `true` only while re-solving it still reproduces the
-current sources; it turns `false` the moment any source is nudged by hand. A
+current slices; it turns `false` the moment any slice is nudged by hand. A
 client can use the record to prefill a rearrangement dialog, or a slider's
 starting position, without tracking the grid itself. It also reports
 `limits` for the recorded values — see above — so the same read seeds a
@@ -1395,7 +1405,7 @@ requires `allow_overlaps = true` and a verified GPU pipeline for activation.
 The [shared canvas example](examples/four-output-shared-canvas.json) uses CPU
 Simple with a 1824×1026 canvas, four 1920×1080 outputs, 200% content scale,
 and a 2×2 arrangement with 10% overlap. Switching its mode to Warp uses the
-same source crops once a capable Auto/GPU renderer is selected.
+same slice crops once a capable Auto/GPU renderer is selected.
 
 The alpha schema is version 2. Existing files are not migrated; create or
 write the current schema directly. There is no legacy seam-weight mode.
@@ -1548,7 +1558,7 @@ shared content crop, and Warp correction use that one selection. Missing
 calibration is initialized with identity pins and neutral centers; switching
 modes preserves the shared composition and retained calibration.
 
-Crop X/Y are source pixels. Content scale is enlargement from source pixels
+Crop X/Y are canvas pixels. Content scale is enlargement from canvas pixels
 to output pixels: 200% maps a 960×540 crop to a 1920×1080 output. This differs
 from compositor **Output scale** and the read-only global **Rendering scale**.
 The canonical stored values are normalized rectangles; displayed crop pixels
@@ -1572,7 +1582,7 @@ in the dialog alongside the aspect that would remove it. See [Grid
 arrangement](#grid-arrangement) for the full contract. It places enabled
 configured outputs in table order, including disconnected outputs with known
 modes. Disabled outputs and existing calibration stay unchanged; mixed-size
-grids that fail source topology validation are rejected. Arrangement is one
+grids that fail slice topology validation are rejected. Arrangement is one
 unsaved edit — `committed: false` — exactly like any other working-copy
 change, so a subsequent Save or Revert still applies to the whole page.
 
@@ -1581,7 +1591,7 @@ The four center-line handles control two shared fractions: moving either end
 of a line moves its partner. Use the numeric fields for precise coordinates,
 or focus a handle and press an arrow key for a 0.001 step (Shift: 0.01).
 Invalid edits show their reason and retain the last accepted shape. **Reset
-centers** and **Reset pins** are also unsaved edits. Source placement and the
+centers** and **Reset pins** are also unsaved edits. Slice placement and the
 physical raster footprint have separate controls; destination pin movement
 does not change the selected browser content or its dimensions.
 
@@ -1626,9 +1636,9 @@ preserve the stored geometry and mode.
 
 Built into the blending component and drawn in **canvas** coordinates, so a
 canvas-anchored feature lands at the same canvas position regardless of an
-output's Content scale or source crop: two aligned projectors superimpose
+output's Content scale or slice crop: two aligned projectors superimpose
 the pattern pixel for pixel. A pattern is sampled through exactly the same
-source-rectangle, warp, and blend path real content is — on both the GPU and
+slice-rectangle, warp, and blend path real content is — on both the GPU and
 CPU rendering paths, and at any Content scale, not only 100% — so what you
 align with a pattern is what content will actually experience; calibration
 done on a pattern holds once you switch back to content. Ramps and black
@@ -1641,7 +1651,7 @@ layout.
 | Pattern | For |
 |---|---|
 | `grid` | Geometry, focus, and seam alignment: 100 px color tiles with crosses, each labeled with its canvas pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
-| `warp-alignment` | Corner and center-pin calibration: 10% grid lines and a center alignment circle on dark gray, drawn in canvas space so the same lines line up across outputs regardless of each one's source crop. |
+| `warp-alignment` | Corner and center-pin calibration: 10% grid lines and a center alignment circle on dark gray, drawn in canvas space so the same lines line up across outputs regardless of each one's slice crop. |
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |

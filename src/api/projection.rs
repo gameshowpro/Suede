@@ -14,7 +14,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::api::json::Json;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    validate_sources, ArrangedOutput, Arrangement, ArrangementLimits, ArrangementRequest,
+    validate_slices, ArrangedOutput, Arrangement, ArrangementLimits, ArrangementRequest,
     CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, Overhang, ProjectionMode, Transform,
     UnusedCanvas,
 };
@@ -89,7 +89,7 @@ const LIMITS: ResolutionLimits = ResolutionLimits {
 ///
 /// Coordinates are first bounded in the original integer layout, so negative
 /// origins and large positive origins have the same result as a layout rooted
-/// at zero.  Source and raster-footprint rectangles are intentionally both
+/// at zero.  The slice and raster-footprint rectangles are intentionally both
 /// explicit in the result, even though the initial candidate uses the same
 /// rectangle for each; later calibration may change the footprint alone.
 pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayoutResponse, String> {
@@ -199,7 +199,7 @@ pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayou
         .dimensions()
         .map_err(|error| format!("converted canvas is invalid: {error}"))?;
 
-    let source = |output: &OutputConfig| -> Result<CanvasRect, String> {
+    let slice = |output: &OutputConfig| -> Result<CanvasRect, String> {
         let mode = output.mode.ok_or_else(|| "missing mode".to_string())?;
         let position = output
             .position
@@ -215,26 +215,26 @@ pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayou
     let outputs = active
         .into_iter()
         .map(|output| {
-            let source = source(output)?;
+            let slice = slice(output)?;
             Ok(ConvertedOutput {
                 key: output.r#match.key(),
                 geometry: OutputGeometry {
-                    source,
+                    slice,
                     corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                     center: [0.5, 0.5],
-                    raster_footprint: source,
+                    raster_footprint: slice,
                 },
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    validate_sources(
+    validate_slices(
         &canvas,
         &outputs
             .iter()
-            .map(|output| output.geometry.source)
+            .map(|output| output.geometry.slice)
             .collect::<Vec<_>>(),
     )
-    .map_err(|error| format!("converted source layout is invalid: {error}"))?;
+    .map_err(|error| format!("converted slice layout is invalid: {error}"))?;
 
     Ok(ConvertLayoutResponse {
         canvas,
@@ -414,7 +414,7 @@ pub fn recommend_for_state(
         .ok()
         .or_else(|| {
             // Conversion intentionally rejects transformed/scaled outputs for
-            // the Warp candidate. Simple can still estimate its shared source
+            // the Warp candidate. Simple can still estimate its shared slice
             // rectangles, so retry the rectangular conversion with those
             // output-only compositor properties normalized away.
             if requested_mode != ProjectionMode::Simple {
@@ -457,7 +457,7 @@ pub fn recommend_for_state(
                     format!("output {} has no complete geometry", output.r#match.key())
                 })?;
             if requested_mode == ProjectionMode::Simple {
-                // Source placement/content selection is shared between the
+                // Slice placement/content selection is shared between the
                 // two modes. Simple contributes no retained corner or center
                 // correction to the sampling estimate.
                 geometry.corners = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
@@ -532,7 +532,7 @@ pub fn recommend_for_state(
                 )
             },
         )?;
-        // Validate source bounds against the requested aspect while keeping
+        // Validate slice bounds against the requested aspect while keeping
         // an invalid/stale persisted render width from preventing a useful
         // read-only recommendation that can explain its clamp.
         let validation_canvas = CanvasConfig {
@@ -547,18 +547,18 @@ pub fn recommend_for_state(
                     output.r#match.key()
                 )
             })?;
-        let source = geometry.source;
-        if !(source.width.is_finite()
-            && source.height.is_finite()
-            && source.width > 0.0
-            && source.height > 0.0)
+        let slice = geometry.slice;
+        if !(slice.width.is_finite()
+            && slice.height.is_finite()
+            && slice.width > 0.0
+            && slice.height > 0.0)
         {
             return Err(format!(
-                "output {} has invalid source dimensions",
+                "output {} has invalid slice dimensions",
                 output.r#match.key()
             ));
         }
-        density = density.max(sample_density(&warp, source.width, source.height)?);
+        density = density.max(sample_density(&warp, slice.width, slice.height)?);
     }
     if !density.is_finite() || density <= 0.0 {
         return Err("geometry has no finite positive sampling density".into());
@@ -863,8 +863,8 @@ mod tests {
         .unwrap();
         assert_eq!(response.canvas.render_width, 2000);
         assert_eq!(response.outputs.len(), 2);
-        assert_eq!(response.outputs[0].geometry.source.x, 0.0);
-        assert_eq!(response.outputs[1].geometry.source.x, 0.5);
+        assert_eq!(response.outputs[0].geometry.slice.x, 0.0);
+        assert_eq!(response.outputs[1].geometry.slice.x, 0.5);
         assert_eq!(
             response.outputs[0].geometry.corners,
             [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
@@ -880,7 +880,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_rejects_duplicate_keys_and_disconnected_sources() {
+    fn conversion_rejects_duplicate_keys_and_disconnected_slices() {
         let a = output("A", 0, 0, 100, 100, true);
         let duplicate = output("A", 100, 0, 100, 100, false);
         assert!(convert_layout_candidate(&[a.clone(), duplicate]).is_err());
@@ -927,7 +927,7 @@ mod tests {
     fn recommendation_detects_a_densest_keystone_region() {
         let mut identity = output("identity", 0, 0, 100, 100, true);
         identity.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -966,17 +966,17 @@ mod tests {
     }
 
     #[test]
-    fn simple_recommendation_uses_identity_correction_with_shared_source() {
+    fn simple_recommendation_uses_identity_correction_with_shared_slice() {
         let mut configured = output("simple", 0, 0, 160, 90, true);
         configured.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.125,
                 y: 0.0,
                 width: 0.5,
                 height: 0.5,
             },
             // Retained Warp calibration must not affect a requested Simple
-            // recommendation. The source rectangle remains shared.
+            // recommendation. The slice rectangle remains shared.
             corners: [[0.0, 0.0], [1.0, 0.0], [1.4, 1.0], [0.0, 1.0]],
             center: [0.25, 0.75],
             raster_footprint: CanvasRect {
@@ -1010,7 +1010,7 @@ mod tests {
     fn recommendation_is_invariant_to_render_width_with_rounded_height() {
         let mut configured = output("odd", 0, 0, 160, 63, true);
         configured.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -1053,7 +1053,7 @@ mod tests {
     fn simple_recommendation_uses_rotated_physical_raster_dimensions() {
         let mut normal = output("normal", 0, 0, 160, 80, true);
         normal.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -1104,7 +1104,7 @@ mod tests {
     fn recommendation_clamps_dimensions_and_reports_achieved_presets() {
         let mut wide = output("wide", 0, 0, 32768, 900, true);
         wide.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -1158,7 +1158,7 @@ mod tests {
         let mut preview = crate::model::DesiredState::new();
         preview.outputs = vec![output("preview", 0, 0, 100, 100, true)];
         preview.outputs[0].geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -1204,7 +1204,7 @@ mod tests {
         });
         configured.position = Some(Position { x: 0, y: 0 });
         configured.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,

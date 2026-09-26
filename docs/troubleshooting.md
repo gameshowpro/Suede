@@ -99,7 +99,7 @@ On a correctly provisioned appliance this is automatic: `suede.service` is
 starting the session starts it again with the new environment. It is worth
 knowing about anyway, because a machine running a second compositor by hand
 breaks that chain — whichever one publishes `SWAYSOCK` last is the one the
-daemon inherits, and it may not be the one with the screens on it.
+daemon inherits, and it may not be the one with the displays on it.
 
 ## A display stays dark
 
@@ -124,7 +124,7 @@ A display can advertise a timing in its EDID that it will not actually sync.
 Nothing in the stack can see this: the kernel drives the signal without
 error, Sway reports the output active in the requested mode, every health
 check passes — and the panel shows nothing. It is real, not hypothetical: a
-Samsung U28E510 4K monitor on a Raspberry Pi 5 stayed dark on the
+Samsung U28E510 4K display on a Raspberry Pi 5 stayed dark on the
 1920×1080@60 it advertises, because its EDID carries *two* 1080p60 timings —
 a DMT one it rejects (listed first, so that is what a request for `60`
 gets) and the CEA-861 one it accepts.
@@ -152,8 +152,8 @@ The signature is `canvasFps`/`presentedFps` staying healthy while every
 output's `discarded` count climbs and `presented` stays at zero. That means
 the slicer is still capturing the canvas and committing frames, but every
 commit is landing on outputs the compositor has already destroyed — the
-layer surfaces the slicer built at startup no longer belong to anything on
-screen. It happens whenever an output is disabled and re-enabled, or
+layer surfaces the slicer built at startup no longer belong to anything the
+compositor is displaying. It happens whenever an output is disabled and re-enabled, or
 unplugged and replugged, since either one destroys and recreates the
 output in the compositor; a running slicer built against the old one has no
 way to notice on its own unless told to.
@@ -211,7 +211,7 @@ messages above and describes its own remediation.
 A `canvas_plan_failed` divergence in `GET /api/v1/status` means the
 configured canvas layout (Simple with a shared canvas, or Warp) could not be
 turned into a plan at all — usually a momentarily inconsistent edit, such as
-a source rectangle mid-drag, rather than a lastingly broken document. Two
+a slice rectangle mid-drag, rather than a lastingly broken document. Two
 things happen while it lasts, and the divergence's `detail` says which:
 
 - If a plan had previously been computed successfully, that last good
@@ -224,7 +224,7 @@ things happen while it lasts, and the divergence's `detail` says which:
   would otherwise show the same pixels on more than one projector.
 
 Check `GET /api/v1/config/projection` and each output's `geometry` for the
-specific problem the divergence names (commonly a source rectangle or a
+specific problem the divergence names (commonly a slice rectangle or a
 corner pin that has drifted outside the canvas). Once the write that fixes
 it lands, this divergence clears on the next reconciliation pass and the
 wall returns to the configured arrangement.
@@ -310,7 +310,7 @@ curl -s http://appliance:9088/api/v1/system/checks   | python3 -c 'import sys,js
 The reliable fix is a browser from a `.deb` rather than a snap — on Debian
 `apt install chromium`, on Ubuntu Google Chrome's own package — because a
 snap also restarts itself whenever it updates, which on an appliance means
-the screens go blank mid-show.
+the displays go blank mid-show.
 
 An app that cannot run does not stay a private matter: after three
 consecutive failed launches Suede raises an `app_crash_looping` divergence and
@@ -388,7 +388,7 @@ each window covers one display, so the buffer and the output match.
     spans the physical outputs: the app renders into the headless canvas and
     the slicer hands each display its own output-sized buffer, which is the
     case direct scanout was built for and cannot be mirrored by mistake.
-    There the variable only costs a full-screen compositor pass per output
+    There the variable only costs a fullscreen compositor pass per output
     per frame, so the same check inverts — it warns while
     `WLR_SCENE_DISABLE_DIRECT_SCANOUT` is set, and its fix *removes* the
     drop-in. A machine showing this symptom while `allow_overlaps` is true is
@@ -533,7 +533,7 @@ until a "user gesture", and an appliance never provides one. The
 A page can report the answer itself — `new AudioContext().state` is
 `suspended` when blocked and `running` when not. Writing it into
 `document.title` makes it readable straight from the API, with no access to
-the machine's screen:
+the machine's display:
 
 ```bash
 curl -s http://appliance:9088/api/v1/windows | python3 -m json.tool

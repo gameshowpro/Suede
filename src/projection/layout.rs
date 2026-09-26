@@ -9,7 +9,9 @@ use crate::model::{CanvasConfig, CanvasRect};
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LayoutParticipant {
     pub output: String,
-    pub source: CanvasRect,
+    /// This output's slice: the canvas region it samples, in normalized
+    /// canvas units — the same value as `geometry.slice`.
+    pub slice: CanvasRect,
     pub raster_footprint: CanvasRect,
 }
 
@@ -23,11 +25,11 @@ pub struct LayoutSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LocalKey {
-    own_source: CanvasRect,
+    own_slice: CanvasRect,
     aspect: f64,
     blend: bool,
     stacked: bool,
-    sources: Vec<CanvasRect>,
+    slices: Vec<CanvasRect>,
     footprints: Vec<CanvasRect>,
     maximum: u32,
     dynamic: bool,
@@ -137,26 +139,26 @@ pub(crate) struct LocalKey {
 /// on the one shared line — a measure-zero edge case for a coverage count.
 pub(crate) struct Evaluator {
     spec: LayoutSpec,
-    sources: Vec<CanvasRect>,
+    slices: Vec<CanvasRect>,
     stacked: bool,
     maximum: u32,
     width: f64,
     vertical_density: f64,
     rows: usize,
     cols: usize,
-    /// Per-row ramp denominator for every source's left and right edge,
-    /// indexed `row * sources.len() + source`: the largest denominator any
+    /// Per-row ramp denominator for every slice's left and right edge,
+    /// indexed `row * slices.len() + source`: the largest denominator any
     /// x-axis pair whose cross-range covers that row asks for from that
     /// edge, or `0.0` for no ramp. The minimum of several ramps measured
     /// from the SAME edge is the ramp over the largest of their
     /// denominators, so one number per edge per row is the exact minimum
     /// over that row's pairs — see [`Evaluator`]'s rule, point 4.
     /// Precomputed once per [`Evaluator`] from [`seam_pairs`] so
-    /// `raw_weight` is a table lookup, never a scan over every other source.
+    /// `raw_weight` is a table lookup, never a scan over every other slice.
     row_left: Vec<f64>,
     row_right: Vec<f64>,
     /// Per-column denominators for the top and bottom edges, symmetric to
-    /// the rows above and indexed `col * sources.len() + source`.
+    /// the rows above and indexed `col * slices.len() + source`.
     col_top: Vec<f64>,
     col_bottom: Vec<f64>,
 }
@@ -177,12 +179,12 @@ fn contains(r: &CanvasRect, x: f64, y: f64) -> bool {
     x >= r.x && x <= right(r) && y >= r.y && y <= bottom(r)
 }
 
-/// One ordered pair of overlapping sources `(r, q)`, reduced to the single
+/// One ordered pair of overlapping slices `(r, q)`, reduced to the single
 /// ramp `q` imposes on `r` — points 1 to 3 of the rule on [`Evaluator`].
 /// Built once per [`Evaluator`] by [`seam_pairs`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SeamPair {
-    /// The attenuated source `r`.
+    /// The attenuated slice `r`'s index.
     source: usize,
     /// The seam axis: x (the intersection is narrower than it is tall) or y.
     axis_x: bool,
@@ -382,10 +384,10 @@ impl Evaluator {
         if dimensions != (width as u32, height as u32) {
             return Err("layout aspect and actual canvas dimensions disagree".into());
         }
-        let sources: Vec<_> = spec.participants.iter().map(|p| p.source).collect();
-        // Not `validate_sources`: connectivity is a requirement of
+        let slices: Vec<_> = spec.participants.iter().map(|p| p.slice).collect();
+        // Not `validate_slices`: connectivity is a requirement of
         // shared-canvas *calibration*, decided once at the model/API layer
-        // (`crate::model::geometry::validate_sources`, still strict, gates
+        // (`crate::model::geometry::validate_slices`, still strict, gates
         // what a user can configure there). By the time a `LayoutSpec`
         // reaches here — legacy integer-position layouts included, see
         // `blend::canvas_plan_with_warp_activation` — disconnection is a
@@ -394,8 +396,7 @@ impl Evaluator {
         // each other, and rejecting it here would have quietly cost every
         // legacy layout its canvas plan the moment `Evaluator` started being
         // the sole blend-weight rule.
-        let stacked =
-            crate::model::geometry::validate_sources_allow_disconnected(&canvas, &sources)?;
+        let stacked = crate::model::geometry::validate_slices_allow_disconnected(&canvas, &slices)?;
         let mut names = std::collections::HashSet::new();
         for p in &spec.participants {
             if p.output.is_empty() || !names.insert(&p.output) {
@@ -449,10 +450,10 @@ impl Evaluator {
         }
         let (cols, rows) = (width as usize, height as usize);
         let vertical_density = height as f64 * spec.aspect;
-        let pairs = seam_pairs(&sources);
+        let pairs = seam_pairs(&slices);
         let (row_left, row_right, col_top, col_bottom) = build_edge_tables(
             &pairs,
-            sources.len(),
+            slices.len(),
             cols,
             rows,
             width as f64,
@@ -460,7 +461,7 @@ impl Evaluator {
         );
         Ok(Self {
             spec: spec.clone(),
-            sources,
+            slices,
             stacked,
             maximum,
             width: width as f64,
@@ -482,11 +483,11 @@ impl Evaluator {
     /// once and reuse them across every source index, which is what keeps
     /// the per-pixel cost proportional to the number of sources.
     fn raw_weight(&self, index: usize, x: f64, y: f64, row: usize, col: usize) -> Option<f64> {
-        let r = &self.sources[index];
+        let r = &self.slices[index];
         if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
             return None;
         }
-        let count = self.sources.len();
+        let count = self.slices.len();
         let (row_base, col_base) = (row * count + index, col * count + index);
         let across = edge_ramp(x - r.x, self.row_left[row_base])
             .min(edge_ramp(right(r) - x, self.row_right[row_base]));
@@ -513,18 +514,18 @@ impl Evaluator {
     }
 
     pub fn key(&self, index: usize, lift: f64, dynamic: bool) -> LocalKey {
-        let source = &self.spec.participants[index].source;
+        let slice = &self.spec.participants[index].slice;
         LocalKey {
-            own_source: *source,
+            own_slice: *slice,
             aspect: self.spec.aspect,
             blend: self.spec.blend,
             stacked: self.stacked,
-            sources: if self.spec.blend && !self.stacked {
+            slices: if self.spec.blend && !self.stacked {
                 self.spec
                     .participants
                     .iter()
-                    .filter(|p| intersects(source, &p.source))
-                    .map(|p| p.source)
+                    .filter(|p| intersects(slice, &p.slice))
+                    .map(|p| p.slice)
                     .collect()
             } else {
                 Vec::new()
@@ -533,7 +534,7 @@ impl Evaluator {
                 self.spec
                     .participants
                     .iter()
-                    .filter(|p| intersects(source, &p.raster_footprint))
+                    .filter(|p| intersects(slice, &p.raster_footprint))
                     .map(|p| p.raster_footprint)
                     .collect()
             } else {
@@ -571,7 +572,7 @@ impl Evaluator {
         } else {
             let mut count = 0;
             let mut total = 0.0;
-            for i in 0..self.sources.len() {
+            for i in 0..self.slices.len() {
                 if let Some(d) = self.raw_weight(i, x, y, row, col) {
                     count += 1;
                     total += d;
@@ -622,7 +623,7 @@ impl Evaluator {
     /// outputs, so table builders compute this once per output and pass it
     /// to [`Self::marker_at`].
     pub fn marker_widths(&self, index: usize, size: (u32, u32)) -> [f64; 2] {
-        let r = &self.sources[index];
+        let r = &self.slices[index];
         [
             MARKER_OUTPUT_PIXELS * r.width * self.width / f64::from(size.0),
             MARKER_OUTPUT_PIXELS * r.height * self.vertical_density / f64::from(size.1),
@@ -659,12 +660,10 @@ impl Evaluator {
         row: usize,
         width: f64,
     ) -> [Option<MarkerBand>; 4] {
-        let r = &self.sources[index];
+        let r = &self.slices[index];
         self.bands(
-            self.row_left.get(row * self.sources.len() + index).copied(),
-            self.row_right
-                .get(row * self.sources.len() + index)
-                .copied(),
+            self.row_left.get(row * self.slices.len() + index).copied(),
+            self.row_right.get(row * self.slices.len() + index).copied(),
             r.x * self.width,
             right(r) * self.width,
             self.width,
@@ -681,11 +680,11 @@ impl Evaluator {
         col: usize,
         width: f64,
     ) -> [Option<MarkerBand>; 4] {
-        let r = &self.sources[index];
+        let r = &self.slices[index];
         self.bands(
-            self.col_top.get(col * self.sources.len() + index).copied(),
+            self.col_top.get(col * self.slices.len() + index).copied(),
             self.col_bottom
-                .get(col * self.sources.len() + index)
+                .get(col * self.slices.len() + index)
                 .copied(),
             r.y * self.vertical_density,
             bottom(r) * self.vertical_density,
@@ -785,7 +784,7 @@ impl Evaluator {
         if !(0.0..=1.0).contains(&x) || !(0.0..=1.0 / self.spec.aspect).contains(&y) {
             return super::blend::MARKER_NONE;
         }
-        let r = &self.sources[index];
+        let r = &self.slices[index];
         if x < r.x || x > right(r) || y < r.y || y > bottom(r) {
             return super::blend::MARKER_NONE;
         }
@@ -905,21 +904,21 @@ pub fn canvas_plan_with_correction(
             .unwrap_or_else(|| config.r#match.key());
         layout.participants.push(LayoutParticipant {
             output: output.clone(),
-            source: geometry.source,
+            slice: geometry.slice,
             raster_footprint: geometry.raster_footprint,
         });
         if attached.is_none() {
             continue;
         }
-        let source = canonical_source(desired, canvas, config).unwrap_or_else(|| {
+        let source = canonical_slice(desired, canvas, config).unwrap_or_else(|| {
             geometry
-                .source
+                .slice
                 .pixel_rect(canvas)
                 .expect("canvas already validated above")
         });
         slices.push(super::blend::SliceSpec {
             output: output.clone(),
-            source: crate::model::Rect {
+            slice: crate::model::Rect {
                 x: source[0].floor() as i32,
                 y: source[1].floor() as i32,
                 width: destination_width,
@@ -955,10 +954,10 @@ pub fn canvas_plan_with_correction(
     })
 }
 
-/// Recover exact integer metadata only when the floating source equals the
+/// Recover exact integer metadata only when the floating slice equals the
 /// canonical simple-layout conversion, with its original canvas dimensions.
 /// This is an equality proof, not tolerance-based snapping of a user edit.
-fn canonical_source(
+fn canonical_slice(
     desired: &crate::model::DesiredState,
     canvas: &CanvasConfig,
     selected: &crate::model::OutputConfig,
@@ -1004,7 +1003,7 @@ fn canonical_source(
         width: px[2] / w as f64,
         height: px[3] / w as f64,
     };
-    (selected.geometry.as_ref()?.source == canonical).then_some(px)
+    (selected.geometry.as_ref()?.slice == canonical).then_some(px)
 }
 
 #[cfg(test)]
@@ -1028,7 +1027,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, r)| LayoutParticipant {
                     output: i.to_string(),
-                    source: *r,
+                    slice: *r,
                     raster_footprint: *r,
                 })
                 .collect(),
@@ -1162,7 +1161,7 @@ mod tests {
             rect(0.6, 0.0, 0.4, 1.0),
         ]);
         let before = Evaluator::new(&input, 100, 100).unwrap();
-        input.participants[0].source.width = 0.42;
+        input.participants[0].slice.width = 0.42;
         let after = Evaluator::new(&input, 100, 100).unwrap();
         assert_ne!(before.key(0, 0.1, false), after.key(0, 0.1, false));
         assert_ne!(before.key(1, 0.1, false), after.key(1, 0.1, false));
@@ -1206,8 +1205,8 @@ mod tests {
         let mut input = spec(&[rect(0.0, 0.0, 1.0, 1.0)]);
         input.blend = false;
         let before = Evaluator::new(&input, 100, 100).unwrap();
-        input.participants[0].source.x = 0.1;
-        input.participants[0].source.width = 0.9;
+        input.participants[0].slice.x = 0.1;
+        input.participants[0].slice.width = 0.9;
         let after = Evaluator::new(&input, 100, 100).unwrap();
         assert_ne!(before.key(0, 0.0, false), after.key(0, 0.0, false));
         assert_eq!(before.transfer(0, 5.0, 50.0, 1.0, 0.0, 1.0), (256, 0));
@@ -1265,7 +1264,7 @@ mod tests {
                     for i in 0..rects.len() {
                         assert_eq!(
                             evaluator.raw_weight(i, px, py, row, col),
-                            naive_raw_weight(&evaluator.sources, i, px, py),
+                            naive_raw_weight(&evaluator.slices, i, px, py),
                             "source {i} at ({x}, {y})"
                         );
                     }
@@ -1406,7 +1405,7 @@ mod tests {
                 .into_iter()
                 .map(|(output, x, y, fx, fy)| LayoutParticipant {
                     output: output.into(),
-                    source: rect(x, y, width, height),
+                    slice: rect(x, y, width, height),
                     raster_footprint: rect(fx, fy, footprint_w, footprint_h),
                 })
                 .collect(),
@@ -2075,7 +2074,7 @@ mod tests {
                 .into_iter()
                 .map(|(output, x, y)| LayoutParticipant {
                     output: output.into(),
-                    source: rect(x, y, width, height),
+                    slice: rect(x, y, width, height),
                     raster_footprint: rect(x, y, width, height),
                 })
                 .collect(),

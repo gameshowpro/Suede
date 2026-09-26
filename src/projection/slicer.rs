@@ -456,8 +456,8 @@ struct Presenter {
     warp_revision: u64,
     warp_reported_revision: Option<u64>,
     warp_submitted_revision: Option<u64>,
-    /// This presenter's region of the canvas.
-    source: crate::model::Rect,
+    /// This presenter's slice: its region of the canvas.
+    slice: crate::model::Rect,
     /// A `wl_surface.frame` callback is outstanding: the compositor has not
     /// yet told us it *committed* an output frame carrying our last commit.
     /// The gate's fallback signal, used where the compositor offers no
@@ -2363,7 +2363,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             warp_revision: 0,
             warp_reported_revision: None,
             warp_submitted_revision: None,
-            source: slice.source,
+            slice: slice.slice,
             frame_pending: false,
             pending_since: None,
             feedback_pending_for: None,
@@ -2743,7 +2743,7 @@ fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
     let mut requested = false;
     for slice in &spec.slices {
         anyhow::ensure!(
-            slice.source.width > 0 && slice.source.height > 0,
+            slice.slice.width > 0 && slice.slice.height > 0,
             "source dimensions must be positive"
         );
         // A source rectangle can crop and scale through the identity mapper
@@ -2751,7 +2751,7 @@ fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
         // correction, whose malformed form must still be rejected here.
         requested |= slice.geometry.as_ref().is_some_and(|geometry| {
             geometry
-                .warp(slice.source.width as u32, slice.source.height as u32)
+                .warp(slice.slice.width as u32, slice.slice.height as u32)
                 .map_or(true, |warp| warp.is_some())
         });
     }
@@ -2767,7 +2767,7 @@ fn requires_linear_sampling(spec: &SlicerSpec) -> Result<bool, String> {
             || super::warp_update::sampling_warp(
                 spec,
                 slice,
-                (slice.source.width as u32, slice.source.height as u32),
+                (slice.slice.width as u32, slice.slice.height as u32),
             )?
             .is_some())
     })
@@ -2922,7 +2922,7 @@ fn static_pattern_rgba(
             && spec.canvas_width as u64 * spec.canvas_height as u64 <= 64_000_000,
         "invalid static canvas dimensions"
     );
-    let rect = slice.source;
+    let rect = slice.slice;
     anyhow::ensure!(
         rect.width > 0 && rect.height > 0,
         "invalid static pattern source rectangle"
@@ -3090,7 +3090,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
         Err(anyhow::anyhow!("output topology changed; restart required"))
     } else if filtering_restart {
         Err(anyhow::anyhow!(
-            "capture format/modifier does not support linear filtering required by the source crop; restarting with CPU"
+            "capture format/modifier does not support linear filtering required by the slice crop; restarting with CPU"
         ))
     } else if prepared
         .outputs
@@ -3177,7 +3177,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
         presenter.transfer = std::mem::take(&mut output.table);
         presenter.dynamic_table = output.dynamic_table.take();
         presenter.warp = output.warp.take();
-        presenter.source = output.source;
+        presenter.slice = output.slice;
         presenter.warp_revision = prepared.generation;
         presenter.stale = true;
     }
@@ -3346,7 +3346,7 @@ fn ensure_capture_buffer(
                 return Ok(());
             }
             let reason =
-                "capture format/modifier does not support linear filtering required by the source crop";
+                "capture format/modifier does not support linear filtering required by the slice crop";
             if state.renderer == Renderer::Gpu {
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
@@ -4228,8 +4228,8 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
             gpu::BlendJob {
                 target: image,
                 output: d.index,
-                source_x: presenter.source.x.max(0) as u32,
-                source_y: presenter.source.y.max(0) as u32,
+                source_x: presenter.slice.x.max(0) as u32,
+                source_y: presenter.slice.y.max(0) as u32,
                 warp: presenter.warp.as_ref(),
             }
         })
@@ -4420,8 +4420,8 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
             // in practice this is never read, but it must still match the
             // old per-pixel call's argument to stay byte-identical).
             let origin = [
-                f64::from(presenter.source.x.max(0) as u32),
-                f64::from(presenter.source.y.max(0) as u32),
+                f64::from(presenter.slice.x.max(0) as u32),
+                f64::from(presenter.slice.y.max(0) as u32),
             ];
             presenter.sample = presenter
                 .warp
@@ -4437,7 +4437,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 transfer,
                 buffers,
                 sample,
-                source,
+                slice,
                 ..
             } = presenter;
             let (_, map) = &mut buffers[slot];
@@ -4449,8 +4449,8 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 y_invert,
                 usable_width,
                 usable_height,
-                source_x: source.x.max(0) as u32,
-                source_y: source.y.max(0) as u32,
+                source_x: slice.x.max(0) as u32,
+                source_y: slice.y.max(0) as u32,
                 width,
                 sample: sample.as_ref(),
             };
@@ -4800,10 +4800,10 @@ fn present_pattern(
         };
         let canvas = static_pattern_rgba(spec, slice, pattern)?;
         let source = slice.source_rect.unwrap_or([
-            f64::from(slice.source.x),
-            f64::from(slice.source.y),
-            f64::from(slice.source.width),
-            f64::from(slice.source.height),
+            f64::from(slice.slice.x),
+            f64::from(slice.slice.y),
+            f64::from(slice.slice.width),
+            f64::from(slice.slice.height),
         ]);
         let warp = super::warp::Warp::identity(width, height)
             .with_source_rect(source)
@@ -4814,8 +4814,8 @@ fn present_pattern(
         let sample = AxisSamples::build(
             &warp,
             [
-                f64::from(slice.source.x.max(0) as u32),
-                f64::from(slice.source.y.max(0) as u32),
+                f64::from(slice.slice.x.max(0) as u32),
+                f64::from(slice.slice.y.max(0) as u32),
             ],
         );
         let blend = Blend {
@@ -4833,8 +4833,8 @@ fn present_pattern(
             y_invert: false,
             usable_width: spec.canvas_width as u32,
             usable_height: spec.canvas_height as u32,
-            source_x: slice.source.x.max(0) as u32,
-            source_y: slice.source.y.max(0) as u32,
+            source_x: slice.slice.x.max(0) as u32,
+            source_y: slice.slice.y.max(0) as u32,
             width,
             sample: Some(&sample),
         };
@@ -5318,8 +5318,8 @@ fn present_sync_gpu(
                 // Unused in sync mode — the shader takes its color from the
                 // shape list, not from a canvas — but carried so a job is
                 // one thing whichever mode built it.
-                source_x: presenter.source.x.max(0) as u32,
-                source_y: presenter.source.y.max(0) as u32,
+                source_x: presenter.slice.x.max(0) as u32,
+                source_y: presenter.slice.y.max(0) as u32,
                 warp: presenter.warp.as_ref(),
             })
         })
@@ -7526,8 +7526,9 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "source":"HEADLESS-1", "canvasWidth":320, "canvasHeight":240,
             "gamma":2.2, "blackLift":0.1, "renderer":"auto",
-            "slices":[{"output":"DP-1","source":{"x":30,"y":20,"width":240,"height":180},"ramps":[]}]
-        })).unwrap()
+            "slices":[{"output":"DP-1","slice":{"x":30,"y":20,"width":240,"height":180},"ramps":[]}]
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -7549,7 +7550,7 @@ mod tests {
                     output: slice.output.clone(),
                     gamma: spec.gamma,
                     black_lift: 0.0,
-                    rect: slice.source,
+                    rect: slice.slice,
                     source_rect: None,
                     pattern: Some(pattern),
                     canvas_size: None,
@@ -7585,8 +7586,8 @@ mod tests {
     fn static_white_covers_larger_fractional_sources_and_clips_negative_origins() {
         let spec = pattern_spec();
         let mut slice = spec.slices[0].clone();
-        slice.source.x = 20;
-        slice.source.y = 10;
+        slice.slice.x = 20;
+        slice.slice.y = 10;
         slice.source_rect = Some([20.25, 10.75, 290.5, 220.5]);
         let canvas = static_pattern_rgba(&spec, &slice, TestPattern::White).unwrap();
         let pixel = |bytes: &[u8], x: usize, y: usize| {
@@ -7597,8 +7598,8 @@ mod tests {
         // the configured source, and must not turn black when sampled.
         assert_eq!(pixel(&canvas, 300, 220), [255, 255, 255, 255]);
         assert_eq!(pixel(&canvas, 0, 0), [0, 0, 0, 255]);
-        slice.source.x = -31;
-        slice.source.y = -21;
+        slice.slice.x = -31;
+        slice.slice.y = -21;
         slice.source_rect = Some([-30.25, -20.75, 300.5, 220.5]);
         let clipped = static_pattern_rgba(&spec, &slice, TestPattern::White).unwrap();
         assert_eq!(pixel(&clipped, 0, 0), [255, 255, 255, 255]);
@@ -7614,8 +7615,8 @@ mod tests {
         spec.canvas_width = 640;
         spec.canvas_height = 480;
         let mut slice = spec.slices[0].clone();
-        slice.source.x = 0;
-        slice.source.y = 0;
+        slice.slice.x = 0;
+        slice.slice.y = 0;
         slice.source_rect = Some([0.5, 0.5, 480.0, 360.0]);
         for pattern in [TestPattern::Grid, TestPattern::Gamma, TestPattern::Identify] {
             let canvas = static_pattern_rgba(&spec, &slice, pattern).unwrap();
@@ -7634,7 +7635,7 @@ mod tests {
                     output: slice.output.clone(),
                     gamma: spec.gamma,
                     black_lift: 0.0,
-                    rect: slice.source,
+                    rect: slice.slice,
                     source_rect: slice.source_rect,
                     pattern: Some(pattern),
                     canvas_size: None,
@@ -7702,8 +7703,8 @@ mod tests {
             assert_eq!(legacy, static_pattern_rgba(&spec, &slice, pattern).unwrap());
             slice.source_rect = None;
         }
-        slice.source.x = 30;
-        slice.source.y = 20;
+        slice.slice.x = 30;
+        slice.slice.y = 20;
         slice.source_rect = Some([30.9, 20.9, 0.25, 0.25]);
         let canvas = static_pattern_rgba(&spec, &slice, TestPattern::White).unwrap();
         // The midpoint (31.025,21.025) uses all four of these support texels.
@@ -7740,7 +7741,7 @@ mod tests {
         for raster in [350i32, 700, 1400] {
             // raster/footprint = 0.5x, 1x, 2x.
             let mut slice = spec.slices[0].clone();
-            slice.source = crate::model::Rect {
+            slice.slice = crate::model::Rect {
                 x: footprint[0].floor() as i32,
                 y: footprint[1].floor() as i32,
                 width: raster,
@@ -7789,7 +7790,7 @@ mod tests {
         spec.canvas_height = 1000;
         let mut left = spec.slices[0].clone();
         left.output = "LEFT".into();
-        left.source = crate::model::Rect {
+        left.slice = crate::model::Rect {
             x: 100,
             y: 100,
             width: 300,
@@ -7798,7 +7799,7 @@ mod tests {
         left.source_rect = Some([100.0, 100.0, 600.0, 600.0]);
         let mut right = spec.slices[0].clone();
         right.output = "RIGHT".into();
-        right.source = crate::model::Rect {
+        right.slice = crate::model::Rect {
             x: 400,
             y: 100,
             width: 1200,
@@ -7836,7 +7837,7 @@ mod tests {
         spec.canvas_width = 320;
         spec.canvas_height = 240;
         // Raster at 2x the canvas footprint's density.
-        spec.slices[0].source = crate::model::Rect {
+        spec.slices[0].slice = crate::model::Rect {
             x: 10,
             y: 10,
             width: 480,
@@ -7869,7 +7870,7 @@ mod tests {
             warp_revision: 0,
             warp_reported_revision: None,
             warp_submitted_revision: None,
-            source: slice.source,
+            slice: slice.slice,
             frame_pending: false,
             pending_since: None,
             feedback_pending_for: None,
@@ -7921,7 +7922,7 @@ mod tests {
                 output: slice.output.clone(),
                 gamma: spec.gamma,
                 black_lift: 0.0,
-                rect: slice.source,
+                rect: slice.slice,
                 source_rect: None,
                 pattern: Some(TestPattern::Grid),
                 canvas_size: Some([320, 240]),
@@ -7992,7 +7993,7 @@ mod tests {
                 warp_revision: 7,
                 warp_reported_revision: None,
                 warp_submitted_revision: None,
-                source: crate::model::Rect {
+                slice: crate::model::Rect {
                     x: i * 4,
                     y: 0,
                     width: 4,
@@ -8128,8 +8129,8 @@ mod reconstruction {
     /// factor, which the minimum-distance rule missed by 0.13.
     const SEPARABILITY_TOLERANCE: f64 = 6.0 / 256.0;
 
-    /// One output's placement: a canvas-space source rectangle (fractional
-    /// canvas pixels, as `geometry.source` stores it) and an independent
+    /// One output's placement: a canvas-space slice rectangle (fractional
+    /// canvas pixels, as `geometry.slice` stores it) and an independent
     /// destination raster size (`mode.width`/`mode.height`, whatever the
     /// output's own resolution is). The two are equal, integer values for
     /// every slice except `brain_scaled_slices`' bottom row when it carries
@@ -8227,7 +8228,7 @@ mod reconstruction {
     }
 
     /// A shared-canvas output: identity corners, center `[0.5, 0.5]`,
-    /// `source == raster_footprint`.
+    /// `slice == raster_footprint`.
     fn output_config(name: &str, geom: SliceGeom) -> crate::model::OutputConfig {
         let mut config = crate::model::OutputConfig::new(crate::model::OutputMatch::by_name(name));
         config.mode = Some(crate::model::Mode {
@@ -8242,7 +8243,7 @@ mod reconstruction {
             height: geom.source_height / f64::from(CANVAS_WIDTH),
         };
         config.geometry = Some(crate::model::OutputGeometry {
-            source,
+            slice: source,
             corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             center: [0.5, 0.5],
             raster_footprint: source,
@@ -8519,8 +8520,8 @@ mod reconstruction {
         spec.slices
             .iter()
             .map(|slice| {
-                let width = slice.source.width as u32;
-                let height = slice.source.height as u32;
+                let width = slice.slice.width as u32;
+                let height = slice.slice.height as u32;
                 let layout_index = evaluator
                     .as_ref()
                     .map(|e| (e, e.index(&slice.output).unwrap()));
@@ -8550,8 +8551,8 @@ mod reconstruction {
                     y_invert: false,
                     usable_width: spec.canvas_width as u32,
                     usable_height: spec.canvas_height as u32,
-                    source_x: slice.source.x.max(0) as u32,
-                    source_y: slice.source.y.max(0) as u32,
+                    source_x: slice.slice.x.max(0) as u32,
+                    source_y: slice.slice.y.max(0) as u32,
                     width,
                     sample: None,
                 };
@@ -8560,8 +8561,8 @@ mod reconstruction {
 
                 RenderedSlice {
                     output: slice.output.clone(),
-                    x: slice.source.x,
-                    y: slice.source.y,
+                    x: slice.slice.x,
+                    y: slice.slice.y,
                     width,
                     height,
                     pixels: output,

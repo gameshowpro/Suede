@@ -1060,7 +1060,7 @@ fn spec_requests_warp(spec: &SlicerSpec) -> bool {
     spec.slices.iter().any(|slice| {
         slice.geometry.as_ref().is_some_and(|geometry| {
             geometry
-                .warp(slice.source.width as u32, slice.source.height as u32)
+                .warp(slice.slice.width as u32, slice.slice.height as u32)
                 .map_or(true, |warp| warp.is_some())
         })
     })
@@ -1104,10 +1104,10 @@ fn slicer_topology_fingerprint(spec: &SlicerSpec) -> u64 {
     for slice in &spec.slices {
         slice.output.hash(&mut hasher);
         if spec.layout.is_some() && spec.pattern.is_none() {
-            slice.source.width.hash(&mut hasher);
-            slice.source.height.hash(&mut hasher);
+            slice.slice.width.hash(&mut hasher);
+            slice.slice.height.hash(&mut hasher);
         } else {
-            serde_json::to_string(&slice.source)
+            serde_json::to_string(&slice.slice)
                 .unwrap_or_default()
                 .hash(&mut hasher);
             serde_json::to_string(&slice.source_rect)
@@ -1277,7 +1277,7 @@ mod tests {
         gpu.slices.push(SliceSpec {
             source_rect: None,
             output: "DP-1".to_string(),
-            source: Rect {
+            slice: Rect {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -1294,9 +1294,9 @@ mod tests {
             center: [0.5, 0.5],
         });
         assert_eq!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
-        gpu.slices[0].source.x = 1;
+        gpu.slices[0].slice.x = 1;
         assert_ne!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
-        gpu.slices[0].source.x = 0;
+        gpu.slices[0].slice.x = 0;
         gpu.free_run = true;
         assert_ne!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
         assert!(slicer_requests_live_candidate(&gpu));
@@ -1328,7 +1328,7 @@ mod tests {
             let mut spec = minimal_slicer_spec();
             spec.slices.push(SliceSpec {
                 output: "DP-1".into(),
-                source: Rect {
+                slice: Rect {
                     x,
                     y,
                     width: 100,
@@ -1348,7 +1348,7 @@ mod tests {
                 blend: true,
                 participants: vec![LayoutParticipant {
                     output: "DP-1".into(),
-                    source: participant_source,
+                    slice: participant_source,
                     raster_footprint: participant_source,
                 }],
             });
@@ -1708,7 +1708,7 @@ mod tests {
         spec.renderer = crate::model::Renderer::Gpu;
         spec.slices.push(SliceSpec {
             output: "DP-1".into(),
-            source: Rect {
+            slice: Rect {
                 x: 0,
                 y: 0,
                 width: 100,
@@ -1728,7 +1728,7 @@ mod tests {
             blend: true,
             participants: vec![crate::projection::layout::LayoutParticipant {
                 output: "DP-1".into(),
-                source,
+                slice: source,
                 raster_footprint: source,
             }],
         });

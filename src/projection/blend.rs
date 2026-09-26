@@ -89,18 +89,18 @@ fn intersect(a: &Rect, b: &Rect) -> Option<Rect> {
     })
 }
 
-/// One projector's slice of the canvas: which region it shows. Its seam
+/// One output's slice of the canvas: which region it shows. Its seam
 /// blend weight is not carried here — it is derived from `SlicerSpec.layout`
 /// (this output's entry in the shared [`super::layout::LayoutSpec`]) through
-/// [`super::layout::Evaluator`], the one place that rule lives. `source` is
+/// [`super::layout::Evaluator`], the one place that rule lives. `slice` is
 /// in canvas coordinates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SliceSpec {
     pub output: String,
-    pub source: Rect,
-    /// Absolute canvas pixel boundaries for generalized source placement.
-    /// `source` retains the exact crop origin and configured raster dimensions.
+    pub slice: Rect,
+    /// Absolute canvas pixel boundaries for generalized slice placement.
+    /// `slice` retains the exact crop origin and configured raster dimensions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rect: Option<[f64; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,7 +306,7 @@ pub fn canvas_plan_with_warp_activation(
                 };
                 LayoutParticipant {
                     output: name.clone(),
-                    source,
+                    slice: source,
                     // A legacy layout has no separate physical-footprint
                     // concept: the configured rectangle is both the crop and
                     // the coverage a black-lift shortfall is computed from.
@@ -316,7 +316,7 @@ pub fn canvas_plan_with_warp_activation(
             .collect(),
     };
     // Validates the topology a legacy layout still requires — nonempty,
-    // non-mixed stacking, in-bounds — but not that every source is reachable
+    // non-mixed stacking, in-bounds — but not that every slice is reachable
     // from every other (`layout::Evaluator::new` no longer requires that; see
     // its own doc): a legacy layout that fails this is not a layout
     // `layout::Evaluator` — and so nothing downstream — can give one seam
@@ -343,7 +343,7 @@ pub fn canvas_plan_with_warp_activation(
             source_rect: None,
             geometry: None,
             output: name.clone(),
-            source: *rect,
+            slice: *rect,
         })
         .collect();
 
@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(layout.participants.len(), 1);
         assert!(!layout.blend);
         assert_eq!(
-            plan.slices[0].source,
+            plan.slices[0].slice,
             Rect {
                 x: 0,
                 y: 0,
@@ -814,7 +814,7 @@ mod tests {
         let left = &plan.slices[0];
         assert_eq!(left.output, "DP-3");
         assert_eq!(
-            left.source,
+            left.slice,
             Rect {
                 x: 0,
                 y: 0,
@@ -823,7 +823,7 @@ mod tests {
             }
         );
         let right = &plan.slices[1];
-        assert_eq!(right.source.x, 1760);
+        assert_eq!(right.slice.x, 1760);
 
         // The synthesized layout carries both participants, normalized by
         // the canvas bounding-box width, and every downstream weight comes
@@ -1029,7 +1029,7 @@ mod tests {
         assert_eq!((plan.canvas_width, plan.canvas_height), (3840, 1080));
         assert_eq!(plan.slices.len(), 2);
         assert_eq!(
-            plan.slices[0].source,
+            plan.slices[0].slice,
             Rect {
                 x: 0,
                 y: 0,
@@ -1038,7 +1038,7 @@ mod tests {
             }
         );
         assert_eq!(
-            plan.slices[1].source,
+            plan.slices[1].slice,
             Rect {
                 x: 1920,
                 y: 0,
@@ -1092,8 +1092,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!((plan.canvas_width, plan.canvas_height), (3680, 1080));
-        assert_eq!(plan.slices[0].source.x, 0);
-        assert_eq!(plan.slices[0].source.y, 0);
+        assert_eq!(plan.slices[0].slice.x, 0);
+        assert_eq!(plan.slices[0].slice.y, 0);
     }
 
     #[test]
@@ -1111,7 +1111,7 @@ mod tests {
             Slicing::WhenOverlapping,
         )
         .unwrap();
-        assert_eq!(plan.slices[0].source, plan.slices[1].source);
+        assert_eq!(plan.slices[0].slice, plan.slices[1].slice);
         let evaluator = evaluator_for(&plan);
         assert_eq!(evaluator.transfer(0, 500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
         assert_eq!(evaluator.transfer(1, 500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
@@ -1416,7 +1416,7 @@ mod tests {
                 blend: true,
                 participants: vec![LayoutParticipant {
                     output: "DP-3".into(),
-                    source: CanvasRect {
+                    slice: CanvasRect {
                         x: 0.0,
                         y: 0.0,
                         width: 0.5,
@@ -1446,7 +1446,7 @@ mod tests {
                 source_rect: None,
                 geometry: None,
                 output: "DP-3".into(),
-                source: Rect {
+                slice: Rect {
                     x: 0,
                     y: 0,
                     width: 1920,

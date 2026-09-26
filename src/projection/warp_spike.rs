@@ -219,7 +219,7 @@ fn validate(bytes: &[u8], spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Req
         if width == 0 || height == 0 || u64::from(width) * u64::from(height) > 33_554_432 {
             return Err("spike supports nonzero outputs up to 32 megapixels".into());
         }
-        if width != slice.source.width as u32 || height != slice.source.height as u32 {
+        if width != slice.slice.width as u32 || height != slice.slice.height as u32 {
             return Err(
                 "spike requires unit scale and output size equal to source rectangle".into(),
             );
@@ -250,7 +250,7 @@ fn build_selected(
 ) -> Result<Prepared, String> {
     let started = Instant::now();
     let request = validate(bytes, spec, sizes)?;
-    let coverage = Coverage::new(spec.slices.iter().map(|s| s.source));
+    let coverage = Coverage::new(spec.slices.iter().map(|s| s.slice));
     let mut outputs = Vec::new();
     for &index in indices {
         let slice = &spec.slices[index];
@@ -294,8 +294,8 @@ fn build_selected(
                         // outside the source. Extend only the edge texel into AA.
                         let sx = sx.clamp(0.5, width as f64 - 0.5);
                         let sy = sy.clamp(0.5, height as f64 - 0.5);
-                        let cx = slice.source.x as f64 + sx;
-                        let cy = slice.source.y as f64 + sy;
+                        let cx = slice.slice.x as f64 + sx;
+                        let cy = slice.slice.y as f64 + sy;
                         if cx < 0.0
                             || cy < 0.0
                             || cx >= spec.canvas_width as f64
@@ -331,15 +331,15 @@ pub fn benchmark(spec: &SlicerSpec) -> Result<(), String> {
     let sizes: Vec<_> = spec
         .slices
         .iter()
-        .map(|s| (s.source.width as u32, s.source.height as u32))
+        .map(|s| (s.slice.width as u32, s.slice.height as u32))
         .collect();
     for workers in [1, 4, 8] {
         for mode in ["off", "identity", "keystone"] {
             let mut outputs = serde_json::Map::new();
             if mode != "off" {
                 for s in &spec.slices {
-                    let w = f64::from(s.source.width);
-                    let h = f64::from(s.source.height);
+                    let w = f64::from(s.slice.width);
+                    let h = f64::from(s.slice.height);
                     let corners = if mode == "identity" {
                         [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]]
                     } else {
@@ -396,7 +396,7 @@ mod tests {
                 source_rect: None,
                 geometry: None,
                 output: "A".into(),
-                source: Rect {
+                slice: Rect {
                     x: 0,
                     y: 0,
                     width: 8,
@@ -458,7 +458,7 @@ mod tests {
         s.canvas_width = 12;
         let mut neighbor = s.slices[0].clone();
         neighbor.output = "B".into();
-        neighbor.source.x = 4;
+        neighbor.slice.x = 4;
         s.slices.push(neighbor);
         let result = build(
             br#"{"outputs":{"A":{"corners":[[0.5,0],[8,0],[8,8],[0.5,8]]}}}"#,

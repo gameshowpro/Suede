@@ -5,7 +5,7 @@ use utoipa::ToSchema;
 
 use super::arrangement::Arrangement;
 use super::black_lift::BlackLift;
-use super::geometry::{validate_sources, CanvasConfig, OutputGeometry, ProjectionMode};
+use super::geometry::{validate_slices, CanvasConfig, OutputGeometry, ProjectionMode};
 use super::observed::{Mode, Output, Position};
 
 /// Current persisted-document schema. Alpha upgrades require this exact
@@ -46,7 +46,7 @@ pub struct DesiredState {
     /// A multi-display installation usually wants one look across every
     /// alternative — repeating a wallpaper, scaling mode and color on each
     /// output — makes the common case the laborious one and guarantees the
-    /// screens drift apart the first time somebody edits only three of four.
+    /// displays drift apart the first time somebody edits only three of four.
     pub backgrounds: Vec<BackgroundPreset>,
     /// Multi-projector features. Absent means no projection processing at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,8 +56,8 @@ pub struct DesiredState {
 
 /// Shared multi-projector content layout and retained Warp correction.
 ///
-/// There is no overlap setting here, because the source layout determines
-/// overlap. Simple and Warp share the configured canvas and normalized source
+/// There is no overlap setting here, because the slice layout determines
+/// overlap. Simple and Warp share the configured canvas and normalized slice
 /// rectangles. Warp adds destination correction to that content selection.
 /// Without an explicit canvas, integer output positions define the layout.
 ///
@@ -122,7 +122,7 @@ pub struct ProjectionConfig {
     /// where the last one left off, and nothing else reads it. A later
     /// manual geometry edit leaves it in place — see
     /// [`crate::model::arrangement::in_effect`], which reports whether it
-    /// still describes the document's sources.
+    /// still describes the document's slices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arrangement: Option<Arrangement>,
     /// Ephemeral settings applied to the working copy like any other field,
@@ -351,7 +351,7 @@ impl DesiredState {
             // A shared crop supersedes an output's legacy integer position,
             // so validating both would reject a good crop over stale
             // compositor coordinates — but that only excuses the outputs
-            // that actually carry a source rectangle. A canvas being
+            // that actually carry a slice rectangle. A canvas being
             // configured elsewhere in the document must not exempt an
             // output with no geometry of its own from this check.
             .filter(|output| output.geometry.is_none())
@@ -538,9 +538,9 @@ impl DesiredState {
         }
         // A per-output nudge applied only by the grid arrangement solve,
         // validated beside the arrangement record it works alongside. `16`
-        // matches the `±16` canvas-span bound `geometry.source` is held to
-        // (`MAX_SOURCE_SPAN` in `geometry.rs`) — an offset need never be
-        // larger than a source rectangle is allowed to stray from the canvas.
+        // matches the `±16` canvas-span bound `geometry.slice` is held to
+        // (`MAX_SLICE_SPAN` in `geometry.rs`) — an offset need never be
+        // larger than a slice rectangle is allowed to stray from the canvas.
         for (index, output) in self.outputs.iter().enumerate() {
             let Some(offset) = output.arrange_offset else {
                 continue;
@@ -564,7 +564,7 @@ impl DesiredState {
         if shared && projection.canvas.is_none() {
             errors.push("projection.canvas is required in warp mode".into());
         }
-        let mut warp_sources = Vec::new();
+        let mut warp_slices = Vec::new();
         let enabled_count = self.outputs.iter().filter(|output| output.enable).count();
         for (index, output) in self.outputs.iter().enumerate() {
             let prefix = format!("outputs[{index}]");
@@ -627,8 +627,8 @@ impl DesiredState {
             }
             match &output.geometry {
                 // Already validated once above (against this same canvas
-                // and mode); only the source needs collecting here.
-                Some(geometry) => warp_sources.push(geometry.source),
+                // and mode); only the slice needs collecting here.
+                Some(geometry) => warp_slices.push(geometry.slice),
                 None => errors.push(format!("{prefix}.geometry is required for a shared canvas")),
             }
         }
@@ -640,9 +640,9 @@ impl DesiredState {
                 errors.push("shared canvas rendering requires at least one enabled output".into());
             }
             if let Some(canvas) = projection.canvas.as_ref() {
-                if warp_sources.len() == enabled_count && !warp_sources.is_empty() {
-                    if let Err(error) = validate_sources(canvas, &warp_sources) {
-                        errors.push(format!("projection sources {error}"));
+                if warp_slices.len() == enabled_count && !warp_slices.is_empty() {
+                    if let Err(error) = validate_slices(canvas, &warp_slices) {
+                        errors.push(format!("projection slices {error}"));
                     }
                 }
             }
@@ -841,7 +841,7 @@ impl OutputMatch {
     }
 }
 
-/// Screen rotation and flipping, as accepted by `sway-output(5)`.
+/// Output rotation and flipping, as accepted by `sway-output(5)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 pub enum Transform {
     #[default]
@@ -920,7 +920,7 @@ pub struct AdoptedOutput {
     pub scale: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<Transform>,
-    /// The display these were taken from, so that swapping the screen on a
+    /// The display these were taken from, so that swapping the display on a
     /// connector re-adopts rather than pinning the old one's values forever.
     /// `None` when the display reported no EDID identity at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -930,7 +930,7 @@ pub struct AdoptedOutput {
     pub captured_at: u64,
 }
 
-/// Enough of a display's EDID to tell "the same screen" from "a different
+/// Enough of a display's EDID to tell "the same display" from "a different
 /// one on the same connector".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -975,8 +975,8 @@ pub struct OutputConfig {
     /// Never adopted — see [`AdoptedOutput`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
-    /// Shared normalized content source plus retained Warp correction and
-    /// independent physical light footprint. Simple uses the same source.
+    /// Shared normalized content slice plus retained Warp correction and
+    /// independent physical light footprint. Simple uses the same slice.
     /// Kept independently from `position` and from the requested pipeline so
     /// switching to simple mode does not discard calibrated warp settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1020,8 +1020,8 @@ pub struct OutputConfig {
 }
 
 /// A per-output nudge the grid arrangement solve adds to this output's
-/// computed source, in normalized canvas units — the same space as
-/// [`super::geometry::OutputGeometry::source`].
+/// computed slice, in normalized canvas units — the same space as
+/// [`super::geometry::OutputGeometry::slice`].
 ///
 /// Applied only by [`crate::model::arrangement::solve`], after placement:
 /// coverage (`unusedCanvas`) and the strict full-coverage gate are computed
@@ -1076,7 +1076,7 @@ pub const DEFAULT_BACKGROUND_COLOR: &str = "#000000";
 
 /// What an output shows behind, or instead of, any window.
 ///
-/// An appliance with a blank screen looks broken even when it is merely
+/// An appliance with a blank display looks broken even when it is merely
 /// between launches, so a background gives it something deliberate to show
 /// while a browser restarts or before the first app starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
@@ -1145,7 +1145,7 @@ pub struct BackgroundPreset {
 ///
 /// A bare string names a preset; an object spells the properties out. Both are
 /// accepted because they serve different callers: the UI wants one dropdown
-/// across every screen, while a script driving the API directly should not
+/// across every output, while a script driving the API directly should not
 /// have to create a preset to paint one output.
 ///
 /// ```json
@@ -1173,7 +1173,7 @@ impl BackgroundRef {
     /// Resolve to concrete properties against `presets`.
     ///
     /// `None` means the reference names a preset that does not exist — the
-    /// caller raises a divergence rather than silently painting the screen.
+    /// caller raises a divergence rather than silently painting the display.
     pub fn resolve<'a>(&'a self, presets: &'a [BackgroundPreset]) -> Option<&'a Background> {
         match self {
             Self::Inline(background) => Some(background),
@@ -1762,7 +1762,7 @@ mod tests {
             // Not finite-positive: fails validate_numbers, which both the
             // general check and the (now removed) duplicate shared-canvas
             // check used to run independently.
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: -1.0,
@@ -1937,12 +1937,12 @@ mod tests {
 
     /// A configured canvas used to exempt every output from the plain
     /// integer-position overlap check, not just the ones that actually
-    /// carry their own source rectangle.
+    /// carry their own slice rectangle.
     #[test]
     fn a_canvas_only_exempts_outputs_that_carry_their_own_geometry_from_the_overlap_check() {
         let mut a = placed("A", 0, 0, 1920, 1080);
         a.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -1971,7 +1971,7 @@ mod tests {
         let errors = state.validate(false).unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("overlap")),
-            "B has no source rectangle of its own and must still be checked \
+            "B has no slice rectangle of its own and must still be checked \
              even though a canvas is configured elsewhere: {errors:?}"
         );
     }

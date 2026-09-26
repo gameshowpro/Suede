@@ -4,7 +4,7 @@
 //! The arithmetic used to live in the reference UI's JavaScript, where every
 //! client had to reimplement it to agree. It is arithmetic over the document
 //! and the canvas, so it belongs here: [`solve`] turns a request into the
-//! source rectangles it implies, [`apply`] writes them into a document, and
+//! slice rectangles it implies, [`apply`] writes them into a document, and
 //! [`in_effect`] says whether a persisted record still describes what the
 //! document actually holds.
 //!
@@ -61,7 +61,7 @@
 //!   and the aspect that would close it.
 //! * [`super::desired::OutputConfig::arrange_offset`] lets one output's
 //!   placement be nudged after the solve, in normalized canvas units.
-//!   [`solve`] adds it to that output's source *after* [`place`] and after
+//!   [`solve`] adds it to that output's slice *after* [`place`] and after
 //!   the coverage and off-canvas gates above, so an offset is never mistaken
 //!   for an uncovered band or a lost slice — it is the caller's deliberate
 //!   shift, e.g. correcting for a projector that is not quite where the grid
@@ -73,9 +73,9 @@ use utoipa::ToSchema;
 use super::desired::{DesiredState, OutputConfig, Transform};
 use super::geometry::{CanvasConfig, CanvasRect, OutputGeometry};
 
-/// Two source rectangles are the same arrangement when every edge agrees to
+/// Two slice rectangles are the same arrangement when every edge agrees to
 /// within this many normalized canvas units.
-const SOURCE_EPS: f64 = 1.0e-9;
+const SLICE_EPS: f64 = 1.0e-9;
 
 /// Overlap above this fraction is legal but almost always a mistake, so the
 /// solution carries a warning a client can show.
@@ -90,7 +90,7 @@ const UNIT_CORNERS: [[f64; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1
 /// client supplied, this records what the solver settled on. When overlaps
 /// were requested they come back exactly as requested and only the content
 /// scale is derived; when a content scale was requested the overlaps are
-/// derived from it. It is a record of *intent*, not canonical geometry — the source
+/// derived from it. It is a record of *intent*, not canonical geometry — the slice
 /// rectangles remain the truth, and a later manual geometry edit leaves this
 /// in place. See [`in_effect`] for the test of whether it still describes the
 /// document.
@@ -140,7 +140,7 @@ pub struct ArrangementRequest {
     /// percentage of the canvas, and the aspect that would close it. `true`
     /// instead fits the whole grid *inside* the canvas at the requested
     /// overlaps — `contentScale = max(fitX, fitY)`, since a smaller scale
-    /// would push a source past the canvas edge and a larger one would cover
+    /// would push a slice past the canvas edge and a larger one would cover
     /// less on both axes — and reports the band that leaves.
     ///
     /// **Behavior change from Suede 0.1.14**: a request that used to succeed
@@ -163,7 +163,7 @@ pub struct ArrangedOutput {
     /// [`super::desired::OutputMatch::key`] of the output this places.
     pub key: String,
     /// The normalized canvas rectangle this output samples.
-    pub source: CanvasRect,
+    pub slice: CanvasRect,
 }
 
 /// The fraction of the canvas left uncovered on each axis, measured before
@@ -501,7 +501,7 @@ fn place(metrics: &Metrics, arrangement: &Arrangement) -> Placement {
 /// The canvas occupies `[0, 1]` by `[0, 1/aspect]` in normalized units; its
 /// extents here come from the same densities [`place`] divided by, so the
 /// two agree exactly. A slice whose intersection with it is empty — or no
-/// wider or taller than [`SOURCE_EPS`], i.e. merely touching an edge — would
+/// wider or taller than [`SLICE_EPS`], i.e. merely touching an edge — would
 /// render nothing but black.
 fn first_black_slice(metrics: &Metrics, rects: &[CanvasRect]) -> Option<usize> {
     let canvas_width = metrics.canvas_w / metrics.x_density;
@@ -509,7 +509,7 @@ fn first_black_slice(metrics: &Metrics, rects: &[CanvasRect]) -> Option<usize> {
     rects.iter().position(|rect| {
         let visible_w = (rect.x + rect.width).min(canvas_width) - rect.x.max(0.0);
         let visible_h = (rect.y + rect.height).min(canvas_height) - rect.y.max(0.0);
-        visible_w <= SOURCE_EPS || visible_h <= SOURCE_EPS
+        visible_w <= SLICE_EPS || visible_h <= SLICE_EPS
     })
 }
 
@@ -667,7 +667,7 @@ pub fn solve(
         if value < 0.0 {
             warnings.push(format!(
                 "{label} is {:.1}%: adjacent {neighbors} leave a gap, which the document will \
-                 reject as disconnected sources",
+                 reject as disconnected slices",
                 value * 100.0
             ));
         } else if value > HIGH_OVERLAP {
@@ -686,14 +686,14 @@ pub fn solve(
         outputs: enabled
             .iter()
             .zip(placement.rects)
-            .map(|(output, mut source)| {
+            .map(|(output, mut slice)| {
                 if let Some(offset) = output.arrange_offset {
-                    source.x += offset.x;
-                    source.y += offset.y;
+                    slice.x += offset.x;
+                    slice.y += offset.y;
                 }
                 ArrangedOutput {
                     key: output.r#match.key(),
-                    source,
+                    slice,
                 }
             })
             .collect(),
@@ -717,7 +717,7 @@ fn checked_overlap(label: &str, value: Option<f64>) -> Result<f64, String> {
 /// Applied uniformly by [`placement_gates`] regardless of which mode
 /// produced the arrangement. Overlap mode's default `min`-of-fits scale
 /// covers both axes by construction (its `unused` is zero up to
-/// [`SOURCE_EPS`]-scale float dust), and its fit-inside scale only runs when
+/// [`SLICE_EPS`]-scale float dust), and its fit-inside scale only runs when
 /// `allowUnusedCanvas` already waived this gate, so in overlap mode it is a
 /// safety net. What can trip it is content-scale mode, which fills every
 /// *seamed* axis exactly but can leave an unseamed axis's single row or
@@ -731,7 +731,7 @@ fn unused_canvas_gate(
         return Ok(());
     }
     for (axis, fraction) in [("X", unused.x), ("Y", unused.y)] {
-        if fraction > SOURCE_EPS {
+        if fraction > SLICE_EPS {
             return Err(format!(
                 "the canvas {axis} axis is left {:.1}% uncovered at this aspect; the canvas \
                  aspect that would close the gap is {implied_aspect:.4}, or pass \
@@ -939,14 +939,14 @@ fn bisect(mut valid_end: f64, mut invalid_end: f64, valid: &impl Fn(f64) -> bool
 
 /// Write a solution into a document.
 ///
-/// Only `geometry.source` is replaced: an output that was already
+/// Only `geometry.slice` is replaced: an output that was already
 /// calibrated keeps its `corners`, `center` and `rasterFootprint`. An output
 /// with no geometry at all is seeded with identity geometry, exactly as the
 /// layout conversion does. Outputs the solution does not name — the
 /// disabled ones — are untouched.
 ///
 /// The caller validates the result; a solution can be arithmetically fine
-/// and still produce a document validation rejects (a gap between sources,
+/// and still produce a document validation rejects (a gap between slices,
 /// for instance).
 pub fn apply(document: &mut DesiredState, solution: &ArrangementSolution) {
     for arranged in &solution.outputs {
@@ -958,13 +958,13 @@ pub fn apply(document: &mut DesiredState, solution: &ArrangementSolution) {
             continue;
         };
         match output.geometry.as_mut() {
-            Some(geometry) => geometry.source = arranged.source,
+            Some(geometry) => geometry.slice = arranged.slice,
             None => {
                 output.geometry = Some(OutputGeometry {
-                    source: arranged.source,
+                    slice: arranged.slice,
                     corners: UNIT_CORNERS,
                     center: [0.5, 0.5],
-                    raster_footprint: arranged.source,
+                    raster_footprint: arranged.slice,
                 })
             }
         }
@@ -974,12 +974,12 @@ pub fn apply(document: &mut DesiredState, solution: &ArrangementSolution) {
     }
 }
 
-/// Whether the recorded arrangement still describes the document's sources.
+/// Whether the recorded arrangement still describes the document's slices.
 ///
 /// The record is intent, so it survives a manual geometry edit; this is how
 /// a client learns that the edit happened. Laying the recorded values out
-/// again and comparing every enabled output's source rectangle is the whole
-/// test — within [`SOURCE_EPS`] normalized units, because the numbers made a
+/// again and comparing every enabled output's slice rectangle is the whole
+/// test — within [`SLICE_EPS`] normalized units, because the numbers made a
 /// round trip through JSON.
 pub fn in_effect(
     document: &DesiredState,
@@ -1025,15 +1025,15 @@ pub fn in_effect(
             output
                 .geometry
                 .as_ref()
-                .is_some_and(|geometry| same_rect(geometry.source, expected))
+                .is_some_and(|geometry| same_rect(geometry.slice, expected))
         })
 }
 
 fn same_rect(left: CanvasRect, right: CanvasRect) -> bool {
-    (left.x - right.x).abs() < SOURCE_EPS
-        && (left.y - right.y).abs() < SOURCE_EPS
-        && (left.width - right.width).abs() < SOURCE_EPS
-        && (left.height - right.height).abs() < SOURCE_EPS
+    (left.x - right.x).abs() < SLICE_EPS
+        && (left.y - right.y).abs() < SLICE_EPS
+        && (left.width - right.width).abs() < SLICE_EPS
+        && (left.height - right.height).abs() < SLICE_EPS
 }
 
 #[cfg(test)]
@@ -1182,14 +1182,14 @@ mod tests {
             .map(|arranged| arranged.key.as_str())
             .collect();
         assert_eq!(keys, ["HDMI-1", "HDMI-2", "HDMI-3", "HDMI-4"]);
-        close_rect(solution.outputs[0].source, [0.0, 0.0, 5.0 / 9.0, 0.3125]);
+        close_rect(solution.outputs[0].slice, [0.0, 0.0, 5.0 / 9.0, 0.3125]);
         close_rect(
-            solution.outputs[1].source,
+            solution.outputs[1].slice,
             [4.0 / 9.0, 0.0, 5.0 / 9.0, 0.3125],
         );
-        close_rect(solution.outputs[2].source, [0.0, 0.25, 5.0 / 9.0, 0.3125]);
+        close_rect(solution.outputs[2].slice, [0.0, 0.25, 5.0 / 9.0, 0.3125]);
         close_rect(
-            solution.outputs[3].source,
+            solution.outputs[3].slice,
             [4.0 / 9.0, 0.25, 5.0 / 9.0, 0.3125],
         );
     }
@@ -1237,25 +1237,25 @@ mod tests {
         assert!(solution.warnings.is_empty(), "{:?}", solution.warnings);
 
         close_rect(
-            solution.outputs[0].source,
+            solution.outputs[0].slice,
             [0.0, -0.0234375, 5.0 / 9.0, 0.3125],
         );
         close_rect(
-            solution.outputs[1].source,
+            solution.outputs[1].slice,
             [4.0 / 9.0, -0.0234375, 5.0 / 9.0, 0.3125],
         );
         close_rect(
-            solution.outputs[2].source,
+            solution.outputs[2].slice,
             [0.0, 0.2734375, 5.0 / 9.0, 0.3125],
         );
         close_rect(
-            solution.outputs[3].source,
+            solution.outputs[3].slice,
             [4.0 / 9.0, 0.2734375, 5.0 / 9.0, 0.3125],
         );
     }
 
     /// The product contract the exact rule keeps: whatever the overlaps,
-    /// the union of source rectangles covers the whole canvas — no gap
+    /// the union of slice rectangles covers the whole canvas — no gap
     /// between neighbors, and every canvas edge reached or passed.
     #[test]
     fn exact_overlaps_still_cover_the_whole_canvas() {
@@ -1268,11 +1268,7 @@ mod tests {
         )
         .unwrap();
         let eps = 1.0e-9;
-        let rects: Vec<CanvasRect> = solution
-            .outputs
-            .iter()
-            .map(|output| output.source)
-            .collect();
+        let rects: Vec<CanvasRect> = solution.outputs.iter().map(|output| output.slice).collect();
 
         // The grid's left edge sits at or before the canvas's left edge, and
         // the two columns overlap or touch rather than leaving a gap between
@@ -1378,9 +1374,9 @@ mod tests {
         close(solution.arrangement.content_scale, 0.9);
         close(solution.unused_canvas.x, 0.0);
         close(solution.unused_canvas.y, 4.0 / 9.0);
-        close_rect(solution.outputs[0].source, [0.0, 0.125, 5.0 / 9.0, 0.3125]);
+        close_rect(solution.outputs[0].slice, [0.0, 0.125, 5.0 / 9.0, 0.3125]);
         close_rect(
-            solution.outputs[1].source,
+            solution.outputs[1].slice,
             [4.0 / 9.0, 0.125, 5.0 / 9.0, 0.3125],
         );
     }
@@ -1418,8 +1414,8 @@ mod tests {
         close(solution.overhang.x, 0.8);
         close(solution.overhang.y, 0.0);
         close(solution.implied_aspect, 3.2);
-        close_rect(solution.outputs[0].source, [-0.4, 0.0, 1.0, 0.5625]);
-        close_rect(solution.outputs[1].source, [0.4, 0.0, 1.0, 0.5625]);
+        close_rect(solution.outputs[0].slice, [-0.4, 0.0, 1.0, 0.5625]);
+        close_rect(solution.outputs[1].slice, [0.4, 0.0, 1.0, 0.5625]);
     }
 
     /// The coverage gate still guards content-scale mode, where an unseamed
@@ -1469,8 +1465,8 @@ mod tests {
         close(solution.unused_canvas.y, 0.0);
         close(solution.overhang.x, 0.0);
         close(solution.overhang.y, 7.0 / 9.0);
-        close_rect(solution.outputs[0].source, [0.0, -0.21875, 0.5625, 1.0]);
-        close_rect(solution.outputs[1].source, [0.4375, -0.21875, 0.5625, 1.0]);
+        close_rect(solution.outputs[0].slice, [0.0, -0.21875, 0.5625, 1.0]);
+        close_rect(solution.outputs[1].slice, [0.4375, -0.21875, 0.5625, 1.0]);
     }
 
     /// The mirror case: divW = 0, so sx = 1920/3840 = 0.5, sy = 0.9 and the
@@ -1491,11 +1487,11 @@ mod tests {
         close(solution.unused_canvas.x, 4.0 / 9.0);
         close(solution.unused_canvas.y, 0.0);
         close_rect(
-            solution.outputs[0].source,
+            solution.outputs[0].slice,
             [2.0 / 9.0, 0.0, 5.0 / 9.0, 0.3125],
         );
         close_rect(
-            solution.outputs[1].source,
+            solution.outputs[1].slice,
             [2.0 / 9.0, 0.25, 5.0 / 9.0, 0.3125],
         );
     }
@@ -1527,11 +1523,11 @@ mod tests {
         close(solution.unused_canvas.x, 465.0 / 3840.0);
         close(solution.unused_canvas.y, 0.0);
         close_rect(
-            solution.outputs[0].source,
+            solution.outputs[0].slice,
             [0.060546875, 0.0, 0.31640625, 0.5625],
         );
         close_rect(
-            solution.outputs[1].source,
+            solution.outputs[1].slice,
             [0.376953125, 0.0, 0.5625, 0.31640625],
         );
     }
@@ -1643,11 +1639,11 @@ mod tests {
         close(solution.overhang.y, 3.5);
         close(solution.implied_aspect, 16.0 / 9.0);
         close_rect(
-            solution.outputs[0].source,
+            solution.outputs[0].slice,
             [0.0, -0.21875, 5.0 / 9.0, 0.3125],
         );
         close_rect(
-            solution.outputs[3].source,
+            solution.outputs[3].slice,
             [4.0 / 9.0, 0.03125, 5.0 / 9.0, 0.3125],
         );
     }
@@ -1714,7 +1710,7 @@ mod tests {
     /// The same extreme 8:1 aspect with `allowUnusedCanvas: true`: the
     /// requested overlaps (unchanged, as always) at
     /// `scale = max(fit_x, fit_y) = 4.05` — the smallest scale that keeps
-    /// every source inside the canvas — with the resulting band reported.
+    /// every slice inside the canvas — with the resulting band reported.
     ///
     /// unused_x = 1 − fit_x/scale = 1 − 0.9/4.05 = 1 − 2/9 = 7/9: column x has
     /// the smaller fit, so it is the axis left short. unused_y = 1 −
@@ -1807,12 +1803,12 @@ mod tests {
     }
 
     #[test]
-    fn apply_replaces_sources_and_keeps_calibration() {
+    fn apply_replaces_slices_and_keeps_calibration() {
         let mut state = document(4);
-        // One output is already calibrated; only its source may change.
+        // One output is already calibrated; only its slice may change.
         let corners = [[0.01, 0.02], [0.99, 0.0], [1.0, 0.98], [0.0, 1.0]];
         state.outputs[1].geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.9,
                 y: 0.1,
                 width: 0.1,
@@ -1849,19 +1845,19 @@ mod tests {
         assert_eq!(calibrated.corners, corners);
         assert_eq!(calibrated.center, [0.4, 0.6]);
         close(calibrated.raster_footprint.x, 0.5);
-        close_rect(calibrated.source, [4.0 / 9.0, 0.0, 5.0 / 9.0, 0.3125]);
+        close_rect(calibrated.slice, [4.0 / 9.0, 0.0, 5.0 / 9.0, 0.3125]);
         // The rest were seeded with identity geometry.
         let seeded = state.outputs[0].geometry.as_ref().unwrap();
         assert_eq!(seeded.corners, UNIT_CORNERS);
         assert_eq!(seeded.center, [0.5, 0.5]);
-        assert_eq!(seeded.raster_footprint, seeded.source);
-        close_rect(seeded.source, [0.0, 0.0, 5.0 / 9.0, 0.3125]);
+        assert_eq!(seeded.raster_footprint, seeded.slice);
+        close_rect(seeded.slice, [0.0, 0.0, 5.0 / 9.0, 0.3125]);
 
         state.validate(true).unwrap();
     }
 
     #[test]
-    fn in_effect_follows_the_sources() {
+    fn in_effect_follows_the_slices() {
         let mut state = document(4);
         assert!(!in_effect(&state, mode_raster));
 
@@ -1875,19 +1871,19 @@ mod tests {
         assert!(in_effect(&state, mode_raster));
 
         // Well under the 1e-9 tolerance: a JSON round trip must not flip it.
-        state.outputs[0].geometry.as_mut().unwrap().source.x += 1.0e-12;
+        state.outputs[0].geometry.as_mut().unwrap().slice.x += 1.0e-12;
         assert!(in_effect(&state, mode_raster));
 
         // A real nudge is a real difference.
-        state.outputs[2].geometry.as_mut().unwrap().source.y += 1.0e-6;
+        state.outputs[2].geometry.as_mut().unwrap().slice.y += 1.0e-6;
         assert!(!in_effect(&state, mode_raster));
     }
 
     /// `arrangeOffset` shifts exactly the output that carries it, applied
-    /// after placement: every other output's source, and the coverage
+    /// after placement: every other output's slice, and the coverage
     /// report, come out identical to the same request with no offset at all.
     #[test]
-    fn arrange_offset_shifts_exactly_that_outputs_source() {
+    fn arrange_offset_shifts_exactly_that_outputs_slice() {
         let plain = hd_outputs(4);
         let mut offset_outputs = plain.clone();
         offset_outputs[1].arrange_offset = Some(ArrangeOffset { x: 0.01, y: -0.02 });
@@ -1899,22 +1895,19 @@ mod tests {
         close(offset.unused_canvas.x, base.unused_canvas.x);
         close(offset.unused_canvas.y, base.unused_canvas.y);
 
-        assert_eq!(offset.outputs[0].source, base.outputs[0].source);
-        assert_eq!(offset.outputs[2].source, base.outputs[2].source);
-        assert_eq!(offset.outputs[3].source, base.outputs[3].source);
+        assert_eq!(offset.outputs[0].slice, base.outputs[0].slice);
+        assert_eq!(offset.outputs[2].slice, base.outputs[2].slice);
+        assert_eq!(offset.outputs[3].slice, base.outputs[3].slice);
 
-        close(offset.outputs[1].source.x, base.outputs[1].source.x + 0.01);
-        close(offset.outputs[1].source.y, base.outputs[1].source.y - 0.02);
-        close(offset.outputs[1].source.width, base.outputs[1].source.width);
-        close(
-            offset.outputs[1].source.height,
-            base.outputs[1].source.height,
-        );
+        close(offset.outputs[1].slice.x, base.outputs[1].slice.x + 0.01);
+        close(offset.outputs[1].slice.y, base.outputs[1].slice.y - 0.02);
+        close(offset.outputs[1].slice.width, base.outputs[1].slice.width);
+        close(offset.outputs[1].slice.height, base.outputs[1].slice.height);
     }
 
     /// `inEffect` applies the document's *current* `arrangeOffset` before
     /// comparing, so an arrangement applied with an offset in place reads as
-    /// in effect; editing the offset afterward — without touching the source
+    /// in effect; editing the offset afterward — without touching the slice
     /// at all — is exactly the manual-geometry-edit case `inEffect` exists to
     /// catch, so it turns `false`.
     #[test]
@@ -1968,7 +1961,7 @@ mod tests {
     fn an_out_of_range_record_fails_document_validation() {
         let mut state = document(1);
         state.outputs[0].geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -2021,7 +2014,7 @@ mod tests {
     fn arrange_offset_out_of_range_fails_document_validation() {
         let mut state = document(1);
         state.outputs[0].geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,
@@ -2084,7 +2077,7 @@ mod tests {
     }
 
     /// A document arranged before the exact rule — the 20%/20% legacy
-    /// record at scale 0.9, with the legacy sources from
+    /// record at scale 0.9, with the legacy slices from
     /// [`two_by_two_at_twenty_percent_reproduces_the_legacy_result`] written
     /// by hand rather than by this solver — still reads as in effect: its
     /// slack is zero on both axes, so centering the signed slack changes
@@ -2094,17 +2087,17 @@ mod tests {
         let mut state = document(4);
         let legacy = [[0.0, 0.0], [4.0 / 9.0, 0.0], [0.0, 0.25], [4.0 / 9.0, 0.25]];
         for (output, [x, y]) in state.outputs.iter_mut().zip(legacy) {
-            let source = CanvasRect {
+            let slice = CanvasRect {
                 x,
                 y,
                 width: 5.0 / 9.0,
                 height: 0.3125,
             };
             output.geometry = Some(OutputGeometry {
-                source,
+                slice,
                 corners: UNIT_CORNERS,
                 center: [0.5, 0.5],
-                raster_footprint: source,
+                raster_footprint: slice,
             });
         }
         state.projection.as_mut().unwrap().arrangement = Some(Arrangement {

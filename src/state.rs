@@ -1170,7 +1170,7 @@ mod tests {
         });
         output.position = Some(Position { x: 0, y: 0 });
         output.geometry = Some(OutputGeometry {
-            source: CanvasRect {
+            slice: CanvasRect {
                 x: 0.0,
                 y: 0.0,
                 width: 1.0,

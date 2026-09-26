@@ -47,7 +47,7 @@
     sudo apt install chromium        # Debian, Raspberry Pi OS
     ```
 
-    On Ubuntu that command installs a **snap**, which Suede ignores — it updates itself on its own schedule and restarts the browser when it does, which on an appliance blanks the screens mid-show. Install Google Chrome's own `.deb` there instead, or accept the snap deliberately with `launcher.program` on the application. The `browsers` health check says which it found and which it declined.
+    On Ubuntu that command installs a **snap**, which Suede ignores — it updates itself on its own schedule and restarts the browser when it does, which on an appliance blanks the displays mid-show. Install Google Chrome's own `.deb` there instead, or accept the snap deliberately with `launcher.program` on the application. The `browsers` health check says which it found and which it declined.
 
 === "From source"
 

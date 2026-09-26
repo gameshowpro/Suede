@@ -898,7 +898,7 @@ impl Reconciler {
             self.allow_overlaps,
             Some(&previous),
         );
-        // Canvas/source geometry is shared by Simple and Warp.  The latter
+        // Canvas/slice geometry is shared by Simple and Warp.  The latter
         // merely adds the retained destination correction; an unavailable
         // Warp renderer must keep the same crop and canvas allocation.
         if desired
@@ -1736,7 +1736,7 @@ mod tests {
             height: 1080.0 / 3680.0,
         };
         config.geometry = Some(crate::model::OutputGeometry {
-            source,
+            slice: source,
             corners,
             center: [0.5, 0.5],
             raster_footprint: source,
@@ -1879,7 +1879,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(first.layout, second.layout);
-        assert_eq!(first.slices[0].source, second.slices[0].source);
+        assert_eq!(first.slices[0].slice, second.slices[0].slice);
         assert_eq!(first.slices[0].source_rect, second.slices[0].source_rect);
         assert_ne!(first.slices[0].geometry, second.slices[0].geometry);
     }
@@ -1913,9 +1913,9 @@ mod tests {
             "a plan that succeeds must not report a planning failure"
         );
 
-        // Break one output's source rectangle so the plan can no longer be
+        // Break one output's slice rectangle so the plan can no longer be
         // computed at all.
-        desired.outputs[0].geometry.as_mut().unwrap().source.width = 0.0;
+        desired.outputs[0].geometry.as_mut().unwrap().slice.width = 0.0;
         let fallback = harness
             .reconciler
             .plan_canvas(&desired)
@@ -1951,7 +1951,7 @@ mod tests {
             .set_outputs(harness.sway.get_outputs().await.unwrap());
         mark_gpu_warp_available(&harness);
         let mut desired = warp_layout(crate::model::ProjectionMode::Warp);
-        desired.outputs[0].geometry.as_mut().unwrap().source.width = 0.0;
+        desired.outputs[0].geometry.as_mut().unwrap().slice.width = 0.0;
 
         let fallback = harness
             .reconciler
@@ -2054,7 +2054,7 @@ mod tests {
                         .geometry
                         .as_ref()
                         .unwrap()
-                        .source
+                        .slice
                         .pixel_rect(canvas)
                         .unwrap(),
                 )
@@ -2117,7 +2117,7 @@ mod tests {
             .plan_canvas(&desired)
             .expect("shared Simple canvas must be planned");
         assert_eq!(
-            (plan.slices[0].source.width, plan.slices[0].source.height),
+            (plan.slices[0].slice.width, plan.slices[0].slice.height),
             (540, 960),
             "1920×1080 at scale 2 and 90° rotation is a 540×960 layer surface"
         );
@@ -2161,7 +2161,7 @@ mod tests {
             height: 1.0,
         };
         output.geometry = Some(crate::model::OutputGeometry {
-            source,
+            slice: source,
             raster_footprint: source,
             corners: [[0.12, 0.1], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
             center: [0.5, 0.5],

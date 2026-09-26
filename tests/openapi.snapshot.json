@@ -41,7 +41,7 @@
               },
               {
                 "$ref": "#/components/schemas/DisplayIdentity",
-                "description": "The display these were taken from, so that swapping the screen on a\nconnector re-adopts rather than pinning the old one's values forever.\n`None` when the display reported no EDID identity at all."
+                "description": "The display these were taken from, so that swapping the display on a\nconnector re-adopts rather than pinning the old one's values forever.\n`None` when the display reported no EDID identity at all."
               }
             ]
           },
@@ -238,7 +238,7 @@
       },
       "ArrangeOffset": {
         "additionalProperties": false,
-        "description": "A per-output nudge the grid arrangement solve adds to this output's\ncomputed source, in normalized canvas units — the same space as\n[`super::geometry::OutputGeometry::source`].\n\nApplied only by [`crate::model::arrangement::solve`], after placement:\ncoverage (`unusedCanvas`) and the strict full-coverage gate are computed\non the *pre-offset* rectangles, since an offset is a deliberate shift\n(mechanical alignment, for instance) that may uncover canvas pixels on\npurpose rather than a coverage failure. [`crate::model::arrangement::in_effect`]\napplies the document's current offset before comparing, so editing the\noffset after an arrangement has been applied turns `inEffect` false, like\nany other manual geometry edit.",
+        "description": "A per-output nudge the grid arrangement solve adds to this output's\ncomputed slice, in normalized canvas units — the same space as\n[`super::geometry::OutputGeometry::slice`].\n\nApplied only by [`crate::model::arrangement::solve`], after placement:\ncoverage (`unusedCanvas`) and the strict full-coverage gate are computed\non the *pre-offset* rectangles, since an offset is a deliberate shift\n(mechanical alignment, for instance) that may uncover canvas pixels on\npurpose rather than a coverage failure. [`crate::model::arrangement::in_effect`]\napplies the document's current offset before comparing, so editing the\noffset after an arrangement has been applied turns `inEffect` false, like\nany other manual geometry edit.",
         "properties": {
           "x": {
             "format": "double",
@@ -262,20 +262,20 @@
             "description": "[`super::desired::OutputMatch::key`] of the output this places.",
             "type": "string"
           },
-          "source": {
+          "slice": {
             "$ref": "#/components/schemas/CanvasRect",
             "description": "The normalized canvas rectangle this output samples."
           }
         },
         "required": [
           "key",
-          "source"
+          "slice"
         ],
         "type": "object"
       },
       "Arrangement": {
         "additionalProperties": false,
-        "description": "The resolved grid arrangement last applied to a document.\n\nAll five values are resolved: whichever of overlap or content scale the\nclient supplied, this records what the solver settled on. When overlaps\nwere requested they come back exactly as requested and only the content\nscale is derived; when a content scale was requested the overlaps are\nderived from it. It is a record of *intent*, not canonical geometry — the source\nrectangles remain the truth, and a later manual geometry edit leaves this\nin place. See [`in_effect`] for the test of whether it still describes the\ndocument.",
+        "description": "The resolved grid arrangement last applied to a document.\n\nAll five values are resolved: whichever of overlap or content scale the\nclient supplied, this records what the solver settled on. When overlaps\nwere requested they come back exactly as requested and only the content\nscale is derived; when a content scale was requested the overlaps are\nderived from it. It is a record of *intent*, not canonical geometry — the slice\nrectangles remain the truth, and a later manual geometry edit leaves this\nin place. See [`in_effect`] for the test of whether it still describes the\ndocument.",
         "properties": {
           "columns": {
             "description": "Grid columns; at least 1.",
@@ -396,7 +396,7 @@
         "description": "What a client asks for: the grid, plus *either* the overlaps *or* the\ncontent scale.\n\nThe overlaps are exact: the solver either honors them as given, choosing\nthe content scale so the grid covers the whole canvas (overhanging it on\nthe axis whose fit is larger), or refuses the request. It never changes an\noverlap. Supplying both overlaps and a content scale is over-determined\nand is an error; supplying neither means both overlaps are zero.",
         "properties": {
           "allowUnusedCanvas": {
-            "description": "Accept a solution that leaves part of the canvas uncovered.\n\nDefault `false`: overlap requests cover the whole canvas, overhanging\nit on the axis whose fit is larger (`contentScale = min(fitX, fitY)`),\nso they never leave a band; a content-scale solve that would leave\none (an unseamed axis falling short of the canvas at the asked-for\nscale) is refused with a `422` naming the axis, the band as a\npercentage of the canvas, and the aspect that would close it. `true`\ninstead fits the whole grid *inside* the canvas at the requested\noverlaps — `contentScale = max(fitX, fitY)`, since a smaller scale\nwould push a source past the canvas edge and a larger one would cover\nless on both axes — and reports the band that leaves.\n\n**Behavior change from Suede 0.1.14**: a request that used to succeed\nwith a band left on the canvas (any single-row or single-column grid\non a mismatched canvas aspect, for instance) now overhangs the canvas\ninstead; set this to `true` to get the old fit-inside answer and its\nband back.",
+            "description": "Accept a solution that leaves part of the canvas uncovered.\n\nDefault `false`: overlap requests cover the whole canvas, overhanging\nit on the axis whose fit is larger (`contentScale = min(fitX, fitY)`),\nso they never leave a band; a content-scale solve that would leave\none (an unseamed axis falling short of the canvas at the asked-for\nscale) is refused with a `422` naming the axis, the band as a\npercentage of the canvas, and the aspect that would close it. `true`\ninstead fits the whole grid *inside* the canvas at the requested\noverlaps — `contentScale = max(fitX, fitY)`, since a smaller scale\nwould push a slice past the canvas edge and a larger one would cover\nless on both axes — and reports the band that leaves.\n\n**Behavior change from Suede 0.1.14**: a request that used to succeed\nwith a band left on the canvas (any single-row or single-column grid\non a mismatched canvas aspect, for instance) now overhangs the canvas\ninstead; set this to `true` to get the old fit-inside answer and its\nband back.",
             "type": "boolean"
           },
           "columns": {
@@ -486,7 +486,7 @@
         "type": "object"
       },
       "ArrangementStatus": {
-        "description": "The persisted grid-arrangement record from the effective document, and\nwhether re-solving it still reproduces the current sources. See\n[`crate::model::in_effect`]: the record is intent, not canonical geometry,\nso a later manual geometry edit leaves it in place and turns `inEffect`\nfalse rather than reverting or dropping it.",
+        "description": "The persisted grid-arrangement record from the effective document, and\nwhether re-solving it still reproduces the current slices. See\n[`crate::model::in_effect`]: the record is intent, not canonical geometry,\nso a later manual geometry edit leaves it in place and turns `inEffect`\nfalse rather than reverting or dropping it.",
         "properties": {
           "arrangement": {
             "oneOf": [
@@ -667,7 +667,7 @@
         "type": "object"
       },
       "Background": {
-        "description": "What an output shows behind, or instead of, any window.\n\nAn appliance with a blank screen looks broken even when it is merely\nbetween launches, so a background gives it something deliberate to show\nwhile a browser restarts or before the first app starts.",
+        "description": "What an output shows behind, or instead of, any window.\n\nAn appliance with a blank display looks broken even when it is merely\nbetween launches, so a background gives it something deliberate to show\nwhile a browser restarts or before the first app starts.",
         "properties": {
           "color": {
             "description": "`#rrggbb`, shown where the wallpaper does not reach, or on its own.\nAbsent means [`DEFAULT_BACKGROUND_COLOR`].",
@@ -721,7 +721,7 @@
         "description": "A named background, defined once and used by any number of outputs."
       },
       "BackgroundRef": {
-        "description": "What an output's `background` may be.\n\nA bare string names a preset; an object spells the properties out. Both are\naccepted because they serve different callers: the UI wants one dropdown\nacross every screen, while a script driving the API directly should not\nhave to create a preset to paint one output.\n\n```json\n\"background\": \"lobby\"\n\"background\": { \"wallpaper\": \"teal\", \"mode\": \"fill\", \"color\": \"#101820\" }\n```",
+        "description": "What an output's `background` may be.\n\nA bare string names a preset; an object spells the properties out. Both are\naccepted because they serve different callers: the UI wants one dropdown\nacross every output, while a script driving the API directly should not\nhave to create a preset to paint one output.\n\n```json\n\"background\": \"lobby\"\n\"background\": { \"wallpaper\": \"teal\", \"mode\": \"fill\", \"color\": \"#101820\" }\n```",
         "oneOf": [
           {
             "description": "Id of an entry in [`DesiredState::backgrounds`].",
@@ -1169,7 +1169,7 @@
           },
           "backgrounds": {
             "default": [],
-            "description": "Named background definitions outputs can refer to.\n\nA multi-display installation usually wants one look across every\nalternative — repeating a wallpaper, scaling mode and color on each\noutput — makes the common case the laborious one and guarantees the\nscreens drift apart the first time somebody edits only three of four.",
+            "description": "Named background definitions outputs can refer to.\n\nA multi-display installation usually wants one look across every\nalternative — repeating a wallpaper, scaling mode and color on each\noutput — makes the common case the laborious one and guarantees the\ndisplays drift apart the first time somebody edits only three of four.",
             "items": {
               "$ref": "#/components/schemas/BackgroundPreset"
             },
@@ -1230,7 +1230,7 @@
       },
       "DisplayIdentity": {
         "additionalProperties": false,
-        "description": "Enough of a display's EDID to tell \"the same screen\" from \"a different\none on the same connector\".",
+        "description": "Enough of a display's EDID to tell \"the same display\" from \"a different\none on the same connector\".",
         "properties": {
           "make": {
             "type": [
@@ -1751,7 +1751,7 @@
               },
               {
                 "$ref": "#/components/schemas/OutputGeometry",
-                "description": "Shared normalized content source plus retained Warp correction and\nindependent physical light footprint. Simple uses the same source.\nKept independently from `position` and from the requested pipeline so\nswitching to simple mode does not discard calibrated warp settings."
+                "description": "Shared normalized content slice plus retained Warp correction and\nindependent physical light footprint. Simple uses the same slice.\nKept independently from `position` and from the requested pipeline so\nswitching to simple mode does not discard calibrated warp settings."
               }
             ]
           },
@@ -1839,15 +1839,15 @@
           },
           "rasterFootprint": {
             "$ref": "#/components/schemas/CanvasRect",
-            "description": "Physical light-field coverage, independent of source and destination\npins. Until a calibrated footprint is supplied, conversion copies the\nsource rectangle into this field."
+            "description": "Physical light-field coverage, independent of the slice and\ndestination pins. Until a calibrated footprint is supplied, conversion\ncopies the slice rectangle into this field."
           },
-          "source": {
+          "slice": {
             "$ref": "#/components/schemas/CanvasRect",
-            "description": "Canonical normalized crop, used by both Simple and Warp. Pixel crop\norigins and content enlargement are derived from this rectangle, never\nstored as a second editable representation."
+            "description": "The slice: the canonical normalized canvas region this output\nsamples, used by both Simple and Warp. Pixel crop origins and content\nenlargement are derived from this rectangle, never stored as a second\neditable representation.\n\nSerialized as `slice`; `source` is still accepted on input (an alpha\nrename) so saved documents and older clients' writes keep parsing,\nbut every response and every re-serialization emits `slice`."
           }
         },
         "required": [
-          "source",
+          "slice",
           "corners",
           "rasterFootprint"
         ],
@@ -2289,7 +2289,7 @@
       },
       "ProjectionConfig": {
         "additionalProperties": false,
-        "description": "Shared multi-projector content layout and retained Warp correction.\n\nThere is no overlap setting here, because the source layout determines\noverlap. Simple and Warp share the configured canvas and normalized source\nrectangles. Warp adds destination correction to that content selection.\nWithout an explicit canvas, integer output positions define the layout.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
+        "description": "Shared multi-projector content layout and retained Warp correction.\n\nThere is no overlap setting here, because the slice layout determines\noverlap. Simple and Warp share the configured canvas and normalized slice\nrectangles. Warp adds destination correction to that content selection.\nWithout an explicit canvas, integer output positions define the layout.\n\nSway never sees any of this. It is always handed a plain edge-to-edge\ntiling; the active app renders into a headless canvas the size of the\nlayout's bounding box; and the slicer cuts that canvas into each\nprojector's configured rectangle, duplicating the intersections and\nfading them from both sides when `blend` is on.",
         "properties": {
           "arrangement": {
             "default": null,
@@ -2299,7 +2299,7 @@
               },
               {
                 "$ref": "#/components/schemas/Arrangement",
-                "description": "The grid arrangement last applied, as a record of what was asked for.\n\nExplicit geometry stays canonical: this holds the resolved rows,\ncolumns, overlaps and content scale so a slider client can pick up\nwhere the last one left off, and nothing else reads it. A later\nmanual geometry edit leaves it in place — see\n[`crate::model::arrangement::in_effect`], which reports whether it\nstill describes the document's sources."
+                "description": "The grid arrangement last applied, as a record of what was asked for.\n\nExplicit geometry stays canonical: this holds the resolved rows,\ncolumns, overlaps and content scale so a slider client can pick up\nwhere the last one left off, and nothing else reads it. A later\nmanual geometry edit leaves it in place — see\n[`crate::model::arrangement::in_effect`], which reports whether it\nstill describes the document's slices."
               }
             ]
           },
@@ -3254,7 +3254,7 @@
         "type": "string"
       },
       "Transform": {
-        "description": "Screen rotation and flipping, as accepted by `sway-output(5)`.",
+        "description": "Output rotation and flipping, as accepted by `sway-output(5)`.",
         "enum": [
           "normal",
           "90",
@@ -4846,7 +4846,7 @@
                 }
               }
             },
-            "description": "The persisted grid-arrangement record from the effective document, whether re-solving it still reproduces the current sources, and (when computable) the overlap limits at the recorded values",
+            "description": "The persisted grid-arrangement record from the effective document, whether re-solving it still reproduces the current slices, and (when computable) the overlap limits at the recorded values",
             "headers": {
               "ETag": {
                 "description": "Persisted document revision, quoted for If-Match",
@@ -4947,7 +4947,7 @@
                 }
               }
             },
-            "description": "The accepted document; the resolved five values are at `projection.arrangement` and every enabled output's `geometry.source` reflects the solve",
+            "description": "The accepted document; the resolved five values are at `projection.arrangement` and every enabled output's `geometry.slice` reflects the solve",
             "headers": {
               "ETag": {
                 "description": "Persisted document revision, quoted for If-Match",
@@ -4978,7 +4978,7 @@
             "description": "The grid does not fit the outputs, an output has no known raster, the request is over- or under-determined, an overlap is outside [0, 1), an edge slice would fall entirely outside the canvas, or the result fails document validation"
           }
         },
-        "summary": "Solve a grid arrangement and write it — each enabled output's\n`geometry.source`, and the resolved five values at\n`projection.arrangement` — exactly like any other config write:\n`committed: false` (the default) replaces the shared working copy and\napplies to the outputs; `committed: true` persists it. See\n[`crate::model::arrangement`] for the solver itself and\n`docs/configuration.md`'s \"Grid arrangement\" section for the contract.",
+        "summary": "Solve a grid arrangement and write it — each enabled output's\n`geometry.slice`, and the resolved five values at\n`projection.arrangement` — exactly like any other config write:\n`committed: false` (the default) replaces the shared working copy and\napplies to the outputs; `committed: true` persists it. See\n[`crate::model::arrangement`] for the solver itself and\n`docs/configuration.md`'s \"Grid arrangement\" section for the contract.",
         "tags": [
           "config"
         ]

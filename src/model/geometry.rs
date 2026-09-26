@@ -11,7 +11,7 @@ use utoipa::ToSchema;
 
 use super::limits::{MAX_CANVAS_PIXELS, MAX_DIMENSION, MAX_OUTPUT_PIXELS};
 
-const MAX_SOURCE_SPAN: f64 = 16.0;
+const MAX_SLICE_SPAN: f64 = 16.0;
 const TOPOLOGY_EPS: f64 = 1.0e-12;
 const SHARED_EDGE_EPS: f64 = 1.0e-10;
 
@@ -22,7 +22,7 @@ pub enum ProjectionMode {
     /// Shared rectangular content selection and scaling, without correction.
     #[default]
     Simple,
-    /// Configured canvas source rectangles and destination corner pins.
+    /// Configured canvas slice rectangles and destination corner pins.
     Warp,
 }
 
@@ -163,17 +163,23 @@ impl CanvasConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OutputGeometry {
-    /// Canonical normalized crop, used by both Simple and Warp. Pixel crop
-    /// origins and content enlargement are derived from this rectangle, never
-    /// stored as a second editable representation.
-    pub source: CanvasRect,
+    /// The slice: the canonical normalized canvas region this output
+    /// samples, used by both Simple and Warp. Pixel crop origins and content
+    /// enlargement are derived from this rectangle, never stored as a second
+    /// editable representation.
+    ///
+    /// Serialized as `slice`; `source` is still accepted on input (an alpha
+    /// rename) so saved documents and older clients' writes keep parsing,
+    /// but every response and every re-serialization emits `slice`.
+    #[serde(alias = "source")]
+    pub slice: CanvasRect,
     /// Output-local normalized destination pins in TL, TR, BR, BL order.
     pub corners: [[f64; 2]; 4],
     #[serde(default = "neutral_center")]
     pub center: [f64; 2],
-    /// Physical light-field coverage, independent of source and destination
-    /// pins. Until a calibrated footprint is supplied, conversion copies the
-    /// source rectangle into this field.
+    /// Physical light-field coverage, independent of the slice and
+    /// destination pins. Until a calibrated footprint is supplied, conversion
+    /// copies the slice rectangle into this field.
     pub raster_footprint: CanvasRect,
 }
 
@@ -182,14 +188,14 @@ fn neutral_center() -> [f64; 2] {
 }
 
 impl OutputGeometry {
-    pub fn source_quad(&self) -> [[f64; 2]; 4] {
-        self.source.corners()
+    pub fn slice_quad(&self) -> [[f64; 2]; 4] {
+        self.slice.corners()
     }
 
     /// Validate the geometry that is independent of the selected pipeline.
     pub fn validate_numbers(&self, canvas: Option<&CanvasConfig>) -> Result<(), String> {
-        if !self.source.finite_positive() {
-            return Err("geometry.source must contain finite positive dimensions".into());
+        if !self.slice.finite_positive() {
+            return Err("geometry.slice must contain finite positive dimensions".into());
         }
         if !self.raster_footprint.finite_positive() {
             return Err("geometry.rasterFootprint must contain finite positive dimensions".into());
@@ -212,7 +218,7 @@ impl OutputGeometry {
             .map(|_| ())
             .map_err(|error| format!("geometry corners are invalid: {error}"))?;
         if let Some(canvas) = canvas {
-            validate_rect_bounds(self.source, canvas, "geometry.source")?;
+            validate_rect_bounds(self.slice, canvas, "geometry.slice")?;
             validate_rect_extent(self.raster_footprint, canvas, "geometry.rasterFootprint")?;
         }
         Ok(())
@@ -235,7 +241,7 @@ impl OutputGeometry {
         let corners = self
             .corners
             .map(|[x, y]| [x * f64::from(width), y * f64::from(height)]);
-        let source_rect = self.source.pixel_rect(canvas)?;
+        let source_rect = self.slice.pixel_rect(canvas)?;
         crate::warp_math::Warp::new(corners, self.center, width, height)
             .and_then(|warp| warp.with_source_rect(source_rect))
             .map(|_| ())
@@ -273,7 +279,7 @@ fn validate_rect_extent(
     }
     let bounds = canvas.bounds()?;
     let span = bounds.width.max(bounds.height);
-    let limit = MAX_SOURCE_SPAN * span;
+    let limit = MAX_SLICE_SPAN * span;
     if rect.x.abs() > limit
         || rect.y.abs() > limit
         || rect.right().abs() > limit
@@ -284,7 +290,7 @@ fn validate_rect_extent(
     Ok(())
 }
 
-/// Validate the topology of public rectangular source regions.
+/// Validate the topology of public rectangular slice regions.
 ///
 /// The boolean is `true` only for a pure near-total stack (every pair covers
 /// at least 80% of the smaller original rectangle).  The graph otherwise
@@ -292,13 +298,13 @@ fn validate_rect_extent(
 /// contact and gaps do not connect regions.
 ///
 /// Requires every region to be reachable from every other (see
-/// [`validate_sources_allow_disconnected`] for the one caller — a legacy
+/// [`validate_slices_allow_disconnected`] for the one caller — a legacy
 /// integer-position layout — that must accept a gap).
-pub fn validate_sources(canvas: &CanvasConfig, sources: &[CanvasRect]) -> Result<bool, String> {
-    validate_sources_inner(canvas, sources, true)
+pub fn validate_slices(canvas: &CanvasConfig, slices: &[CanvasRect]) -> Result<bool, String> {
+    validate_slices_inner(canvas, slices, true)
 }
 
-/// As [`validate_sources`], but a source graph with more than one connected
+/// As [`validate_slices`], but a slice graph with more than one connected
 /// component is not an error: disconnected groups simply never blend with
 /// each other. Every other check — bounds, minimum area, and the
 /// near-total-stack-vs-ordinary-seam consistency rule — is unchanged and
@@ -310,35 +316,35 @@ pub fn validate_sources(canvas: &CanvasConfig, sources: &[CanvasRect]) -> Result
 /// had, not of the legacy positioning scheme itself. A wall with a
 /// deliberate gap between two output groups produced a canvas plan before
 /// canvas calibration existed and must keep doing so.
-pub(crate) fn validate_sources_allow_disconnected(
+pub(crate) fn validate_slices_allow_disconnected(
     canvas: &CanvasConfig,
-    sources: &[CanvasRect],
+    slices: &[CanvasRect],
 ) -> Result<bool, String> {
-    validate_sources_inner(canvas, sources, false)
+    validate_slices_inner(canvas, slices, false)
 }
 
-fn validate_sources_inner(
+fn validate_slices_inner(
     canvas: &CanvasConfig,
-    sources: &[CanvasRect],
+    slices: &[CanvasRect],
     require_connected: bool,
 ) -> Result<bool, String> {
-    if sources.is_empty() || sources.len() > 8 {
-        return Err("sources must contain between 1 and 8 regions".into());
+    if slices.is_empty() || slices.len() > 8 {
+        return Err("slices must contain between 1 and 8 regions".into());
     }
     let bounds = canvas.bounds()?;
     let span = bounds.width.max(bounds.height);
-    for (index, source) in sources.iter().copied().enumerate() {
-        validate_rect_bounds(source, canvas, &format!("source[{index}]"))?;
-        if source.width * source.height <= TOPOLOGY_EPS * span * span {
-            return Err(format!("source[{index}] area is too small"));
+    for (index, slice) in slices.iter().copied().enumerate() {
+        validate_rect_bounds(slice, canvas, &format!("slice[{index}]"))?;
+        if slice.width * slice.height <= TOPOLOGY_EPS * span * span {
+            return Err(format!("slice[{index}] area is too small"));
         }
     }
 
     let mut all_stack = true;
-    for i in 0..sources.len() {
-        for j in (i + 1)..sources.len() {
-            let a = sources[i];
-            let b = sources[j];
+    for i in 0..slices.len() {
+        for j in (i + 1)..slices.len() {
+            let a = slices[i];
+            let b = slices[j];
             let intersection = clipped_intersection(a, b, bounds);
             let overlap = intersection.width.max(0.0) * intersection.height.max(0.0);
             let shared_edge = shared_edge_length(a, b, bounds);
@@ -364,15 +370,15 @@ fn validate_sources_inner(
             overlap > TOPOLOGY_EPS * span * span
                 || shared_edge_length(a, b, bounds) > SHARED_EDGE_EPS * span
         };
-        let mut connected = vec![false; sources.len()];
+        let mut connected = vec![false; slices.len()];
         connected[0] = true;
         let mut stack = vec![0usize];
         while let Some(current) = stack.pop() {
-            for j in 0..sources.len() {
+            for j in 0..slices.len() {
                 if connected[j] || j == current {
                     continue;
                 }
-                if linked(sources[current], sources[j]) {
+                if linked(slices[current], slices[j]) {
                     connected[j] = true;
                     stack.push(j);
                 }
@@ -380,27 +386,27 @@ fn validate_sources_inner(
         }
         if connected.iter().any(|value| !value) {
             return Err(
-                "sources are disconnected: gaps and point contacts do not connect regions".into(),
+                "slices are disconnected: gaps and point contacts do not connect regions".into(),
             );
         }
     }
 
     let mut any_near_total = false;
-    for i in 0..sources.len() {
-        for j in (i + 1)..sources.len() {
-            let overlap = raw_intersection(sources[i], sources[j]);
+    for i in 0..slices.len() {
+        for j in (i + 1)..slices.len() {
+            let overlap = raw_intersection(slices[i], slices[j]);
             let overlap = overlap.width.max(0.0) * overlap.height.max(0.0);
-            if overlap >= 0.8 * sources[i].area().min(sources[j].area()) {
+            if overlap >= 0.8 * slices[i].area().min(slices[j].area()) {
                 any_near_total = true;
             } else if any_near_total {
                 return Err(
-                    "mixed_stack_topology: source pairs must all be near-total or ordinary".into(),
+                    "mixed_stack_topology: slice pairs must all be near-total or ordinary".into(),
                 );
             }
         }
     }
     if any_near_total && !all_stack {
-        return Err("mixed_stack_topology: source pairs must all be near-total or ordinary".into());
+        return Err("mixed_stack_topology: slice pairs must all be near-total or ordinary".into());
     }
     Ok(any_near_total)
 }
@@ -487,22 +493,22 @@ mod tests {
     }
 
     #[test]
-    fn source_topology_distinguishes_stack_and_gap() {
+    fn slice_topology_distinguishes_stack_and_gap() {
         let canvas = CanvasConfig {
             aspect: 1.0,
             render_width: 100,
         };
-        assert!(!validate_sources(
+        assert!(!validate_slices(
             &canvas,
             &[rect(0.0, 0.0, 1.0, 1.0), rect(0.5, 0.0, 1.0, 1.0)]
         )
         .unwrap());
-        assert!(validate_sources(
+        assert!(validate_slices(
             &canvas,
             &[rect(0.0, 0.0, 1.0, 1.0), rect(1.1, 0.0, 1.0, 1.0)]
         )
         .is_err());
-        assert!(validate_sources(
+        assert!(validate_slices(
             &canvas,
             &[rect(0.0, 0.0, 1.0, 1.0), rect(0.1, 0.0, 1.0, 1.0)]
         )
@@ -510,18 +516,18 @@ mod tests {
     }
 
     #[test]
-    fn source_topology_rejects_two_disjoint_chains() {
+    fn slice_topology_rejects_two_disjoint_chains() {
         let canvas = CanvasConfig {
             aspect: 1.0,
             render_width: 100,
         };
-        let sources = [
+        let slices = [
             rect(0.0, 0.0, 0.2, 1.0),
             rect(0.2, 0.0, 0.2, 1.0),
             rect(0.6, 0.0, 0.2, 1.0),
             rect(0.8, 0.0, 0.2, 1.0),
         ];
-        let error = validate_sources(&canvas, &sources).unwrap_err();
+        let error = validate_slices(&canvas, &slices).unwrap_err();
         assert!(error.contains("disconnected"), "{error}");
     }
 
@@ -529,7 +535,7 @@ mod tests {
     fn geometry_uses_camel_case_and_defaults_neutral_center() {
         let geometry: OutputGeometry = serde_json::from_str(
             r#"{
-                "source":{"x":0,"y":0,"width":1,"height":1},
+                "slice":{"x":0,"y":0,"width":1,"height":1},
                 "corners":[[0,0],[1,0],[1,1],[0,1]],
                 "rasterFootprint":{"x":0,"y":0,"width":1,"height":1}
             }"#,
@@ -539,5 +545,31 @@ mod tests {
         let value = serde_json::to_value(geometry).unwrap();
         assert!(value.get("rasterFootprint").is_some());
         assert!(value.get("raster_footprint").is_none());
+    }
+
+    /// The alpha rename's back-compat contract: a document (or an old
+    /// client's write) naming the field `source` still parses, and every
+    /// re-serialization emits the new name, `slice`, never the alias.
+    #[test]
+    fn geometry_slice_accepts_the_source_alias_and_serializes_as_slice() {
+        let geometry: OutputGeometry = serde_json::from_str(
+            r#"{
+                "source":{"x":0.25,"y":0.5,"width":1,"height":1},
+                "corners":[[0,0],[1,0],[1,1],[0,1]],
+                "rasterFootprint":{"x":0,"y":0,"width":1,"height":1}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(geometry.slice, rect(0.25, 0.5, 1.0, 1.0));
+        let value = serde_json::to_value(&geometry).unwrap();
+        assert_eq!(
+            value.get("slice"),
+            Some(&serde_json::json!({"x":0.25,"y":0.5,"width":1.0,"height":1.0}))
+        );
+        assert!(value.get("source").is_none());
+
+        // Round-trips through the canonical name too, unsurprisingly.
+        let round_tripped: OutputGeometry = serde_json::from_value(value).unwrap();
+        assert_eq!(round_tripped, geometry);
     }
 }

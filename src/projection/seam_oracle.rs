@@ -698,7 +698,7 @@ mod tests {
             participants: vec![
                 LayoutParticipant {
                     output: "A".into(),
-                    source: CanvasRect {
+                    slice: CanvasRect {
                         x: 0.0,
                         y: 0.0,
                         width: 2.0,
@@ -713,7 +713,7 @@ mod tests {
                 },
                 LayoutParticipant {
                     output: "B".into(),
-                    source: CanvasRect {
+                    slice: CanvasRect {
                         x: -1.0,
                         y: 0.0,
                         width: 2.0,
@@ -993,7 +993,7 @@ mod tests {
                 };
                 LayoutParticipant {
                     output: i.to_string(),
-                    source,
+                    slice: source,
                     raster_footprint: source,
                 }
             })
@@ -1056,7 +1056,7 @@ mod tests {
                 };
                 LayoutParticipant {
                     output: i.to_string(),
-                    source,
+                    slice: source,
                     raster_footprint: source,
                 }
             })
