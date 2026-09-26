@@ -243,8 +243,11 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   assert.equal(await page.evaluate(()=>configEpoch),'restarted-fixture');
   mark('daemon restart epoch still retires the old event source for status correlation');
   await page.locator('#pj-lift-mode').selectOption('adaptive');await settle();
-  await page.locator('#pj-lift').fill('0.2');await settle();
-  await page.locator('#pj-rise').fill('800');await settle();
+  // Number fields commit on "change", not "input" — fill() alone only fires
+  // "input", so a real blur/change is dispatched to land the value, exactly
+  // as a Tab-out or spinner step would.
+  await page.locator('#pj-lift').fill('0.2');await page.locator('#pj-lift').dispatchEvent('change');await settle();
+  await page.locator('#pj-rise').fill('800');await page.locator('#pj-rise').dispatchEvent('change');await settle();
   let lift=(await read()).projection.blackLift;
   assert.deepEqual(lift,{mode:'adaptive',level:.2,darkThreshold:.02,brightThreshold:.2,riseMs:800,fallMs:250,slewPerSecond:.1});
   await page.locator('#tp-pattern').selectOption('white');await settle();
@@ -252,7 +255,7 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   await page.locator('#pj-save').click();await page.waitForFunction(()=>config.committed);await settle();
   assert.deepEqual(committed.projection.blackLift,lift);
   assert.equal(committed.projection.testPattern,null);
-  await page.locator('#pj-lift').fill('0.3');await settle();
+  await page.locator('#pj-lift').fill('0.3');await page.locator('#pj-lift').dispatchEvent('change');await settle();
   await page.locator('#pj-cancel').click();await page.waitForFunction(()=>config.projection.blackLift.level===.2);
   assert.deepEqual((await read()).projection.blackLift,lift);
   mark('adaptive fields survive pattern preview, Save, and Cancel');
@@ -275,6 +278,25 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
   assert.equal((await read()).projection.blackLift,.2);
   assert.equal(await page.locator('#pj-adaptive-fields').isHidden(),true);
   mark('fixed mode restores numeric configuration semantics');
+
+  // Round 5: number inputs commit on "change", never "input" — a part-typed
+  // value must not preview mid-edit, a blur/change must round and normalize
+  // gamma to 2 decimal places, and emptying the field must restore rather
+  // than committing Number("") === 0.
+  const gammaRequests=history.length;
+  await page.locator('#pj-gamma').fill('2.1555');
+  assert.equal(history.length,gammaRequests);
+  await settle();
+  assert.equal(history.length,gammaRequests);assert.equal((await read()).projection.gamma,2.2);
+  mark('typing a partial gamma value sends no preview until blur');
+  await page.locator('#pj-gamma').dispatchEvent('change');await settle();
+  assert.equal((await read()).projection.gamma,2.16);
+  assert.equal(await page.locator('#pj-gamma').inputValue(),'2.16');
+  mark('blur commits gamma rounded to 2 decimal places and normalizes the field text');
+  await page.locator('#pj-gamma').fill('');await page.locator('#pj-gamma').dispatchEvent('change');await settle();
+  assert.equal((await read()).projection.gamma,2.16);
+  assert.equal(await page.locator('#pj-gamma').inputValue(),'2.16');
+  mark('emptying pj-gamma restores the last committed value instead of pushing 0');
 
   assert.deepEqual(failures,[]);
   const output=process.env.UI_EVIDENCE;
