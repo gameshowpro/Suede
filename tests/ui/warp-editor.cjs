@@ -217,9 +217,11 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
   await page.locator('#arrange-outputs').click();
   await page.locator('#arrange-rows').fill('2'); await page.locator('#arrange-columns').fill('2');
 
-  // Unchecked by default, and sent on every dry run either way (a no-op in
-  // scale mode, but the daemon's own default is also false).
-  assert.equal(await page.locator('#arrange-allow-unused').isChecked(), false);
+  // "Use all canvas pixels" is the default side, and the flag is sent on
+  // every dry run either way (a no-op in scale mode, but the daemon's own
+  // default is also false).
+  assert.equal(await page.locator('#arrange-coverage-all').getAttribute('aria-pressed'), 'true');
+  assert.equal(await page.locator('#arrange-coverage-inside').getAttribute('aria-pressed'), 'false');
 
   // The order list is config.outputs order itself, one row per configured
   // output, position first. Bumping the second row above the first is an
@@ -286,13 +288,15 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
   assert.deepEqual(arrangeQueries.at(-1),
     { rows: '2', columns: '2', overlapX: '0.1', overlapY: '0.1', allowUnusedCanvas: 'false' });
 
-  // Ticking the box resends the same numbers with the flag true; the daemon
-  // now fits the grid inside the canvas instead (the band case), trading
-  // the horizontal overhang for a vertical band. "Overlap: 10% H, 10% V"
-  // is already on screen from the overhang answer above, so "unused
-  // vertically" (only ever true for the band answer) is the wait that
-  // actually proves the new response landed.
-  await page.locator('#arrange-allow-unused').check();
+  // Clicking "Keep slices inside the canvas" resends the same numbers with
+  // the flag true; the daemon now fits the grid inside the canvas instead
+  // (the band case), trading the horizontal overhang for a vertical band.
+  // "Overlap: 10% H, 10% V" is already in the preview text from the
+  // overhang answer above, so "unused vertically" (only ever true for the
+  // band answer) is the wait that actually proves the new response landed.
+  await page.locator('#arrange-coverage-inside').click();
+  assert.equal(await page.locator('#arrange-coverage-all').getAttribute('aria-pressed'), 'false');
+  assert.equal(await page.locator('#arrange-coverage-inside').getAttribute('aria-pressed'), 'true');
   await arrangeSays('unused vertically');
   assert.equal(await page.locator('#arrange-scale').inputValue(), '91.2');
   assert.equal(await page.locator('#arrange-apply').isDisabled(), false);
@@ -315,9 +319,10 @@ const veryHighOverlap = 'Overlap is very high (>80%); outputs almost entirely co
   assert.deepEqual(edited.outputs.find(output => output.match.name === 'HDMI-A-2').geometry.corners,
     before.outputs[1].geometry.corners);
 
-  // Reopening the dialog remembers the checkbox choice, same as the mode.
+  // Reopening the dialog remembers the toggle choice, same as the mode.
   await page.locator('#arrange-outputs').click();
-  assert.equal(await page.locator('#arrange-allow-unused').isChecked(), true);
+  assert.equal(await page.locator('#arrange-coverage-all').getAttribute('aria-pressed'), 'false');
+  assert.equal(await page.locator('#arrange-coverage-inside').getAttribute('aria-pressed'), 'true');
   await page.locator('#arrange-cancel').click();
 
   await page.evaluate(() => { projectionStats.geometry.warpAvailable = false; renderWarpEditor(); });

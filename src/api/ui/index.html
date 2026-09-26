@@ -560,13 +560,16 @@ window.addEventListener("error", (event) => {
     <dialog id="arrange-dialog" aria-labelledby="arrange-title">
       <form method="dialog">
         <h2 id="arrange-title">Arrange outputs</h2>
-        <p class="hint">Enabled outputs are placed left to right, then top to bottom, in the order listed below. The daemon does the arithmetic. Overlap sends the two overlaps you set below exactly — the daemon never adjusts either one — and derives the content scale (100% = 1:1 pixel sampling) that covers the canvas: the axis with less room to spare fills it exactly, and the other centers a black overhang past the canvas's edge — the line below says how much, and which canvas aspect would remove it — unless "Allow unused canvas pixels" below is checked, which instead fits the whole grid inside the canvas and leaves an uncovered band there rather than any overhang. An edge output whose slice would fall off the canvas entirely is refused outright, in either case. Scale sends the content scale instead and gets both overlaps back.</p>
+        <p class="hint">Enabled outputs are placed left to right, then top to bottom, in the order listed below. The daemon does the arithmetic. Overlap sends the two overlaps you set below exactly — the daemon never adjusts either one — and derives the content scale (100% = 1:1 pixel sampling) that covers the canvas: the axis with less room to spare fills it exactly, and the other centers a black overhang past the canvas's edge — the line below says how much, and which canvas aspect would remove it. "Use all canvas pixels" (the default) accepts that overhang, so the slack spills past the canvas's edges and those slice regions render black. "Keep slices inside the canvas" instead shrinks the grid to fit, so the slack becomes an unprojected canvas band there rather than any overhang. An edge output whose slice would fall off the canvas entirely is refused outright, in either case. Scale sends the content scale instead and gets both overlaps back.</p>
         <div class="row arrange-mode-row">
           <div class="mode-toggle" role="group" aria-label="Arrange by">
             <button type="button" id="arrange-mode-overlap" aria-pressed="true">Overlap</button>
             <button type="button" id="arrange-mode-scale" aria-pressed="false">Scale</button>
           </div>
-          <label for="arrange-allow-unused"><input type="checkbox" id="arrange-allow-unused"> Allow unused canvas pixels</label>
+          <div class="mode-toggle" role="group" aria-label="Canvas coverage">
+            <button type="button" id="arrange-coverage-all" aria-pressed="true">Use all canvas pixels</button>
+            <button type="button" id="arrange-coverage-inside" aria-pressed="false">Keep slices inside the canvas</button>
+          </div>
         </div>
         <div class="fields">
           <div><label for="arrange-rows">Rows</label><input id="arrange-rows" type="number" min="1" step="1" value="1"></div>
@@ -2257,11 +2260,21 @@ $("arrange-mode-overlap").onclick = () => setArrangeMode("overlap");
 $("arrange-mode-scale").onclick = () => setArrangeMode("scale");
 setArrangeMode(arrangeMode);
 
-$("arrange-allow-unused").checked = loadArrangeAllowUnused();
-$("arrange-allow-unused").onchange = () => {
-  saveArrangeAllowUnused($("arrange-allow-unused").checked);
+// Same toggle pattern as arrangeMode above; stays enabled in both Scale and
+// Overlap modes — under the exact+overfill solver the flag is not inert in
+// scale mode either, it still decides whether a band is refused or
+// accepted-with-band.
+let arrangeAllowUnused = loadArrangeAllowUnused();
+function setArrangeAllowUnused(value) {
+  arrangeAllowUnused = value;
+  saveArrangeAllowUnused(value);
+  $("arrange-coverage-all").setAttribute("aria-pressed", String(!value));
+  $("arrange-coverage-inside").setAttribute("aria-pressed", String(value));
   scheduleArrangePreview();
-};
+}
+$("arrange-coverage-all").onclick = () => setArrangeAllowUnused(false);
+$("arrange-coverage-inside").onclick = () => setArrangeAllowUnused(true);
+setArrangeAllowUnused(arrangeAllowUnused);
 
 // Never repaint the control being typed into, exactly as the panel render
 // functions do not.
@@ -2280,7 +2293,7 @@ function arrangeRequest() {
   // Always sent, in both modes: it is a no-op in scale mode (which always
   // fills both axes) but the daemon's default is false either way, so the
   // dry run must say so explicitly rather than relying on that default.
-  const allowUnusedCanvas = $("arrange-allow-unused").checked;
+  const allowUnusedCanvas = arrangeAllowUnused;
   if (arrangeMode === "scale") {
     const contentScale = Number($("arrange-scale").value) / 100;
     if (!(contentScale > 0 && Number.isFinite(contentScale))) throw new Error("Content scale must be positive.");
@@ -2393,7 +2406,7 @@ $("arrange-outputs").onclick = () => {
     }
   }
   setArrangeMode(loadArrangeMode());
-  $("arrange-allow-unused").checked = loadArrangeAllowUnused();
+  setArrangeAllowUnused(loadArrangeAllowUnused());
   renderArrangeOutputs();
   $("arrange-preview").textContent = "Calculating…";
   $("arrange-apply").disabled = true;
