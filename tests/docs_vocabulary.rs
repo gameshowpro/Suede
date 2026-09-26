@@ -180,7 +180,10 @@ fn inline_code_spans_are_exempt_but_the_prose_around_them_is_not() {
     );
     // An unbalanced backtick treats the tail as code: safe for identifiers,
     // and the balanced form is what well-formed docs write anyway.
-    assert_eq!(banned_words_in("run `pw-dump --monitor"), Vec::<&str>::new());
+    assert_eq!(
+        banned_words_in("run `pw-dump --monitor"),
+        Vec::<&str>::new()
+    );
 }
 
 #[test]
