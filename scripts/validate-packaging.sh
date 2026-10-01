@@ -64,6 +64,195 @@ expect_scanout "scanout turned off for the A/B" "allow_overlaps = true
 direct_scanout = false"                                                                        1
 
 echo
+echo "The login profile chooses the direct-presentation session from suede.toml"
+# The PRESENTATION_EOF block decides, at every login, whether sway starts
+# headless-only for direct presentation or as the ordinary DRM session. It has
+# to agree with suede::presentation::resolve (and BootstrapConfig's
+# presentation_effective), and its runtime files are what the daemon reads.
+PRESENTATION_SNIPPET="$(sed -n "/<<'PRESENTATION_EOF'/,/^PRESENTATION_EOF$/p" packaging/provision.sh | sed '1d;$d')"
+[[ -n "$PRESENTATION_SNIPPET" ]] || bad "could not find the PRESENTATION_EOF block in provision.sh"
+# $1 = suede.toml contents (empty for no file), $2 = previous session (empty
+# for none), $3 = direct-attempts (empty for none), $4 = "marker" to start
+# with a fallback marker. Prints: chosen session, WLR_BACKENDS,
+# WLR_HEADLESS_OUTPUTS, the session file, the attempts file, whether a
+# marker exists afterwards, and whether display-reset ran.
+presentation_for() {
+  local home runtime stub snippet
+  home="$(mktemp -d)"
+  runtime="$home/run"
+  mkdir -p "$runtime/suede"
+  if [[ -n "$1" ]]; then
+    mkdir -p "$home/.config/suede"
+    printf '%s\n' "$1" > "$home/.config/suede/suede.toml"
+  fi
+  [[ -n "${2:-}" ]] && printf '%s\n' "$2" > "$runtime/suede/session"
+  [[ -n "${3:-}" ]] && printf '%s\n' "$3" > "$runtime/suede/direct-attempts"
+  [[ "${4:-}" == "marker" ]] && echo '{"reason":"test","time":0,"bootId":""}' \
+    > "$runtime/suede/presentation-fallback"
+  # Never run the real binary from a test: it opens the DRM cards.
+  stub="$home/suede-stub"
+  printf '#!/bin/sh\necho "$@" >> "%s/reset.log"\n' "$home" > "$stub"
+  chmod +x "$stub"
+  snippet="${PRESENTATION_SNIPPET//\/usr\/bin\/suede/$stub}"
+  (
+    HOME="$home"
+    XDG_RUNTIME_DIR="$runtime"
+    unset WLR_BACKENDS WLR_HEADLESS_OUTPUTS suede_session
+    eval "$snippet"
+    printf '%s %s %s session=%s attempts=%s marker=%s reset=%s\n' \
+      "$suede_session" "${WLR_BACKENDS:-unset}" "${WLR_HEADLESS_OUTPUTS:-unset}" \
+      "$(cat "$runtime/suede/session" 2>/dev/null)" \
+      "$(cat "$runtime/suede/direct-attempts" 2>/dev/null || echo none)" \
+      "$([[ -e "$runtime/suede/presentation-fallback" ]] && echo yes || echo no)" \
+      "$([[ -s "$home/reset.log" ]] && echo yes || echo no)"
+  )
+  rm -rf "$home"
+}
+expect_presentation() {  # $1 = label, $2 = expected line, then presentation_for's arguments
+  local label="$1" expected="$2" got
+  shift 2
+  got="$(presentation_for "$@")"
+  if [[ "$got" == "$expected" ]]; then ok "$label -> $got"; else bad "$label -> $got (expected $expected)"; fi
+}
+DIRECT_TOML='presentation = "direct"
+allow_overlaps = true'
+expect_presentation "no suede.toml" \
+  "wayland unset unset session=wayland attempts=none marker=no reset=no" ""
+expect_presentation "direct without allow_overlaps" \
+  "wayland unset unset session=wayland attempts=none marker=no reset=no" 'presentation = "direct"'
+expect_presentation "direct commented out" \
+  "wayland unset unset session=wayland attempts=none marker=no reset=no" '# presentation = "direct"
+allow_overlaps = true'
+expect_presentation "presentation = wayland" \
+  "wayland unset unset session=wayland attempts=none marker=no reset=no" 'presentation = "wayland"
+allow_overlaps = true'
+expect_presentation "direct with allow_overlaps" \
+  "direct headless 1 session=direct attempts=1 marker=no reset=no" "$DIRECT_TOML"
+expect_presentation "direct, second attempt" \
+  "direct headless 1 session=direct attempts=2 marker=no reset=no" "$DIRECT_TOML" "" 1
+expect_presentation "direct after a fallback this boot" \
+  "wayland unset unset session=wayland attempts=none marker=yes reset=no" "$DIRECT_TOML" "" "" marker
+expect_presentation "direct after 3 unconfirmed attempts" \
+  "wayland unset unset session=wayland attempts=3 marker=yes reset=no" "$DIRECT_TOML" "" 3
+expect_presentation "leaving a direct session resets the displays" \
+  "wayland unset unset session=wayland attempts=none marker=yes reset=yes" "$DIRECT_TOML" direct "" marker
+expect_presentation "a direct session after a direct session also resets" \
+  "direct headless 1 session=direct attempts=2 marker=no reset=yes" "$DIRECT_TOML" direct 1
+expect_presentation "leaving a wayland session does not reset" \
+  "direct headless 1 session=direct attempts=1 marker=no reset=no" "$DIRECT_TOML" wayland
+expect_presentation "a garbled attempts file counts as none" \
+  "direct headless 1 session=direct attempts=1 marker=no reset=no" "$DIRECT_TOML" "" "x"
+# The marker the profile writes must be one the daemon can read back.
+MARKER_JSON="$(
+  home="$(mktemp -d)"; mkdir -p "$home/.config/suede" "$home/run/suede"
+  printf '%s\n' "$DIRECT_TOML" > "$home/.config/suede/suede.toml"
+  echo 3 > "$home/run/suede/direct-attempts"
+  ( HOME="$home"; XDG_RUNTIME_DIR="$home/run"; eval "$PRESENTATION_SNIPPET" )
+  cat "$home/run/suede/presentation-fallback"; rm -rf "$home"
+)"
+if python3 -c 'import json,sys; m=json.loads(sys.argv[1]); assert m["reason"] and isinstance(m["time"], int) and "bootId" in m' "$MARKER_JSON" 2>/dev/null; then
+  ok "the attempts marker is valid JSON with reason, time and bootId"
+else
+  bad "the attempts marker is not the JSON the daemon reads: $MARKER_JSON"
+fi
+
+echo
+echo "The login profile picks the render node of the card that drives the displays"
+# On a machine with more than one GPU (an integrated GPU beside the discrete
+# card that drives the wall — System B's shape: card0/i915 with nothing
+# connected, card1/nvidia with three connected outputs), the headless canvas
+# must be allocated on the same device pick_direct_physical_device will later
+# match by DRM primary node, or direct presentation finds no candidate GPU at
+# all. The block reads SUEDE_DRM_SYSFS/SUEDE_DRM_DEV instead of the real
+# /sys/class/drm and /dev/dri whenever they are set, which is only here.
+RENDER_ROOT="$(mktemp -d)"
+render_node_for() {  # each remaining arg is "card:connected-count[:renderD]"
+  local drm dev home card_spec card connected render i
+  rm -rf "$RENDER_ROOT"
+  home="$RENDER_ROOT/home"
+  drm="$RENDER_ROOT/drm"
+  dev="$RENDER_ROOT/dev"
+  mkdir -p "$drm" "$dev" "$home/.config/suede" "$home/run/suede"
+  printf '%s\n' "$DIRECT_TOML" > "$home/.config/suede/suede.toml"
+  for card_spec in "$@"; do
+    IFS=':' read -r card connected render <<<"$card_spec"
+    mkdir -p "$drm/$card"
+    if [[ -n "$render" ]]; then
+      mkdir -p "$drm/$card/device/drm/$render"
+      : > "$dev/$render"
+    fi
+    i=0
+    while [[ "$i" -lt "$connected" ]]; do
+      mkdir -p "$drm/$card-DP-$i"
+      echo connected > "$drm/$card-DP-$i/status"
+      i=$((i + 1))
+    done
+    # Every card also has one disconnected connector, so "has a connector
+    # directory at all" is never mistaken for "has a connected one".
+    mkdir -p "$drm/$card-DP-idle"
+    echo disconnected > "$drm/$card-DP-idle/status"
+  done
+  (
+    HOME="$home"
+    XDG_RUNTIME_DIR="$home/run"
+    SUEDE_DRM_SYSFS="$drm"
+    SUEDE_DRM_DEV="$dev"
+    unset WLR_RENDER_DRM_DEVICE suede_session
+    eval "$PRESENTATION_SNIPPET"
+    echo "${WLR_RENDER_DRM_DEVICE:-unset}"
+  )
+}
+expect_render_node() {  # $1 = label, $2 = expected WLR_RENDER_DRM_DEVICE, then card specs
+  local label="$1" expected="$2" got
+  shift 2
+  got="$(render_node_for "$@")"
+  if [[ "$got" == "$expected" ]]; then ok "$label -> $got"; else bad "$label -> $got (expected $expected)"; fi
+}
+expect_render_node "an idle iGPU beside the card that drives the wall (System B's shape)" \
+  "$RENDER_ROOT/dev/renderD129" card0:0:renderD128 card1:3:renderD129
+expect_render_node "the same, cards in the other order" \
+  "$RENDER_ROOT/dev/renderD128" card0:3:renderD128 card1:0:renderD129
+expect_render_node "a single card with nothing connected falls back to the first renderD*" \
+  "$RENDER_ROOT/dev/renderD128" card0:0:renderD128
+rm -rf "$RENDER_ROOT"
+
+echo
+echo "The login profile exports __GL_YIELD from suede.toml"
+# The GL_YIELD_EOF block runs before both exec sway branches, so it has to
+# agree with GlYieldMode::parse in src/config.rs about which values it acts
+# on: only "usleep" and "nothing" export anything; anything else (absent,
+# "default", commented out, or a typo) leaves the variable unset, since Mesa
+# ignores it anyway and NVIDIA's own default is what "unset" means.
+GL_YIELD_SNIPPET="$(sed -n "/<<'GL_YIELD_EOF'/,/^GL_YIELD_EOF$/p" packaging/provision.sh | sed '1d;$d')"
+[[ -n "$GL_YIELD_SNIPPET" ]] || bad "could not find the GL_YIELD_EOF block in provision.sh"
+gl_yield_for() {  # $1 = suede.toml contents, empty for no file at all
+  local home
+  home="$(mktemp -d)"
+  if [[ -n "$1" ]]; then
+    mkdir -p "$home/.config/suede"
+    printf '%s\n' "$1" > "$home/.config/suede/suede.toml"
+  fi
+  (
+    HOME="$home"
+    unset __GL_YIELD
+    eval "$GL_YIELD_SNIPPET"
+    echo "${__GL_YIELD:-unset}"
+  )
+  rm -rf "$home"
+}
+expect_gl_yield() {  # $1 = label, $2 = toml, $3 = expected value of the variable
+  local got
+  got="$(gl_yield_for "$2")"
+  if [[ "$got" == "$3" ]]; then ok "$1 -> $3"; else bad "$1 -> $got (expected $3)"; fi
+}
+expect_gl_yield "no suede.toml"           ""                     unset
+expect_gl_yield "gl_yield = \"default\""  'gl_yield = "default"'  unset
+expect_gl_yield "gl_yield = \"usleep\""   'gl_yield = "usleep"'   USLEEP
+expect_gl_yield "gl_yield = \"nothing\""  'gl_yield = "nothing"'  NOTHING
+expect_gl_yield "gl_yield commented out"  '# gl_yield = "usleep"' unset
+expect_gl_yield "an unrecognized value"   'gl_yield = "busy"'     unset
+
+echo
 echo "Packaged assets exist"
 python3 - <<'PY' || exit 1
 import re, sys, pathlib

@@ -9,10 +9,13 @@ pub mod audio;
 pub mod capabilities;
 pub mod checks;
 pub mod config;
+pub mod drm_inventory;
 pub mod error;
 pub mod events;
 pub mod model;
+pub mod nvidia_driver;
 pub mod ports;
+pub mod presentation;
 pub mod probe;
 #[cfg(feature = "projection")]
 pub mod projection;

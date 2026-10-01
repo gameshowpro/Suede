@@ -1,19 +1,19 @@
 //! Bootstrap configuration: everything that must be known before the API can serve.
 //!
 //! Read once at startup from `$XDG_CONFIG_HOME/suede/suede.toml`; every value
-//! but [`BootstrapConfig::allow_overlaps`] and
-//! [`BootstrapConfig::direct_scanout`] is overridable by a `SUEDE_*`
-//! environment variable, which wins. Those two describe how the compositor
-//! was started, which an environment variable on *Suede's* process cannot
-//! change. Everything else is desired state, owned by the API (see
-//! [`crate::state`]).
+//! but [`BootstrapConfig::allow_overlaps`], [`BootstrapConfig::direct_scanout`],
+//! [`BootstrapConfig::presentation`] and [`BootstrapConfig::gl_yield`] is
+//! overridable by a `SUEDE_*` environment variable, which wins. Those four
+//! describe how the compositor was started, which an environment variable on
+//! *Suede's* process cannot change. Everything else is desired state, owned
+//! by the API (see [`crate::state`]).
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::model::PowerVerb;
+use crate::model::{GlYieldMode, PowerVerb, PresentationMode};
 use crate::supervisor::launcher::{CHROMIUM_PROGRAMS, FIREFOX_PROGRAMS};
 
 pub const DEFAULT_BIND: &str = "0.0.0.0:9088";
@@ -43,6 +43,14 @@ struct FileConfig {
     /// `allow_overlaps` is false, where scanning out is not safe; an absent
     /// key must never turn an upgrade into a startup failure.
     direct_scanout: Option<bool>,
+    /// Raw string, like `power`: a bad value must become a
+    /// [`ConfigError::Presentation`] naming the value and the accepted ones,
+    /// not whatever wording `toml`'s enum deserialization happens to produce.
+    presentation: Option<String>,
+    /// Raw string, like `presentation`: a bad value must become a
+    /// [`ConfigError::GlYield`] naming the value and the accepted ones, not
+    /// whatever wording `toml`'s enum deserialization happens to produce.
+    gl_yield: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +125,24 @@ pub struct BootstrapConfig {
     /// some drivers. The key being absent is not refused, because true is
     /// simply its default.
     pub direct_scanout: bool,
+    /// How this session was asked to present its outputs — experimental; see
+    /// [`Self::presentation_effective`].
+    ///
+    /// Bootstrap rather than desired state for the same reason as
+    /// [`Self::allow_overlaps`]: it is a fact about how the compositor was
+    /// started, fixed until the next session restart, and a remotely
+    /// writable desired-state document must not be able to push the wall
+    /// onto a path that can black it out.
+    pub presentation: PresentationMode,
+    /// NVIDIA's `__GL_YIELD` toggle to export into Sway's environment at
+    /// login — experimental; see [`crate::model::GlYieldStatus`].
+    ///
+    /// Bootstrap rather than desired state, and not `SUEDE_*`-overridable,
+    /// for the same reason as [`Self::presentation`]: it describes how the
+    /// compositor's environment was set at login, which cannot be changed
+    /// from Suede's own process afterwards. Defaults to `default`: driver
+    /// behavior is unchanged unless an operator opts in.
+    pub gl_yield: GlYieldMode,
 }
 
 impl Default for BootstrapConfig {
@@ -132,6 +158,8 @@ impl Default for BootstrapConfig {
             allowed_programs: default_allowed_programs(),
             allow_overlaps: false,
             direct_scanout: true,
+            presentation: PresentationMode::Wayland,
+            gl_yield: GlYieldMode::Default,
         }
     }
 }
@@ -203,6 +231,21 @@ pub enum ConfigError {
          remove direct_scanout — it only has an effect there."
     )]
     DirectScanoutWithoutOverlaps,
+    /// A typo here must not silently keep the appliance on whichever path it
+    /// already runs — the same reasoning as [`ConfigError::PowerVerb`].
+    #[error(
+        "unknown presentation {value:?}; accepted values are {}",
+        PresentationMode::ALL.iter().map(PresentationMode::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    Presentation { value: String },
+    /// Same reasoning as [`ConfigError::Presentation`]: a typo must not
+    /// silently leave the appliance running whichever `__GL_YIELD` behavior
+    /// it already has.
+    #[error(
+        "unknown gl_yield {value:?}; accepted values are {}",
+        GlYieldMode::ALL.iter().map(GlYieldMode::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    GlYield { value: String },
 }
 
 impl BootstrapConfig {
@@ -261,6 +304,20 @@ impl BootstrapConfig {
             return Err(ConfigError::DirectScanoutWithoutOverlaps);
         }
         config.direct_scanout = file.direct_scanout.unwrap_or(true);
+        config.presentation = match file.presentation {
+            Some(value) => {
+                PresentationMode::parse(&value).ok_or_else(|| ConfigError::Presentation {
+                    value: value.clone(),
+                })?
+            }
+            None => PresentationMode::Wayland,
+        };
+        config.gl_yield = match file.gl_yield {
+            Some(value) => GlYieldMode::parse(&value).ok_or_else(|| ConfigError::GlYield {
+                value: value.clone(),
+            })?,
+            None => GlYieldMode::Default,
+        };
 
         Ok(config)
     }
@@ -278,6 +335,41 @@ impl BootstrapConfig {
     /// different conclusions about the same file.
     pub fn scanout_expected(&self) -> bool {
         self.allow_overlaps && self.direct_scanout
+    }
+
+    /// Resolve `presentation` into what `GET /system` reports: the effective
+    /// mode this session actually runs, and why it differs from what was
+    /// requested, if it does.
+    ///
+    /// The one place this is decided, so the startup log and the API cannot
+    /// reach different conclusions about the same file — same reasoning as
+    /// [`Self::scanout_expected`].
+    ///
+    /// `direct` without `allow_overlaps = true` never fails startup; it
+    /// resolves to effective `wayland` instead, because the login profile
+    /// applies the same rule and starts the ordinary Wayland session
+    /// regardless (see `packaging/provision.sh`).
+    ///
+    /// This is the file's answer only — what the login profile will have
+    /// started given nothing else. The session the daemon actually finds
+    /// (the compositor it connects to, and a fallback earlier this boot) can
+    /// still turn `direct` into `wayland`; that is
+    /// [`crate::presentation::resolve`], which starts from this.
+    pub fn presentation_effective(&self) -> (PresentationMode, Option<String>) {
+        match self.presentation {
+            PresentationMode::Wayland => (PresentationMode::Wayland, None),
+            PresentationMode::Direct if !self.allow_overlaps => (
+                PresentationMode::Wayland,
+                Some(
+                    "presentation = \"direct\" needs allow_overlaps = true; the login \
+                     profile applies the same rule and starts the ordinary Wayland \
+                     session, so the daemon reports effective wayland instead of \
+                     failing to start."
+                        .to_string(),
+                ),
+            ),
+            PresentationMode::Direct => (PresentationMode::Direct, None),
+        }
     }
 
     /// Whether this appliance is permitted to perform `verb`.
@@ -566,6 +658,106 @@ mod tests {
 
         std::fs::write(&path, "direct_scanouts = false\n").unwrap();
         assert!(BootstrapConfig::load(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn presentation_defaults_to_wayland_and_is_read_from_the_file() {
+        let _guard = env_lock();
+        // Absent means wayland: the path every existing appliance already
+        // runs, so an upgrade cannot change what a machine does at its next
+        // boot.
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert_eq!(config.presentation, PresentationMode::Wayland);
+        let (effective, reason) = config.presentation_effective();
+        assert_eq!(effective, PresentationMode::Wayland);
+        assert!(reason.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+
+        std::fs::write(&path, "presentation = \"wayland\"\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.presentation, PresentationMode::Wayland);
+
+        // `direct` never fails startup, even without `allow_overlaps` — it is
+        // a request the daemon resolves, not a hard requirement.
+        std::fs::write(&path, "presentation = \"direct\"\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.presentation, PresentationMode::Direct);
+
+        // A misspelling is refused outright rather than silently leaving the
+        // machine on whichever path it already runs.
+        std::fs::write(&path, "presentation = \"headless\"\n").unwrap();
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("headless"), "{error}");
+        assert!(error.contains("wayland"), "{error}");
+        assert!(error.contains("direct"), "{error}");
+    }
+
+    #[test]
+    fn direct_without_overlaps_resolves_to_effective_wayland_with_a_reason() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+
+        // `direct` without `allow_overlaps = true`: this must not fail
+        // startup (see decision 3) — it resolves to effective wayland with a
+        // reason instead, because the login profile applies the same rule.
+        std::fs::write(&path, "presentation = \"direct\"\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.presentation, PresentationMode::Direct);
+        let (effective, reason) = config.presentation_effective();
+        assert_eq!(effective, PresentationMode::Wayland);
+        let reason = reason.expect("a reason when requested and effective differ");
+        assert!(reason.contains("allow_overlaps"), "{reason}");
+
+        // `direct` with `allow_overlaps = true`: the file asks for direct,
+        // and nothing about the file stands in its way (the session the
+        // daemon finds still can; see `presentation::resolve`).
+        std::fs::write(&path, "presentation = \"direct\"\nallow_overlaps = true\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        let (effective, reason) = config.presentation_effective();
+        assert_eq!(effective, PresentationMode::Direct);
+        assert!(reason.is_none(), "{reason:?}");
+    }
+
+    #[test]
+    fn gl_yield_defaults_to_default_and_is_read_from_the_file() {
+        let _guard = env_lock();
+        // Absent means default: unchanged driver behavior, so an upgrade
+        // cannot change what a machine does at its next boot.
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert_eq!(config.gl_yield, GlYieldMode::Default);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+
+        std::fs::write(&path, "gl_yield = \"default\"\n").unwrap();
+        assert_eq!(
+            BootstrapConfig::load(Some(&path)).unwrap().gl_yield,
+            GlYieldMode::Default
+        );
+
+        std::fs::write(&path, "gl_yield = \"usleep\"\n").unwrap();
+        assert_eq!(
+            BootstrapConfig::load(Some(&path)).unwrap().gl_yield,
+            GlYieldMode::Usleep
+        );
+
+        std::fs::write(&path, "gl_yield = \"nothing\"\n").unwrap();
+        assert_eq!(
+            BootstrapConfig::load(Some(&path)).unwrap().gl_yield,
+            GlYieldMode::Nothing
+        );
+
+        // A misspelling is refused outright rather than silently leaving the
+        // machine on whichever behavior it already has.
+        std::fs::write(&path, "gl_yield = \"busy\"\n").unwrap();
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("busy"), "{error}");
+        assert!(error.contains("default"), "{error}");
+        assert!(error.contains("usleep"), "{error}");
+        assert!(error.contains("nothing"), "{error}");
     }
 
     #[test]

@@ -547,6 +547,211 @@ pub struct SystemInfo {
     /// UI uses it to disable and explain its buttons rather than offering ones
     /// that would be refused.
     pub power_verbs: Vec<PowerVerb>,
+    /// How this session was asked to present, and how it actually is —
+    /// experimental; see
+    /// [`crate::config::BootstrapConfig::presentation_effective`].
+    pub presentation: PresentationStatus,
+    /// NVIDIA's `__GL_YIELD` toggle, requested and live — experimental; see
+    /// [`GlYieldStatus`].
+    pub gl_yield: GlYieldStatus,
+    /// The NVIDIA driver this session runs, or `null` on a non-NVIDIA
+    /// machine — see [`crate::nvidia_driver::detect`]. Read fresh on every
+    /// request, like `gl_yield.effective`.
+    pub nvidia_driver: Option<NvidiaDriverStatus>,
+}
+
+/// How an appliance presents its outputs: the default Wayland path (sway
+/// tiles or slices, as [`crate::config::BootstrapConfig::allow_overlaps`]
+/// decides), or the experimental direct path where the daemon takes
+/// ownership of the physical outputs itself and presents through the
+/// slicer's Vulkan swapchain, bypassing the compositor entirely.
+///
+/// Read once at startup from `suede.toml`'s top-level `presentation` key,
+/// exactly like [`crate::config::BootstrapConfig::allow_overlaps`] — never
+/// overridable by a `SUEDE_*` variable, because it describes how the
+/// compositor was started, which a variable on Suede's own process cannot
+/// change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum PresentationMode {
+    Wayland,
+    Direct,
+}
+
+impl PresentationMode {
+    /// Every accepted value, in the order an error message should list them.
+    pub const ALL: &'static [PresentationMode] =
+        &[PresentationMode::Wayland, PresentationMode::Direct];
+
+    /// The lowercase spelling used in TOML and reported over the API — the
+    /// same word in both places, like [`PowerVerb::as_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wayland => "wayland",
+            Self::Direct => "direct",
+        }
+    }
+
+    /// Parse the lowercase spelling. `None` rather than an error type of its
+    /// own: the caller wants to name the bad value and list
+    /// [`PresentationMode::ALL`] itself, which needs the original string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "wayland" => Some(Self::Wayland),
+            "direct" => Some(Self::Direct),
+            _ => None,
+        }
+    }
+}
+
+/// What `GET /system` reports about presentation — requested, effective, and
+/// why they differ, if they do.
+///
+/// Experimental. `effective` is what this session runs, decided once when
+/// the daemon starts (see [`crate::presentation::resolve`]): `direct` only
+/// when the login started a headless-only compositor for it and no
+/// fallback has happened this boot. A fallback ends the session and the
+/// next one reports `wayland` with the fallback's reason until a reboot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PresentationStatus {
+    /// What `suede.toml` asked for.
+    pub requested: PresentationMode,
+    /// What this session is actually running.
+    pub effective: PresentationMode,
+    /// Why `effective` differs from `requested`, or `null` when they match.
+    pub reason: Option<String>,
+    /// Physical outputs the daemon owns directly, bypassing the compositor:
+    /// every connected display while `effective` is `direct`, and empty
+    /// otherwise.
+    pub outputs: Vec<String>,
+}
+
+/// NVIDIA's `__GL_YIELD` toggle for Sway's environment — experimental; see
+/// [`crate::config::BootstrapConfig::gl_yield`].
+///
+/// Read once at startup from `suede.toml`'s top-level `gl_yield` key, exactly
+/// like [`PresentationMode`] — never overridable by a `SUEDE_*` variable,
+/// because it too describes how the compositor was started. NVIDIA-only:
+/// Mesa ignores `__GL_YIELD` entirely, so this has no effect on other
+/// drivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GlYieldMode {
+    Default,
+    Usleep,
+    Nothing,
+}
+
+impl GlYieldMode {
+    /// Every accepted value, in the order an error message should list them.
+    pub const ALL: &'static [GlYieldMode] = &[
+        GlYieldMode::Default,
+        GlYieldMode::Usleep,
+        GlYieldMode::Nothing,
+    ];
+
+    /// The lowercase spelling used in TOML and reported over the API — the
+    /// same word in both places, like [`PresentationMode::as_str`].
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Usleep => "usleep",
+            Self::Nothing => "nothing",
+        }
+    }
+
+    /// Parse the lowercase spelling. `None` rather than an error type of its
+    /// own: the caller wants to name the bad value and list
+    /// [`GlYieldMode::ALL`] itself, which needs the original string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "default" => Some(Self::Default),
+            "usleep" => Some(Self::Usleep),
+            "nothing" => Some(Self::Nothing),
+            _ => None,
+        }
+    }
+
+    /// Map the live `__GL_YIELD` value found in the compositor's own
+    /// environment to the mode it corresponds to. Absent, or set to anything
+    /// other than NVIDIA's two recognized spellings (case-insensitively,
+    /// matching the driver itself) reads as `default` — that is what the
+    /// driver does without the variable, and this is a live read of
+    /// whatever is actually there, not a validated `suede.toml` value.
+    pub fn from_env_value(value: Option<&str>) -> Self {
+        match value {
+            Some(v) if v.eq_ignore_ascii_case("USLEEP") => Self::Usleep,
+            Some(v) if v.eq_ignore_ascii_case("NOTHING") => Self::Nothing,
+            _ => Self::Default,
+        }
+    }
+}
+
+/// What `GET /system` reports about `gl_yield` — requested and live.
+///
+/// Experimental. Unlike [`PresentationStatus`], `effective` is not resolved
+/// once at startup and cached: it is read from the live Sway's
+/// `/proc/<pid>/environ` on every request, so a session that has not been
+/// restarted since `suede.toml` changed shows the mismatch instead of a
+/// stale cached answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GlYieldStatus {
+    /// What `suede.toml` asks for.
+    pub requested: GlYieldMode,
+    /// What the live compositor's environment actually shows right now.
+    pub effective: GlYieldMode,
+}
+
+/// Which NVIDIA kernel module is loaded, read from the `NVRM version:` line
+/// of `/proc/driver/nvidia/version` — see [`crate::nvidia_driver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum NvidiaKernelModule {
+    /// The closed-source binary blob: `NVIDIA UNIX x86_64 Kernel Module`.
+    Proprietary,
+    /// The open-source kernel module NVIDIA ships alongside it: `Open Kernel
+    /// Module`. This one has no option to run without GSP firmware.
+    Open,
+}
+
+/// Whether the GPU Systems Processor firmware is active for this GPU, read
+/// from the `GPU Firmware:` line of
+/// `/proc/driver/nvidia/gpus/*/information` — see [`crate::nvidia_driver`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum GspFirmware {
+    /// The information file names a firmware version rather than `N/A`.
+    On,
+    /// The information file reports `N/A`.
+    Off,
+    /// The information file has no `GPU Firmware:` line at all, so the
+    /// driver does not say whether GSP is running. Older drivers (e.g. 550)
+    /// omit the line even where GSP firmware is configured on.
+    Unknown,
+}
+
+/// What `GET /system` reports about the NVIDIA driver, or `null` on a
+/// machine `/proc/driver/nvidia` does not exist on — see
+/// [`crate::nvidia_driver::detect`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct NvidiaDriverStatus {
+    /// The dotted version NVRM reports, e.g. `595.91.07`.
+    pub version: String,
+    pub kernel_module: NvidiaKernelModule,
+    pub gsp_firmware: GspFirmware,
+    /// True only for the proprietary module: the open module requires GSP
+    /// and has no way to disable it.
+    pub gsp_optional: bool,
+    /// The newest driver release Suede's direct and Wayland presentation
+    /// paths have been validated on — see
+    /// [`crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER`]. Reported
+    /// alongside `version` so a client can compare them without also
+    /// shipping the constant, and so the `nvidia-driver-version` health
+    /// check's warning is self-explanatory from the API alone.
+    pub newest_tested: String,
 }
 
 /// A host power operation Suede may be permitted to perform.
@@ -958,8 +1163,9 @@ pub struct ProjectionStats {
     /// Times an output stopped answering frame callbacks and was dropped from the gate.
     pub stalls: u32,
     pub per_frame_ms: FrameCost,
-    /// Whether the compositor offers wp_presentation; without it offset_ms and the
-    /// per-output presented/discarded/refreshHz fields cannot be measured.
+    /// Whether the backend supplies per-image presentation feedback. Completion
+    /// can be known even when its timestamp is unavailable; missing timestamp
+    /// measurements remain null, not zero.
     pub presentation_feedback: bool,
     /// Spread between the earliest and latest output to present the same frame.
     /// None when fewer than two outputs reported a frame this interval.
@@ -977,6 +1183,13 @@ pub struct ProjectionStats {
     pub gate_holds: u32,
     /// Which backend this interval's frames were blended on: `"cpu"` or `"gpu"`.
     pub renderer: String,
+    /// Presentation backend used for this interval: `wayland` or `vulkan-display`.
+    /// Absent in reports from older slicers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_backend: Option<String>,
+    /// Clock and protocol used to timestamp displayed frames, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_source: Option<String>,
     /// How many canvas periods elapsed between successive captures reaching
     /// the slicer, bucketed. Says directly whether the capture loop is
     /// keeping up with every canvas frame or only every second one.
@@ -1074,6 +1287,42 @@ pub struct LagFrames {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_stats_presentation_fields_are_backward_compatible() {
+        let legacy = serde_json::json!({
+            "measuredAt": 10,
+            "intervalSeconds": 1.0,
+            "freeRun": false,
+            "canvasFps": 60.0,
+            "presentedFps": 60.0,
+            "framesSuperseded": 0,
+            "stalls": 0,
+            "perFrameMs": {"waiting": 0.1, "snapshot": 0.1, "requesting": 0.1, "blending": 0.1, "gpu": 0.0},
+            "presentationFeedback": true,
+            "offsetMs": null,
+            "straddles": 0,
+            "gateHolds": 0,
+            "renderer": "gpu",
+            "captureIntervals": {"one": 0, "two": 0, "three": 0, "more": 0},
+            "outputs": []
+        });
+        let stats: ProjectionStats = serde_json::from_value(legacy).unwrap();
+        assert_eq!(stats.presentation_backend, None);
+        assert_eq!(stats.timestamp_source, None);
+        let serialized = serde_json::to_value(&stats).unwrap();
+        assert!(serialized.get("presentationBackend").is_none());
+        assert!(serialized.get("timestampSource").is_none());
+
+        let stats = ProjectionStats {
+            presentation_backend: Some("vulkan-display".into()),
+            timestamp_source: Some("VK_EXT_present_timing".into()),
+            ..stats
+        };
+        let serialized = serde_json::to_value(stats).unwrap();
+        assert_eq!(serialized["presentationBackend"], "vulkan-display");
+        assert_eq!(serialized["timestampSource"], "VK_EXT_present_timing");
+    }
 
     #[test]
     fn mode_formats_for_sway() {

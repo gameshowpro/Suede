@@ -8,6 +8,7 @@ pub mod raw;
 
 #[cfg(unix)]
 pub mod client;
+pub mod direct;
 pub mod mock;
 
 use std::path::PathBuf;
@@ -116,7 +117,7 @@ pub fn discover_socket() -> Option<PathBuf> {
     // 1. The environment variable, when Suede shares the compositor's session.
     if let Ok(path) = std::env::var("SWAYSOCK") {
         let path = PathBuf::from(path);
-        if path.exists() {
+        if path.exists() && socket_owner_alive(&path) {
             return Some(path);
         }
     }
@@ -153,9 +154,36 @@ fn scan_for_socket(dir: &std::path::Path) -> Option<PathBuf> {
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.starts_with("sway-ipc."))
         })
+        .filter(|path| socket_owner_alive(path))
         .collect();
     matches.sort();
     matches.into_iter().next()
+}
+
+/// Whether the sway that created `path` is still running, as far as can be
+/// told: sway names its socket `sway-ipc.<uid>.<pid>.sock`, and a sway that
+/// was killed rather than asked to exit leaves the file behind. Connecting
+/// to such a leftover can only fail, and a daemon that picked one would stay
+/// bound to it, so it is skipped. Anything that cannot be judged — a name in
+/// another shape, a system without `/proc` — counts as alive, which is what
+/// discovery assumed before.
+///
+/// Matters most around a session switch (experimental direct presentation's
+/// fallback), where the daemon restarts while the old compositor's socket is
+/// gone and the new one's is not yet in systemd's environment.
+pub fn socket_owner_alive(path: &std::path::Path) -> bool {
+    let Some(pid) = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("sway-ipc."))
+        .and_then(|rest| rest.strip_suffix(".sock"))
+        .and_then(|rest| rest.split('.').nth(1))
+        .and_then(|pid| pid.parse::<u32>().ok())
+    else {
+        return true;
+    };
+    let proc = std::path::Path::new("/proc");
+    !proc.join("self").exists() || proc.join(pid.to_string()).exists()
 }
 
 /// Connect to Sway and start pumping its events.
@@ -166,6 +194,18 @@ pub async fn connect(
     shutdown: tokio::sync::watch::Receiver<bool>,
     deadline: Option<std::time::Duration>,
 ) -> SwayResult<Arc<dyn SwayClient>> {
+    connect_with_path(shutdown, deadline)
+        .await
+        .map(|(client, _)| client)
+}
+
+/// [`connect`], also returning the socket path the client is bound to — what
+/// experimental direct presentation watches to learn that its compositor
+/// has gone away.
+pub async fn connect_with_path(
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    deadline: Option<std::time::Duration>,
+) -> SwayResult<(Arc<dyn SwayClient>, PathBuf)> {
     #[cfg(not(unix))]
     {
         let _ = (shutdown, deadline);
@@ -179,9 +219,9 @@ pub async fn connect(
         loop {
             if let Some(path) = discover_socket() {
                 tracing::info!(socket = %path.display(), "using sway IPC socket");
-                let client = Arc::new(client::IpcClient::new(path));
+                let client = Arc::new(client::IpcClient::new(path.clone()));
                 tokio::spawn(client.clone().run_event_loop(shutdown));
-                return Ok(client);
+                return Ok((client, path));
             }
             if let Some(deadline) = deadline {
                 if started.elapsed() >= deadline {
@@ -220,7 +260,14 @@ mod tests {
     #[test]
     fn finds_socket_in_a_directory() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("sway-ipc.1000.4242.sock"), b"").unwrap();
+        // Named for a process that exists (this one), since a socket whose
+        // sway has died is skipped — see the test below.
+        std::fs::write(
+            dir.path()
+                .join(format!("sway-ipc.1000.{}.sock", std::process::id())),
+            b"",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("unrelated"), b"").unwrap();
         let found = scan_for_socket(dir.path()).unwrap();
         assert!(found
@@ -229,6 +276,25 @@ mod tests {
             .to_str()
             .unwrap()
             .starts_with("sway-ipc."));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_socket_left_behind_by_a_dead_sway_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        // Above the kernel's largest possible pid (2^22), so never running.
+        let dead = dir.path().join("sway-ipc.1000.99999999.sock");
+        std::fs::write(&dead, b"").unwrap();
+        assert!(!socket_owner_alive(&dead));
+        assert!(scan_for_socket(dir.path()).is_none());
+
+        let live = dir
+            .path()
+            .join(format!("sway-ipc.1000.{}.sock", std::process::id()));
+        std::fs::write(&live, b"").unwrap();
+        assert_eq!(scan_for_socket(dir.path()), Some(live));
+        // A name in some other shape cannot be judged, so it is kept.
+        assert!(socket_owner_alive(std::path::Path::new("sway-ipc.sock")));
     }
 
     #[test]

@@ -28,6 +28,9 @@ run_stage() {
 }
 
 if [[ "$STAGE" == "docs" ]]; then
+  # No test-machine names or unlinked aliases, before anything that needs
+  # pip or a network.
+  scripts/check-machine-names.sh || exit 1
   # Build the documentation site exactly as CI does.
   python3 -m pip install --quiet --user -r docs/requirements.txt || {
     echo "could not install mkdocs"; exit 1; }

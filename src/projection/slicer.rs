@@ -223,6 +223,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
+use std::ops::{Deref, DerefMut};
 use std::os::fd::{AsFd, AsRawFd};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -403,11 +404,11 @@ fn pixel_format(raw: u32) -> Option<PixelFormat> {
     }
 }
 
-struct Presenter {
+/// Wayland presentation resources. Direct presentation never constructs one.
+struct WaylandPresenter {
     surface: WlSurface,
     #[allow(dead_code)]
     layer_surface: ZwlrLayerSurfaceV1,
-    configured: Option<(u32, u32)>,
     /// The size the surface's opaque region was last set for, so a
     /// `Configure` that repeats a size it already answered does not build
     /// and destroy a `wl_region` for nothing. See the `Configure` handler.
@@ -420,9 +421,6 @@ struct Presenter {
     /// startup `scanout candidate:` line. `None` if the compositor never
     /// sent a current mode for it.
     output_mode: Option<(i32, i32)>,
-    /// Output name, carried on the presenter so stats and stall messages can
-    /// name it without threading the spec through every call.
-    name: String,
     /// [`CPU_PRESENT_SLOTS`] buffers, rotated so we never write one the
     /// compositor reads. CPU path only — empty on the GPU path, which uses
     /// `gpu_buffers` instead; the two are never both populated for one
@@ -439,6 +437,12 @@ struct Presenter {
     /// `wl_buffer.release`.
     busy: Vec<bool>,
     next_buffer: usize,
+}
+
+struct Presenter {
+    wayland: Option<WaylandPresenter>,
+    configured: Option<(u32, u32)>,
+    name: String,
     /// Fixed-point per-pixel transfer `(a, b)`: `out = (a·in)>>8 + b`,
     /// row-major at the configured size. Two-dimensional because seams can
     /// run on any edge — a grid corner is the product of two ramps.
@@ -456,6 +460,9 @@ struct Presenter {
     warp_revision: u64,
     warp_reported_revision: Option<u64>,
     warp_submitted_revision: Option<u64>,
+    /// Direct completion must acknowledge the revision carried by that
+    /// submission, even if a control update installs a newer one meanwhile.
+    direct_pending_warp: BTreeMap<u64, u64>,
     /// This presenter's slice: its region of the canvas.
     slice: crate::model::Rect,
     /// A `wl_surface.frame` callback is outstanding: the compositor has not
@@ -487,6 +494,20 @@ struct Presenter {
     stalled: bool,
     /// The latest snapshot has not been committed to this output yet.
     stale: bool,
+}
+
+impl Deref for Presenter {
+    type Target = WaylandPresenter;
+
+    fn deref(&self) -> &Self::Target {
+        self.wayland.as_ref().expect("Wayland presenter required")
+    }
+}
+
+impl DerefMut for Presenter {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.wayland.as_mut().expect("Wayland presenter required")
+    }
 }
 
 /// Which pipeline the running slicer settled on for this process's whole
@@ -696,7 +717,7 @@ enum Slot {
     Waiting,
     /// The compositor showed this update to the user.
     Presented {
-        at_ns: u64,
+        at_ns: Option<u64>,
         refresh_ns: u32,
         /// The `zero_copy` bit of the feedback's `flags` — the compositor
         /// scanned this output's buffer out directly, with no compositing
@@ -712,6 +733,7 @@ enum Slot {
 #[derive(Debug, Clone, Copy, Default)]
 struct OutputAccum {
     presented: u32,
+    timestamped: u32,
     discarded: u32,
     /// How many of `presented` carried the `zero_copy` feedback flag — the
     /// compositor scanned the slicer's buffer straight to the display
@@ -760,6 +782,7 @@ enum SettledOutcome {
     Presented {
         refresh_ns: Option<u32>,
         zero_copy: bool,
+        timestamped: bool,
     },
     Discarded,
 }
@@ -865,13 +888,16 @@ fn settle(slots: &[Slot]) -> Settled {
                     SettledOutcome::Presented {
                         refresh_ns,
                         zero_copy,
+                        timestamped: at_ns.is_some(),
                     },
                 ));
-                presented_at.push(at_ns);
-                if let Some(refresh_ns) = refresh_ns {
-                    known_refreshes.push(refresh_ns);
+                if let Some(at_ns) = at_ns {
+                    presented_at.push(at_ns);
+                    if let Some(refresh_ns) = refresh_ns {
+                        known_refreshes.push(refresh_ns);
+                    }
+                    presented.push((index, at_ns, refresh_ns));
                 }
-                presented.push((index, at_ns, refresh_ns));
             }
             Slot::Discarded => outcomes.push((index, SettledOutcome::Discarded)),
             Slot::NotCommitted | Slot::Waiting => {}
@@ -994,6 +1020,17 @@ impl Timing {
     }
 
     fn presented(&mut self, id: u64, index: usize, at_ns: u64, refresh_ns: u32, zero_copy: bool) {
+        self.presented_optional(id, index, Some(at_ns), refresh_ns, zero_copy);
+    }
+
+    fn presented_optional(
+        &mut self,
+        id: u64,
+        index: usize,
+        at_ns: Option<u64>,
+        refresh_ns: u32,
+        zero_copy: bool,
+    ) {
         if let Some(slot) = self.pending.get_mut(&id).and_then(|s| s.get_mut(index)) {
             *slot = Slot::Presented {
                 at_ns,
@@ -1036,8 +1073,12 @@ impl Timing {
                 SettledOutcome::Presented {
                     refresh_ns,
                     zero_copy,
+                    timestamped,
                 } => {
                     accum.presented += 1;
+                    if timestamped {
+                        accum.timestamped += 1;
+                    }
                     if zero_copy {
                         accum.zero_copy_presented += 1;
                     }
@@ -1094,7 +1135,7 @@ impl Timing {
             .enumerate()
             .map(|(index, accum)| {
                 if index == 0 {
-                    let presented = accum.presented > 0;
+                    let presented = accum.timestamped > 0;
                     (presented.then_some(0.0), presented.then_some(0.0))
                 } else {
                     let accum = &self.phase[index];
@@ -1105,6 +1146,7 @@ impl Timing {
 
         for accum in &mut self.per_output {
             accum.presented = 0;
+            accum.timestamped = 0;
             accum.discarded = 0;
             accum.zero_copy_presented = 0;
             accum.lag_frames = LagFrames::default();
@@ -1351,6 +1393,9 @@ impl Presenter {
 }
 
 struct State {
+    direct: bool,
+    direct_timestamp_seen: bool,
+    deadline: Option<Instant>,
     /// Third element: this output's current-mode refresh in mHz, from
     /// `wl_output`'s `Mode` event — used only to size the canvas period for
     /// the capture-interval histogram (see `report_stats_if_due`). Fourth:
@@ -1897,6 +1942,26 @@ fn free_present_slot(busy: &[bool], next: usize) -> Option<usize> {
 }
 
 impl State {
+    fn should_stop(&self) -> bool {
+        self.closed
+            || SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+            || self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+    }
+
+    fn finish(&mut self) -> anyhow::Result<()> {
+        if self.direct {
+            let _ = poll_direct_feedback(self)?;
+            self.report_stats_if_due();
+            self.gpu
+                .as_mut()
+                .context("direct GPU unavailable at shutdown")?
+                .shutdown_direct()
+                .context("direct display shutdown failed")?;
+        }
+        Ok(())
+    }
     fn all_configured(&self) -> bool {
         self.presenters.iter().all(|p| p.configured.is_some())
     }
@@ -1905,7 +1970,7 @@ impl State {
     /// feedback wherever the compositor offers `wp_presentation`, frame
     /// callbacks otherwise.
     fn gate_signal(&self) -> GateSignal {
-        gate_signal(self.presentation.is_some())
+        gate_signal(self.direct || self.presentation.is_some())
     }
 
     /// The locked-mode gate as it stands right now.
@@ -1950,17 +2015,16 @@ impl State {
             self.presenters.iter().any(|p| {
                 p.stale
                     && p.gate_ready(signal)
-                    && free_present_slot(&p.busy, p.next_buffer).is_some()
+                    && (self.direct || free_present_slot(&p.busy, p.next_buffer).is_some())
             })
         } else {
-            self.presenters
+            self.presenters.iter().any(|p| {
+                p.stale && (self.direct || free_present_slot(&p.busy, p.next_buffer).is_some())
+            }) && self
+                .presenters
                 .iter()
-                .any(|p| p.stale && free_present_slot(&p.busy, p.next_buffer).is_some())
-                && self
-                    .presenters
-                    .iter()
-                    .filter(|p| p.stale && !p.stalled)
-                    .all(|p| free_present_slot(&p.busy, p.next_buffer).is_some())
+                .filter(|p| p.stale && !p.stalled)
+                .all(|p| self.direct || free_present_slot(&p.busy, p.next_buffer).is_some())
                 && self.gate_open()
         }
     }
@@ -2029,7 +2093,7 @@ impl State {
         }
         let elapsed = self.stats.since.elapsed();
         let interval = self.timing.drain_interval();
-        let presentation_feedback = self.presentation.is_some();
+        let presentation_feedback = self.direct || self.presentation.is_some();
         let captured = f64::from(self.stats.captured);
         let per_ms = |total: Duration| total.as_secs_f64() * 1000.0 / captured;
         let canvas_fps = captured / elapsed.as_secs_f64();
@@ -2165,6 +2229,20 @@ impl State {
             straddles: interval.straddles,
             gate_holds: self.stats.gate_holds,
             renderer: renderer_name.to_string(),
+            presentation_backend: Some(
+                if self.direct {
+                    "vulkan-display"
+                } else {
+                    "wayland"
+                }
+                .into(),
+            ),
+            timestamp_source: if self.direct {
+                self.direct_timestamp_seen
+                    .then(|| "VK_EXT_present_timing calibrated monotonic estimate".into())
+            } else {
+                self.presentation.as_ref().map(|_| "wp_presentation".into())
+            },
             capture_intervals: ci,
             outputs,
         };
@@ -2179,7 +2257,71 @@ impl State {
     }
 }
 
+/// Set by [`request_shutdown`]; observed by [`State::should_stop`] so a
+/// signal drains the same clean-shutdown path as every other stop condition
+/// (a dead-interval trip, the compositor closing the output, or a deadline)
+/// — in direct mode this reaches `state.finish()` and, from there,
+/// `DirectDisplay::shutdown`'s NVKMS sub-ownership revoke.
+///
+/// `KillMode=control-group` sends SIGTERM to this process when the daemon
+/// stops (and an operator's plain `kill`/Ctrl-C sends SIGTERM/SIGINT
+/// directly); without a handler the default action terminates the process
+/// immediately, and the revoke never runs, leaving the grant for the next
+/// opener to clear.
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Async-signal-safe: a single relaxed store and nothing else, so it is
+/// sound to run on any thread at any point, including inside a blocking
+/// syscall.
+extern "C" fn request_shutdown(_signal: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Installed once per process, before anything that might block. `signal(2)`
+/// is enough here — no `siginfo_t` payload is needed, and every blocking
+/// call already on this process's path (`libc::poll`, Wayland dispatch)
+/// either retries past `EINTR` or returns promptly to a loop that rechecks
+/// [`State::should_stop`].
+fn install_shutdown_signal_handler() {
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGINT,
+            request_shutdown as *const () as libc::sighandler_t,
+        );
+    }
+}
+
 pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
+    run_with_presentation_until(spec, None, None)
+}
+
+pub fn run_with_presentation(
+    spec: &SlicerSpec,
+    direct: Option<&gpu::display::DirectDisplayConfig>,
+) -> anyhow::Result<()> {
+    run_with_presentation_until(spec, direct, None)
+}
+
+pub fn run_with_presentation_until(
+    spec: &SlicerSpec,
+    direct: Option<&gpu::display::DirectDisplayConfig>,
+    deadline: Option<Instant>,
+) -> anyhow::Result<()> {
+    install_shutdown_signal_handler();
+    if direct.is_some() {
+        anyhow::ensure!(
+            spec.renderer != Renderer::Cpu,
+            "direct presentation requires the GPU renderer"
+        );
+    }
+    if let Some(config) = direct {
+        validate_direct_outputs(spec, config)?;
+    }
     let nonexact = requested_warp(spec)?;
     let requires_linear_sampling = requires_linear_sampling(spec).map_err(anyhow::Error::msg)?;
     if nonexact && spec.renderer == Renderer::Cpu {
@@ -2210,6 +2352,9 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     let dmabuf: Option<ZwpLinuxDmabufV1> = globals.bind(&handle, 4..=4, ()).ok();
 
     let mut state = State {
+        direct: direct.is_some(),
+        direct_timestamp_seen: false,
+        deadline,
         outputs: Vec::new(),
         used_outputs: Vec::new(),
         output_modes: HashMap::new(),
@@ -2291,13 +2436,13 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
 
     // Negotiate for content and every pattern; forced GPU failures stay explicit.
     if spec.renderer != Renderer::Cpu {
-        match negotiate_gpu(dmabuf.as_ref(), &mut state, &mut queue, &handle) {
+        match negotiate_gpu(dmabuf.as_ref(), &mut state, &mut queue, &handle, direct) {
             Ok((gpu, formats)) => {
                 state.gpu = Some(gpu);
                 state.gpu_formats = formats;
             }
             Err(reason) => {
-                if spec.renderer == Renderer::Gpu {
+                if spec.renderer == Renderer::Gpu || direct.is_some() {
                     report_capability(spec, Renderer::Gpu, false, Some(reason.clone()), nonexact);
                     anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
                 }
@@ -2306,55 +2451,60 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         }
     }
 
-    // One presenter per slice, covering its physical output entirely.
+    // One presenter per slice. Direct outputs use their configured physical
+    // mode; only Wayland outputs resolve wl_output and create layer surfaces.
     for (index, slice) in spec.slices.iter().enumerate() {
-        let target = find(&state, &slice.output)
-            .ok_or_else(|| anyhow::anyhow!("no output named {}", slice.output))?;
-        // The mode is recorded on the presenter as it stood after the
-        // roundtrip above, so the `scanout candidate:` line can say whether
-        // the buffer will be the output's own pixel grid. See
-        // `Presenter.output_mode`.
-        let mut output_mode = None;
-        if let Some(name) = state
-            .outputs
-            .iter()
-            .find(|(o, ..)| *o == target)
-            .map(|(.., name)| *name)
-        {
-            state.used_outputs.push(name);
-            output_mode = state.output_modes.get(&name).copied();
-        }
-        let surface = compositor.create_surface(&handle, ());
-        let region: WlRegion = compositor.create_region(&handle, ());
-        surface.set_input_region(Some(&region));
-        region.destroy();
-        // The opaque region itself cannot be set yet — it wants the size the
-        // compositor has not configured us with — so the layer-surface
-        // `Configure` handler sets it, and resets it on any later resize.
-        let layer_surface = layer_shell.get_layer_surface(
-            &surface,
-            Some(&target),
-            Layer::Overlay,
-            "suede-slice".to_string(),
-            &handle,
-            index,
-        );
-        layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-        layer_surface.set_exclusive_zone(-1);
-        layer_surface.set_size(0, 0);
-        surface.commit();
+        let (wayland, configured) = if let Some(config) = direct {
+            let output = &config.outputs[index];
+            (None, Some((output.width, output.height)))
+        } else {
+            let target = find(&state, &slice.output)
+                .ok_or_else(|| anyhow::anyhow!("no output named {}", slice.output))?;
+            let mut output_mode = None;
+            if let Some(name) = state
+                .outputs
+                .iter()
+                .find(|(o, ..)| *o == target)
+                .map(|(.., name)| *name)
+            {
+                state.used_outputs.push(name);
+                output_mode = state.output_modes.get(&name).copied();
+            }
+            let surface = compositor.create_surface(&handle, ());
+            let region: WlRegion = compositor.create_region(&handle, ());
+            surface.set_input_region(Some(&region));
+            region.destroy();
+            let layer_surface = layer_shell.get_layer_surface(
+                &surface,
+                Some(&target),
+                Layer::Overlay,
+                "suede-slice".to_string(),
+                &handle,
+                index,
+            );
+            layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+            layer_surface.set_exclusive_zone(-1);
+            layer_surface.set_size(0, 0);
+            surface.commit();
+            (
+                Some(WaylandPresenter {
+                    surface,
+                    layer_surface,
+                    opaque_for: None,
+                    output_mode,
+                    buffers: Vec::new(),
+                    gpu_buffers: Vec::new(),
+                    busy: Vec::new(),
+                    next_buffer: 0,
+                }),
+                None,
+            )
+        };
 
         state.presenters.push(Presenter {
-            surface,
-            layer_surface,
-            configured: None,
-            opaque_for: None,
-            output_mode,
+            wayland,
+            configured,
             name: slice.output.clone(),
-            buffers: Vec::new(),
-            gpu_buffers: Vec::new(),
-            busy: Vec::new(),
-            next_buffer: 0,
             transfer: Vec::new(),
             dynamic_table: None,
             warp: None,
@@ -2363,6 +2513,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             warp_revision: 0,
             warp_reported_revision: None,
             warp_submitted_revision: None,
+            direct_pending_warp: BTreeMap::new(),
             slice: slice.slice,
             frame_pending: false,
             pending_since: None,
@@ -2374,9 +2525,13 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     }
 
     while !state.all_configured() {
-        queue.blocking_dispatch(&mut state)?;
-        if state.closed {
-            return Ok(());
+        if let Some(deadline) = state.deadline {
+            dispatch_until(&connection, &mut queue, &mut state, deadline)?;
+        } else {
+            queue.blocking_dispatch(&mut state)?;
+        }
+        if state.should_stop() {
+            return state.finish();
         }
     }
     if state.gpu.is_some() {
@@ -2463,11 +2618,15 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             state.new_snapshot();
             loop {
                 apply_warp_updates(&mut state)?;
-                if state.closed {
-                    return Ok(());
+                if state.should_stop() {
+                    return state.finish();
                 }
                 if state.can_present() {
-                    present_frame_gpu(&mut state, &handle);
+                    if state.direct {
+                        present_frame_direct(&mut state, None)?;
+                    } else {
+                        present_frame_gpu(&mut state, &handle);
+                    }
                 }
                 dispatch_until(
                     &connection,
@@ -2479,9 +2638,14 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         }
         present_pattern(&mut state, spec, pattern)?;
         loop {
-            queue.blocking_dispatch(&mut state)?;
-            if state.closed {
-                return Ok(());
+            if state.deadline.is_some() {
+                let deadline = state.deadline.unwrap();
+                dispatch_until(&connection, &mut queue, &mut state, deadline)?;
+            } else {
+                queue.blocking_dispatch(&mut state)?;
+            }
+            if state.should_stop() {
+                return state.finish();
             }
         }
     }
@@ -2512,8 +2676,13 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     // iteration below.
     let mut current = request_capture(&mut state, &screencopy, &source, &handle);
     loop {
+        if state.should_stop() {
+            current.destroy();
+            return state.finish();
+        }
         if !arm_copy(
             &mut state,
+            &connection,
             &mut queue,
             &shm,
             dmabuf.as_ref(),
@@ -2529,7 +2698,8 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 nonexact,
             )
         })? {
-            return Ok(());
+            current.destroy();
+            return state.finish();
         }
         if !state.capture.failed {
             break;
@@ -2551,11 +2721,20 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
     let mut next = request_capture(&mut state, &screencopy, &source, &handle);
 
     loop {
+        if state.should_stop() {
+            current.destroy();
+            next.destroy();
+            return state.finish();
+        }
         let waiting_from = Instant::now();
         apply_warp_updates(&mut state)?;
         tick_adaptive(&mut state);
         while !state.capture.ready && !state.capture.failed && !state.can_present() {
-            if state.warp_updates.is_some() || state.gpu_retry_after.is_some() {
+            if state.direct
+                || state.deadline.is_some()
+                || state.warp_updates.is_some()
+                || state.gpu_retry_after.is_some()
+            {
                 dispatch_until(
                     &connection,
                     &mut queue,
@@ -2567,10 +2746,10 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             } else {
                 queue.blocking_dispatch(&mut state)?;
             }
-            if state.closed {
+            if state.should_stop() {
                 current.destroy();
                 next.destroy();
-                return Ok(());
+                return state.finish();
             }
         }
         state.stats.waiting += waiting_from.elapsed();
@@ -2592,13 +2771,15 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
             current = request_capture(&mut state, &screencopy, &source, &handle);
             if !arm_copy(
                 &mut state,
+                &connection,
                 &mut queue,
                 &shm,
                 dmabuf.as_ref(),
                 &handle,
                 &current,
             )? {
-                return Ok(());
+                current.destroy();
+                return state.finish();
             }
             next = request_capture(&mut state, &screencopy, &source, &handle);
             continue;
@@ -2662,13 +2843,15 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 let requesting_from = Instant::now();
                 if !arm_copy(
                     &mut state,
+                    &connection,
                     &mut queue,
                     &shm,
                     dmabuf.as_ref(),
                     &handle,
                     &next,
                 )? {
-                    return Ok(());
+                    next.destroy();
+                    return state.finish();
                 }
                 state.stats.requesting += requesting_from.elapsed();
                 current = next;
@@ -2678,7 +2861,7 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 // not only on the ones the gate lets out — `gpu_blend_due`
                 // used to be the only place this happened, and it no longer
                 // runs on a gated cycle.
-                if let Some(dmabuf) = dmabuf.as_ref() {
+                if let Some(dmabuf) = dmabuf.as_ref().filter(|_| !state.direct) {
                     for index in 0..state.presenters.len() {
                         ensure_gpu_present_buffers(&mut state, dmabuf, &handle, index);
                     }
@@ -2696,13 +2879,15 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
                 let requesting_from = Instant::now();
                 if !arm_copy(
                     &mut state,
+                    &connection,
                     &mut queue,
                     &shm,
                     dmabuf.as_ref(),
                     &handle,
                     &next,
                 )? {
-                    return Ok(());
+                    next.destroy();
+                    return state.finish();
                 }
                 state.stats.requesting += requesting_from.elapsed();
                 current = next;
@@ -2713,7 +2898,12 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         if state.can_present() {
             let blending_from = Instant::now();
             let before = state.stats.presented;
-            present_frame(&mut state, &handle);
+            if state.direct {
+                let capture_slot = state.capture.pending_slot;
+                present_frame_direct(&mut state, capture_slot)?;
+            } else {
+                present_frame(&mut state, &handle);
+            }
             state.stats.blending += blending_from.elapsed();
             if state.stats.presented > before {
                 state.note_commit_cycle(false);
@@ -2731,12 +2921,38 @@ pub fn run(spec: &SlicerSpec) -> anyhow::Result<()> {
         // exits on the interval it was decided, rather than drifting on for
         // another cycle or more before the next `blocking_dispatch` above
         // happens to re-check it.
-        if state.closed {
+        if state.should_stop() {
             current.destroy();
             next.destroy();
-            return Ok(());
+            return state.finish();
         }
     }
+}
+
+fn validate_direct_outputs(
+    spec: &SlicerSpec,
+    config: &gpu::display::DirectDisplayConfig,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config.outputs.len() == spec.slices.len(),
+        "direct presentation config has {} outputs but the wall has {} slices",
+        config.outputs.len(),
+        spec.slices.len()
+    );
+    for (index, (output, slice)) in config.outputs.iter().zip(&spec.slices).enumerate() {
+        anyhow::ensure!(
+            output.name == slice.output,
+            "direct output {index} names {}, expected {} from the wall spec",
+            output.name,
+            slice.output
+        );
+        anyhow::ensure!(
+            output.width > 0 && output.height > 0 && output.refresh_millihz > 0,
+            "direct output {} needs a positive mode size and refresh rate",
+            output.name
+        );
+    }
+    Ok(())
 }
 
 fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
@@ -2865,6 +3081,9 @@ fn initialize_warp_control(
     // Initial matrices and tables must exist before any submission. Later
     // edits build off-thread and retain the current complete generation.
     while !state.warp_updates.as_ref().unwrap().initialized() {
+        if state.should_stop() {
+            return Ok(());
+        }
         apply_warp_updates(state)?;
         if state.warp_updates.as_ref().unwrap().initialized() {
             break;
@@ -2875,6 +3094,9 @@ fn initialize_warp_control(
             state,
             Instant::now() + Duration::from_secs(60),
         )?;
+        if state.should_stop() {
+            return Ok(());
+        }
         anyhow::ensure!(!state.closed, "output closed during initial warp build");
     }
     Ok(())
@@ -3230,6 +3452,7 @@ fn request_capture(
 /// went away.
 fn arm_copy(
     state: &mut State,
+    connection: &Connection,
     queue: &mut wayland_client::EventQueue<State>,
     shm: &WlShm,
     dmabuf: Option<&ZwpLinuxDmabufV1>,
@@ -3237,8 +3460,12 @@ fn arm_copy(
     frame: &ZwlrScreencopyFrameV1,
 ) -> anyhow::Result<bool> {
     while !state.capture.buffer_done && !state.capture.failed {
-        queue.blocking_dispatch(state)?;
-        if state.closed {
+        if let Some(deadline) = state.deadline {
+            dispatch_until(connection, queue, state, deadline)?;
+        } else {
+            queue.blocking_dispatch(state)?;
+        }
+        if state.should_stop() {
             return Ok(false);
         }
     }
@@ -3347,7 +3574,7 @@ fn ensure_capture_buffer(
             }
             let reason =
                 "capture format/modifier does not support linear filtering required by the slice crop";
-            if state.renderer == Renderer::Gpu {
+            if state.renderer == Renderer::Gpu || state.direct {
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
@@ -3381,7 +3608,7 @@ fn decide_backend(state: &mut State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> anyho
     match gpu_availability(state, dmabuf) {
         Ok(()) => Ok(Backend::Gpu),
         Err(reason) => {
-            if state.renderer == Renderer::Gpu {
+            if state.renderer == Renderer::Gpu || state.direct {
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
@@ -3430,7 +3657,11 @@ fn gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Result<
             "capture format {format:#010x} has no Vulkan-importable modifier"
         ));
     }
-    present_format_available(gpu, &state.gpu_formats)
+    if state.direct {
+        Ok(())
+    } else {
+        present_format_available(gpu, &state.gpu_formats)
+    }
 }
 
 /// Everything [`gpu_availability`] checks except the parts about capture —
@@ -3446,7 +3677,11 @@ fn sync_gpu_availability(state: &State, dmabuf: Option<&ZwpLinuxDmabufV1>) -> Re
             .clone()
             .unwrap_or_else(|| "no Vulkan device available".to_string()));
     };
-    present_format_available(gpu, &state.gpu_formats)
+    if state.direct {
+        Ok(())
+    } else {
+        present_format_available(gpu, &state.gpu_formats)
+    }
 }
 
 /// Whether a Present image can be allocated at all — the half of the GPU
@@ -3813,6 +4048,18 @@ fn create_present_buffers(
     dmabuf_proxy: Option<&ZwpLinuxDmabufV1>,
     handle: &QueueHandle<State>,
 ) -> anyhow::Result<()> {
+    if state.direct {
+        let gpu = state
+            .gpu
+            .as_mut()
+            .context("direct GPU was not initialized")?;
+        for (index, presenter) in state.presenters.iter().enumerate() {
+            let (width, height) = presenter.configured.context("direct output has no mode")?;
+            gpu.set_transfer(index, width, height, &presenter.transfer)
+                .with_context(|| format!("gpu.set_transfer (direct output {index})"))?;
+        }
+        return Ok(());
+    }
     match state.capture.backend {
         Some(Backend::Gpu) => {
             let dmabuf_proxy = dmabuf_proxy
@@ -4046,6 +4293,7 @@ fn negotiate_gpu(
     state: &mut State,
     queue: &mut wayland_client::EventQueue<State>,
     handle: &QueueHandle<State>,
+    direct: Option<&gpu::display::DirectDisplayConfig>,
 ) -> Result<(gpu::Gpu, DmabufFormats), String> {
     let Some(dmabuf) = dmabuf else {
         return Err("compositor does not offer zwp_linux_dmabuf_v1 version 4".to_string());
@@ -4066,17 +4314,20 @@ fn negotiate_gpu(
     if !collected.done {
         return Err("compositor never sent zwp_linux_dmabuf_feedback_v1.done".to_string());
     }
-    gpu::Gpu::new(collected.main_device)
-        .map(|gpu| {
-            (
-                gpu,
-                DmabufFormats {
-                    all: collected.formats,
-                    scanout: collected.scanout_formats,
-                },
-            )
-        })
-        .map_err(|error| format!("Gpu::new: {error:#}"))
+    let gpu = match direct {
+        Some(config) => gpu::Gpu::new_direct(collected.main_device, config.clone()),
+        None => gpu::Gpu::new(collected.main_device),
+    };
+    gpu.map(|gpu| {
+        (
+            gpu,
+            DmabufFormats {
+                all: collected.formats,
+                scanout: collected.scanout_formats,
+            },
+        )
+    })
+    .map_err(|error| format!("Gpu::new: {error:#}"))
 }
 
 /// Bump `FrameStats.capture_intervals` for the gap since the previous
@@ -4111,6 +4362,176 @@ fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
         Some(Backend::Gpu) => present_frame_gpu(state, handle),
         _ => present_frame_cpu(state, handle),
     }
+}
+
+/// Draw the current captured image (or a retained pattern) into Vulkan
+/// display swapchains. The same transfer tables and warp revisions used by
+/// the Wayland GPU path are installed on `Gpu`; only the final target differs.
+fn present_frame_direct(state: &mut State, capture_slot: Option<usize>) -> anyhow::Result<()> {
+    let signal = state.gate_signal();
+    let due: Vec<usize> = state
+        .presenters
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.stale && (!state.free_run || p.gate_ready(signal)))
+        .map(|(index, _)| index)
+        .collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    let jobs: Vec<gpu::display::DirectBlendJob<'_>> = due
+        .iter()
+        .map(|&index| {
+            let p = &state.presenters[index];
+            gpu::display::DirectBlendJob {
+                display: index,
+                output: index,
+                source_x: p.slice.x.max(0) as u32,
+                source_y: p.slice.y.max(0) as u32,
+                warp: p.warp.as_ref(),
+            }
+        })
+        .collect();
+    let gpu = state.gpu.as_mut().context("direct GPU unavailable")?;
+    if let Some(runtime) = &state.adaptive {
+        gpu.set_dynamic_lift(runtime.controller.level(), runtime.maximum)?;
+    }
+    let snapshot_id = state.timing.snapshot_id;
+    if state.static_canvases.is_empty() {
+        let slot = capture_slot
+            .or(state.capture.last_blended_slot)
+            .context("direct presentation has no completed capture")?;
+        let canvas = &state.capture.gpu_images[slot].0;
+        let frame = gpu
+            .blend_direct(canvas, state.capture.y_invert, &jobs)
+            .context("direct blend failed")?;
+        state.stats.gpu += frame.gpu_wait;
+        gpu.present_direct(frame, snapshot_id)
+            .context("direct present failed")?;
+        state.capture.last_blended_slot = Some(slot);
+        state.capture.pending_slot = None;
+    } else {
+        // Static canvases carry per-output labels. Keep that source mapping
+        // and submit each display with the same snapshot identity.
+        for job in &jobs {
+            let canvas = &state.static_canvases[job.output];
+            let frame = gpu
+                .blend_static_direct(canvas, std::slice::from_ref(job))
+                .context("direct static blend failed")?;
+            state.stats.gpu += frame.gpu_wait;
+            gpu.present_direct(frame, snapshot_id)
+                .context("direct static present failed")?;
+        }
+    }
+    for index in due {
+        let p = &mut state.presenters[index];
+        p.stale = false;
+        state.timing.request(snapshot_id, index);
+        p.commit_sent(snapshot_id, true);
+        p.direct_pending_warp.insert(snapshot_id, p.warp_revision);
+        while p.direct_pending_warp.len() > 16 {
+            p.direct_pending_warp.pop_first();
+        }
+        if p.warp_submitted_revision
+            .is_none_or(|r| p.warp_revision > r)
+        {
+            p.warp_submitted_revision = Some(p.warp_revision);
+            if let Some(controller) = &state.warp_updates {
+                controller.event(
+                    p.warp_revision,
+                    super::control::ControlEventKind::Submitted {
+                        outputs: vec![p.name.clone()],
+                    },
+                );
+            }
+        }
+    }
+    state.stats.presented += 1;
+    Ok(())
+}
+
+/// Returns whether any display completed a present. A completion can open
+/// the gate without producing a Wayland event, so dispatch must wake its
+/// caller immediately to reconsider the frame already waiting to show.
+fn poll_direct_feedback(state: &mut State) -> anyhow::Result<bool> {
+    if !state.direct {
+        return Ok(false);
+    }
+    let feedback = state
+        .gpu
+        .as_mut()
+        .context("direct GPU unavailable")?
+        .poll_direct_feedback()
+        .context("direct presentation feedback failed")?;
+    let mut completed = false;
+    for event in feedback {
+        if !event.complete {
+            continue;
+        }
+        completed = true;
+        complete_direct_presentation(
+            state,
+            event.display,
+            &event.output_name,
+            event.snapshot_id,
+            event.monotonic_ns,
+            event.refresh_millihz,
+        )?;
+    }
+    Ok(completed)
+}
+
+fn complete_direct_presentation(
+    state: &mut State,
+    index: usize,
+    output_name: &str,
+    snapshot_id: u64,
+    monotonic_ns: Option<u64>,
+    refresh_millihz: u32,
+) -> anyhow::Result<()> {
+    let p = state
+        .presenters
+        .get_mut(index)
+        .with_context(|| format!("direct feedback named unknown display {index}"))?;
+    anyhow::ensure!(
+        p.name == output_name,
+        "direct feedback display {index} named {}, expected {}",
+        output_name,
+        p.name
+    );
+    if p.feedback_pending_for
+        .is_some_and(|pending| snapshot_id >= pending)
+    {
+        p.feedback_pending_for = None;
+        p.feedback_since = None;
+        p.stalled = false;
+    }
+    if monotonic_ns.is_some() {
+        state.direct_timestamp_seen = true;
+    }
+    state.timing.presented_optional(
+        snapshot_id,
+        index,
+        monotonic_ns,
+        (1_000_000_000_000u64 / u64::from(refresh_millihz.max(1))) as u32,
+        false,
+    );
+    if let Some(revision) = p
+        .direct_pending_warp
+        .remove(&snapshot_id)
+        .filter(|&revision| p.warp_reported_revision.is_none_or(|r| revision > r))
+    {
+        p.warp_reported_revision = Some(revision);
+        if let Some(controller) = &state.warp_updates {
+            controller.event(
+                revision,
+                super::control::ControlEventKind::Presented {
+                    outputs: vec![p.name.clone()],
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// GPU path: blend the newest complete capture into whichever presenters are
@@ -4435,12 +4856,12 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
             // presenter's buffer is written.
             let Presenter {
                 transfer,
-                buffers,
+                wayland,
                 sample,
                 slice,
                 ..
             } = presenter;
-            let (_, map) = &mut buffers[slot];
+            let (_, map) = &mut wayland.as_mut().unwrap().buffers[slot];
             let blend = Blend {
                 canvas,
                 transfer,
@@ -4838,7 +5259,7 @@ fn present_pattern(
             width,
             sample: Some(&sample),
         };
-        let (_, map) = &mut presenter.buffers[0];
+        let (_, map) = &mut presenter.wayland.as_mut().unwrap().buffers[0];
         let row_bytes = width as usize * 4;
         // Clear first: a crop can extend beyond the canvas, same as content.
         for pixel in map[..height as usize * row_bytes].chunks_exact_mut(4) {
@@ -4939,6 +5360,9 @@ fn run_sync(
     let mut floor = Instant::now();
     let mut force = floor;
     loop {
+        if state.should_stop() {
+            return state.finish();
+        }
         apply_warp_updates(state)?;
         // Sleep to whichever the loop is actually waiting for: the floor
         // when the gate is already open (there is nothing to wait for but
@@ -4948,8 +5372,8 @@ fn run_sync(
         let waiting_from = Instant::now();
         dispatch_until(connection, queue, state, deadline)?;
         state.stats.waiting += waiting_from.elapsed();
-        if state.closed {
-            return Ok(());
+        if state.should_stop() {
+            return state.finish();
         }
 
         let now = Instant::now();
@@ -4970,14 +5394,18 @@ fn run_sync(
             // output whose mode changed under us needs Present images of
             // the new size before anything is drawn into them.
             if state.capture.backend == Some(Backend::Gpu) {
-                if let Some(dmabuf) = dmabuf {
+                if let Some(dmabuf) = dmabuf.filter(|_| !state.direct) {
                     for index in 0..state.presenters.len() {
                         ensure_gpu_present_buffers(state, dmabuf, handle, index);
                     }
                 }
             }
             let blending_from = Instant::now();
-            if present_sync(state, handle, frame) {
+            if if state.direct {
+                present_sync_direct(state, frame)?
+            } else {
+                present_sync(state, handle, frame)
+            } {
                 frame = frame.wrapping_add(1);
             }
             state.stats.blending += blending_from.elapsed();
@@ -4990,10 +5418,80 @@ fn run_sync(
         }
 
         state.report_stats_if_due();
-        if state.closed {
-            return Ok(());
+        if state.should_stop() {
+            return state.finish();
         }
     }
+}
+
+fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
+    let signal = state.gate_signal();
+    let due: Vec<usize> = state
+        .presenters
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.stale && (!state.free_run || p.gate_ready(signal)))
+        .map(|(index, _)| index)
+        .collect();
+    if due.is_empty() {
+        return Ok(false);
+    }
+    let snapshot_id = state.timing.snapshot_id;
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64);
+    let gpu = state.gpu.as_mut().context("direct GPU unavailable")?;
+    for &index in &due {
+        let p = &state.presenters[index];
+        let (width, height) = p.configured.context("direct output has no mode")?;
+        let groups =
+            super::pattern::sync_rects(width, height, frame, &p.name, snapshot_id, unix_ms);
+        let (count, items) = sync_shape_items(&groups);
+        gpu.set_sync_shapes(index, count, &items)
+            .with_context(|| format!("sync pattern upload failed for {}", p.name))?;
+    }
+    let jobs: Vec<gpu::display::DirectBlendJob<'_>> = due
+        .iter()
+        .map(|&index| {
+            let p = &state.presenters[index];
+            gpu::display::DirectBlendJob {
+                display: index,
+                output: index,
+                source_x: p.slice.x.max(0) as u32,
+                source_y: p.slice.y.max(0) as u32,
+                warp: p.warp.as_ref(),
+            }
+        })
+        .collect();
+    let frame = gpu.sync_direct(&jobs).context("direct sync blend failed")?;
+    state.stats.gpu += frame.gpu_wait;
+    gpu.present_direct(frame, snapshot_id)
+        .context("direct sync present failed")?;
+    for index in due {
+        let p = &mut state.presenters[index];
+        p.stale = false;
+        state.timing.request(snapshot_id, index);
+        p.commit_sent(snapshot_id, true);
+        p.direct_pending_warp.insert(snapshot_id, p.warp_revision);
+        while p.direct_pending_warp.len() > 16 {
+            p.direct_pending_warp.pop_first();
+        }
+        if p.warp_submitted_revision
+            .is_none_or(|r| p.warp_revision > r)
+        {
+            p.warp_submitted_revision = Some(p.warp_revision);
+            if let Some(controller) = &state.warp_updates {
+                controller.event(
+                    p.warp_revision,
+                    super::control::ControlEventKind::Submitted {
+                        outputs: vec![p.name.clone()],
+                    },
+                );
+            }
+        }
+    }
+    state.stats.presented += 1;
+    Ok(true)
 }
 
 /// `decide_backend` for a run with no capture: the same `Auto`/`Cpu`/`Gpu`
@@ -5017,7 +5515,7 @@ fn decide_sync_backend(
     match availability {
         Ok(()) => Ok(Backend::Gpu),
         Err(reason) => {
-            if state.renderer == Renderer::Gpu {
+            if state.renderer == Renderer::Gpu || state.direct {
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
@@ -5043,10 +5541,24 @@ fn dispatch_until(
     state: &mut State,
     deadline: Instant,
 ) -> anyhow::Result<()> {
+    dispatch_until_with_feedback(connection, queue, state, deadline, poll_direct_feedback)
+}
+
+fn dispatch_until_with_feedback(
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    deadline: Instant,
+    mut poll_feedback: impl FnMut(&mut State) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
     queue.flush()?;
+    if poll_feedback(state)? {
+        return Ok(());
+    }
     // `None` means events are already queued; there is nothing to wait for.
     let Some(guard) = queue.prepare_read() else {
         queue.dispatch_pending(state)?;
+        let _ = poll_feedback(state)?;
         return Ok(());
     };
     let deadline = state
@@ -5058,6 +5570,20 @@ fn dispatch_until(
         .as_ref()
         .and_then(|runtime| runtime.next_tick)
         .map_or(deadline, |tick| deadline.min(tick));
+    let deadline = state.deadline.map_or(deadline, |stop| deadline.min(stop));
+    // Vulkan display completion is not signaled on the Wayland socket.
+    // Poll at a bounded interval while a flip is outstanding; a canvas or
+    // control event still wakes this poll earlier.
+    let deadline = if state.direct
+        && state
+            .presenters
+            .iter()
+            .any(|p| p.feedback_pending_for.is_some())
+    {
+        deadline.min(Instant::now() + Duration::from_millis(4))
+    } else {
+        deadline
+    };
     let millis = deadline
         .saturating_duration_since(Instant::now())
         .as_millis()
@@ -5095,6 +5621,7 @@ fn dispatch_until(
         drop(guard);
     }
     queue.dispatch_pending(state)?;
+    let _ = poll_feedback(state)?;
     Ok(())
 }
 
@@ -5214,9 +5741,9 @@ fn present_sync_cpu(
             // Split-borrow: the transfer table is read while this
             // presenter's buffer is written.
             let Presenter {
-                transfer, buffers, ..
+                transfer, wayland, ..
             } = presenter;
-            let (_, map) = &mut buffers[d.slot];
+            let (_, map) = &mut wayland.as_mut().unwrap().buffers[d.slot];
             let paint = SyncPaint {
                 transfer,
                 rects: &rects,
@@ -6245,7 +6772,7 @@ mod tests {
             (1_000_000_000.0 / refresh_hz).round() as u32
         };
         Slot::Presented {
-            at_ns: at_ms * 1_000_000,
+            at_ns: Some(at_ms * 1_000_000),
             refresh_ns,
             zero_copy,
         }
@@ -6281,6 +6808,7 @@ mod tests {
                     SettledOutcome::Presented {
                         refresh_ns: Some(16_666_667),
                         zero_copy: false,
+                        timestamped: true,
                     }
                 ),
                 (1, SettledOutcome::Discarded),
@@ -6341,6 +6869,7 @@ mod tests {
                     SettledOutcome::Presented {
                         refresh_ns: Some(16_666_667),
                         zero_copy: true,
+                        timestamped: true,
                     }
                 ),
                 (
@@ -6348,6 +6877,7 @@ mod tests {
                     SettledOutcome::Presented {
                         refresh_ns: Some(16_666_667),
                         zero_copy: false,
+                        timestamped: true,
                     }
                 ),
             ]
@@ -6433,7 +6963,7 @@ mod tests {
     /// precision — needed here to land exactly on refresh-period multiples.
     fn presented_at_ns(at_ns: u64, refresh_ns: u32) -> Slot {
         Slot::Presented {
-            at_ns,
+            at_ns: Some(at_ns),
             refresh_ns,
             zero_copy: false,
         }
@@ -6692,6 +7222,9 @@ mod tests {
     /// falls back to printing the registry name instead).
     fn bare_state(used_outputs: Vec<u32>) -> State {
         State {
+            direct: false,
+            direct_timestamp_seen: false,
+            deadline: None,
             outputs: Vec::new(),
             used_outputs,
             output_modes: HashMap::new(),
@@ -7849,19 +8382,21 @@ mod tests {
         let transfer = vec![(200u16, 3u8); 480 * 360];
         let mut state = bare_state(vec![]);
         state.presenters = vec![Presenter {
-            surface: WlSurface::inert(backend.clone()),
-            layer_surface: ZwlrLayerSurfaceV1::inert(backend.clone()),
+            wayland: Some(WaylandPresenter {
+                surface: WlSurface::inert(backend.clone()),
+                layer_surface: ZwlrLayerSurfaceV1::inert(backend.clone()),
+                opaque_for: None,
+                output_mode: None,
+                buffers: vec![(
+                    WlBuffer::inert(backend.clone()),
+                    memmap2::MmapMut::map_anon(480 * 360 * 4).unwrap(),
+                )],
+                gpu_buffers: vec![],
+                busy: vec![false],
+                next_buffer: 0,
+            }),
             configured: Some((480, 360)),
-            opaque_for: None,
-            output_mode: None,
             name: slice.output.clone(),
-            buffers: vec![(
-                WlBuffer::inert(backend.clone()),
-                memmap2::MmapMut::map_anon(480 * 360 * 4).unwrap(),
-            )],
-            gpu_buffers: vec![],
-            busy: vec![false],
-            next_buffer: 0,
             transfer: transfer.clone(),
             dynamic_table: None,
             warp: None,
@@ -7870,6 +8405,7 @@ mod tests {
             warp_revision: 0,
             warp_reported_revision: None,
             warp_submitted_revision: None,
+            direct_pending_warp: BTreeMap::new(),
             slice: slice.slice,
             frame_pending: false,
             pending_since: None,
@@ -7968,23 +8504,25 @@ mod tests {
         let mut state = bare_state(vec![]);
         state.presenters = (0..2)
             .map(|i| Presenter {
-                surface: WlSurface::inert(backend.clone()),
-                layer_surface: ZwlrLayerSurfaceV1::inert(backend.clone()),
+                wayland: Some(WaylandPresenter {
+                    surface: WlSurface::inert(backend.clone()),
+                    layer_surface: ZwlrLayerSurfaceV1::inert(backend.clone()),
+                    opaque_for: None,
+                    output_mode: None,
+                    buffers: (0..2)
+                        .map(|_| {
+                            (
+                                WlBuffer::inert(backend.clone()),
+                                memmap2::MmapMut::map_anon(64).unwrap(),
+                            )
+                        })
+                        .collect(),
+                    gpu_buffers: vec![],
+                    busy: vec![false; 2],
+                    next_buffer: 0,
+                }),
                 configured: Some((4, 4)),
-                opaque_for: None,
-                output_mode: None,
                 name: format!("OUT-{i}"),
-                buffers: (0..2)
-                    .map(|_| {
-                        (
-                            WlBuffer::inert(backend.clone()),
-                            memmap2::MmapMut::map_anon(64).unwrap(),
-                        )
-                    })
-                    .collect(),
-                gpu_buffers: vec![],
-                busy: vec![false; 2],
-                next_buffer: 0,
                 transfer: vec![(256, 0); 16],
                 dynamic_table: None,
                 warp: None,
@@ -7993,6 +8531,7 @@ mod tests {
                 warp_revision: 7,
                 warp_reported_revision: None,
                 warp_submitted_revision: None,
+                direct_pending_warp: BTreeMap::new(),
                 slice: crate::model::Rect {
                     x: i * 4,
                     y: 0,
@@ -8008,6 +8547,64 @@ mod tests {
             })
             .collect();
         (connection, server, state)
+    }
+
+    #[test]
+    fn direct_completion_opens_only_the_matching_gate_and_keeps_missing_time_unavailable() {
+        let (_connection, _server, mut state) = lifecycle_state();
+        state.direct = true;
+        state.timing = Timing::new(2);
+        state.timing.snapshot_id = 2;
+        state.timing.request(2, 0);
+        state.timing.request(2, 1);
+        state.presenters[0].commit_sent(2, true);
+        state.presenters[1].commit_sent(2, true);
+        state.presenters[0].direct_pending_warp.insert(2, 7);
+        state.presenters[0].warp_revision = 8;
+        complete_direct_presentation(&mut state, 0, "OUT-0", 1, Some(1_000), 60_000).unwrap();
+        assert_eq!(state.presenters[0].feedback_pending_for, Some(2));
+        assert_eq!(state.presenters[0].warp_reported_revision, None);
+        assert!(!state.gate_open());
+        complete_direct_presentation(&mut state, 0, "OUT-0", 2, None, 60_000).unwrap();
+        assert_eq!(state.presenters[0].warp_reported_revision, Some(7));
+        assert!(!state.gate_open());
+        complete_direct_presentation(&mut state, 1, "OUT-1", 2, None, 60_000).unwrap();
+        assert!(state.gate_open());
+        let interval = state.timing.drain_interval();
+        assert_eq!(interval.outputs[0].presented, 1);
+        assert_eq!(interval.outputs[1].presented, 1);
+        assert!(interval.offset.is_none());
+        assert!(interval.phases.iter().all(|phase| phase.0.is_none()));
+    }
+
+    #[test]
+    fn direct_completion_during_dispatch_wakes_the_waiting_canvas_frame() {
+        let (connection, _server, mut state) = lifecycle_state();
+        state.direct = true;
+        state.timing = Timing::new(2);
+        state.timing.snapshot_id = 1;
+        for index in 0..2 {
+            state.presenters[index].stale = true;
+            state.presenters[index].commit_sent(1, true);
+            state.timing.request(1, index);
+        }
+        assert!(!state.can_present());
+        let mut queue = connection.new_event_queue::<State>();
+        let started = Instant::now();
+        dispatch_until_with_feedback(
+            &connection,
+            &mut queue,
+            &mut state,
+            started + Duration::from_millis(500),
+            |state| {
+                complete_direct_presentation(state, 0, "OUT-0", 1, None, 60_000)?;
+                complete_direct_presentation(state, 1, "OUT-1", 1, None, 60_000)?;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert!(state.can_present());
+        assert!(started.elapsed() < Duration::from_millis(250));
     }
 
     #[test]

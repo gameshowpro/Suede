@@ -39,6 +39,14 @@ is any attached device.
 
 ## The path of a frame {: #the-path-of-a-frame }
 
+This section describes the default Sway/Wayland presentation path. An
+[experimental direct Vulkan presenter](plans/display-integration.md) shares
+the same capture, warp, blend, and timing logic, but renders into display
+swapchains instead of exported presentation buffers. It is selected through
+the internal slice command; persistent appliance configuration still uses
+Wayland. [System A](developer/test-systems.md#system-a) [comparison results](plans/display-component-results.md) track
+performance and the remaining synchronization and driver recovery limits.
+
 Sway never sees the overlaps. It is always handed a plain edge-to-edge
 tiling (sway cannot render overlapping outputs distinctly — its single
 global coordinate space gives every output the same pixels in a shared

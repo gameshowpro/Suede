@@ -1333,6 +1333,42 @@
         ],
         "type": "object"
       },
+      "GlYieldMode": {
+        "description": "NVIDIA's `__GL_YIELD` toggle for Sway's environment — experimental; see\n[`crate::config::BootstrapConfig::gl_yield`].\n\nRead once at startup from `suede.toml`'s top-level `gl_yield` key, exactly\nlike [`PresentationMode`] — never overridable by a `SUEDE_*` variable,\nbecause it too describes how the compositor was started. NVIDIA-only:\nMesa ignores `__GL_YIELD` entirely, so this has no effect on other\ndrivers.",
+        "enum": [
+          "default",
+          "usleep",
+          "nothing"
+        ],
+        "type": "string"
+      },
+      "GlYieldStatus": {
+        "description": "What `GET /system` reports about `gl_yield` — requested and live.\n\nExperimental. Unlike [`PresentationStatus`], `effective` is not resolved\nonce at startup and cached: it is read from the live Sway's\n`/proc/<pid>/environ` on every request, so a session that has not been\nrestarted since `suede.toml` changed shows the mismatch instead of a\nstale cached answer.",
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/GlYieldMode",
+            "description": "What the live compositor's environment actually shows right now."
+          },
+          "requested": {
+            "$ref": "#/components/schemas/GlYieldMode",
+            "description": "What `suede.toml` asks for."
+          }
+        },
+        "required": [
+          "requested",
+          "effective"
+        ],
+        "type": "object"
+      },
+      "GspFirmware": {
+        "description": "Whether the GPU Systems Processor firmware is active for this GPU, read\nfrom the `GPU Firmware:` line of\n`/proc/driver/nvidia/gpus/*/information` — see [`crate::nvidia_driver`].",
+        "enum": [
+          "on",
+          "off",
+          "unknown"
+        ],
+        "type": "string"
+      },
       "HeartbeatConfig": {
         "additionalProperties": false,
         "description": "Content-level watchdog settings.",
@@ -1613,6 +1649,45 @@
           "refreshHz"
         ],
         "type": "object"
+      },
+      "NvidiaDriverStatus": {
+        "description": "What `GET /system` reports about the NVIDIA driver, or `null` on a\nmachine `/proc/driver/nvidia` does not exist on — see\n[`crate::nvidia_driver::detect`].",
+        "properties": {
+          "gspFirmware": {
+            "$ref": "#/components/schemas/GspFirmware"
+          },
+          "gspOptional": {
+            "description": "True only for the proprietary module: the open module requires GSP\nand has no way to disable it.",
+            "type": "boolean"
+          },
+          "kernelModule": {
+            "$ref": "#/components/schemas/NvidiaKernelModule"
+          },
+          "newestTested": {
+            "description": "The newest driver release Suede's direct and Wayland presentation\npaths have been validated on — see\n[`crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER`]. Reported\nalongside `version` so a client can compare them without also\nshipping the constant, and so the `nvidia-driver-version` health\ncheck's warning is self-explanatory from the API alone.",
+            "type": "string"
+          },
+          "version": {
+            "description": "The dotted version NVRM reports, e.g. `595.91.07`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "kernelModule",
+          "gspFirmware",
+          "gspOptional",
+          "newestTested"
+        ],
+        "type": "object"
+      },
+      "NvidiaKernelModule": {
+        "description": "Which NVIDIA kernel module is loaded, read from the `NVRM version:` line\nof `/proc/driver/nvidia/version` — see [`crate::nvidia_driver`].",
+        "enum": [
+          "proprietary",
+          "open"
+        ],
+        "type": "string"
       },
       "Output": {
         "description": "A video output as reported by Sway's `get_outputs`.",
@@ -2061,6 +2136,14 @@
         ],
         "type": "string"
       },
+      "PresentationMode": {
+        "description": "How an appliance presents its outputs: the default Wayland path (sway\ntiles or slices, as [`crate::config::BootstrapConfig::allow_overlaps`]\ndecides), or the experimental direct path where the daemon takes\nownership of the physical outputs itself and presents through the\nslicer's Vulkan swapchain, bypassing the compositor entirely.\n\nRead once at startup from `suede.toml`'s top-level `presentation` key,\nexactly like [`crate::config::BootstrapConfig::allow_overlaps`] — never\noverridable by a `SUEDE_*` variable, because it describes how the\ncompositor was started, which a variable on Suede's own process cannot\nchange.",
+        "enum": [
+          "wayland",
+          "direct"
+        ],
+        "type": "string"
+      },
       "PresentationOffset": {
         "description": "Spread between the earliest and latest output to present the same frame,\nfrom `wp_presentation` feedback, in ms.",
         "properties": {
@@ -2076,6 +2159,39 @@
         "required": [
           "mean",
           "max"
+        ],
+        "type": "object"
+      },
+      "PresentationStatus": {
+        "description": "What `GET /system` reports about presentation — requested, effective, and\nwhy they differ, if they do.\n\nExperimental. `effective` is what this session runs, decided once when\nthe daemon starts (see [`crate::presentation::resolve`]): `direct` only\nwhen the login started a headless-only compositor for it and no\nfallback has happened this boot. A fallback ends the session and the\nnext one reports `wayland` with the fallback's reason until a reboot.",
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/PresentationMode",
+            "description": "What this session is actually running."
+          },
+          "outputs": {
+            "description": "Physical outputs the daemon owns directly, bypassing the compositor:\nevery connected display while `effective` is `direct`, and empty\notherwise.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why `effective` differs from `requested`, or `null` when they match.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "requested": {
+            "$ref": "#/components/schemas/PresentationMode",
+            "description": "What `suede.toml` asked for."
+          }
+        },
+        "required": [
+          "requested",
+          "effective",
+          "outputs"
         ],
         "type": "object"
       },
@@ -2735,8 +2851,15 @@
           "perFrameMs": {
             "$ref": "#/components/schemas/FrameCost"
           },
+          "presentationBackend": {
+            "description": "Presentation backend used for this interval: `wayland` or `vulkan-display`.\nAbsent in reports from older slicers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "presentationFeedback": {
-            "description": "Whether the compositor offers wp_presentation; without it offset_ms and the\nper-output presented/discarded/refreshHz fields cannot be measured.",
+            "description": "Whether the backend supplies per-image presentation feedback. Completion\ncan be known even when its timestamp is unavailable; missing timestamp\nmeasurements remain null, not zero.",
             "type": "boolean"
           },
           "presentedFps": {
@@ -2759,6 +2882,13 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "timestampSource": {
+            "description": "Clock and protocol used to timestamp displayed frames, when available.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3174,10 +3304,25 @@
             "description": "Which build is running: `git describe` output, e.g.\n`v0.1.0-12-g81226ee`. `suedeVersion` names the release this is meant\nto be; this names the commit it was actually built from, which is the\nquestion when a fix appears not to have landed.",
             "type": "string"
           },
+          "glYield": {
+            "$ref": "#/components/schemas/GlYieldStatus",
+            "description": "NVIDIA's `__GL_YIELD` toggle, requested and live — experimental; see\n[`GlYieldStatus`]."
+          },
           "hostname": {
             "type": [
               "string",
               "null"
+            ]
+          },
+          "nvidiaDriver": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/NvidiaDriverStatus",
+                "description": "The NVIDIA driver this session runs, or `null` on a non-NVIDIA\nmachine — see [`crate::nvidia_driver::detect`]. Read fresh on every\nrequest, like `gl_yield.effective`."
+              }
             ]
           },
           "packages": {
@@ -3192,6 +3337,10 @@
               "$ref": "#/components/schemas/PowerVerb"
             },
             "type": "array"
+          },
+          "presentation": {
+            "$ref": "#/components/schemas/PresentationStatus",
+            "description": "How this session was asked to present, and how it actually is —\nexperimental; see\n[`crate::config::BootstrapConfig::presentation_effective`]."
           },
           "suedeVersion": {
             "type": "string"
@@ -3224,7 +3373,9 @@
           "packages",
           "supportsTearing",
           "webUiEnabled",
-          "powerVerbs"
+          "powerVerbs",
+          "presentation",
+          "glYield"
         ],
         "type": "object"
       },

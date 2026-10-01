@@ -71,7 +71,7 @@ check "audio inputs are visible" "1" \
   "$(json_of "${BASE}/api/v1/av" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["audioInputs"]))')"
 check "video inputs are visible" "1" \
   "$(json_of "${BASE}/api/v1/av" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["videoInputs"]))')"
-check "health checks run" "17" \
+check "health checks run" "19" \
   "$(json_of "${BASE}/api/v1/system/checks" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)))')"
 check "system reports its version" "true" \
   "$(json_of "${BASE}/api/v1/system" | python3 -c 'import sys,json;print(str(len(json.load(sys.stdin)["suedeVersion"])>0).lower())')"

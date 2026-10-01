@@ -199,6 +199,10 @@ pub enum Slicing {
     /// buffer instead of sharing one window across the lot — the case direct
     /// scanout was built for, and the case a driver cannot mirror by mistake.
     Always,
+    /// Every layout, a single output included: experimental direct
+    /// presentation, where the slicer is the only thing that can put a pixel
+    /// on a physical display, so an unsliced output would stay dark.
+    Every,
 }
 
 /// Derive the canvas from the configured layout.
@@ -221,8 +225,10 @@ pub enum Slicing {
 ///
 /// A single identity output is never sliced: there is nothing to cut up, and
 /// a canvas the size of one display bought with a capture and a blend pass is
-/// pure loss. The internal warp activation seam below is the deliberate
-/// exception: a nonidentity output needs the slicer even with blend off.
+/// pure loss. Two deliberate exceptions: the internal warp activation seam
+/// below (a nonidentity output needs the slicer even with blend off), and
+/// [`Slicing::Every`] (in direct presentation the slicer is the only
+/// presenter there is).
 pub fn canvas_plan(
     participants: &[Participant],
     config: Option<&ProjectionConfig>,
@@ -247,7 +253,7 @@ pub fn canvas_plan_with_warp_activation(
         || participants
             .iter()
             .any(|participant| participant.rect.width <= 0 || participant.rect.height <= 0)
-        || (participants.len() < 2 && !has_nonidentity_warp)
+        || (participants.len() < 2 && !has_nonidentity_warp && slicing != Slicing::Every)
     {
         return None;
     }
@@ -1076,6 +1082,30 @@ mod tests {
             Slicing::Always,
         )
         .is_none());
+    }
+
+    #[test]
+    fn direct_presentation_slices_even_a_single_output() {
+        // Nothing but the slicer can light a directly presented display.
+        let plan = canvas_plan(
+            &[participant("DP-1", 100, 50, 1920, 1080)],
+            Some(&blending()),
+            Slicing::Every,
+        )
+        .expect("a single output is sliced in direct presentation");
+        assert_eq!((plan.canvas_width, plan.canvas_height), (1920, 1080));
+        assert_eq!(plan.slices.len(), 1);
+        assert_eq!(
+            plan.slices[0].slice,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080
+            }
+        );
+        let evaluator = evaluator_for(&plan);
+        assert_eq!(evaluator.transfer(0, 500.0, 500.0, 1.0, 0.0, 1.0).0, 256);
     }
 
     #[test]

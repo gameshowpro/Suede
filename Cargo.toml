@@ -114,7 +114,15 @@ depends = "$auto, sway, swayidle, pipewire, pipewire-pulse"
 # "medium" - see packaging/postinst. A Recommends, not a Depends: postinst
 # guards the call with `command -v setcap` and does not fail the install
 # without it, so a machine that skips this only loses the priority bump.
-recommends = "libcap2-bin"
+#
+# hwdata, for experimental direct presentation: the daemon names each display
+# it drives itself (make/model/serial from the EDID) with the PNP vendor table
+# in /usr/share/hwdata/pnp.ids, the same table wlroots compiles in, so the
+# names match what sway reports for the same display. Without it the daemon
+# falls back to systemd's hwdb and then to the bare three-letter code, which
+# can rename a display that saved configuration refers to - worth a
+# Recommends, not worth refusing an install over (Wayland needs none of it).
+recommends = "libcap2-bin, hwdata"
 # No browser relationship at all. Suede does not link against a browser or
 # name one at build time: it resolves whichever of several binaries it finds
 # at launch, and says plainly when it finds none. Declaring them here only

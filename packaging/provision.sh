@@ -203,6 +203,146 @@ SCANOUT_BLOCK="$(cat <<'SCANOUT_EOF'
 SCANOUT_EOF
 )"
 
+# Experimental direct presentation (`presentation = "direct"` in suede.toml):
+# a headless-only sway holds the canvas the app renders into, and the Suede
+# slicer drives the displays itself. Chosen here, at every login, because the
+# compositor's backends are fixed when it starts. The daemon resolves the same
+# keys the same way (suede::presentation::resolve), and asks this block for
+# the ordinary session instead by writing the fallback marker and ending the
+# headless sway; getty's auto-login then comes straight back here.
+#
+# Runtime state lives in $XDG_RUNTIME_DIR/suede, a tmpfs, so a fallback lasts
+# for the rest of this boot only and direct is tried again after a reboot:
+#   session                what the last login started (direct or wayland)
+#   direct-attempts        headless starts this boot not yet confirmed by the
+#                          daemon; the third unconfirmed one falls back
+#   presentation-fallback  JSON {reason, time, bootId}; present = wayland
+#
+# For a direct session it also chooses which DRM card's render node the
+# headless canvas is allocated on: the one with the most connected
+# connectors, never one with none — see the comment above the
+# WLR_RENDER_DRM_DEVICE loop below for why a multi-GPU machine needs this.
+#
+# Kept in its own heredoc, delimited by PRESENTATION_EOF, so
+# scripts/validate-packaging.sh can run it against sample files. It sets
+# suede_session, which the lines after it act on, rather than starting sway
+# itself.
+PRESENTATION_BLOCK="$(cat <<'PRESENTATION_EOF'
+  # Direct presentation (experimental): see presentation in suede.toml.
+  suede_state="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/suede"
+  mkdir -p "$suede_state" 2>/dev/null
+  suede_toml_word() {
+    sed -n -E "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*\"?([A-Za-z_]+)\"?.*/\1/p" \
+      "$HOME/.config/suede/suede.toml" 2>/dev/null | head -n1
+  }
+  # After a direct session, hand the displays back before a DRM sway wants
+  # them: give the daemon's slicer time to release them itself, then clear
+  # any NVKMS grant a killed slicer left behind.
+  if [ "$(cat "$suede_state/session" 2>/dev/null)" = "direct" ]; then
+    suede_wait=0
+    while [ "$suede_wait" -lt 15 ] \
+       && pgrep -u "$(id -u)" -f -- ' slice --spec .*--presentation-config' >/dev/null 2>&1; do
+      sleep 1
+      suede_wait=$((suede_wait + 1))
+    done
+    /usr/bin/suede display-reset >/dev/null 2>&1 || true
+  fi
+  suede_attempts="$(cat "$suede_state/direct-attempts" 2>/dev/null)"
+  case "$suede_attempts" in ''|*[!0-9]*) suede_attempts=0 ;; esac
+  suede_session=wayland
+  if [ "$(suede_toml_word presentation)" = "direct" ] \
+     && [ "$(suede_toml_word allow_overlaps)" = "true" ] \
+     && [ ! -e "$suede_state/presentation-fallback" ]; then
+    if [ "$suede_attempts" -lt 3 ]; then
+      suede_session=direct
+    else
+      printf '{"reason":"%s","time":%s,"bootId":"%s"}\n' \
+        "headless compositor failed to start 3 times" "$(date +%s)" \
+        "$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)" \
+        > "$suede_state/presentation-fallback"
+    fi
+  fi
+  echo "$suede_session" > "$suede_state/session"
+  if [ "$suede_session" = "direct" ]; then
+    echo $((suede_attempts + 1)) > "$suede_state/direct-attempts"
+    export WLR_BACKENDS=headless
+    export WLR_HEADLESS_OUTPUTS=1
+    # Pick the render node of the DRM card that actually drives the physical
+    # displays, not just the first one enumerated. On a machine with more
+    # than one GPU — an integrated GPU beside the discrete card that outputs
+    # to the wall, System B's shape — the first renderD* is often the iGPU's,
+    # which has nothing connected. The headless canvas must be allocated on
+    # the same device the direct-mode slicer will later match by DRM primary
+    # node (pick_direct_physical_device in src/projection/gpu/display.rs), or
+    # it finds no candidate GPU at all. The card with the most connected
+    # connectors wins; a card with none is never chosen over one that has
+    # any. SUEDE_DRM_SYSFS/SUEDE_DRM_DEV stand in for /sys/class/drm and
+    # /dev/dri only under scripts/validate-packaging.sh's fake sysfs tree.
+    suede_drm_sysfs="${SUEDE_DRM_SYSFS:-/sys/class/drm}"
+    suede_drm_dev="${SUEDE_DRM_DEV:-/dev/dri}"
+    suede_best_card=""
+    suede_best_count=-1
+    for suede_card_dir in "$suede_drm_sysfs"/card[0-9]*; do
+      [ -d "$suede_card_dir" ] || continue
+      # Skip per-connector directories (card1-DP-1); only bare cardN dirs
+      # name a device.
+      case "${suede_card_dir##*/}" in *-*) continue ;; esac
+      suede_count=0
+      for suede_status in "$suede_card_dir"-*/status; do
+        [ -e "$suede_status" ] || continue
+        [ "$(cat "$suede_status" 2>/dev/null)" = "connected" ] \
+          && suede_count=$((suede_count + 1))
+      done
+      if [ "$suede_count" -gt "$suede_best_count" ]; then
+        suede_best_count="$suede_count"
+        suede_best_card="${suede_card_dir##*/}"
+      fi
+    done
+    if [ -n "$suede_best_card" ] && [ "$suede_best_count" -gt 0 ]; then
+      for suede_render in "$suede_drm_sysfs/$suede_best_card"/device/drm/renderD*; do
+        [ -e "$suede_render" ] \
+          && export WLR_RENDER_DRM_DEVICE="$suede_drm_dev/${suede_render##*/}"
+        break
+      done
+    fi
+    # No card reports a connected connector, or the chosen one has no render
+    # node of its own: fall back to the first renderD* found at all, exactly
+    # as before this rule existed.
+    if [ -z "${WLR_RENDER_DRM_DEVICE:-}" ]; then
+      for suede_render in "$suede_drm_dev"/renderD*; do
+        [ -e "$suede_render" ] && export WLR_RENDER_DRM_DEVICE="$suede_render"
+        break
+      done
+    fi
+  fi
+  unset -f suede_toml_word
+  unset suede_state suede_attempts suede_wait suede_render suede_drm_sysfs \
+    suede_drm_dev suede_best_card suede_best_count suede_card_dir \
+    suede_count suede_status
+PRESENTATION_EOF
+)"
+
+# NVIDIA's EGL busy-wait workaround (`gl_yield` in suede.toml, experimental):
+# exported into Sway's environment before either branch below execs it, so it
+# applies equally to the ordinary DRM session and the headless one that backs
+# direct presentation. Mesa ignores the variable, so an absent key or
+# anything but "usleep"/"nothing" exports nothing and driver behavior is
+# unchanged. See docs/configuration.md and docs/developer/vk-khr.md for the
+# measured trade-off.
+#
+# Kept in its own heredoc, delimited by GL_YIELD_EOF, so
+# scripts/validate-packaging.sh can run it against sample suede.toml files.
+GL_YIELD_BLOCK="$(cat <<'GL_YIELD_EOF'
+  suede_gl_yield="$(sed -n -E 's/^[[:space:]]*gl_yield[[:space:]]*=[[:space:]]*"?([A-Za-z_]+)"?.*/\1/p' \
+    "$HOME/.config/suede/suede.toml" 2>/dev/null | head -n1)"
+  case "$suede_gl_yield" in
+    usleep) export __GL_YIELD=USLEEP ;;
+    nothing) export __GL_YIELD=NOTHING ;;
+  esac
+  unset suede_gl_yield
+GL_YIELD_EOF
+)"
+
 BEGIN="# BEGIN SUEDE_PROVISION"
 END="# END SUEDE_PROVISION"
 PROFILE="$USER_HOME/.bash_profile"
@@ -220,6 +360,13 @@ if [ "\$(tty)" = "/dev/tty1" ] && [ -z "\${WAYLAND_DISPLAY:-}" ]; then
   export XDG_CURRENT_DESKTOP=sway
   export XDG_SESSION_DESKTOP=sway
 $SCANOUT_BLOCK
+$PRESENTATION_BLOCK
+$GL_YIELD_BLOCK
+  if [ "\$suede_session" = "direct" ]; then
+    clear
+    exec sway${SWAY_FLAGS} > "\$HOME/.sway.log" 2>&1
+  fi
+  unset suede_session
   # The headless backend provides the projection canvas: an off-screen
   # output the app renders into, which the slicer cuts up per projector.
   export WLR_BACKENDS=drm,libinput,headless

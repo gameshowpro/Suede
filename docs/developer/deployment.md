@@ -37,6 +37,45 @@ sudo apt install ./suede_1.2.4-1_arm64.deb
 
 `postinst` also grants `/usr/bin/suede` the `cap_sys_nice+ep` file capability (via `setcap`, from the `libcap2-bin` Recommends) so the slicer's GPU blend can negotiate a realtime Vulkan queue priority instead of the driver's unprivileged "medium" default — see [Where the blend runs](../how-it-works.md#where-the-blend-runs). dpkg does not preserve file capabilities across an upgrade, so this reapplies on every `configure`, not just first install.
 
+The package also `Recommends` `hwdata`: for experimental direct presentation, the daemon names each display it drives itself from its EDID, and `/usr/share/hwdata/pnp.ids` is the same PNP vendor table wlroots compiles in, so the names it produces agree with what Sway reports for the same display. Without it the daemon falls back to systemd's `20-acpi-vendor.hwdb` and then to the bare three-letter code — worth a `Recommends`, not worth refusing an install over, since Wayland needs none of it.
+
+### The login profile block {: #the-login-profile-block }
+
+`provision.sh` writes a block into the tty1 auto-login user's `~/.bash_profile`, between `# BEGIN SUEDE_PROVISION` and `# END SUEDE_PROVISION` markers so re-running it replaces only its own block. Two pieces of it are generated from their own heredocs so `scripts/validate-packaging.sh` can lift each one out and run it against sample `suede.toml` files in isolation:
+
+- **The scanout block** (`SCANOUT_EOF`) derives `WLR_SCENE_DISABLE_DIRECT_SCANOUT` from `allow_overlaps` and `direct_scanout` every time the profile runs — see [Overlapping layouts and direct scanout](../configuration.md#direct-scanout).
+- **The presentation block** (`PRESENTATION_EOF`), for [experimental direct presentation](../configuration.md#experimental-direct-presentation): reads `presentation` and `allow_overlaps` from `suede.toml`, decides whether this login starts a headless-only Sway or the ordinary DRM one, and exports `WLR_BACKENDS=headless`, `WLR_HEADLESS_OUTPUTS=1` and `WLR_RENDER_DRM_DEVICE` for the former. Runtime state lives in `$XDG_RUNTIME_DIR/suede`, a tmpfs, so it lasts only for the current boot:
+
+  | File | Holds |
+  |---|---|
+  | `session` | what the last login started, `direct` or `wayland` |
+  | `direct-attempts` | headless starts this boot the daemon has not yet confirmed; the third one falls back |
+  | `presentation-fallback` | JSON `{reason, time, bootId}` once a fallback has happened; present means `wayland` for the rest of this boot |
+
+  Before starting anything, the block also waits up to 15 seconds for a
+  previous direct session's `suede slice` process to release DRM master, then
+  runs `suede display-reset` — see [the recovery
+  runbook](vk-khr.md#recovery-runbook) — so an operator restarting
+  `getty@tty1` mid-session cannot race the DRM Sway onto a card the slicer
+  still holds.
+
+  `WLR_RENDER_DRM_DEVICE` is not simply the first `/dev/dri/renderD*` found:
+  on a machine with more than one GPU — an integrated GPU beside the discrete
+  card that actually drives the wall, [System B](test-systems.md#system-b)'s
+  shape — that would allocate the headless canvas on the wrong device. The
+  block instead scans `/sys/class/drm/card*-*/status` for the card with the
+  most connected connectors (never one with none, even if it is enumerated
+  first) and picks that card's own render node, falling back to the first
+  `renderD*` found at all only when no card reports a connected connector.
+  This has to agree with the daemon's own card choice
+  (`DrmInventory::preflight` (`src/drm_inventory.rs`)) and with
+  `pick_direct_physical_device`'s DRM-primary match
+  (`src/projection/gpu/display.rs`),
+  or the slicer starts against a GPU with no path to the displays.
+  `scripts/validate-packaging.sh` exercises the rule against a fake sysfs
+  tree via the `SUEDE_DRM_SYSFS`/`SUEDE_DRM_DEV` overrides the block reads
+  instead of the real filesystem when they are set.
+
 The package declares **no relationship to a browser**. Suede resolves whichever
 of `chromium`, `chromium-browser`, `google-chrome-stable`, `google-chrome`,
 `firefox` or `firefox-esr` it finds when it launches an app, and both

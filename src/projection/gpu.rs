@@ -94,11 +94,14 @@ use std::borrow::Cow;
 use std::ffi::{c_char, CStr};
 use std::io::Cursor;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
 use ash::vk;
+
+pub mod display;
 
 const VERT_SPV: &[u8] = include_bytes!("shaders/blend.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("shaders/blend.frag.spv");
@@ -326,6 +329,78 @@ pub struct BlendJob<'a> {
     pub warp: Option<&'a super::warp::Warp>,
 }
 
+#[derive(Clone, Copy)]
+enum TargetKind {
+    Dmabuf,
+    Swapchain { old_layout: vk::ImageLayout },
+}
+
+struct TargetTransitions {
+    old_layout: vk::ImageLayout,
+    render_layout: vk::ImageLayout,
+    release_layout: vk::ImageLayout,
+    acquire_src_family: u32,
+    acquire_dst_family: u32,
+    release_src_family: u32,
+    release_dst_family: u32,
+}
+
+impl TargetKind {
+    fn transitions(self, queue_family: u32) -> TargetTransitions {
+        match self {
+            Self::Dmabuf => TargetTransitions {
+                old_layout: vk::ImageLayout::GENERAL,
+                render_layout: vk::ImageLayout::GENERAL,
+                release_layout: vk::ImageLayout::GENERAL,
+                acquire_src_family: vk::QUEUE_FAMILY_FOREIGN_EXT,
+                acquire_dst_family: queue_family,
+                release_src_family: queue_family,
+                release_dst_family: vk::QUEUE_FAMILY_FOREIGN_EXT,
+            },
+            Self::Swapchain { old_layout } => TargetTransitions {
+                old_layout,
+                render_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                release_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+                acquire_src_family: vk::QUEUE_FAMILY_IGNORED,
+                acquire_dst_family: vk::QUEUE_FAMILY_IGNORED,
+                release_src_family: vk::QUEUE_FAMILY_IGNORED,
+                release_dst_family: vk::QUEUE_FAMILY_IGNORED,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RenderTarget {
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    image: vk::Image,
+    view: vk::ImageView,
+    kind: TargetKind,
+}
+
+impl From<&DmabufImage> for RenderTarget {
+    fn from(image: &DmabufImage) -> Self {
+        Self {
+            width: image.width,
+            height: image.height,
+            format: image.format,
+            image: image.image,
+            view: image.view,
+            kind: TargetKind::Dmabuf,
+        }
+    }
+}
+
+struct RenderJob<'a> {
+    target: RenderTarget,
+    output: usize,
+    source_x: u32,
+    source_y: u32,
+    warp: Option<&'a super::warp::Warp>,
+}
+
 /// One output-local transfer table in an atomic [`Gpu::replace_transfers`]
 /// update. The table is borrowed only for the duration of the call; the GPU
 /// stages its own inactive buffer before changing any active descriptor.
@@ -374,6 +449,8 @@ struct DeviceState {
     /// What `create_device`'s global-priority ladder granted `queue` — see
     /// `QueuePriority` and the module doc's "Queue priority" section.
     queue_priority: QueuePriority,
+    direct_mode: bool,
+    direct_failed: AtomicBool,
 }
 
 impl Drop for DeviceState {
@@ -388,7 +465,9 @@ impl Drop for DeviceState {
         // submission might still be reading, in case a caller dropped
         // everything without waiting on the last `blend()`'s fence.
         unsafe {
-            let _ = self.device.device_wait_idle();
+            if !self.direct_mode {
+                let _ = self.device.device_wait_idle();
+            }
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
         }
@@ -743,6 +822,7 @@ impl MeasurementPass {
 
 pub struct Gpu {
     device: Arc<DeviceState>,
+    direct: Option<display::DirectDisplay>,
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: vk::DescriptorPool,
     pipeline_layout: vk::PipelineLayout,
@@ -827,7 +907,7 @@ impl Gpu {
         let instance = unsafe { entry.create_instance(&instance_create_info, None) }
             .context("vkCreateInstance")?;
 
-        let device_state = match Self::create_device(&entry, &instance, render_node) {
+        let device_state = match Self::create_device(&entry, &instance, render_node, None) {
             Ok(state) => state,
             Err(error) => {
                 // Safety: nothing has been created from `instance` on this
@@ -842,18 +922,62 @@ impl Gpu {
         Self::from_device(device_state)
     }
 
+    /// Open an explicitly selected DRM card and use the same Vulkan device
+    /// for capture, blending, and direct display swapchains.
+    pub fn new_direct(
+        render_node: Option<u64>,
+        config: display::DirectDisplayConfig,
+    ) -> anyhow::Result<Gpu> {
+        let (card, primary) = display::open_card(&config)?;
+        let entry = unsafe { ash::Entry::load() }
+            .map_err(|error| anyhow!("loading libvulkan.so.1: {error}"))?;
+        display::check_instance_extensions(&entry)?;
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(c"suede")
+            .engine_name(c"suede")
+            .api_version(vk::API_VERSION_1_3);
+        let names: Vec<_> = display::INSTANCE_EXTENSIONS
+            .iter()
+            .map(|name| name.as_ptr())
+            .collect();
+        let info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(&names);
+        let instance = unsafe { entry.create_instance(&info, None) }
+            .context("vkCreateInstance for direct display")?;
+        let state = match Self::create_device(&entry, &instance, render_node, Some(primary)) {
+            Ok(state) => state,
+            Err(error) => {
+                unsafe { instance.destroy_instance(None) };
+                return Err(error);
+            }
+        };
+        let mut gpu = Self::from_device(state)?;
+        let direct = display::DirectDisplay::new(&gpu.device, card, config)?;
+        gpu.direct = Some(direct);
+        Ok(gpu)
+    }
+
     fn create_device(
         entry: &ash::Entry,
         instance: &ash::Instance,
         render_node: Option<u64>,
+        direct_primary: Option<(i64, i64)>,
     ) -> anyhow::Result<Arc<DeviceState>> {
-        let physical_device = pick_physical_device(instance, render_node)?;
+        let physical_device = if let Some(primary) = direct_primary {
+            display::pick_direct_physical_device(instance, render_node, primary)?
+        } else {
+            pick_physical_device(instance, render_node)?
+        };
         let queue_family = pick_queue_family(instance, physical_device)?;
 
         let mut device_extensions: Vec<*const c_char> = REQUIRED_DEVICE_EXTENSIONS
             .iter()
             .map(|name| name.as_ptr())
             .collect();
+        if direct_primary.is_some() {
+            device_extensions.extend(display::DEVICE_EXTENSIONS.iter().map(|name| name.as_ptr()));
+        }
 
         // Global queue priority — see the module doc's "Queue priority"
         // section for why this is worth the trouble. Entirely best-effort:
@@ -907,6 +1031,7 @@ impl Gpu {
                 queue_family,
                 &device_extensions,
                 candidate,
+                direct_primary.is_some(),
             ) {
                 Ok(created) => {
                     queue_priority = priority_tier(candidate);
@@ -948,6 +1073,8 @@ impl Gpu {
             external_memory_fd,
             drm_format_modifier,
             queue_priority,
+            direct_mode: direct_primary.is_some(),
+            direct_failed: AtomicBool::new(false),
         }))
     }
 
@@ -962,6 +1089,7 @@ impl Gpu {
         queue_family: u32,
         device_extensions: &[*const c_char],
         priority: Option<vk::QueueGlobalPriorityKHR>,
+        direct: bool,
     ) -> Result<ash::Device, vk::Result> {
         let queue_priorities = [1.0f32];
         let mut global_priority_info = priority.map(|priority| {
@@ -978,10 +1106,26 @@ impl Gpu {
         // `missing_requirement` already confirmed the device reports it.
         let mut vulkan_1_3_features =
             vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
-        let device_create_info = vk::DeviceCreateInfo::default()
+        let mut wait_feature =
+            vk::PhysicalDevicePresentWaitFeaturesKHR::default().present_wait(true);
+        let mut id_feature = vk::PhysicalDevicePresentIdFeaturesKHR::default().present_id(true);
+        let mut timing_feature = display::timing::Features::default();
+        let mut id2_feature = display::timing::Id2Features::default();
+        let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(device_extensions)
             .push_next(&mut vulkan_1_3_features);
+        if direct {
+            device_create_info = device_create_info
+                .push_next(&mut wait_feature)
+                .push_next(&mut id_feature);
+            timing_feature.present_timing = vk::TRUE;
+            id2_feature.present_id2 = vk::TRUE;
+            timing_feature.p_next = device_create_info.p_next as *mut std::ffi::c_void;
+            id2_feature.p_next = (&mut timing_feature as *mut display::timing::Features).cast();
+            device_create_info.p_next =
+                (&mut id2_feature as *mut display::timing::Id2Features).cast();
+        }
         // Safety: every pointer this chain holds (`queue_create_infos` and,
         // transitively, `global_priority_info`; `device_extensions`;
         // `vulkan_1_3_features`) outlives this call.
@@ -1106,6 +1250,7 @@ impl Gpu {
 
         Ok(Gpu {
             device: device_state,
+            direct: None,
             descriptor_set_layout,
             descriptor_pool,
             pipeline_layout,
@@ -1425,8 +1570,12 @@ impl Gpu {
             // See the module doc: we are the first writer of a `Present`
             // image, so we owe it the one-off UNDEFINED -> GENERAL
             // transition before it is ever used.
-            self.transition_to_general(image)
-                .context("initial UNDEFINED -> GENERAL transition")?;
+            if let Err(error) = self.transition_to_general(image) {
+                if self.device.direct_failed.load(Ordering::Relaxed) {
+                    cleanup.defuse();
+                }
+                return Err(error).context("initial UNDEFINED -> GENERAL transition");
+            }
         }
 
         let fd_info = vk::MemoryGetFdInfoKHR::default()
@@ -1686,20 +1835,37 @@ impl Gpu {
             }
             self.fence_in_flight = true;
             // Safety: the upload submission above owns this fence.
-            unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }?;
+            let wait = unsafe {
+                device.wait_for_fences(
+                    &[self.fence],
+                    true,
+                    if self.device.direct_mode {
+                        2_000_000_000
+                    } else {
+                        u64::MAX
+                    },
+                )
+            };
+            wait?;
             self.fence_in_flight = false;
             Ok(())
         })();
         // Safety: the upload is complete on success. On an error after a
         // successful submit, `fence_in_flight` remains true so Gpu's later
         // cleanup waits before the staging buffer can be destroyed.
-        if upload_result.is_ok() {
-            upload.destroy(device);
-        } else if self.fence_in_flight {
-            let _ = self.wait_for_pending_work();
+        let upload_complete = if self.fence_in_flight {
+            self.wait_for_pending_work().is_ok()
+        } else {
+            true
+        };
+        if upload_complete {
             upload.destroy(device);
         } else {
-            upload.destroy(device);
+            self.device.direct_failed.store(true, Ordering::Relaxed);
+            cleanup.defuse();
+            // HostBuffer has no Drop; leaving its Vulkan handles untouched
+            // deliberately retains staging storage while the submit may run.
+            return Err(anyhow!("static canvas upload completion unverified"));
         }
         upload_result.context("uploading static canvas")?;
 
@@ -1729,7 +1895,9 @@ impl Gpu {
         let result = self.transition_to_general_with_pool(device, pool, image);
         // Safety: `pool` was created just above in this function; destroying
         // it also frees the one command buffer allocated from it below.
-        unsafe { device.destroy_command_pool(pool, None) };
+        if !self.device.direct_failed.load(Ordering::Relaxed) {
+            unsafe { device.destroy_command_pool(pool, None) };
+        }
         result
     }
 
@@ -1785,14 +1953,29 @@ impl Gpu {
             // just created, unsignalled, and used by nothing else.
             unsafe { device.queue_submit(self.device.queue, &[submit], fence) }
                 .context("vkQueueSubmit")?;
-            unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }
-                .context("vkWaitForFences")?;
+            let wait = unsafe {
+                device.wait_for_fences(
+                    &[fence],
+                    true,
+                    if self.device.direct_mode {
+                        2_000_000_000
+                    } else {
+                        u64::MAX
+                    },
+                )
+            };
+            if wait.is_err() && self.device.direct_mode {
+                self.device.direct_failed.store(true, Ordering::Relaxed);
+            }
+            wait.context("vkWaitForFences")?;
             Ok(())
         })();
         // Safety: `fence` is done being useful either way — waited on above
         // when submission succeeded, never signaled (so nothing could be
         // waiting on it) when it did not.
-        unsafe { device.destroy_fence(fence, None) };
+        if !self.device.direct_failed.load(Ordering::Relaxed) {
+            unsafe { device.destroy_fence(fence, None) };
+        }
         result
     }
 
@@ -2341,8 +2524,12 @@ impl Gpu {
         // A descriptor's image layout must match the image's actual layout,
         // and `render` writes binding 0 as GENERAL like every other image
         // here.
-        self.transition_to_general(image)
-            .context("sync placeholder UNDEFINED -> GENERAL transition")?;
+        if let Err(error) = self.transition_to_general(image) {
+            if self.device.direct_failed.load(Ordering::Relaxed) {
+                cleanup.defuse();
+            }
+            return Err(error).context("sync placeholder UNDEFINED -> GENERAL transition");
+        }
 
         cleanup.defuse();
         self.placeholder = Some(PlaceholderImage {
@@ -2793,6 +2980,134 @@ impl Gpu {
     /// something else.
     pub fn sync(&mut self, jobs: &[BlendJob<'_>]) -> anyhow::Result<Duration> {
         self.render(Source::Sync, jobs)
+    }
+
+    /// Render captured canvas slices directly into acquired display images.
+    pub fn blend_direct(
+        &mut self,
+        canvas: &DmabufImage,
+        y_invert: bool,
+        jobs: &[display::DirectBlendJob<'_>],
+    ) -> anyhow::Result<display::DirectFrame> {
+        self.render_direct(
+            Source::Canvas {
+                image: CanvasImage::Dmabuf(canvas),
+                y_invert,
+            },
+            jobs,
+        )
+    }
+
+    /// Render an uploaded static canvas with the ordinary blend shader.
+    pub fn blend_static_direct(
+        &mut self,
+        canvas: &StaticCanvas,
+        jobs: &[display::DirectBlendJob<'_>],
+    ) -> anyhow::Result<display::DirectFrame> {
+        for job in jobs {
+            let (width, height) = self
+                .direct
+                .as_ref()
+                .ok_or_else(|| anyhow!("direct display unavailable"))?
+                .target_size(job.display)?;
+            if job.warp.is_some_and(|warp| warp.source_rect().is_some()) {
+                continue;
+            }
+            let right = job
+                .source_x
+                .checked_add(width)
+                .ok_or_else(|| anyhow!("direct static source x overflow"))?;
+            let bottom = job
+                .source_y
+                .checked_add(height)
+                .ok_or_else(|| anyhow!("direct static source y overflow"))?;
+            if right > canvas.width || bottom > canvas.height {
+                bail!(
+                    "direct static source exceeds canvas for output {}",
+                    job.output
+                );
+            }
+        }
+        self.render_direct(
+            Source::Canvas {
+                image: CanvasImage::Static(canvas),
+                y_invert: false,
+            },
+            jobs,
+        )
+    }
+
+    /// Render the ordinary synchronization pattern into direct targets.
+    pub fn sync_direct(
+        &mut self,
+        jobs: &[display::DirectBlendJob<'_>],
+    ) -> anyhow::Result<display::DirectFrame> {
+        self.render_direct(Source::Sync, jobs)
+    }
+
+    fn render_direct(
+        &mut self,
+        source: Source<'_>,
+        jobs: &[display::DirectBlendJob<'_>],
+    ) -> anyhow::Result<display::DirectFrame> {
+        let displays: Vec<_> = jobs.iter().map(|job| job.display).collect();
+        let acquired = self
+            .direct
+            .as_mut()
+            .ok_or_else(|| anyhow!("direct display unavailable"))?
+            .acquire(&displays)?;
+        let render_jobs: Vec<_> = jobs
+            .iter()
+            .zip(acquired.targets)
+            .map(|(job, target)| RenderJob {
+                target,
+                output: job.output,
+                source_x: job.source_x,
+                source_y: job.source_y,
+                warp: job.warp,
+            })
+            .collect();
+        match self.render_targets(source, &render_jobs, &acquired.waits, &acquired.signals) {
+            Ok(gpu_wait) => Ok(display::DirectFrame {
+                gpu_wait,
+                owner: self.device.device.handle(),
+                displays,
+                image_indices: acquired.image_indices,
+            }),
+            Err(error) => {
+                self.direct.as_mut().unwrap().render_failed();
+                Err(error)
+            }
+        }
+    }
+
+    /// Submit one batch to the display engine and associate timing with a snapshot.
+    pub fn present_direct(
+        &mut self,
+        frame: display::DirectFrame,
+        snapshot_id: u64,
+    ) -> anyhow::Result<()> {
+        self.direct
+            .as_mut()
+            .ok_or_else(|| anyhow!("direct display unavailable"))?
+            .present(&frame, snapshot_id)
+    }
+
+    /// Poll complete display-stage timing records without waiting for vblank.
+    pub fn poll_direct_feedback(&mut self) -> anyhow::Result<Vec<display::DirectFeedback>> {
+        self.direct
+            .as_mut()
+            .ok_or_else(|| anyhow!("direct display unavailable"))?
+            .poll()
+    }
+
+    /// Verify final present completion and release the DRM display resources.
+    /// A failed verification leaves resources intact for safe quarantine on drop.
+    pub fn shutdown_direct(&mut self) -> anyhow::Result<()> {
+        self.direct
+            .as_mut()
+            .ok_or_else(|| anyhow!("direct display unavailable"))?
+            .shutdown()
     }
 
     /// Set the shared adaptive lift state used by tagged transfer entries.
@@ -3279,8 +3594,18 @@ impl Gpu {
             // Safety: same fence; waiting on an unsignalled fence whose
             // submission was accepted above cannot deadlock against this
             // thread, which submits nothing else until it returns.
-            unsafe { device.wait_for_fences(&[pass.fence], true, u64::MAX) }
-                .context("vkWaitForFences source measurement")?;
+            unsafe {
+                device.wait_for_fences(
+                    &[pass.fence],
+                    true,
+                    if self.device.direct_mode {
+                        2_000_000_000
+                    } else {
+                        u64::MAX
+                    },
+                )
+            }
+            .context("vkWaitForFences source measurement")?;
             true
         };
         self.measurement_flight = None;
@@ -3318,17 +3643,46 @@ impl Gpu {
         }
         // Safety: `fence` belongs to this device and is the fence attached to
         // the only submission that can reference the active output buffers.
-        unsafe {
-            self.device
-                .device
-                .wait_for_fences(&[self.fence], true, u64::MAX)
+        let wait = unsafe {
+            self.device.device.wait_for_fences(
+                &[self.fence],
+                true,
+                if self.device.direct_mode {
+                    2_000_000_000
+                } else {
+                    u64::MAX
+                },
+            )
+        };
+        if wait.is_err() && self.device.direct_mode {
+            self.device.direct_failed.store(true, Ordering::Relaxed);
         }
-        .context("vkWaitForFences before resource replacement")?;
+        wait.context("vkWaitForFences before resource replacement")?;
         self.fence_in_flight = false;
         Ok(())
     }
 
     fn render(&mut self, source: Source<'_>, jobs: &[BlendJob<'_>]) -> anyhow::Result<Duration> {
+        let jobs: Vec<_> = jobs
+            .iter()
+            .map(|job| RenderJob {
+                target: job.target.into(),
+                output: job.output,
+                source_x: job.source_x,
+                source_y: job.source_y,
+                warp: job.warp,
+            })
+            .collect();
+        self.render_targets(source, &jobs, &[], &[])
+    }
+
+    fn render_targets(
+        &mut self,
+        source: Source<'_>,
+        jobs: &[RenderJob<'_>],
+        wait_semaphores: &[vk::Semaphore],
+        signal_semaphores: &[vk::Semaphore],
+    ) -> anyhow::Result<Duration> {
         if jobs.is_empty() {
             return Ok(Duration::ZERO);
         }
@@ -3489,13 +3843,14 @@ impl Gpu {
                 .as_ref()
                 .expect("validated before recording");
 
+            let transitions = job.target.kind.transitions(queue_family);
             let acquire_target = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
-                .dst_queue_family_index(queue_family)
+                .old_layout(transitions.old_layout)
+                .new_layout(transitions.render_layout)
+                .src_queue_family_index(transitions.acquire_src_family)
+                .dst_queue_family_index(transitions.acquire_dst_family)
                 .image(job.target.image)
                 .subresource_range(color_subresource);
             // Safety: same command buffer, still recording.
@@ -3513,7 +3868,7 @@ impl Gpu {
 
             let color_attachments = [vk::RenderingAttachmentInfo::default()
                 .image_view(job.target.view)
-                .image_layout(vk::ImageLayout::GENERAL)
+                .image_layout(transitions.render_layout)
                 .load_op(vk::AttachmentLoadOp::DONT_CARE)
                 .store_op(vk::AttachmentStoreOp::STORE)];
             let rendering_info = vk::RenderingInfo::default()
@@ -3589,10 +3944,10 @@ impl Gpu {
             let release_target = vk::ImageMemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
                 .dst_access_mask(vk::AccessFlags::empty())
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_queue_family_index(queue_family)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_FOREIGN_EXT)
+                .old_layout(transitions.render_layout)
+                .new_layout(transitions.release_layout)
+                .src_queue_family_index(transitions.release_src_family)
+                .dst_queue_family_index(transitions.release_dst_family)
                 .image(job.target.image)
                 .subresource_range(color_subresource);
             unsafe {
@@ -3640,7 +3995,13 @@ impl Gpu {
         // resetting it here cannot race an in-flight wait.
         unsafe { device.reset_fences(&[self.fence]) }.context("vkResetFences")?;
         let command_buffers = [self.command_buffer];
-        let submit_info = vk::SubmitInfo::default().command_buffers(&command_buffers);
+        let wait_stages =
+            vec![vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT; wait_semaphores.len()];
+        let submit_info = vk::SubmitInfo::default()
+            .wait_semaphores(wait_semaphores)
+            .wait_dst_stage_mask(&wait_stages)
+            .command_buffers(&command_buffers)
+            .signal_semaphores(signal_semaphores);
         // Safety: `self.command_buffer` finished recording above; `self.fence`
         // was just reset and is used by nothing else.
         unsafe { device.queue_submit(self.device.queue, &[submit_info], self.fence) }
@@ -3653,8 +4014,18 @@ impl Gpu {
         // no implicit fencing — see the module doc's measurements. Waiting
         // here is what makes it safe for the caller to commit right after
         // `blend()` returns.
-        unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-            .context("vkWaitForFences")?;
+        unsafe {
+            device.wait_for_fences(
+                &[self.fence],
+                true,
+                if self.device.direct_mode {
+                    2_000_000_000
+                } else {
+                    u64::MAX
+                },
+            )
+        }
+        .context("vkWaitForFences")?;
         self.fence_in_flight = false;
         Ok(wait_from.elapsed())
     }
@@ -3662,6 +4033,22 @@ impl Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        let direct_mode = self.device.direct_mode;
+        if self.device.direct_failed.load(Ordering::Relaxed) {
+            if let Some(direct) = self.direct.take() {
+                std::mem::forget(direct);
+            }
+            std::mem::forget(self.device.clone());
+            eprintln!("direct Vulkan completion unverified; retaining Vulkan and DRM resources");
+            return;
+        }
+        if let Some(mut direct) = self.direct.take() {
+            if let Err(error) = direct.shutdown() {
+                eprintln!("direct display shutdown could not verify final presentation: {error:#}; retaining Vulkan and DRM resources");
+                std::mem::forget(direct);
+                return;
+            }
+        }
         let device = &self.device.device;
         // Safety: waits out anything still in flight from our own
         // submissions before destroying the objects they used. `blend()`
@@ -3669,7 +4056,27 @@ impl Drop for Gpu {
         // this only matters for a `Gpu` dropped without ever calling
         // `blend()`, or one dropped right after a `blend()` call that
         // itself failed partway through recording (never submitted).
-        let _ = unsafe { device.device_wait_idle() };
+        if direct_mode {
+            if self.fence_in_flight
+                && unsafe { device.wait_for_fences(&[self.fence], true, 2_000_000_000) }.is_err()
+            {
+                eprintln!("direct blend fence completion unverified; retaining Vulkan resources");
+                std::mem::forget(self.device.clone());
+                return;
+            }
+            if let Some(measurement) = &self.measurement {
+                if self.measurement_flight.is_some()
+                    && unsafe { device.wait_for_fences(&[measurement.fence], true, 2_000_000_000) }
+                        .is_err()
+                {
+                    eprintln!("direct measurement fence completion unverified; retaining Vulkan resources");
+                    std::mem::forget(self.device.clone());
+                    return;
+                }
+            }
+        } else {
+            let _ = unsafe { device.device_wait_idle() };
+        }
         // Safety: every handle destroyed below was created by this same
         // `Gpu` (in `from_device`, `ensure_pipeline`, or `allocate_output`)
         // and is owned exclusively by it — nothing else holds a copy.
@@ -4352,6 +4759,34 @@ fn priority_tier(candidate: Option<vk::QueueGlobalPriorityKHR>) -> QueuePriority
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn render_target_transitions_preserve_each_owner_contract() {
+        use super::{vk, TargetKind};
+        let family = 3;
+        let dmabuf = TargetKind::Dmabuf.transitions(family);
+        assert_eq!(dmabuf.old_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(dmabuf.render_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(dmabuf.release_layout, vk::ImageLayout::GENERAL);
+        assert_eq!(dmabuf.acquire_src_family, vk::QUEUE_FAMILY_FOREIGN_EXT);
+        assert_eq!(dmabuf.release_dst_family, vk::QUEUE_FAMILY_FOREIGN_EXT);
+        let fresh = TargetKind::Swapchain {
+            old_layout: vk::ImageLayout::UNDEFINED,
+        }
+        .transitions(family);
+        assert_eq!(fresh.old_layout, vk::ImageLayout::UNDEFINED);
+        assert_eq!(
+            fresh.render_layout,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+        );
+        assert_eq!(fresh.release_layout, vk::ImageLayout::PRESENT_SRC_KHR);
+        assert_eq!(fresh.acquire_src_family, vk::QUEUE_FAMILY_IGNORED);
+        assert_eq!(fresh.release_dst_family, vk::QUEUE_FAMILY_IGNORED);
+        let reused = TargetKind::Swapchain {
+            old_layout: vk::ImageLayout::PRESENT_SRC_KHR,
+        }
+        .transitions(family);
+        assert_eq!(reused.old_layout, vk::ImageLayout::PRESENT_SRC_KHR);
+    }
     use super::*;
 
     #[test]

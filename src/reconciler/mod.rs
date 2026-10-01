@@ -160,6 +160,18 @@ pub struct Reconciler {
     /// drains it immediately after calling `plan_canvas`.
     #[cfg(feature = "projection")]
     canvas_plan_divergences: std::sync::Mutex<Vec<Divergence>>,
+    /// Experimental direct presentation: the live inventory of the physical
+    /// displays the slicer drives itself, or `None` when the compositor
+    /// presents (the default). Set only through
+    /// [`Reconciler::with_direct_presentation`], by a daemon whose `sway`
+    /// is a [`crate::sway::direct::DirectOutputs`] over the same inventory.
+    direct: Option<Arc<crate::drm_inventory::DrmInventory>>,
+    /// The direct session's lifecycle — confirmation, crash budget,
+    /// fallback — when `direct` is set in a running daemon. Tests that
+    /// exercise direct presentation without one keep the plain
+    /// divergence-and-no-slicer behavior. See
+    /// [`Reconciler::with_direct_session`].
+    direct_session: Option<Arc<crate::presentation::DirectSession>>,
 }
 
 /// Everything a [`Reconciler`] collaborates with.
@@ -223,7 +235,37 @@ impl Reconciler {
             last_good_canvas_plan: std::sync::Mutex::new(None),
             #[cfg(feature = "projection")]
             canvas_plan_divergences: std::sync::Mutex::new(Vec::new()),
+            direct: None,
+            direct_session: None,
         }
+    }
+
+    /// Run this reconciler for experimental direct presentation over
+    /// `inventory`'s displays: every layout is sliced (a single output
+    /// included, since nothing else can light a display), the slicer is told
+    /// which connectors and modes to present to, and the headless canvas is
+    /// never retired. `None` keeps compositor presentation.
+    ///
+    /// A builder rather than a [`ReconcilerDeps`] field so a daemon that
+    /// never presents directly constructs exactly what it always has.
+    pub fn with_direct_presentation(
+        mut self,
+        inventory: Option<Arc<crate::drm_inventory::DrmInventory>>,
+    ) -> Self {
+        self.direct = inventory;
+        self
+    }
+
+    /// Report this direct session's slicer exits and failures to `session`,
+    /// which decides when to fall back, and stop presenting once it is
+    /// ending. Only meaningful alongside
+    /// [`Self::with_direct_presentation`].
+    pub fn with_direct_session(
+        mut self,
+        session: Option<Arc<crate::presentation::DirectSession>>,
+    ) -> Self {
+        self.direct_session = session;
+        self
     }
 
     /// Stop everything this reconciler spawned. Called at daemon shutdown so
@@ -238,6 +280,12 @@ impl Reconciler {
     #[cfg(all(test, feature = "projection"))]
     async fn slicer_pid(&self) -> Option<u32> {
         self.blend.lock().await.slicer_pid()
+    }
+
+    /// What the running slicer was told to present directly, for tests.
+    #[cfg(all(test, feature = "projection"))]
+    async fn slicer_direct(&self) -> Option<crate::presentation::DirectDisplayConfig> {
+        self.blend.lock().await.slicer_direct().cloned()
     }
 
     /// Detect version-gated compositor features. Safe to call repeatedly.
@@ -755,11 +803,17 @@ impl Reconciler {
                     // bench-alignment case.
                     let anything_to_show =
                         desired.active_app.is_some() || projection.test_pattern.is_some();
+                    // Direct presentation has no backgrounds to uncover:
+                    // with the slicer stood down nobody drives the displays
+                    // and the console shows through. So an idle direct wall
+                    // keeps a slicer presenting black, which also keeps the
+                    // displays owned for the next app.
+                    let idle_direct = self.direct.is_some() && !anything_to_show;
                     // With nothing attached there is nowhere to present, but
                     // the canvas stays exactly as configured so the app is
                     // never resized — displays coming back find the frame
                     // they left.
-                    if anything_to_show && !plan.slices.is_empty() {
+                    if (anything_to_show || idle_direct) && !plan.slices.is_empty() {
                         slicer = Some(SlicerSpec {
                             layout: plan.layout,
                             coverage_rects: plan.coverage_rects,
@@ -770,7 +824,11 @@ impl Reconciler {
                             gamma: projection.gamma,
                             black_lift: projection.black_lift.level(),
                             adaptive_lift: projection.black_lift.adaptive(),
-                            pattern: projection.test_pattern,
+                            pattern: if idle_direct {
+                                Some(crate::model::TestPattern::Black)
+                            } else {
+                                projection.test_pattern
+                            },
                             free_run: projection.free_run,
                             renderer: projection.renderer,
                             highlight_overlaps: projection.temporary.highlight_overlaps,
@@ -780,6 +838,12 @@ impl Reconciler {
                     canvas = Some(name);
                 }
             }
+        } else if self.direct.is_some() {
+            // Direct presentation: the headless canvas is the compositor's
+            // only output, so it is never retired, and there are no
+            // compositor outputs to draw per-output overlays on. With no
+            // plan — nothing enabled in the layout — the displays stay dark.
+            tracing::debug!("direct presentation has no canvas plan; nothing to present");
         } else {
             // Leaving canvas mode: a lingering headless output would be
             // spanned by fullscreen-global apps, so retire it.
@@ -819,12 +883,63 @@ impl Reconciler {
             }
         }
 
+        // Direct presentation: tell the slicer which connectors, at which
+        // modes, carry each slice. A slicer that cannot be told that must
+        // not start at all — it would look for compositor outputs that do
+        // not exist.
+        let direct = match (&self.direct, slicer.as_ref()) {
+            (Some(inventory), Some(spec)) => {
+                match crate::presentation::direct_config_for(
+                    spec,
+                    &self.snapshot.outputs(),
+                    inventory,
+                ) {
+                    Ok(config) => Some(config),
+                    Err(error) => {
+                        // Never present through the headless compositor
+                        // instead: it has no displays. A running daemon
+                        // gives up on direct presentation for this boot.
+                        if let Some(session) = &self.direct_session {
+                            session.fall_back(format!("direct presentation cannot start: {error}"));
+                        }
+                        divergences.push(Divergence::new(
+                            "direct_presentation_failed",
+                            "projection",
+                            format!("direct presentation cannot start: {error}"),
+                        ));
+                        slicer = None;
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let mut manager = self.blend.lock().await;
+        let mut direct = direct;
+        if let Some(session) = &self.direct_session {
+            // An exit the daemon did not cause counts against the session
+            // before anything is respawned, so the exit that spends the
+            // crash budget is never followed by another slicer.
+            if let Some(exit) = manager.reap_exited_slicer() {
+                session.slicer_exited(&exit.status, exit.last_stderr_line.as_deref());
+            }
+            // A session that is ending presents nothing more; the stop
+            // below is graceful, so the displays are handed back cleanly.
+            if session.exit_requested() {
+                slicer = None;
+                direct = None;
+            }
+        }
         divergences.extend(manager.sync(&overlay));
         if restart_slicer {
             manager.restart_slicer();
         }
-        divergences.extend(manager.sync_slicer(slicer.as_ref(), config_generation));
+        divergences.extend(manager.sync_slicer_presenting(
+            slicer.as_ref(),
+            config_generation,
+            direct.as_ref(),
+        ));
         // `sync_slicer` above already reaped a dead child before deciding
         // whether to respawn, so the manager knows definitively whether one
         // is alive now — publish that rather than leaving the API and the
@@ -1017,7 +1132,9 @@ impl Reconciler {
         crate::projection::canvas_plan_with_warp_activation(
             &participants,
             desired.projection.as_ref(),
-            if self.allow_overlaps {
+            if self.direct.is_some() {
+                crate::projection::Slicing::Every
+            } else if self.allow_overlaps {
                 crate::projection::Slicing::Always
             } else {
                 crate::projection::Slicing::WhenOverlapping
@@ -1505,6 +1622,15 @@ impl Reconciler {
                     self.reconcile().await;
                 }
                 _ = tick.tick() => {
+                    // A direct session's slicer exiting is a crash-budget
+                    // event and a dark wall, so it is noticed within a
+                    // second rather than at the next unrelated pass.
+                    #[cfg(feature = "projection")]
+                    if self.direct_session.is_some()
+                        && self.blend.lock().await.slicer_has_exited()
+                    {
+                        self.reconcile().await;
+                    }
                     let windows = self.refresh_windows().await;
                     self.supervisor.tick(&windows).await;
                     let current = self.supervisor.fault_signature().await;
@@ -2631,6 +2757,323 @@ mod tests {
             harness.reconciler.slicer_pid().await.is_some(),
             "the slicer must still be running after the topology-changing pass"
         );
+        harness.supervisor.shutdown().await;
+    }
+
+    /// A direct-presentation harness: a headless-only compositor (just the
+    /// canvas) behind [`crate::sway::direct::DirectOutputs`] simulating the
+    /// displays in `inventory`, and a reconciler told to present directly.
+    #[cfg(feature = "projection")]
+    fn direct_harness(
+        inventory: crate::drm_inventory::DrmInventory,
+    ) -> (Harness, Arc<dyn SwayClient>) {
+        direct_harness_in_session(inventory, None)
+    }
+
+    /// [`direct_harness`], with the running daemon's session lifecycle.
+    #[cfg(feature = "projection")]
+    fn direct_harness_in_session(
+        inventory: crate::drm_inventory::DrmInventory,
+        session: Option<Arc<crate::presentation::DirectSession>>,
+    ) -> (Harness, Arc<dyn SwayClient>) {
+        let mut harness = harness_with_allow_overlaps(true);
+        let inner = Arc::new(MockSway::empty());
+        inner.set_outputs(vec![Output {
+            name: "HEADLESS-1".into(),
+            active: true,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: Some(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            }),
+            modes: vec![],
+            rect: crate::model::Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale: Some(1.0),
+            transform: Some("normal".into()),
+            adaptive_sync_status: Some("disabled".into()),
+        }]);
+        let direct: Arc<dyn SwayClient> =
+            crate::sway::direct::DirectOutputs::new(inner.clone(), &inventory);
+        let dir = tempfile::tempdir().unwrap();
+        harness.reconciler = Arc::new(
+            Reconciler::new(ReconcilerDeps {
+                sway: direct.clone(),
+                audio: harness.audio.clone(),
+                store: harness.store.clone(),
+                snapshot: harness.snapshot.clone(),
+                supervisor: harness.supervisor.clone(),
+                events: harness.events.clone(),
+                wallpapers: Arc::new(WallpaperStore::new(dir.path().join("wallpapers"))),
+                docs_base_url: "https://suede.gameshow.pro/".to_string(),
+                allow_overlaps: true,
+            })
+            .with_direct_presentation(Some(Arc::new(inventory)))
+            .with_direct_session(session),
+        );
+        // The mock the harness exposes is the headless compositor itself,
+        // so `commands()` shows exactly what reached sway.
+        harness.sway = inner;
+        (harness, direct)
+    }
+
+    #[cfg(feature = "projection")]
+    fn direct_output(name: &str, x: i32, refresh_hz: f64) -> OutputConfig {
+        let mut config = configured_output(name, x);
+        config.mode = Some(Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz,
+        });
+        config
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn direct_presentation_slices_a_single_output_onto_its_connector() {
+        let (harness, _) =
+            direct_harness(crate::drm_inventory::test_support::wall(&["DP-1", "DP-2"]));
+        harness
+            .store
+            .update(|state| {
+                state.outputs.push(direct_output("DP-1", 0, 59.939));
+                state.projection = Some(crate::model::ProjectionConfig {
+                    test_pattern: Some(crate::model::TestPattern::Grid),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+
+        let status = harness.reconciler.reconcile().await;
+        assert!(
+            !status
+                .divergences
+                .iter()
+                .any(|d| d.kind == "command_failed"),
+            "{:?}",
+            status.divergences
+        );
+        let sent = harness.sway.commands();
+        assert!(
+            // (`workspace N output DP-1` is an assignment sway accepts for
+            // an output it does not have; it is not an output command.)
+            sent.iter()
+                .all(|command| !command.starts_with("output DP-")),
+            "physical output commands must never reach the headless sway: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|c| c.starts_with("output HEADLESS-1 mode --custom 1920x1080")),
+            "the canvas is sized to the one output: {sent:?}"
+        );
+        let direct = harness
+            .reconciler
+            .slicer_direct()
+            .await
+            .expect("a single output is sliced and presented directly");
+        assert_eq!(direct.card, std::path::PathBuf::from("/dev/dri/card1"));
+        assert_eq!(direct.outputs.len(), 1);
+        assert_eq!(direct.outputs[0].name, "DP-1");
+        assert_eq!(direct.outputs[0].connector_id, 129);
+        assert_eq!(direct.outputs[0].refresh_millihz, 59_939);
+        harness.reconciler.shutdown().await;
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn an_inventory_that_fails_preflight_starts_no_slicer() {
+        let mut inventory = crate::drm_inventory::test_support::wall(&["DP-1", "DP-2"]);
+        inventory.outputs[1].connector_id = None;
+        let (harness, _) = direct_harness(inventory);
+        harness
+            .store
+            .update(|state| {
+                state.outputs.push(direct_output("DP-1", 0, 60.0));
+                state.outputs.push(direct_output("DP-2", 1920, 60.0));
+                state.projection = Some(crate::model::ProjectionConfig {
+                    test_pattern: Some(crate::model::TestPattern::Grid),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+
+        let status = harness.reconciler.reconcile().await;
+        let failure = status
+            .divergences
+            .iter()
+            .find(|d| d.kind == "direct_presentation_failed")
+            .expect("the refusal is reported");
+        assert!(
+            failure.detail.contains("connector_id"),
+            "{}",
+            failure.detail
+        );
+        assert!(harness.reconciler.slicer_pid().await.is_none());
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn an_idle_direct_wall_keeps_a_slicer_presenting_black() {
+        let (harness, _) =
+            direct_harness(crate::drm_inventory::test_support::wall(&["DP-1", "DP-2"]));
+        harness
+            .store
+            .update(|state| {
+                // Outputs, but no active app and no test pattern.
+                state.outputs.push(direct_output("DP-1", 0, 60.0));
+                state.outputs.push(direct_output("DP-2", 1920, 60.0));
+                state.active_app = None;
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        let manager = harness.reconciler.blend.lock().await;
+        assert_eq!(
+            manager.slicer_pattern(),
+            Some(Some(crate::model::TestPattern::Black)),
+            "the displays stay owned, showing black"
+        );
+        assert!(manager.slicer_direct().is_some());
+        drop(manager);
+        harness.reconciler.shutdown().await;
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn an_idle_wayland_wall_still_stands_the_slicer_down() {
+        // The idle black wall is direct presentation's alone: the compositor
+        // path keeps uncovering its backgrounds, exactly as before.
+        let harness = harness_with_allow_overlaps(true);
+        harness
+            .store
+            .update(|state| {
+                state.outputs.push(configured_output("DP-1", 0));
+                state.outputs.push(configured_output("DP-2", 1920));
+                state.active_app = None;
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        assert!(harness.reconciler.slicer_pid().await.is_none());
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn a_direct_derivation_failure_falls_back_instead_of_presenting() {
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = crate::presentation::RuntimeState::new(dir.path().join("suede"));
+        let session = crate::presentation::DirectSession::new(Some(runtime.clone()));
+        let (harness, _) = direct_harness_in_session(
+            crate::drm_inventory::test_support::wall(&["DP-1"]),
+            Some(session.clone()),
+        );
+        harness
+            .store
+            .update(|state| {
+                state.outputs.push(direct_output("DP-1", 0, 60.0));
+                state.projection = Some(crate::model::ProjectionConfig {
+                    test_pattern: Some(crate::model::TestPattern::Grid),
+                    // The CPU renderer cannot present directly.
+                    renderer: crate::model::Renderer::Cpu,
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        assert!(harness.reconciler.slicer_pid().await.is_none());
+        match session.exit_reason() {
+            Some(crate::presentation::SessionExit::Fallback(reason)) => {
+                assert!(reason.contains("GPU renderer"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(runtime.fallback().is_some(), "the marker is written");
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn an_ending_direct_session_stops_its_slicer_and_starts_no_other() {
+        let session = crate::presentation::DirectSession::new(None);
+        let (harness, _) = direct_harness_in_session(
+            crate::drm_inventory::test_support::wall(&["DP-1"]),
+            Some(session.clone()),
+        );
+        harness
+            .store
+            .update(|state| {
+                state.outputs.push(direct_output("DP-1", 0, 60.0));
+                state.projection = Some(crate::model::ProjectionConfig {
+                    test_pattern: Some(crate::model::TestPattern::Grid),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        session.compositor_lost("gone");
+        harness.reconciler.reconcile().await;
+        assert!(harness.reconciler.slicer_pid().await.is_none());
+        assert!(harness.reconciler.slicer_direct().await.is_none());
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn direct_presentation_never_retires_the_canvas_or_draws_overlays() {
+        let (harness, _) = direct_harness(crate::drm_inventory::test_support::wall(&["DP-1"]));
+        harness
+            .store
+            .update(|state| {
+                // A projection section but nothing enabled: no canvas plan.
+                state.projection = Some(crate::model::ProjectionConfig {
+                    test_pattern: Some(crate::model::TestPattern::Grid),
+                    ..Default::default()
+                });
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        assert!(
+            !harness.sway.ran_command_containing("unplug"),
+            "the headless canvas is the compositor's only output: {:?}",
+            harness.sway.commands()
+        );
+        assert!(harness.reconciler.slicer_pid().await.is_none());
+        assert_eq!(harness.reconciler.blend.lock().await.overlay_count(), 0);
+        harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn direct_physical_outputs_are_configured_in_simulation() {
+        let (harness, direct) =
+            direct_harness(crate::drm_inventory::test_support::wall(&["DP-1", "DP-2"]));
+        harness
+            .store
+            .update(|state| {
+                let mut disabled = direct_output("DP-2", 1920, 60.0);
+                disabled.enable = false;
+                state.outputs.push(direct_output("DP-1", 0, 59.939));
+                state.outputs.push(disabled);
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        let outputs = direct.get_outputs().await.unwrap();
+        let dp1 = outputs.iter().find(|o| o.name == "DP-1").unwrap();
+        let dp2 = outputs.iter().find(|o| o.name == "DP-2").unwrap();
+        assert!(dp1.active && !dp2.active);
+        assert_eq!(dp1.current_mode.unwrap().refresh_hz, 59.939);
+        // `/outputs` sees the same simulated state the planner acted on.
+        let observed = harness.snapshot.outputs();
+        assert!(observed.iter().any(|o| o.name == "DP-2" && !o.active));
         harness.supervisor.shutdown().await;
     }
 

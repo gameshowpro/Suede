@@ -177,8 +177,11 @@ impl SwayClient for MockSway {
 
 /// Apply `output <name> <setting> …` to simulated state.
 ///
-/// Returns whether anything changed.
-fn apply_output_command(outputs: &mut [Output], command: &str) -> bool {
+/// Returns whether anything changed. Shared with
+/// [`super::direct::DirectOutputs`], which simulates the physical outputs of
+/// a direct-presentation session with these same rules after vetting each
+/// command against what direct presentation supports.
+pub(crate) fn apply_output_command(outputs: &mut [Output], command: &str) -> bool {
     let words: Vec<&str> = command.split_whitespace().collect();
     let ["output", name, setting, rest @ ..] = words.as_slice() else {
         return false;
@@ -273,7 +276,7 @@ fn apply_output_command(outputs: &mut [Output], command: &str) -> bool {
 }
 
 /// Parse `1920x1080@60Hz` as sway formats it.
-fn parse_mode(spec: &str) -> Option<Mode> {
+pub(crate) fn parse_mode(spec: &str) -> Option<Mode> {
     let (size, refresh) = match spec.split_once('@') {
         Some((size, refresh)) => (size, refresh.trim_end_matches("Hz").parse().ok()?),
         None => (spec, 60.0),

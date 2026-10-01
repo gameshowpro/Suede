@@ -10,7 +10,7 @@ defined in the [pipeline vocabulary](how-it-works.md#vocabulary).
 
 ## Bootstrap configuration
 
-Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps` and `direct_scanout` can be overridden by an environment variable, which wins — those two describe how the compositor was started, which a variable on Suede's own process cannot change. A missing file means all defaults.
+Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps`, `direct_scanout`, `presentation` and `gl_yield` can be overridden by an environment variable, which wins — those four describe how the compositor was started, which a variable on Suede's own process cannot change. A missing file means all defaults.
 
 ```toml
 --8<-- "examples/suede.toml"
@@ -26,6 +26,8 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `allowed_programs` | `SUEDE_ALLOWED_PROGRAMS` | the browsers Suede knows how to drive | Programs applications may launch — see [Allowed programs](#allowed-programs) |
 | `allow_overlaps` | — | `false` | Whether outputs may overlap in canvas space, and so which display path this machine runs — see [Overlapping layouts and direct scanout](#direct-scanout) |
 | `direct_scanout` | — | `true` | Whether the compositor may flip the slicer's buffers straight to the display controllers; only meaningful with `allow_overlaps = true` — see [Overlapping layouts and direct scanout](#direct-scanout) |
+| `presentation` | — | `"wayland"` | **Experimental.** `"wayland"` or `"direct"`: which display path the login session starts — see [Experimental: direct presentation](#experimental-direct-presentation). `"direct"` without `allow_overlaps = true` resolves to effective `wayland` with a reason instead of failing to start; an unrecognized value fails startup. `GET /api/v1/system` reports `requested`, `effective`, and why they differ, if they do |
+| `gl_yield` | — | `"default"` | **Experimental, NVIDIA-only.** `"default"`, `"usleep"` or `"nothing"`: exports `__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into the login session's Sway environment (both the DRM Sway and direct presentation's headless one); Mesa ignores it. An unrecognized value fails startup. `GET /api/v1/system` reports `requested` and a live `effective` read from the running Sway's environment, so a session started before an edit shows the mismatch — see [NVIDIA `__GL_YIELD`](#gl-yield) |
 
 ### Host power control {: #host-power }
 
@@ -206,6 +208,77 @@ switches between a flipped and a composited wall while nothing else about the
 machine changes, which is what makes the two directly comparable. [Comparing
 the two](how-it-works.md#comparing-the-two) is the procedure, and what to read
 in `GET /projection/stats` under each arm.
+
+### Experimental: direct presentation {: #experimental-direct-presentation }
+
+`presentation = "direct"` (with `allow_overlaps = true`) is a third, wholly
+different display path: instead of Sway driving the physical outputs, the
+login session starts a headless-only Sway that holds only the application's
+canvas, and the daemon takes ownership of the physical outputs itself,
+presenting them directly through the slicer's own Vulkan swapchain. The
+compositor is never in the output path at all — no scanout, no compositing,
+no `direct_scanout` — so that key is ignored while `presentation = "direct"`
+is actually in effect.
+
+This is experimental and off by default. Sway/Wayland remains the only path
+proven in production, and on every NVIDIA card and driver tested so far it is
+also the better-performing one; direct presentation is worth retesting as new
+drivers ship. See [VK_KHR direct display](developer/vk-khr.md) for
+what has and has not been measured, and the full list of limits (no hotplug,
+no mode/scale/transform changes, no adaptive sync or tearing, no backgrounds,
+single GPU only, and more).
+
+Like `allow_overlaps` and `direct_scanout`, `presentation` takes effect only
+on session restart, and only through `suede.toml` — never the API document,
+never a `SUEDE_*` variable — because it describes how the compositor was
+started. To switch a provisioned appliance: edit `suede.toml`, then
+
+```bash
+sudo systemctl restart getty@tty1
+systemctl --user restart suede
+```
+
+`direct` without `allow_overlaps = true` does not fail startup: it resolves
+to effective `wayland` with a reason, because the login profile applies the
+same rule. A direct session that fails — a display preflight refusal, or the
+slicer exiting unexpectedly three times within ten minutes — falls back to
+Wayland for the rest of that boot; it is retried on the next reboot. See
+[Session lifecycle of the experimental
+option](developer/vk-khr.md#session-lifecycle-of-the-experimental-option) for
+the full state machine and the crash-recovery runbook.
+
+`GET /api/v1/system` reports `presentation.requested`, `.effective`, `.reason`
+and `.outputs`. While `effective` is `direct`, the `direct-scanout` and
+`swaybg` health checks report not applicable, `real-displays` passes on the
+directly presented outputs, and `output-phase`'s disable/re-enable fix is
+unavailable (its verdict is unaffected). On a proprietary NVIDIA driver with
+GSP firmware on, the `gsp-firmware` health check also warns only while
+`effective` is `direct` — see [GSP firmware](developer/vk-khr.md#gsp-firmware).
+
+### NVIDIA `__GL_YIELD` {: #gl-yield }
+
+`gl_yield = "usleep"` or `gl_yield = "nothing"` exports NVIDIA's
+`__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into Sway's environment at login,
+stopping the proprietary driver's EGL busy-wait; Mesa ignores the variable
+entirely, so this has no effect on other drivers. It applies to both display
+paths — the ordinary DRM Sway and, while `presentation = "direct"`, the
+headless Sway that backs it — because both run the same EGL busy-wait
+otherwise.
+
+Measured trade-off (see [Conclusions](developer/vk-khr.md#conclusions-direct-vulkan-path-vs-swaywayland)
+for the full numbers): `USLEEP` cut total Sway CPU by about a third with no
+frame-rate loss, reproduced on a second appliance under an animated
+workload. Frame coherence paid for it: straddles rose in three of the four
+cases measured across both appliances; one canvas size improved instead, so
+this is a CPU-versus-coherence trade-off, not a free win.
+
+Like `presentation`, this takes effect only on session restart and only
+through `suede.toml`:
+
+```bash
+sudo systemctl restart getty@tty1
+systemctl --user restart suede
+```
 
 ## Desired state
 

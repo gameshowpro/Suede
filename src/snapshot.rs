@@ -27,11 +27,26 @@ pub struct Snapshot {
     /// a static source can still show whether a requested edit was installed.
     projection_control: RwLock<ProjectionControlStatus>,
     projection_geometry: RwLock<crate::model::observed::ProjectionGeometryStatus>,
+    /// How this session presents, as resolved once at startup against the
+    /// compositor the daemon found (see [`crate::presentation::resolve`]).
+    /// `None` until then, and in harnesses that never resolve, where
+    /// `GET /system` falls back to the bootstrap file's own answer.
+    presentation: RwLock<Option<crate::model::PresentationStatus>>,
 }
 
 impl Snapshot {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// How this session presents, if the daemon has resolved it.
+    pub fn presentation(&self) -> Option<crate::model::PresentationStatus> {
+        self.presentation.read().unwrap().clone()
+    }
+
+    /// Record how this session presents. Set once at startup.
+    pub fn set_presentation(&self, status: crate::model::PresentationStatus) {
+        *self.presentation.write().unwrap() = Some(status);
     }
 
     pub fn outputs(&self) -> Vec<Output> {
@@ -285,6 +300,8 @@ mod tests {
             straddles: 0,
             gate_holds: 0,
             renderer: "cpu".to_string(),
+            presentation_backend: None,
+            timestamp_source: None,
             capture_intervals: CaptureIntervals::default(),
             outputs: Vec::new(),
         };
@@ -356,6 +373,8 @@ mod tests {
             straddles: 0,
             gate_holds: 0,
             renderer: "cpu".to_string(),
+            presentation_backend: None,
+            timestamp_source: None,
             capture_intervals: CaptureIntervals::default(),
             outputs: Vec::new(),
         };

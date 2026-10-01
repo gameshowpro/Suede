@@ -55,6 +55,8 @@ nav:
   - Troubleshooting: troubleshooting.md
   - Developer:
       - Architecture: developer/architecture.md
+      - VK_KHR direct display: developer/vk-khr.md
+      - Test systems: developer/test-systems.md
       - Deployment: developer/deployment.md
       - Versioning: developer/versioning.md
       - Specification: specification.md

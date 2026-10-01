@@ -11,7 +11,8 @@ use utoipa::ToSchema;
 use super::ApiState;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
-    AvDevices, Check, CheckSummary, Output, PowerVerb, ProjectionReport, Status, SystemInfo, Window,
+    AvDevices, Check, CheckSummary, GlYieldMode, GlYieldStatus, Output, PowerVerb,
+    PresentationStatus, ProjectionReport, Status, SystemInfo, Window,
 };
 
 #[utoipa::path(
@@ -141,6 +142,30 @@ pub async fn get_system(State(state): State<ApiState>) -> Json<SystemInfo> {
         supports_tearing: version.as_ref().is_some_and(|v| v.supports_tearing()),
         web_ui_enabled: !state.bootstrap.auth_enabled(),
         power_verbs: state.bootstrap.power.clone(),
+        // Resolved at startup against the session the daemon found; the
+        // file's own answer only where nothing resolved it (tests, mocks).
+        presentation: state.snapshot.presentation().unwrap_or_else(|| {
+            let (effective, reason) = state.bootstrap.presentation_effective();
+            PresentationStatus {
+                requested: state.bootstrap.presentation,
+                effective,
+                reason,
+                outputs: Vec::new(),
+            }
+        }),
+        // Read live rather than cached: unlike `presentation`, nothing
+        // resolves this once at startup, so a session that has not been
+        // restarted since `suede.toml` changed shows the mismatch instead of
+        // a stale answer.
+        gl_yield: GlYieldStatus {
+            requested: state.bootstrap.gl_yield,
+            effective: GlYieldMode::from_env_value(
+                crate::checks::compositor_env("__GL_YIELD").as_deref(),
+            ),
+        },
+        // Read live rather than cached, like `gl_yield.effective` above:
+        // nothing resolves this once at startup either.
+        nvidia_driver: crate::nvidia_driver::detect(),
     })
 }
 
@@ -809,6 +834,31 @@ mod tests {
             body["powerVerbs"],
             serde_json::json!(["reboot", "poweroff"])
         );
+    }
+
+    /// The test environment has no `/proc/driver/nvidia` — exactly the
+    /// "non-NVIDIA machine" case `crate::nvidia_driver::detect` reports as
+    /// `None`, so `GET /system` must serve `null` rather than omit the key
+    /// or fail.
+    #[tokio::test]
+    async fn get_system_reports_null_nvidia_driver_when_absent() {
+        let harness = harness(None);
+        let response = harness
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/system")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(body["nvidiaDriver"].is_null(), "{body}");
     }
 
     #[tokio::test]

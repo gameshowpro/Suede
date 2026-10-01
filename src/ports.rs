@@ -69,7 +69,7 @@ fn enumerate_in(root: &str) -> Vec<Port> {
 /// memory, never a display — must also be dropped: older kernels expose them
 /// as `Unknown-*`, but the Raspberry Pi's vc4 names them `Writeback-N`, and
 /// offering one as a socket to put a projector on helps nobody.
-fn connector_name(entry: &str) -> Option<String> {
+pub(crate) fn connector_name(entry: &str) -> Option<String> {
     let (card, connector) = entry.split_once('-')?;
     if !card.starts_with("card")
         || connector.is_empty()

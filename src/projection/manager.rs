@@ -10,7 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ use crate::events::{EventHub, ServerEvent};
 use crate::model::{
     Divergence, ProjectionControlFailure, ProjectionControlOutputStatus, ProjectionControlStatus,
 };
+use crate::presentation::DirectDisplayConfig;
 use crate::snapshot::Snapshot;
 
 use super::blend::{OverlaySpec, SlicerSpec};
@@ -49,7 +50,28 @@ struct RunningSlicer {
     /// without a new child, and a child starts its sequence at zero.
     config_generations: Arc<Mutex<BTreeMap<u64, u64>>>,
     protocol_mismatch: Arc<std::sync::atomic::AtomicBool>,
+    /// The slicer's last non-empty stderr line, trimmed and length-capped —
+    /// see [`crate::presentation`]'s fallback reason, which names the cause
+    /// with it. Only the slicer's stderr is captured; a blend overlay has
+    /// nothing a fallback reason would want, so its stderr still flows
+    /// straight to the daemon's own journal (see [`spawn_internal`]).
+    last_stderr: Arc<Mutex<Option<String>>>,
 }
+
+/// How a slicer ended on its own: its process status, and — for direct
+/// presentation's fallback reason — the last non-empty line it wrote to
+/// stderr, if the reader thread caught one before this was reaped.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SlicerExit {
+    pub status: String,
+    pub last_stderr_line: Option<String>,
+}
+
+/// How long a slicer presenting directly gets to release its displays after
+/// being asked to stop, before it is killed. It normally needs under a
+/// second (0.8 s measured on System A, 2026-09-29); the margin covers a stop
+/// that lands mid-way through its multi-second display acquisition.
+const DIRECT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Session-scoped state owned by the stdout reader. Keeping it together makes
 /// the reader's epoch, session and config-generation gate one coherent
@@ -145,6 +167,12 @@ pub struct BlendManager {
     /// changing status after a fresh child has begun.
     slicer_epoch: Arc<Mutex<u64>>,
     next_generation: u64,
+    /// The physical displays the running slicer presents to directly, if
+    /// any; always `None` while no slicer runs. Part of its fingerprint (a
+    /// change restarts the child, never a live update), and what makes a stop
+    /// graceful so the child can hand the displays back (see
+    /// [`stop_running_slicer`]).
+    slicer_direct: Option<DirectDisplayConfig>,
 }
 
 /// What a sync pass decided, before any process is touched. Pure, so the
@@ -188,6 +216,7 @@ impl BlendManager {
             events,
             slicer_epoch: Arc::new(Mutex::new(0)),
             next_generation: 1,
+            slicer_direct: None,
         }
     }
 
@@ -210,6 +239,59 @@ impl BlendManager {
     #[cfg(test)]
     pub(crate) fn slicer_pid(&self) -> Option<u32> {
         self.slicer.as_ref().map(|running| running.child.id())
+    }
+
+    /// Whether the slicer has exited on its own and not been reaped yet.
+    /// Cheap enough to ask every second; the exit status is kept for
+    /// [`Self::reap_exited_slicer`].
+    pub fn slicer_has_exited(&mut self) -> bool {
+        self.slicer
+            .as_mut()
+            .is_some_and(|running| !matches!(running.child.try_wait(), Ok(None)))
+    }
+
+    /// Reap a slicer that exited on its own, returning how it ended; `None`
+    /// when none is running or it is still alive. Stops done by this
+    /// manager never show up here — only exits the daemon did not cause,
+    /// which is what direct presentation's crash budget counts.
+    pub fn reap_exited_slicer(&mut self) -> Option<SlicerExit> {
+        let status = match self.slicer.as_mut()?.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status.to_string(),
+            Err(error) => format!("could not check the slicer: {error}"),
+        };
+        // Read before `stop_slicer` drops the `RunningSlicer`: the `Arc` is
+        // shared with the (possibly still finishing) stderr reader thread,
+        // so this is the last non-empty line seen by the time the child was
+        // confirmed dead, not necessarily its very last write.
+        let last_stderr_line = self
+            .slicer
+            .as_ref()
+            .and_then(|running| running.last_stderr.lock().unwrap().clone());
+        tracing::warn!(%status, ?last_stderr_line, "slicer exited");
+        self.stop_slicer("slicer exited");
+        Some(SlicerExit {
+            status,
+            last_stderr_line,
+        })
+    }
+
+    /// How many per-output blend overlays are running.
+    #[cfg(test)]
+    pub(crate) fn overlay_count(&self) -> usize {
+        self.overlays.len()
+    }
+
+    /// The running slicer's test pattern, if a slicer is running.
+    #[cfg(test)]
+    pub(crate) fn slicer_pattern(&self) -> Option<Option<crate::model::TestPattern>> {
+        self.slicer.as_ref().map(|running| running.desired.pattern)
+    }
+
+    /// What the running slicer presents to directly, if anything.
+    #[cfg(test)]
+    pub(crate) fn slicer_direct(&self) -> Option<&DirectDisplayConfig> {
+        self.slicer_direct.as_ref()
     }
 
     fn publish_projection_report(&self) {
@@ -294,16 +376,10 @@ impl BlendManager {
 
     fn stop_slicer(&mut self, reason: &'static str) {
         *self.slicer_epoch.lock().unwrap() += 1;
-        if let Some(mut old) = self.slicer.take() {
-            tracing::info!(reason, "stopping the slicer");
-            if let Some(writer) = &mut old.writer {
-                writer.close();
-            }
-            let _ = old.child.kill();
-            let _ = old.child.wait();
-            if let Some(writer) = &mut old.writer {
-                writer.join();
-            }
+        let direct = self.slicer_direct.take();
+        if let Some(old) = self.slicer.take() {
+            tracing::info!(reason, direct = direct.is_some(), "stopping the slicer");
+            stop_running_slicer(old, direct.is_some());
             self.clear_projection_stats();
         }
     }
@@ -417,11 +493,29 @@ impl BlendManager {
         self.stop_slicer("output topology changed");
     }
 
-    /// Make the running slicer match `spec`. `None` tears it down.
+    /// Make the running slicer match `spec`, presenting through the
+    /// compositor. `None` tears it down.
     pub fn sync_slicer(
         &mut self,
         spec: Option<&SlicerSpec>,
         config_generation: u64,
+    ) -> Vec<Divergence> {
+        self.sync_slicer_presenting(spec, config_generation, None)
+    }
+
+    /// Make the running slicer match `spec`, presenting directly to the
+    /// displays in `direct` when given (experimental direct presentation)
+    /// and through the compositor otherwise. `None` tears it down.
+    ///
+    /// `direct` is part of the child's identity: any change to it — a
+    /// different connector, mode or card, or switching between direct and
+    /// compositor presentation — replaces the child rather than updating it
+    /// live, because the displays are acquired once at startup.
+    pub fn sync_slicer_presenting(
+        &mut self,
+        spec: Option<&SlicerSpec>,
+        config_generation: u64,
+        direct: Option<&DirectDisplayConfig>,
     ) -> Vec<Divergence> {
         if self.poll_slicer() {
             tracing::warn!("slicer control pipe closed; will respawn");
@@ -464,7 +558,10 @@ impl BlendManager {
                     .requested
                     .is_some_and(|generation| generation > 0);
                 running.live_control = false;
-                running.fingerprint = slicer_fingerprint(&running.desired, false);
+                running.fingerprint = with_direct_presentation(
+                    slicer_fingerprint(&running.desired, false),
+                    self.slicer_direct.as_ref(),
+                );
             }
         }
         if restart_for_auto_cpu_update {
@@ -482,7 +579,7 @@ impl BlendManager {
                 .filter(|running| running.desired.renderer == spec.renderer)
                 .map(|running| running.live_control)
                 .unwrap_or_else(|| slicer_requests_live_candidate(spec));
-            slicer_fingerprint(spec, live)
+            with_direct_presentation(slicer_fingerprint(spec, live), direct)
         });
         let running = self.slicer.as_ref().map(|s| s.fingerprint);
         if wanted == running {
@@ -553,22 +650,41 @@ impl BlendManager {
         let live_control = slicer_requests_live_candidate(spec);
         // A replacement re-probes Auto; do not carry the old CPU child's
         // complete restart fingerprint into this live GPU candidate.
-        let fingerprint = slicer_fingerprint(spec, live_control);
+        let fingerprint = with_direct_presentation(slicer_fingerprint(spec, live_control), direct);
         // Every child needs a session so its initial capability report is
         // attributable, even when CPU deliberately has no stdin controller.
         let session = fresh_control_session();
         let mut desired = spec.clone();
         desired.control_session = session.clone();
+        let mut extra_args = Vec::new();
+        if let Some(direct) = direct {
+            match serde_json::to_string(direct) {
+                Ok(json) => {
+                    extra_args.push("--presentation-config-json".to_string());
+                    extra_args.push(json);
+                }
+                Err(error) => {
+                    return vec![Divergence::new(
+                        "blend_overlay_failed",
+                        "slicer",
+                        format!("could not encode the direct presentation config: {error}"),
+                    )]
+                }
+            }
+        }
         match spawn_internal(
             "slice",
             &serde_json::to_string(&desired).unwrap_or_default(),
+            &extra_args,
             live_control,
+            true,
             true,
         ) {
             Ok(mut child) => {
                 tracing::info!(
                     canvas = format!("{}x{}", spec.canvas_width, spec.canvas_height),
                     slices = spec.slices.len(),
+                    direct = direct.is_some(),
                     "started the slicer"
                 );
                 // Piped because `pipe_stdout` was true above; `take()` still
@@ -619,6 +735,10 @@ impl BlendManager {
                         },
                     );
                 }
+                let last_stderr = Arc::new(Mutex::new(None));
+                if let Some(stderr) = child.stderr.take() {
+                    spawn_slicer_stderr_reader(stderr, last_stderr.clone());
+                }
                 self.slicer = Some(RunningSlicer {
                     child,
                     fingerprint,
@@ -628,7 +748,9 @@ impl BlendManager {
                     writer: stdin.map(ControlWriter::spawn),
                     config_generations,
                     protocol_mismatch,
+                    last_stderr,
                 });
+                self.slicer_direct = direct.cloned();
                 // --spec is generation zero in this new session. Do not
                 // enqueue a duplicate no-op revision: it would be applied
                 // without a repaint and obscure the initial presentation.
@@ -658,17 +780,11 @@ impl BlendManager {
             let _ = overlay.child.kill();
             let _ = overlay.child.wait();
         }
-        if let Some(mut slicer) = self.slicer.take() {
+        let direct = self.slicer_direct.take();
+        if let Some(slicer) = self.slicer.take() {
             tracing::debug!("stopping the slicer");
             *self.slicer_epoch.lock().unwrap() += 1;
-            if let Some(writer) = &mut slicer.writer {
-                writer.close();
-            }
-            let _ = slicer.child.kill();
-            let _ = slicer.child.wait();
-            if let Some(writer) = &mut slicer.writer {
-                writer.join();
-            }
+            stop_running_slicer(slicer, direct.is_some());
             self.clear_projection_stats();
         }
     }
@@ -916,7 +1032,14 @@ impl Drop for BlendManager {
 
 /// The overlay is this same binary: one ELF on disk, per the packaging story.
 fn spawn_overlay(spec: &OverlaySpec) -> std::io::Result<Child> {
-    spawn_internal("blend", &serde_json::to_string(spec)?, false, false)
+    spawn_internal(
+        "blend",
+        &serde_json::to_string(spec)?,
+        &[],
+        false,
+        false,
+        false,
+    )
 }
 
 /// `pipe_stdout` is true only for the slicer: it reports `ProjectionStats` as
@@ -924,11 +1047,19 @@ fn spawn_overlay(spec: &OverlaySpec) -> std::io::Result<Child> {
 /// process reads back with [`spawn_stats_reader`]. Blend overlays have
 /// nothing to say there, so theirs keeps inheriting the daemon's stdout —
 /// piping it for no reason would just make it silently vanish.
+///
+/// `pipe_stderr` is likewise true only for the slicer, so its last line can
+/// be named in direct presentation's fallback reason (see
+/// [`spawn_slicer_stderr_reader`]); every captured line is re-logged through
+/// the daemon's own tracing, so it still lands in the journal, just no
+/// longer tagged with the child's own name the way an inherited fd was.
 fn spawn_internal(
     subcommand: &str,
     spec: &str,
+    extra_args: &[String],
     pipe_stdin: bool,
     pipe_stdout: bool,
+    pipe_stderr: bool,
 ) -> std::io::Result<Child> {
     let program = std::env::current_exe()?;
     let mut command = Command::new(program);
@@ -936,6 +1067,7 @@ fn spawn_internal(
         .arg(subcommand)
         .arg("--spec")
         .arg(spec)
+        .args(extra_args)
         .stdin(if pipe_stdin {
             Stdio::piped()
         } else {
@@ -944,7 +1076,11 @@ fn spawn_internal(
     if pipe_stdout {
         command.stdout(Stdio::piped());
     }
-    // Stderr flows to the daemon's own journal, tagged per process.
+    if pipe_stderr {
+        command.stderr(Stdio::piped());
+    }
+    // Otherwise stderr flows straight to the daemon's own journal, tagged
+    // per process.
     command.spawn()
 }
 
@@ -1038,6 +1174,135 @@ fn spawn_slicer_stdout_reader(
     if let Err(error) = build {
         tracing::warn!(%error, "could not start the slicer-stats reader thread");
     }
+}
+
+/// Track the slicer's last non-empty stderr line, trimmed and length-capped
+/// to what a fallback reason can use — see
+/// [`crate::presentation::DirectHealth::slicer_exited`]. Piping stderr loses
+/// the child-tagged journal entry an inherited fd gave for free, so every
+/// line is also re-emitted through the daemon's own tracing to keep it
+/// visible there.
+fn spawn_slicer_stderr_reader(stderr: ChildStderr, last_line: Arc<Mutex<Option<String>>>) {
+    let build = std::thread::Builder::new()
+        .name("slicer-stderr".to_string())
+        .spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            loop {
+                let line = match read_bounded_line(&mut reader, MAX_CONTROL_LINE_BYTES) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    // Same recovery rule as the stdout reader: an oversize
+                    // line is drained and realigned, anything else ends it.
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                        tracing::debug!(%error, "slicer stderr reader recovered from a long line");
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                let text = String::from_utf8_lossy(&line);
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                tracing::warn!(target: "suede::slicer", "{trimmed}");
+                let capped: String = trimmed
+                    .chars()
+                    .take(crate::presentation::MAX_STDERR_REASON_CHARS)
+                    .collect();
+                *last_line.lock().unwrap() = Some(capped);
+            }
+        });
+    if let Err(error) = build {
+        tracing::warn!(%error, "could not start the slicer-stderr reader thread");
+    }
+}
+
+/// Stop a slicer child and its control writer.
+///
+/// A slicer presenting through the compositor is killed outright, as it
+/// always has been: it holds nothing the compositor cannot take back. One
+/// presenting directly holds DRM master and, on NVIDIA, an NVKMS
+/// sub-ownership grant that only its own clean shutdown revokes — a SIGKILL
+/// leaves the grant behind for the next opener to clear. So it is asked to
+/// stop instead: its control stdin is closed (EOF ends it cleanly) and it is
+/// sent SIGTERM (its handler takes the same path, and does not depend on
+/// the child having reached the point where it reads stdin), and it is
+/// killed only if it has not exited within [`DIRECT_STOP_TIMEOUT`].
+fn stop_running_slicer(mut slicer: RunningSlicer, direct: bool) {
+    if let Some(writer) = &mut slicer.writer {
+        writer.close();
+    }
+    stop_child(&mut slicer.child, direct.then_some(DIRECT_STOP_TIMEOUT));
+    if let Some(writer) = &mut slicer.writer {
+        writer.join();
+    }
+}
+
+/// Kill `child` now, or with `graceful` ask it to stop and wait up to that
+/// long before killing it. Either way it has been reaped on return.
+fn stop_child(child: &mut Child, graceful: Option<std::time::Duration>) {
+    if let Some(timeout) = graceful {
+        // `try_wait` first: once std has reaped the child its pid may belong
+        // to another process, and must not be signaled.
+        if matches!(child.try_wait(), Ok(None)) {
+            #[cfg(unix)]
+            // SAFETY: `kill` has no memory-safety preconditions; the pid is
+            // this still-unreaped child's.
+            unsafe {
+                libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+            }
+            let exited = run_blocking(|| wait_bounded(child, timeout));
+            if !exited {
+                tracing::warn!(
+                    timeout_s = timeout.as_secs_f64(),
+                    "the slicer did not stop in time; killing it"
+                );
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Poll `child` until it exits or `timeout` passes; whether it exited.
+fn wait_bounded(child: &mut Child, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Run a blocking wait without stalling the async workers when called from
+/// the multi-threaded runtime (the reconciler holds the manager across an
+/// `.await`); anywhere else, just run it.
+fn run_blocking<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// Fold the direct presentation config into a slicer fingerprint. `None`
+/// leaves the fingerprint exactly as it was, so compositor presentation's
+/// restart rules are untouched.
+fn with_direct_presentation(fingerprint: u64, direct: Option<&DirectDisplayConfig>) -> u64 {
+    let Some(direct) = direct else {
+        return fingerprint;
+    };
+    let mut hasher = DefaultHasher::new();
+    fingerprint.hash(&mut hasher);
+    direct.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn event_belongs_to_session(event: &ControlEvent, session: &str) -> bool {
@@ -1258,6 +1523,136 @@ mod tests {
             Some(pid),
             "a forced restart must respawn even an unchanged spec"
         );
+    }
+
+    fn direct_config(refresh_millihz: u32) -> DirectDisplayConfig {
+        DirectDisplayConfig {
+            card: "/dev/dri/card1".into(),
+            outputs: vec![crate::presentation::DirectOutputConfig {
+                name: "DP-1".into(),
+                connector_id: 129,
+                width: 1920,
+                height: 1080,
+                refresh_millihz,
+            }],
+        }
+    }
+
+    #[test]
+    fn the_direct_config_is_part_of_the_slicer_fingerprint() {
+        let spec = minimal_slicer_spec();
+        let base = slicer_fingerprint(&spec, true);
+        // Compositor presentation keeps exactly the fingerprint it had.
+        assert_eq!(with_direct_presentation(base, None), base);
+        let a = with_direct_presentation(base, Some(&direct_config(59_939)));
+        assert_ne!(a, base, "switching to direct must restart");
+        assert_eq!(
+            a,
+            with_direct_presentation(base, Some(&direct_config(59_939)))
+        );
+        assert_ne!(
+            a,
+            with_direct_presentation(base, Some(&direct_config(60_000))),
+            "a mode change must restart"
+        );
+        let mut other_connector = direct_config(59_939);
+        other_connector.outputs[0].connector_id = 133;
+        assert_ne!(a, with_direct_presentation(base, Some(&other_connector)));
+    }
+
+    #[test]
+    fn a_direct_config_change_restarts_the_slicer_and_an_unchanged_one_does_not() {
+        // Same back-to-back discipline as the tests above: the fake child
+        // is this test binary, which exits almost immediately.
+        let mut manager = manager_for_test();
+        let spec = minimal_slicer_spec();
+        let a = direct_config(59_939);
+
+        manager.sync_slicer_presenting(Some(&spec), 0, Some(&a));
+        let first = manager.slicer_pid().expect("must have spawned a slicer");
+        assert_eq!(manager.slicer_direct.as_ref(), Some(&a));
+        manager.sync_slicer_presenting(Some(&spec), 0, Some(&a));
+        assert_eq!(manager.slicer_pid(), Some(first), "unchanged: left alone");
+
+        manager.sync_slicer_presenting(Some(&spec), 0, Some(&direct_config(60_000)));
+        let second = manager.slicer_pid().expect("respawned");
+        assert_ne!(second, first, "a new mode is a new child");
+
+        manager.sync_slicer(Some(&spec), 0);
+        assert_ne!(
+            manager.slicer_pid(),
+            Some(second),
+            "leaving direct restarts"
+        );
+        assert!(manager.slicer_direct.is_none());
+
+        manager.sync_slicer(None, 0);
+        assert!(!manager.slicer_running());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_graceful_stop_lets_the_child_exit_on_its_own() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap 'exit 7' TERM; while :; do sleep 0.02; done"])
+            .spawn()
+            .unwrap();
+        // Let the shell install its trap.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let started = std::time::Instant::now();
+        stop_child(&mut child, Some(std::time::Duration::from_secs(10)));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(child.try_wait().unwrap().and_then(|s| s.code()), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_graceful_stop_kills_a_child_that_does_not_exit_in_time() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.02; done"])
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        stop_child(&mut child, Some(std::time::Duration::from_millis(300)));
+        assert_eq!(
+            child.try_wait().unwrap().and_then(|s| s.signal()),
+            Some(libc::SIGKILL)
+        );
+    }
+
+    #[test]
+    fn an_exit_the_manager_did_not_cause_is_reaped_and_reported_once() {
+        let mut manager = manager_for_test();
+        assert_eq!(manager.reap_exited_slicer(), None);
+        // The fake child is this test binary, which exits almost at once.
+        manager.sync_slicer_presenting(
+            Some(&minimal_slicer_spec()),
+            0,
+            Some(&direct_config(59_939)),
+        );
+        assert!(manager.slicer_running());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !manager.slicer_has_exited() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let exit = manager.reap_exited_slicer().expect("reported");
+        assert!(exit.status.contains("exit"), "{}", exit.status);
+        assert!(!manager.slicer_running());
+        assert!(manager.slicer_direct.is_none());
+        assert_eq!(manager.reap_exited_slicer(), None, "only once");
+        // A stop the manager makes itself is never an unexpected exit.
+        manager.sync_slicer_presenting(
+            Some(&minimal_slicer_spec()),
+            0,
+            Some(&direct_config(59_939)),
+        );
+        manager.sync_slicer(None, 0);
+        assert_eq!(manager.reap_exited_slicer(), None);
     }
 
     #[test]
@@ -1814,6 +2209,7 @@ mod tests {
             writer: Some(writer),
             config_generations: Arc::new(Mutex::new(BTreeMap::from([(0, 0)]))),
             protocol_mismatch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_stderr: Arc::new(Mutex::new(None)),
         });
         manager.snapshot.update_projection_control(|status| {
             status.session = Some(spec.control_session.clone());

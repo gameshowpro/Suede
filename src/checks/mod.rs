@@ -17,7 +17,8 @@ use crate::config::BootstrapConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::events::{EventHub, ServerEvent};
 use crate::model::{
-    format_refresh, Check, CheckStatus, Output, OutputConfig, OutputTiming, PackageVersion,
+    format_refresh, Check, CheckStatus, GspFirmware, NvidiaDriverStatus, NvidiaKernelModule,
+    Output, OutputConfig, OutputTiming, PackageVersion, PresentationMode, PresentationStatus,
     ProjectionStats,
 };
 use crate::reconciler::plan::{plan_outputs, Capabilities};
@@ -105,6 +106,8 @@ pub mod ids {
     pub const CAPTURE_DEVICES: &str = "capture-devices";
     pub const REFRESH_RATES: &str = "refresh-rates";
     pub const OUTPUT_PHASE: &str = "output-phase";
+    pub const GSP_FIRMWARE: &str = "gsp-firmware";
+    pub const NVIDIA_DRIVER_VERSION: &str = "nvidia-driver-version";
 
     /// Every check `run_all` runs, in the order it runs them — kept here so
     /// the count carried by `every_check_reports_something`,
@@ -129,6 +132,8 @@ pub mod ids {
         API_REACHABILITY,
         CAPTURE_DEVICES,
         DECODE_MEASURED,
+        GSP_FIRMWARE,
+        NVIDIA_DRIVER_VERSION,
     ];
 }
 
@@ -351,6 +356,8 @@ impl CheckRunner {
             self.check_api_reachability().await,
             self.check_capture_devices(),
             self.check_decode_measured(),
+            self.check_gsp_firmware(),
+            self.check_nvidia_driver_version(),
         ];
 
         let changed = {
@@ -516,6 +523,21 @@ impl CheckRunner {
     /// check is what says whether the running compositor actually agrees —
     /// otherwise the A/B compares a machine with itself.
     fn check_direct_scanout(&self) -> Check {
+        // While this appliance is configured for direct presentation,
+        // WLR_SCENE_DISABLE_DIRECT_SCANOUT is beside the point: `direct`
+        // presents through the slicer's own Vulkan swapchain, bypassing the
+        // compositor's scanout path entirely, whether or not this session is
+        // actually running direct right now. A session that fell back to the
+        // compositor for this boot is not a scanout misconfiguration either,
+        // so it is reported against the fallback reason instead of the
+        // ordinary matrix below, and with no fix offered — writing or
+        // removing the drop-in would not address what the check is saying.
+        if let Some(presentation) = self.snapshot.presentation() {
+            if presentation.requested == PresentationMode::Direct {
+                return self.check_direct_scanout_for_direct_mode(&presentation);
+            }
+        }
+
         let spanning: Vec<String> = self
             .store
             .get()
@@ -559,6 +581,34 @@ impl CheckRunner {
         check
     }
 
+    /// What `direct-scanout` says while this appliance is configured for
+    /// direct presentation — see [`CheckRunner::check_direct_scanout`].
+    fn check_direct_scanout_for_direct_mode(&self, presentation: &PresentationStatus) -> Check {
+        if presentation.effective == PresentationMode::Direct {
+            return self.check(
+                ids::DIRECT_SCANOUT,
+                "Outputs presented directly",
+                CheckStatus::Pass,
+                "not applicable: outputs presented directly (experimental)".to_string(),
+                Some("developer/vk-khr/#session-lifecycle-of-the-experimental-option"),
+            );
+        }
+        let reason = presentation
+            .reason
+            .clone()
+            .unwrap_or_else(|| "direct presentation did not start".to_string());
+        self.check(
+            ids::DIRECT_SCANOUT,
+            "Direct presentation is not running",
+            CheckStatus::Warn,
+            format!(
+                "direct presentation was requested but this session is running through \
+                 the compositor instead: {reason}"
+            ),
+            Some("developer/vk-khr/#session-lifecycle-of-the-experimental-option"),
+        )
+    }
+
     /// An appliance whose compositor drives no physical display shows nothing,
     /// however healthy everything else looks.
     ///
@@ -569,6 +619,16 @@ impl CheckRunner {
     /// silently rather than take over the GPU.
     async fn check_real_displays(&self) -> Check {
         let outputs = self.sway.get_outputs().await.unwrap_or_default();
+        // In direct mode `self.sway` is `DirectOutputs`: these "outputs" are
+        // the daemon's own simulated physical outputs, presented directly by
+        // the slicer, plus the compositor's headless canvas — never actual
+        // compositor-driven connectors. Real hardware is still behind them
+        // (the live inventory refuses to start otherwise), so the pass/warn
+        // logic below is unchanged; only the wording says who is presenting.
+        let direct = self
+            .snapshot
+            .presentation()
+            .is_some_and(|status| status.effective == PresentationMode::Direct);
         let synthetic: Vec<&str> = outputs
             .iter()
             .filter(|o| is_synthetic_output(&o.name))
@@ -596,6 +656,25 @@ impl CheckRunner {
                      WLR_BACKENDS=drm and an empty WAYLAND_DISPLAY.",
                     synthetic.join(", ")
                 ),
+            )
+        } else if direct {
+            (
+                CheckStatus::Pass,
+                if synthetic.is_empty() {
+                    format!(
+                        "presenting {} physical output(s) directly (experimental), \
+                         bypassing the compositor: {}",
+                        real.len(),
+                        real.join(", ")
+                    )
+                } else {
+                    format!(
+                        "presenting {} directly (experimental), bypassing the \
+                         compositor; also present: {}",
+                        real.join(", "),
+                        synthetic.join(", ")
+                    )
+                },
             )
         } else if synthetic.is_empty() {
             (
@@ -666,11 +745,82 @@ impl CheckRunner {
             detail,
             Some("how-it-works/#keeping-the-displays-in-step"),
         );
-        if check.status == CheckStatus::Warn {
+        // The fix issues `output <name> disable`/`enable` IPC commands. In
+        // direct mode those names are not the compositor's outputs: they are
+        // owned and presented directly by the daemon, so the commands would
+        // only perturb `DirectOutputs`' simulated state, not the physical
+        // displays the verdict above is actually about.
+        let direct = self
+            .snapshot
+            .presentation()
+            .is_some_and(|status| status.effective == PresentationMode::Direct);
+        if check.status == CheckStatus::Warn && !direct {
             check.fix_available = true;
             check.fix_description = Some(
                 "Disable every active display and re-enable them together. \
                  The wall goes dark for about three seconds."
+                    .to_string(),
+            );
+        }
+        check
+    }
+
+    /// Whether NVIDIA's GSP firmware is costing the direct presentation path
+    /// anything, from the live driver state in
+    /// [`crate::nvidia_driver::detect`]. See [`gsp_firmware_verdict`] for the
+    /// decision itself and `docs/developer/vk-khr.md`'s "GSP firmware"
+    /// section for the measurements it is built on.
+    fn check_gsp_firmware(&self) -> Check {
+        let driver = crate::nvidia_driver::detect();
+        let direct = self
+            .snapshot
+            .presentation()
+            .is_some_and(|status| status.effective == PresentationMode::Direct);
+        let (status, detail) = gsp_firmware_verdict(driver.as_ref(), direct);
+
+        let mut check = self.check(
+            ids::GSP_FIRMWARE,
+            "GSP firmware",
+            status,
+            detail,
+            Some("developer/vk-khr/#gsp-firmware"),
+        );
+        if check.status == CheckStatus::Warn {
+            // Writing a modprobe drop-in and rebooting is outside what a
+            // session fix can do without the operator's consent to reboot
+            // the machine.
+            check.fix_available = false;
+            check.fix_description = Some(
+                "Add `options nvidia NVreg_EnableGpuFirmware=0` to a file under \
+                 `/etc/modprobe.d/` (e.g. `nvidia-gsp-off.conf`) and reboot. Only \
+                 the proprietary kernel module supports disabling GSP firmware \
+                 (verified on Turing and Ampere GPUs)."
+                    .to_string(),
+            );
+        }
+        check
+    }
+
+    /// Whether the running NVIDIA driver is at least as new as the newest
+    /// release Suede's presentation paths have been validated on. See
+    /// [`nvidia_driver_version_verdict`] for the decision itself and
+    /// [`crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER`] for the constant.
+    fn check_nvidia_driver_version(&self) -> Check {
+        let driver = crate::nvidia_driver::detect();
+        let (status, detail) = nvidia_driver_version_verdict(driver.as_ref());
+
+        let mut check = self.check(
+            ids::NVIDIA_DRIVER_VERSION,
+            "NVIDIA driver version",
+            status,
+            detail,
+            Some("developer/vk-khr/#what-it-takes-to-get-there"),
+        );
+        if check.status == CheckStatus::Warn {
+            check.fix_available = false;
+            check.fix_description = Some(
+                "Upgrade the NVIDIA driver through the distribution's packaged driver, \
+                 then reboot."
                     .to_string(),
             );
         }
@@ -788,6 +938,25 @@ impl CheckRunner {
     /// `bg` command succeeds and nothing appears, which is the worst
     /// combination: a screen that stays black with no error anywhere.
     async fn check_swaybg(&self) -> Check {
+        // Owned outputs' `bg` commands are no-ops in `DirectOutputs` — see
+        // `src/sway/direct.rs` — so whether swaybg is installed changes
+        // nothing physical while this session presents directly.
+        if self
+            .snapshot
+            .presentation()
+            .is_some_and(|status| status.effective == PresentationMode::Direct)
+        {
+            return self.check(
+                ids::SWAYBG,
+                "Backgrounds can be drawn",
+                CheckStatus::Pass,
+                "not applicable: physical outputs are presented directly \
+                 (experimental), so a background command for one is a no-op"
+                    .to_string(),
+                Some("configuration/#backgrounds-and-wallpapers"),
+            );
+        }
+
         let desired = self.store.get();
         let wanted = desired
             .outputs
@@ -2293,6 +2462,107 @@ fn output_phase_verdict(running: bool, stats: Option<&ProjectionStats>) -> (Chec
     )
 }
 
+/// What the `gsp-firmware` check should say, given the detected driver (if
+/// any) and whether this session is actually presenting directly right now.
+/// Pure, so every branch is table-testable without a real
+/// `/proc/driver/nvidia`.
+///
+/// GSP firmware has no measured effect on the Wayland path — its cost there
+/// is Sway's own EGL busy-wait, not per-present kernel objects — so this
+/// only ever warns while a session presents directly, on the proprietary
+/// module, with GSP actually on. See [`CheckRunner::check_gsp_firmware`].
+fn gsp_firmware_verdict(
+    driver: Option<&NvidiaDriverStatus>,
+    direct: bool,
+) -> (CheckStatus, String) {
+    let Some(driver) = driver else {
+        return (CheckStatus::Pass, "not an NVIDIA machine".to_string());
+    };
+
+    // Older drivers (550) print no `GPU Firmware:` line at all. Nothing to
+    // recommend on a state the driver will not report — and per-present
+    // timing, which direct presentation needs, is absent on those drivers
+    // anyway, so the `nvidia-driver-version` check is the one that warns.
+    if driver.gsp_firmware == GspFirmware::Unknown {
+        return (
+            CheckStatus::Pass,
+            format!(
+                "driver does not report GSP state (driver {})",
+                driver.version
+            ),
+        );
+    }
+
+    if driver.gsp_firmware == GspFirmware::Off {
+        return (
+            CheckStatus::Pass,
+            format!("GSP firmware off (driver {})", driver.version),
+        );
+    }
+
+    if driver.kernel_module == NvidiaKernelModule::Open {
+        return (
+            CheckStatus::Pass,
+            "open kernel module; GSP firmware is required and cannot be disabled".to_string(),
+        );
+    }
+
+    if !direct {
+        return (
+            CheckStatus::Pass,
+            "GSP firmware on; no measured effect on the Wayland path".to_string(),
+        );
+    }
+
+    (
+        CheckStatus::Warn,
+        "Direct presentation pays about 12 points of one core for GSP round trips \
+         inside every present on this driver (measured 17% to 4.6% kernel CPU \
+         for four heads); set \
+         `options nvidia NVreg_EnableGpuFirmware=0` in `/etc/modprobe.d/` and reboot."
+            .to_string(),
+    )
+}
+
+/// What the `nvidia-driver-version` check should say, given the detected
+/// driver (if any) against
+/// [`crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER`]. Pure, so every
+/// branch — including a version that cannot be parsed — is table-testable.
+/// See [`CheckRunner::check_nvidia_driver_version`].
+fn nvidia_driver_version_verdict(driver: Option<&NvidiaDriverStatus>) -> (CheckStatus, String) {
+    let Some(driver) = driver else {
+        return (CheckStatus::Pass, "not an NVIDIA machine".to_string());
+    };
+
+    let newest = crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER;
+    match crate::nvidia_driver::compare_versions(&driver.version, newest) {
+        Some(std::cmp::Ordering::Less) => (
+            CheckStatus::Warn,
+            format!(
+                "NVIDIA driver {} is older than the newest tested release {newest}; \
+                 behavior on older drivers is not validated (per-present timing needs \
+                 595 or later)",
+                driver.version
+            ),
+        ),
+        Some(_) => (
+            CheckStatus::Pass,
+            format!(
+                "driver {} is at least as new as the newest tested release {newest}",
+                driver.version
+            ),
+        ),
+        None => (
+            CheckStatus::Warn,
+            format!(
+                "driver version {} could not be compared against the newest tested \
+                 release {newest} (not a dotted-integer version)",
+                driver.version
+            ),
+        ),
+    }
+}
+
 /// A GPU vendor, and what it needs for hardware video decode.
 pub struct GpuVendor {
     pub name: &'static str,
@@ -2453,7 +2723,11 @@ fn compositor_unit() -> Option<String> {
 ///
 /// Sway's IPC socket is named `sway-ipc.<uid>.<pid>.sock`, which is how the
 /// running compositor can be identified without any extra plumbing.
-fn compositor_env(key: &str) -> Option<String> {
+///
+/// `pub(crate)` rather than private: `GET /system` reuses it to read
+/// `__GL_YIELD` live for [`crate::model::GlYieldStatus::effective`], the same
+/// way this module reads `WLR_SCENE_DISABLE_DIRECT_SCANOUT` above.
+pub(crate) fn compositor_env(key: &str) -> Option<String> {
     let socket = crate::sway::discover_socket()?;
     let name = socket.file_name()?.to_str()?;
     let pid: u32 = name.split('.').nth_back(1)?.parse().ok()?;
@@ -2622,6 +2896,41 @@ mod tests {
         }
     }
 
+    /// The same runner, with the daemon's resolved presentation status
+    /// recorded on its snapshot — what every direct-mode-aware check reads
+    /// to tell direct mode apart from the ordinary Wayland path.
+    fn runner_with_presentation(
+        state_dir: std::path::PathBuf,
+        presentation: PresentationStatus,
+    ) -> CheckRunner {
+        let runner = runner(state_dir);
+        let snapshot = Arc::new(Snapshot::new());
+        snapshot.set_presentation(presentation);
+        CheckRunner { snapshot, ..runner }
+    }
+
+    /// A session confirmed running direct, driving `outputs` directly.
+    fn direct_presentation(outputs: &[&str]) -> PresentationStatus {
+        PresentationStatus {
+            requested: PresentationMode::Direct,
+            effective: PresentationMode::Direct,
+            reason: None,
+            outputs: outputs.iter().map(|name| name.to_string()).collect(),
+        }
+    }
+
+    /// A session that asked for direct presentation but is running through
+    /// the compositor instead — a fallback, or `direct` without
+    /// `allow_overlaps = true`.
+    fn fallen_back_presentation(reason: &str) -> PresentationStatus {
+        PresentationStatus {
+            requested: PresentationMode::Direct,
+            effective: PresentationMode::Wayland,
+            reason: Some(reason.to_string()),
+            outputs: Vec::new(),
+        }
+    }
+
     #[test]
     fn a_tiling_appliance_wants_direct_scanout_disabled() {
         let tiling = expectation(false, true);
@@ -2742,6 +3051,59 @@ mod tests {
             "{:?}",
             composited.docs_url
         );
+    }
+
+    #[test]
+    fn direct_scanout_is_not_applicable_while_confirmed_direct() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = runner_with_presentation(
+            dir.path().to_path_buf(),
+            direct_presentation(&["DP-1", "DP-2"]),
+        )
+        .check_direct_scanout();
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("not applicable"), "{}", check.detail);
+        assert!(
+            check.detail.contains("presented directly"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.fix_available);
+    }
+
+    #[test]
+    fn direct_scanout_warns_with_the_fallback_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = runner_with_presentation(
+            dir.path().to_path_buf(),
+            fallen_back_presentation("the slicer exited 3 times within 10 minutes"),
+        )
+        .check_direct_scanout();
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check
+                .detail
+                .contains("the slicer exited 3 times within 10 minutes"),
+            "{}",
+            check.detail
+        );
+        // Writing or removing the scanout drop-in would not address a
+        // fallback: no fix is offered even though the status is Warn.
+        assert!(!check.fix_available);
+    }
+
+    #[tokio::test]
+    async fn swaybg_is_not_applicable_in_direct_mode() {
+        // Owned outputs' `bg` command is a no-op regardless of whether
+        // swaybg is installed or any output configures a background, so the
+        // check short-circuits to Pass before consulting either.
+        let dir = tempfile::tempdir().unwrap();
+        let check =
+            runner_with_presentation(dir.path().to_path_buf(), direct_presentation(&["DP-1"]))
+                .check_swaybg()
+                .await;
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(check.detail.contains("not applicable"), "{}", check.detail);
     }
 
     fn codec(family: &str, supported: bool, hardware: Option<bool>) -> crate::model::CodecSupport {
@@ -2907,6 +3269,160 @@ mod tests {
             .unwrap();
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(check.detail.contains("exited"), "{}", check.detail);
+    }
+
+    /// A proprietary-module driver with GSP off, on or unknown, used across the
+    /// `gsp-firmware` table tests below.
+    fn nvidia_driver(
+        gsp_firmware: GspFirmware,
+        kernel_module: NvidiaKernelModule,
+    ) -> NvidiaDriverStatus {
+        NvidiaDriverStatus {
+            version: "595.91.07".to_string(),
+            kernel_module,
+            gsp_firmware,
+            gsp_optional: kernel_module == NvidiaKernelModule::Proprietary,
+            newest_tested: crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER.to_string(),
+        }
+    }
+
+    #[test]
+    fn gsp_firmware_verdict_is_pass_on_a_non_nvidia_machine() {
+        let (status, detail) = gsp_firmware_verdict(None, false);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("not an NVIDIA machine"), "{detail}");
+    }
+
+    #[test]
+    fn gsp_firmware_verdict_is_pass_when_gsp_is_off() {
+        let driver = nvidia_driver(GspFirmware::Off, NvidiaKernelModule::Proprietary);
+        let (status, detail) = gsp_firmware_verdict(Some(&driver), true);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("off"), "{detail}");
+    }
+
+    #[test]
+    fn gsp_firmware_verdict_is_pass_with_a_note_when_the_driver_does_not_report_gsp() {
+        let mut driver = nvidia_driver(GspFirmware::Unknown, NvidiaKernelModule::Proprietary);
+        driver.version = "550.163.01".to_string();
+        for direct in [false, true] {
+            let (status, detail) = gsp_firmware_verdict(Some(&driver), direct);
+            assert_eq!(status, CheckStatus::Pass);
+            assert_eq!(
+                detail,
+                "driver does not report GSP state (driver 550.163.01)"
+            );
+        }
+    }
+
+    #[test]
+    fn gsp_firmware_verdict_is_pass_on_the_open_module_even_with_gsp_on() {
+        let driver = nvidia_driver(GspFirmware::On, NvidiaKernelModule::Open);
+        let (status, detail) = gsp_firmware_verdict(Some(&driver), true);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("open kernel module"), "{detail}");
+    }
+
+    #[test]
+    fn gsp_firmware_verdict_is_pass_on_wayland_even_with_gsp_on() {
+        let driver = nvidia_driver(GspFirmware::On, NvidiaKernelModule::Proprietary);
+        let (status, detail) = gsp_firmware_verdict(Some(&driver), false);
+        assert_eq!(status, CheckStatus::Pass);
+        assert_eq!(
+            detail,
+            "GSP firmware on; no measured effect on the Wayland path"
+        );
+    }
+
+    #[test]
+    fn gsp_firmware_verdict_warns_only_for_proprietary_gsp_on_direct() {
+        let driver = nvidia_driver(GspFirmware::On, NvidiaKernelModule::Proprietary);
+        let (status, detail) = gsp_firmware_verdict(Some(&driver), true);
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("NVreg_EnableGpuFirmware=0"), "{detail}");
+    }
+
+    #[test]
+    fn gsp_firmware_check_never_offers_an_automatic_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let check =
+            runner_with_presentation(dir.path().to_path_buf(), direct_presentation(&["DP-1"]))
+                .check_gsp_firmware();
+        // This test environment has no /proc/driver/nvidia, so the verdict
+        // itself is Pass; the fix-availability contract (always false, per
+        // the plan) is asserted directly against the pure function's Warn
+        // branch above, and here against the wiring that would apply it.
+        assert!(!check.fix_available);
+        assert!(
+            check
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("#gsp-firmware")),
+            "{:?}",
+            check.docs_url
+        );
+    }
+
+    #[test]
+    fn nvidia_driver_version_verdict_is_pass_on_a_non_nvidia_machine() {
+        let (status, detail) = nvidia_driver_version_verdict(None);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("not an NVIDIA machine"), "{detail}");
+    }
+
+    #[test]
+    fn nvidia_driver_version_verdict_passes_the_exact_newest_release() {
+        let mut driver = nvidia_driver(GspFirmware::Off, NvidiaKernelModule::Proprietary);
+        driver.version = crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER.to_string();
+        let (status, _) = nvidia_driver_version_verdict(Some(&driver));
+        assert_eq!(status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn nvidia_driver_version_verdict_passes_a_newer_release() {
+        let mut driver = nvidia_driver(GspFirmware::Off, NvidiaKernelModule::Proprietary);
+        // Newer than any constant this check will plausibly carry.
+        driver.version = "9999.1.1".to_string();
+        let (status, detail) = nvidia_driver_version_verdict(Some(&driver));
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("9999.1.1"), "{detail}");
+    }
+
+    #[test]
+    fn nvidia_driver_version_verdict_warns_on_an_older_release() {
+        let mut driver = nvidia_driver(GspFirmware::Off, NvidiaKernelModule::Proprietary);
+        driver.version = "550.163.01".to_string();
+        let (status, detail) = nvidia_driver_version_verdict(Some(&driver));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("550.163.01"), "{detail}");
+        assert!(
+            detail.contains(crate::nvidia_driver::NEWEST_TESTED_NVIDIA_DRIVER),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn nvidia_driver_version_verdict_warns_with_a_parse_note_on_a_malformed_version() {
+        let mut driver = nvidia_driver(GspFirmware::Off, NvidiaKernelModule::Proprietary);
+        driver.version = "not-a-version".to_string();
+        let (status, detail) = nvidia_driver_version_verdict(Some(&driver));
+        assert_eq!(status, CheckStatus::Warn);
+        assert!(detail.contains("could not be compared"), "{detail}");
+    }
+
+    #[test]
+    fn nvidia_driver_version_check_never_offers_an_automatic_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = runner(dir.path().to_path_buf()).check_nvidia_driver_version();
+        assert!(!check.fix_available);
+        assert!(
+            check
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("#what-it-takes-to-get-there")),
+            "{:?}",
+            check.docs_url
+        );
     }
 
     #[tokio::test]
@@ -3350,6 +3866,8 @@ mod tests {
             straddles: 0,
             gate_holds: 0,
             renderer: "cpu".to_string(),
+            presentation_backend: None,
+            timestamp_source: None,
             capture_intervals: crate::model::CaptureIntervals::default(),
             outputs,
         }
@@ -3456,6 +3974,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn output_phase_fix_is_unavailable_in_direct_mode() {
+        // Same out-of-phase stats either way: the verdict must not change.
+        // Only whether a fix is offered depends on the mode, because the
+        // fix's `output <name> disable`/`enable` commands only mean anything
+        // when the compositor actually owns those outputs.
+        let stats = stats_with(
+            true,
+            vec![timing("DP-5", Some(0.0)), timing("DP-6", Some(7.1))],
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let wayland = runner(dir.path().to_path_buf());
+        wayland.snapshot.set_slicer_running(true);
+        wayland.snapshot.set_projection_stats(Some(stats.clone()));
+        let wayland_check = wayland.check_output_phase().await;
+        assert_eq!(wayland_check.status, CheckStatus::Warn);
+        assert!(wayland_check.fix_available);
+
+        let direct = runner_with_presentation(
+            dir.path().to_path_buf(),
+            direct_presentation(&["DP-5", "DP-6"]),
+        );
+        direct.snapshot.set_slicer_running(true);
+        direct.snapshot.set_projection_stats(Some(stats));
+        let direct_check = direct.check_output_phase().await;
+        assert_eq!(
+            direct_check.status,
+            CheckStatus::Warn,
+            "the verdict itself is unaffected by mode"
+        );
+        assert!(!direct_check.fix_available);
+        assert!(direct_check.fix_description.is_none());
+    }
+
+    #[tokio::test]
     async fn a_headless_compositor_is_flagged() {
         // The fixtures are HDMI connectors, so this passes; swap in a headless
         // set and the check must warn that nothing reaches a display.
@@ -3507,6 +4060,26 @@ mod tests {
         let check = checks.iter().find(|c| c.id == ids::REAL_DISPLAYS).unwrap();
         // The fixtures are HDMI-A-*, which are genuine connectors.
         assert_eq!(check.status, CheckStatus::Pass);
+    }
+
+    #[tokio::test]
+    async fn real_displays_reword_for_direct_mode() {
+        // Same fixtures (genuine connectors) as `real_connectors_pass`, but
+        // the presentation status says this session presents them directly:
+        // the check must still pass, saying who is presenting instead of
+        // "driving" them.
+        let dir = tempfile::tempdir().unwrap();
+        let check =
+            runner_with_presentation(dir.path().to_path_buf(), direct_presentation(&["DP-1"]))
+                .check_real_displays()
+                .await;
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert!(
+            check.detail.contains("presented directly") || check.detail.contains("directly"),
+            "{}",
+            check.detail
+        );
+        assert!(!check.detail.starts_with("driving"), "{}", check.detail);
     }
 
     #[tokio::test]

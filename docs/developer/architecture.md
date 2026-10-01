@@ -12,6 +12,9 @@ Everything else follows from that. Boot-restore, hotplug recovery, crash recover
 src/
 ├── main.rs           CLI (`run`, `openapi`), daemon wiring, signal handling
 ├── config.rs         Bootstrap configuration: file + SUEDE_* overrides
+├── presentation.rs   Experimental direct-presentation session lifecycle: resolving requested vs. effective mode against runtime state, the fallback marker and crash budget, and running `suede display-reset` as a bounded child process during fallback
+├── drm_inventory.rs  Experimental: live physical-output inventory for direct mode — EDID identity and exact mode timings read straight from sysfs and DRM_IOCTL_MODE_GETCONNECTOR, with no prior Wayland boot
+├── nvidia_driver.rs  NVIDIA kernel module and GSP firmware state, read straight from /proc/driver/nvidia, for GET /system and the gsp-firmware and nvidia-driver-version health checks
 ├── model/
 │   ├── observed.rs   What sway and PipeWire report
 │   ├── desired.rs    The document clients write, and its validation
@@ -21,7 +24,8 @@ src/
 │   ├── protocol.rs   IPC framing
 │   ├── raw.rs        Sway's JSON shapes, and the mapping into the model
 │   ├── client.rs     Live client over a Unix socket
-│   └── mock.rs       In-memory client that simulates output commands
+│   ├── mock.rs       In-memory client that simulates output commands
+│   └── direct.rs     Experimental: `DirectOutputs`, a `SwayClient` wrapper that intercepts commands for owned physical outputs and simulates their effect, so the reconciler and planner need no direct-mode branch of their own
 ├── audio/
 │   ├── pw.rs         PipeWire via pw-dump / pw-cli
 │   └── mock.rs       In-memory monitor
