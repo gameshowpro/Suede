@@ -28,7 +28,11 @@ pub struct MeasurementKey {
     /// upgraded browser answers afresh rather than inheriting.
     pub program: String,
     pub program_mtime_secs: u64,
-    /// GPU driver fingerprint, where one announces itself.
+    /// GPU driver fingerprint, where one announces itself. On NVIDIA it also
+    /// records whether `nvidia_uvm` is loaded: the browser's VA-API decode
+    /// needs it and its sandbox cannot load it, so a report measured before
+    /// the module was loaded says "software decode" and must not survive the
+    /// module appearing (for example after provisioning's boot-time load).
     pub driver: String,
     /// Kernel release, which carries the V4L2 and DRM side of the story.
     pub kernel: String,
@@ -49,14 +53,28 @@ impl MeasurementKey {
             env: app.env.clone().into_iter().collect(),
             program: program.display().to_string(),
             program_mtime_secs: mtime,
-            driver: std::fs::read_to_string("/sys/module/nvidia/version")
-                .map(|v| format!("nvidia {}", v.trim()))
-                .unwrap_or_default(),
+            driver: driver_fingerprint(
+                std::fs::read_to_string("/sys/module/nvidia/version").ok(),
+                std::path::Path::new("/sys/module/nvidia_uvm").exists(),
+            ),
             kernel: std::fs::read_to_string("/proc/sys/kernel/osrelease")
                 .map(|v| v.trim().to_string())
                 .unwrap_or_default(),
             build: crate::BUILD_ID.to_string(),
         }
+    }
+}
+
+/// The `driver` part of a [`MeasurementKey`]: the NVIDIA module version,
+/// plus whether `nvidia_uvm` is loaded. Empty when no NVIDIA module is.
+fn driver_fingerprint(nvidia_version: Option<String>, uvm_loaded: bool) -> String {
+    match nvidia_version {
+        Some(version) => format!(
+            "nvidia {}{}",
+            version.trim(),
+            if uvm_loaded { " +uvm" } else { "" }
+        ),
+        None => String::new(),
     }
 }
 
@@ -138,6 +156,19 @@ pub fn subject(state: &DesiredState) -> Option<AppConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loading_nvidia_uvm_changes_the_driver_fingerprint() {
+        let without = driver_fingerprint(Some("615.71.09\n".into()), false);
+        let with = driver_fingerprint(Some("615.71.09\n".into()), true);
+        assert_eq!(without, "nvidia 615.71.09");
+        assert_eq!(with, "nvidia 615.71.09 +uvm");
+        assert_ne!(
+            without, with,
+            "a stale software-decode report must be re-measured"
+        );
+        assert_eq!(driver_fingerprint(None, true), "");
+    }
 
     fn kiosk(id: &str) -> AppConfig {
         serde_json::from_value(serde_json::json!({
