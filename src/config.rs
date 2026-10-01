@@ -51,6 +51,7 @@ struct FileConfig {
     /// [`ConfigError::GlYield`] naming the value and the accepted ones, not
     /// whatever wording `toml`'s enum deserialization happens to produce.
     gl_yield: Option<String>,
+    align_outputs: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -140,9 +141,22 @@ pub struct BootstrapConfig {
     /// Bootstrap rather than desired state, and not `SUEDE_*`-overridable,
     /// for the same reason as [`Self::presentation`]: it describes how the
     /// compositor's environment was set at login, which cannot be changed
-    /// from Suede's own process afterwards. Defaults to `default`: driver
-    /// behavior is unchanged unless an operator opts in.
+    /// from Suede's own process afterwards. Defaults to `usleep`, the
+    /// recommended NVIDIA profile (harmless under Mesa); `default` is the
+    /// explicit opt-out that leaves driver behavior unchanged.
     pub gl_yield: GlYieldMode,
+    /// Whether the daemon aligns the physical outputs' vblank phase itself
+    /// after a Wayland session starts them out of phase — see
+    /// [`crate::alignment`].
+    ///
+    /// Defaults to `true`: on the NVIDIA rigs this was measured on, every
+    /// compositor restart left the heads several milliseconds apart, and the
+    /// `output-phase` check's disable/re-enable fix brought them within
+    /// 0.2 ms on its first attempt every time. `false` leaves the fix to an
+    /// operator. Unlike [`Self::allow_overlaps`] this is daemon behavior,
+    /// not a fact about how the compositor was started, so
+    /// `SUEDE_ALIGN_OUTPUTS` overrides it like any other value.
+    pub align_outputs: bool,
 }
 
 impl Default for BootstrapConfig {
@@ -159,7 +173,8 @@ impl Default for BootstrapConfig {
             allow_overlaps: false,
             direct_scanout: true,
             presentation: PresentationMode::Wayland,
-            gl_yield: GlYieldMode::Default,
+            gl_yield: GlYieldMode::Usleep,
+            align_outputs: true,
         }
     }
 }
@@ -246,6 +261,10 @@ pub enum ConfigError {
         GlYieldMode::ALL.iter().map(GlYieldMode::as_str).collect::<Vec<_>>().join(", ")
     )]
     GlYield { value: String },
+    /// Same reasoning as [`ConfigError::PowerVerb`], for the one boolean that
+    /// an environment variable can set: a typo must not silently pick a side.
+    #[error("invalid SUEDE_ALIGN_OUTPUTS {value:?}; accepted values are true, false")]
+    AlignOutputs { value: String },
 }
 
 impl BootstrapConfig {
@@ -316,7 +335,18 @@ impl BootstrapConfig {
             Some(value) => GlYieldMode::parse(&value).ok_or_else(|| ConfigError::GlYield {
                 value: value.clone(),
             })?,
-            None => GlYieldMode::Default,
+            None => GlYieldMode::Usleep,
+        };
+        config.align_outputs = match std::env::var("SUEDE_ALIGN_OUTPUTS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(value) => match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(ConfigError::AlignOutputs { value }),
+            },
+            None => file.align_outputs.unwrap_or(true),
         };
 
         Ok(config)
@@ -722,12 +752,12 @@ mod tests {
     }
 
     #[test]
-    fn gl_yield_defaults_to_default_and_is_read_from_the_file() {
+    fn gl_yield_defaults_to_usleep_and_is_read_from_the_file() {
         let _guard = env_lock();
-        // Absent means default: unchanged driver behavior, so an upgrade
-        // cannot change what a machine does at its next boot.
+        // Absent means usleep, the recommended NVIDIA profile; "default" is
+        // the explicit opt-out.
         let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
-        assert_eq!(config.gl_yield, GlYieldMode::Default);
+        assert_eq!(config.gl_yield, GlYieldMode::Usleep);
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("suede.toml");
@@ -758,6 +788,37 @@ mod tests {
         assert!(error.contains("default"), "{error}");
         assert!(error.contains("usleep"), "{error}");
         assert!(error.contains("nothing"), "{error}");
+    }
+
+    /// One test, like the power test, because `SUEDE_ALIGN_OUTPUTS` is
+    /// process-wide state.
+    #[test]
+    fn align_outputs_defaults_to_on_and_is_read_from_file_and_env() {
+        let _guard = env_lock();
+        // Safety: the whole test holds `env_lock`.
+        unsafe { std::env::remove_var("SUEDE_ALIGN_OUTPUTS") };
+
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(config.align_outputs, "absent means on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+        std::fs::write(&path, "align_outputs = false\n").unwrap();
+        assert!(!BootstrapConfig::load(Some(&path)).unwrap().align_outputs);
+        std::fs::write(&path, "align_outputs = true\n").unwrap();
+        assert!(BootstrapConfig::load(Some(&path)).unwrap().align_outputs);
+
+        // The environment wins over the file, like every other override.
+        unsafe { std::env::set_var("SUEDE_ALIGN_OUTPUTS", "false") };
+        assert!(!BootstrapConfig::load(Some(&path)).unwrap().align_outputs);
+
+        // A typo fails loudly rather than silently picking a side.
+        unsafe { std::env::set_var("SUEDE_ALIGN_OUTPUTS", "yes") };
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("yes"), "{error}");
+        assert!(error.contains("true, false"), "{error}");
+
+        unsafe { std::env::remove_var("SUEDE_ALIGN_OUTPUTS") };
     }
 
     #[test]

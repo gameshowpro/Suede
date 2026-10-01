@@ -55,6 +55,14 @@ impl ReconcileTrigger {
             tracing::trace!(reason, "reconciliation already pending");
         }
     }
+
+    /// Whether an ordinary request is queued and not yet picked up. The
+    /// channel holds one, so a full channel is exactly "a pass is pending".
+    /// A pass already in flight shows as [`crate::model::SyncState::Reconciling`]
+    /// on the snapshot's status instead.
+    pub fn is_pending(&self) -> bool {
+        self.sender.capacity() == 0
+    }
 }
 
 /// Bounded ordinary requests and a separate coalesced projection wakeup.

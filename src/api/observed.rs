@@ -166,6 +166,12 @@ pub async fn get_system(State(state): State<ApiState>) -> Json<SystemInfo> {
         // Read live rather than cached, like `gl_yield.effective` above:
         // nothing resolves this once at startup either.
         nvidia_driver: crate::nvidia_driver::detect(),
+        // The bootstrap key decides `enabled`, so the answer is right even
+        // before the alignment task has published anything.
+        output_alignment: crate::model::OutputAlignmentStatus {
+            enabled: state.bootstrap.align_outputs,
+            ..state.snapshot.output_alignment()
+        },
     })
 }
 
@@ -859,6 +865,17 @@ mod tests {
             .unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(body["nvidiaDriver"].is_null(), "{body}");
+        // Additive: on by default, nothing attempted before any stats.
+        assert_eq!(
+            body["outputAlignment"],
+            serde_json::json!({
+                "enabled": true,
+                "attempts": 0,
+                "lastResult": null,
+                "lastPhaseMs": null
+            }),
+            "{body}"
+        );
     }
 
     #[tokio::test]

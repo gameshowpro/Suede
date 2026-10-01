@@ -306,6 +306,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         allow_overlaps = bootstrap.allow_overlaps,
         direct_scanout = bootstrap.direct_scanout,
         presentation = bootstrap.presentation.as_str(),
+        align_outputs = bootstrap.align_outputs,
         mock = args.mock,
         "starting suede"
     );
@@ -438,6 +439,15 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         shutdown_rx.clone(),
     ));
     tokio::spawn(reconciler.clone().run(trigger_rx, shutdown_rx.clone()));
+    tokio::spawn(
+        suede::alignment::Aligner::new(
+            bootstrap.align_outputs,
+            checks.clone(),
+            snapshot.clone(),
+            trigger.clone(),
+        )
+        .run(shutdown_rx.clone()),
+    );
     tokio::spawn(run_checks(
         checks.clone(),
         events.clone(),

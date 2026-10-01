@@ -325,9 +325,10 @@ PRESENTATION_EOF
 # NVIDIA's EGL busy-wait workaround (`gl_yield` in suede.toml, experimental):
 # exported into Sway's environment before either branch below execs it, so it
 # applies equally to the ordinary DRM session and the headless one that backs
-# direct presentation. Mesa ignores the variable, so an absent key or
-# anything but "usleep"/"nothing" exports nothing and driver behavior is
-# unchanged. See docs/configuration.md and docs/developer/vk-khr.md for the
+# direct presentation. An absent key (or "usleep") exports USLEEP, the
+# recommended NVIDIA profile; "default" exports nothing, leaving driver
+# behavior unchanged, and "nothing" exports NOTHING. Mesa ignores the
+# variable, so the default is harmless on other drivers. See docs/configuration.md and docs/developer/vk-khr.md for the
 # measured trade-off.
 #
 # Kept in its own heredoc, delimited by GL_YIELD_EOF, so
@@ -336,12 +337,49 @@ GL_YIELD_BLOCK="$(cat <<'GL_YIELD_EOF'
   suede_gl_yield="$(sed -n -E 's/^[[:space:]]*gl_yield[[:space:]]*=[[:space:]]*"?([A-Za-z_]+)"?.*/\1/p' \
     "$HOME/.config/suede/suede.toml" 2>/dev/null | head -n1)"
   case "$suede_gl_yield" in
-    usleep) export __GL_YIELD=USLEEP ;;
+    ""|usleep) export __GL_YIELD=USLEEP ;;
     nothing) export __GL_YIELD=NOTHING ;;
   esac
   unset suede_gl_yield
 GL_YIELD_EOF
 )"
+
+# --- 3b. nvidia_uvm at boot ---------------------------------------------
+# The browser's VA-API decode needs nvidia_uvm, which nothing loads on its own.
+# Only on machines with an NVIDIA GPU: a PCI device with vendor 10de, a loaded
+# proprietary driver, or an installed nvidia module. SUEDE_FAKE_ROOT prefixes
+# every path this function reads or writes so scripts/validate-packaging.sh
+# can run it against a scratch tree; it is empty in real use.
+step "Loading nvidia_uvm at boot (NVIDIA machines only)"
+# BEGIN NVIDIA_UVM_FUNCTION
+install_nvidia_uvm() {
+  local root="${SUEDE_FAKE_ROOT:-}" found=""
+  if lspci -n -d 10de: 2>/dev/null | grep -q .; then found="a PCI device with vendor 10de"
+  elif [[ -e "$root/proc/driver/nvidia/version" ]]; then found="the loaded NVIDIA driver"
+  elif modinfo nvidia >/dev/null 2>&1; then found="an installed nvidia module"
+  fi
+  if [[ -z "$found" ]]; then
+    echo "  no NVIDIA GPU found: skipping"
+    return 0
+  fi
+  echo "  NVIDIA GPU detected ($found)"
+  install -d "$root/etc/modules-load.d"
+  printf 'nvidia-uvm\n' > "$root/etc/modules-load.d/nvidia-uvm.conf"
+  echo "  $root/etc/modules-load.d/nvidia-uvm.conf: nvidia-uvm"
+  local rule="$root/etc/udev/rules.d/70-suede-nvidia-uvm.rules"
+  if [[ -x "$root/usr/bin/nvidia-modprobe" ]]; then
+    install -d "$root/etc/udev/rules.d"
+    printf 'KERNEL=="nvidia_uvm", RUN+="/usr/bin/nvidia-modprobe -c0 -u"\n' > "$rule"
+    echo "  $rule installed"
+  else
+    # Without nvidia-modprobe, module load plus the driver's own node
+    # creation is all there is; drop a rule left by an earlier run.
+    rm -f "$rule"
+    echo "  nvidia-modprobe not found: relying on module load alone"
+  fi
+}
+# END NVIDIA_UVM_FUNCTION
+install_nvidia_uvm
 
 BEGIN="# BEGIN SUEDE_PROVISION"
 END="# END SUEDE_PROVISION"

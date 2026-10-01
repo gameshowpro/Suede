@@ -159,6 +159,8 @@ impl Modify for SecurityAddon {
         crate::model::GlYieldStatus,
         crate::model::GlYieldMode,
         crate::model::NvidiaDriverStatus,
+        crate::model::OutputAlignmentStatus,
+        crate::model::OutputAlignmentResult,
         crate::model::NvidiaKernelModule,
         crate::model::GspFirmware,
         crate::model::CheckStatus,

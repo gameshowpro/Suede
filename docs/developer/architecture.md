@@ -14,6 +14,7 @@ src/
 ├── config.rs         Bootstrap configuration: file + SUEDE_* overrides
 ├── presentation.rs   Experimental direct-presentation session lifecycle: resolving requested vs. effective mode against runtime state, the fallback marker and crash budget, and running `suede display-reset` as a bounded child process during fallback
 ├── drm_inventory.rs  Experimental: live physical-output inventory for direct mode — EDID identity and exact mode timings read straight from sysfs and DRM_IOCTL_MODE_GETCONNECTOR, with no prior Wayland boot
+├── alignment.rs      Automatic output phase alignment: judges the slicer's `phaseMs` after a Wayland session starts and runs the output-phase fix itself, within a per-session budget
 ├── nvidia_driver.rs  NVIDIA kernel module and GSP firmware state, read straight from /proc/driver/nvidia, for GET /system and the gsp-firmware and nvidia-driver-version health checks
 ├── model/
 │   ├── observed.rs   What sway and PipeWire report

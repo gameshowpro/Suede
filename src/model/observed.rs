@@ -558,6 +558,53 @@ pub struct SystemInfo {
     /// machine — see [`crate::nvidia_driver::detect`]. Read fresh on every
     /// request, like `gl_yield.effective`.
     pub nvidia_driver: Option<NvidiaDriverStatus>,
+    /// Automatic output phase alignment this compositor session — see
+    /// [`OutputAlignmentStatus`] and
+    /// [`crate::config::BootstrapConfig::align_outputs`].
+    pub output_alignment: OutputAlignmentStatus,
+}
+
+/// What `GET /system` reports about automatic output phase alignment: the
+/// daemon re-aligning the displays itself, with the `output-phase` check's
+/// own fix, after a Wayland session starts them out of phase — see
+/// [`crate::alignment`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputAlignmentStatus {
+    /// `align_outputs` in `suede.toml` (default `true`).
+    pub enabled: bool,
+    /// Alignments run this compositor session, at most three. Resets when the
+    /// compositor or the set of active displays changes.
+    pub attempts: u32,
+    /// What the last judgment or attempt concluded, or `null` before
+    /// anything has been judged this session.
+    pub last_result: Option<OutputAlignmentResult>,
+    /// The largest absolute `phaseMs` of the last judged slicer interval, or
+    /// `null` before one has been judged.
+    pub last_phase_ms: Option<f64>,
+}
+
+/// The outcome behind [`OutputAlignmentStatus::last_result`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum OutputAlignmentResult {
+    /// Within 1.0 ms without any alignment this session.
+    InPhase,
+    /// Out of phase for one interval; a second in a row starts an alignment.
+    OutOfPhase,
+    /// Within 1.0 ms after an alignment.
+    Aligned,
+    /// Still out of phase after an alignment; another is attempted if the
+    /// budget allows.
+    StillOutOfPhase,
+    /// Out of phase with all three attempts used; nothing more is tried
+    /// until the compositor or the set of active displays changes.
+    GaveUp,
+    /// The alignment itself failed (for example, sway refused the commands).
+    Failed,
+    /// The slicer is running but has reported no frames, so the phase could
+    /// not be judged — what a static page looks like.
+    NotJudged,
 }
 
 /// How an appliance presents its outputs: the default Wayland path (sway

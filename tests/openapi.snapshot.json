@@ -1771,6 +1771,58 @@
         ],
         "type": "object"
       },
+      "OutputAlignmentResult": {
+        "description": "The outcome behind [`OutputAlignmentStatus::last_result`].",
+        "enum": [
+          "inPhase",
+          "outOfPhase",
+          "aligned",
+          "stillOutOfPhase",
+          "gaveUp",
+          "failed",
+          "notJudged"
+        ],
+        "type": "string"
+      },
+      "OutputAlignmentStatus": {
+        "description": "What `GET /system` reports about automatic output phase alignment: the\ndaemon re-aligning the displays itself, with the `output-phase` check's\nown fix, after a Wayland session starts them out of phase — see\n[`crate::alignment`].",
+        "properties": {
+          "attempts": {
+            "description": "Alignments run this compositor session, at most three. Resets when the\ncompositor or the set of active displays changes.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "description": "`align_outputs` in `suede.toml` (default `true`).",
+            "type": "boolean"
+          },
+          "lastPhaseMs": {
+            "description": "The largest absolute `phaseMs` of the last judged slicer interval, or\n`null` before one has been judged.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "lastResult": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputAlignmentResult",
+                "description": "What the last judgment or attempt concluded, or `null` before\nanything has been judged this session."
+              }
+            ]
+          }
+        },
+        "required": [
+          "enabled",
+          "attempts"
+        ],
+        "type": "object"
+      },
       "OutputConfig": {
         "additionalProperties": false,
         "description": "Desired configuration for one output.",
@@ -3325,6 +3377,10 @@
               }
             ]
           },
+          "outputAlignment": {
+            "$ref": "#/components/schemas/OutputAlignmentStatus",
+            "description": "Automatic output phase alignment this compositor session — see\n[`OutputAlignmentStatus`] and\n[`crate::config::BootstrapConfig::align_outputs`]."
+          },
           "packages": {
             "items": {
               "$ref": "#/components/schemas/PackageVersion"
@@ -3375,7 +3431,8 @@
           "webUiEnabled",
           "powerVerbs",
           "presentation",
-          "glYield"
+          "glYield",
+          "outputAlignment"
         ],
         "type": "object"
       },

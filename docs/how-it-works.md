@@ -543,6 +543,14 @@ letting each one restart its raster, and that means going through
 itself only re-measures on the slicer's own ten-second interval, so the
 result shows up on the next report after the fix, not immediately.
 
+By default Suede does not wait for an operator: with
+[`align_outputs`](configuration.md#align-outputs) on, it runs the same fix
+itself once two intervals in a row are out of phase, at most three times per
+compositor session, and judges the result on the next interval that started
+after it. That covers the case the batched mode-set above does not: on an
+NVIDIA appliance measured after each of many sway restarts, the heads still
+came up 3.7–8.3 ms apart, and one automatic fix brought them within 0.2 ms.
+
 ## Comparing the two {: #comparing-the-two }
 
 With [`allow_overlaps = true`](configuration.md#direct-scanout), flipping

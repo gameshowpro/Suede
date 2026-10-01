@@ -4,6 +4,7 @@
 //! reconciler continuously drives the live Sway session toward it. Observed
 //! state is always re-derived from the compositor and never persisted.
 
+pub mod alignment;
 pub mod api;
 pub mod audio;
 pub mod capabilities;

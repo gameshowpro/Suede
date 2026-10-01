@@ -8,6 +8,30 @@ There are two kinds of configuration, and the split is a hard rule:
 Terms below — canvas, slice, warp, output, display — are used exactly as
 defined in the [pipeline vocabulary](how-it-works.md#vocabulary).
 
+## Recommended NVIDIA profile {: #recommended-nvidia-profile }
+
+This is the best-performing setup measured on NVIDIA appliances today
+(Turing and Ampere cards, drivers 595 through 615). Items 1–4 are Suede's
+defaults, so a fresh `suede.toml` already follows it; item 5 is the host's
+driver.
+
+| | Setting | Why |
+| --- | --- | --- |
+| 1 | `presentation = "wayland"` (default) | Direct presentation never beat it; under GPU saturation it falls behind on frame rate and coherence. See [VK_KHR direct display](developer/vk-khr.md#conclusions-direct-vulkan-path-vs-swaywayland). |
+| 2 | [`align_outputs = true`](#align-outputs) (default) | Some machines start every Sway session with heads several milliseconds out of phase, which multiplies frames that land on different refreshes; aligning once removes it. |
+| 3 | [`gl_yield = "usleep"`](#gl-yield) (default) | Stops NVIDIA's EGL busy-wait in Sway: about 60 points of one core saved under GPU saturation, at about one extra straddle per 10 s. Mesa ignores it. |
+| 4 | `nvidia_uvm` loaded at boot (provisioning) | The browser's hardware video decode needs it, and its sandbox cannot load it. |
+| 5 | NVIDIA driver at or above the newest tested release (615.71.09), open kernel module | The `nvidia-driver-version` health check warns below it. GSP firmware state makes no measurable difference on the Wayland path. |
+
+Evidence: the two-card comparison in the
+[component results](plans/display-component-results.md). An existing
+`suede.toml` that sets `gl_yield = "default"` or `align_outputs = false`
+opts out deliberately; remove those lines to follow the profile, then
+restart the session (`sudo systemctl restart getty@tty1` and
+`systemctl --user restart suede`). Re-run `provision.sh` on machines
+provisioned before this profile existed so the boot-time module load is
+installed.
+
 ## Bootstrap configuration
 
 Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.toml`). Every value but `allow_overlaps`, `direct_scanout`, `presentation` and `gl_yield` can be overridden by an environment variable, which wins — those four describe how the compositor was started, which a variable on Suede's own process cannot change. A missing file means all defaults.
@@ -27,7 +51,8 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `allow_overlaps` | — | `false` | Whether outputs may overlap in canvas space, and so which display path this machine runs — see [Overlapping layouts and direct scanout](#direct-scanout) |
 | `direct_scanout` | — | `true` | Whether the compositor may flip the slicer's buffers straight to the display controllers; only meaningful with `allow_overlaps = true` — see [Overlapping layouts and direct scanout](#direct-scanout) |
 | `presentation` | — | `"wayland"` | **Experimental.** `"wayland"` or `"direct"`: which display path the login session starts — see [Experimental: direct presentation](#experimental-direct-presentation). `"direct"` without `allow_overlaps = true` resolves to effective `wayland` with a reason instead of failing to start; an unrecognized value fails startup. `GET /api/v1/system` reports `requested`, `effective`, and why they differ, if they do |
-| `gl_yield` | — | `"default"` | **Experimental, NVIDIA-only.** `"default"`, `"usleep"` or `"nothing"`: exports `__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into the login session's Sway environment (both the DRM Sway and direct presentation's headless one); Mesa ignores it. An unrecognized value fails startup. `GET /api/v1/system` reports `requested` and a live `effective` read from the running Sway's environment, so a session started before an edit shows the mismatch — see [NVIDIA `__GL_YIELD`](#gl-yield) |
+| `align_outputs` | `SUEDE_ALIGN_OUTPUTS` | `true` | Whether Suede re-aligns the displays' vblank phase itself when a Wayland session starts them out of phase, with the `output-phase` check's own fix — see [Automatic output phase alignment](#align-outputs) |
+| `gl_yield` | — | `"usleep"` | **Experimental, NVIDIA-only.** `"usleep"` (the default), `"nothing"` or `"default"` (opt out; driver behavior): exports `__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into the login session's Sway environment (both the DRM Sway and direct presentation's headless one); Mesa ignores it. An unrecognized value fails startup. `GET /api/v1/system` reports `requested` and a live `effective` read from the running Sway's environment, so a session started before an edit shows the mismatch — see [NVIDIA `__GL_YIELD`](#gl-yield) |
 
 ### Host power control {: #host-power }
 
@@ -251,16 +276,57 @@ the full state machine and the crash-recovery runbook.
 and `.outputs`. While `effective` is `direct`, the `direct-scanout` and
 `swaybg` health checks report not applicable, `real-displays` passes on the
 directly presented outputs, and `output-phase`'s disable/re-enable fix is
-unavailable (its verdict is unaffected). On a proprietary NVIDIA driver with
+unavailable (its verdict is unaffected), as is [automatic
+alignment](#align-outputs). On a proprietary NVIDIA driver with
 GSP firmware on, the `gsp-firmware` health check also warns only while
 `effective` is `direct` — see [GSP firmware](developer/vk-khr.md#gsp-firmware).
 
+### Automatic output phase alignment {: #align-outputs }
+
+On the Wayland path a compositor session can start its displays several
+milliseconds out of phase with each other, so the same frame lands on
+different refreshes on different heads (straddles). On a four-head NVIDIA
+appliance every sway restart measured 3.7–8.3 ms apart and 31–56 straddles
+per ten-second interval; the `output-phase` health check's fix (disable every
+display and re-enable them together in one sway command) brought them within
+0.04–0.16 ms, on its first attempt, in every one of more than forty runs.
+
+With `align_outputs = true` (the default) Suede runs that fix itself:
+
+- only while presentation is effectively `wayland`, with at least two
+  active physical displays and a slicer reporting `phaseMs`;
+- once two of the slicer's ten-second intervals in a row are out of
+  tolerance by the `output-phase` check's own rule (any display more than
+  1.0 ms from the first), never on a single disturbed interval;
+- at most three times per compositor session; the budget resets when sway
+  restarts or the set of active displays changes;
+- never in a direct session or while a reconcile pass is pending, and never
+  without fresh stats: a static page produces none, so Suede logs once that
+  it could not judge the phase and does nothing.
+
+After each attempt it waits for an interval that started after the fix and
+judges again. Every attempt is logged with the phase before and after. The
+wall goes dark for about three seconds while the fix runs, which on a fresh
+session is normally before anyone is watching. Set `align_outputs = false`
+(or `SUEDE_ALIGN_OUTPUTS=false`) to leave the fix to an operator; the
+`output-phase` check still offers it.
+
+`GET /api/v1/system` reports `outputAlignment`: `enabled`, `attempts` this
+session, `lastResult` (`inPhase`, `outOfPhase`, `aligned`, `stillOutOfPhase`,
+`gaveUp`, `failed`, `notJudged`, or `null` before anything was judged) and
+`lastPhaseMs`, the largest absolute `phaseMs` of the last judged interval.
+The `output-phase` check's detail says when automatic alignment is on. See
+[Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step)
+for the measurement behind the check.
+
 ### NVIDIA `__GL_YIELD` {: #gl-yield }
 
-`gl_yield = "usleep"` or `gl_yield = "nothing"` exports NVIDIA's
-`__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into Sway's environment at login,
-stopping the proprietary driver's EGL busy-wait; Mesa ignores the variable
-entirely, so this has no effect on other drivers. It applies to both display
+`gl_yield` defaults to `"usleep"`, which exports NVIDIA's `__GL_YIELD=USLEEP`
+into Sway's environment at login, stopping the proprietary driver's EGL
+busy-wait; `"nothing"` exports `__GL_YIELD=NOTHING`, and `"default"` is the
+explicit opt-out that exports nothing and leaves driver behavior unchanged.
+Mesa ignores the variable entirely, so the default is harmless on other
+drivers. It applies to both display
 paths — the ordinary DRM Sway and, while `presentation = "direct"`, the
 headless Sway that backs it — because both run the same EGL busy-wait
 otherwise.

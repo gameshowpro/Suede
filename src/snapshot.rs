@@ -32,6 +32,10 @@ pub struct Snapshot {
     /// `None` until then, and in harnesses that never resolve, where
     /// `GET /system` falls back to the bootstrap file's own answer.
     presentation: RwLock<Option<crate::model::PresentationStatus>>,
+    /// What automatic output phase alignment has done this compositor
+    /// session, as [`crate::alignment`] last published it. `enabled` here is
+    /// only what that task wrote; `GET /system` reports the bootstrap key.
+    output_alignment: RwLock<crate::model::OutputAlignmentStatus>,
 }
 
 impl Snapshot {
@@ -47,6 +51,16 @@ impl Snapshot {
     /// Record how this session presents. Set once at startup.
     pub fn set_presentation(&self, status: crate::model::PresentationStatus) {
         *self.presentation.write().unwrap() = Some(status);
+    }
+
+    /// What automatic output phase alignment has done this session.
+    pub fn output_alignment(&self) -> crate::model::OutputAlignmentStatus {
+        self.output_alignment.read().unwrap().clone()
+    }
+
+    /// Record what automatic output phase alignment has done this session.
+    pub fn set_output_alignment(&self, status: crate::model::OutputAlignmentStatus) {
+        *self.output_alignment.write().unwrap() = status;
     }
 
     pub fn outputs(&self) -> Vec<Output> {

@@ -77,3 +77,13 @@ docs_base_url = "https://suede.gameshow.pro/"
 # compositor, and watch zeroCopyPresented, straddles and lagFrames in
 # GET /projection/stats. See configuration.md#direct-scanout.
 # direct_scanout = true
+
+# Whether Suede re-aligns the displays' vblank phase itself when a Wayland
+# session starts them out of phase.  Env: SUEDE_ALIGN_OUTPUTS
+#
+# On by default: it runs the output-phase health check's own fix (every
+# display disabled and re-enabled together, about three seconds dark) after
+# two slicer intervals in a row more than 1.0 ms apart, at most three times
+# per compositor session, and never in a direct session or on static content.
+# Set false to leave the fix to an operator. See configuration.md#align-outputs.
+# align_outputs = true

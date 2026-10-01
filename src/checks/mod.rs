@@ -737,14 +737,7 @@ impl CheckRunner {
     async fn check_output_phase(&self) -> Check {
         let stats = self.snapshot.projection_stats();
         let running = self.snapshot.slicer_running();
-        let (status, detail) = output_phase_verdict(running, stats.as_ref());
-        let mut check = self.check(
-            ids::OUTPUT_PHASE,
-            "Displays are in phase",
-            status,
-            detail,
-            Some("how-it-works/#keeping-the-displays-in-step"),
-        );
+        let (status, mut detail) = output_phase_verdict(running, stats.as_ref());
         // The fix issues `output <name> disable`/`enable` IPC commands. In
         // direct mode those names are not the compositor's outputs: they are
         // owned and presented directly by the daemon, so the commands would
@@ -754,6 +747,24 @@ impl CheckRunner {
             .snapshot
             .presentation()
             .is_some_and(|status| status.effective == PresentationMode::Direct);
+        // Automatic alignment runs the same fix on its own, and never in
+        // direct mode, so it is only worth a sentence where it can act.
+        if self.bootstrap.align_outputs && !direct {
+            if !detail.ends_with('.') {
+                detail.push('.');
+            }
+            detail.push(' ');
+            detail.push_str(&crate::alignment::check_note(
+                &self.snapshot.output_alignment(),
+            ));
+        }
+        let mut check = self.check(
+            ids::OUTPUT_PHASE,
+            "Displays are in phase",
+            status,
+            detail,
+            Some("how-it-works/#keeping-the-displays-in-step"),
+        );
         if check.status == CheckStatus::Warn && !direct {
             check.fix_available = true;
             check.fix_description = Some(
@@ -2337,6 +2348,45 @@ fn refresh_rate_verdict(outputs: &[Output], configured: &[OutputConfig]) -> (Che
     (CheckStatus::Warn, detail)
 }
 
+/// How far, in ms, an output's `phaseMs` may sit from the slicer's
+/// reference output before the `output-phase` check calls it out of phase —
+/// see [`CheckRunner::check_output_phase`] for the measurement behind it.
+/// Automatic alignment ([`crate::alignment`]) judges by the same rule.
+pub const PHASE_TOLERANCE_MS: f64 = 1.0;
+
+/// One slicer interval's phase, reduced to what automatic alignment needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PhaseJudgment {
+    /// Whether any output is more than [`PHASE_TOLERANCE_MS`] from the
+    /// reference — exactly when [`output_phase_verdict`] warns.
+    pub out_of_phase: bool,
+    /// The largest absolute `phaseMs` among the measured outputs.
+    pub max_abs_ms: f64,
+}
+
+/// Judge one slicer interval by the `output-phase` check's own rule, or
+/// `None` where that check passes without having compared anything: no
+/// presentation timing, or fewer than two outputs reporting a phase.
+pub fn phase_judgment(stats: &ProjectionStats) -> Option<PhaseJudgment> {
+    if !stats.presentation_feedback {
+        return None;
+    }
+    let phases: Vec<f64> = stats
+        .outputs
+        .iter()
+        .filter_map(|output| output.phase_ms)
+        .collect();
+    if phases.len() < 2 {
+        return None;
+    }
+    Some(PhaseJudgment {
+        out_of_phase: phases[1..]
+            .iter()
+            .any(|phase| phase.abs() > PHASE_TOLERANCE_MS),
+        max_abs_ms: phases.iter().map(|phase| phase.abs()).fold(0.0, f64::max),
+    })
+}
+
 /// Judge whether the active displays' vblank phase is aligned, from the
 /// slicer's own presentation-timestamp measurement.
 ///
@@ -2392,7 +2442,7 @@ fn output_phase_verdict(running: bool, stats: Option<&ProjectionStats>) -> (Chec
     let reference = measured[0];
     let out_of_phase: Vec<&OutputTiming> = measured[1..]
         .iter()
-        .filter(|output| output.phase_ms.unwrap().abs() > 1.0)
+        .filter(|output| output.phase_ms.unwrap().abs() > PHASE_TOLERANCE_MS)
         .copied()
         .collect();
 
@@ -2420,7 +2470,7 @@ fn output_phase_verdict(running: bool, stats: Option<&ProjectionStats>) -> (Chec
     // needs — not which output the measurement happened to be taken from.
     let in_phase_with_reference = measured[1..]
         .iter()
-        .any(|output| output.phase_ms.unwrap().abs() <= 1.0);
+        .any(|output| output.phase_ms.unwrap().abs() <= PHASE_TOLERANCE_MS);
     if !in_phase_with_reference {
         let values: Vec<f64> = out_of_phase
             .iter()
@@ -4006,6 +4056,81 @@ mod tests {
         );
         assert!(!direct_check.fix_available);
         assert!(direct_check.fix_description.is_none());
+
+        // Automatic alignment is on by default and mentioned only where it
+        // can act: never in direct mode.
+        assert!(
+            wayland_check.detail.contains("Automatic alignment is on"),
+            "{}",
+            wayland_check.detail
+        );
+        assert!(
+            !direct_check.detail.contains("Automatic alignment"),
+            "{}",
+            direct_check.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn output_phase_detail_omits_automatic_alignment_when_it_is_off() {
+        let stats = stats_with(
+            true,
+            vec![timing("DP-5", Some(0.0)), timing("DP-6", Some(7.1))],
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let runner = runner(dir.path().to_path_buf());
+        let runner = CheckRunner {
+            bootstrap: Arc::new(BootstrapConfig {
+                align_outputs: false,
+                ..(*runner.bootstrap).clone()
+            }),
+            ..runner
+        };
+        runner.snapshot.set_slicer_running(true);
+        runner.snapshot.set_projection_stats(Some(stats));
+        let check = runner.check_output_phase().await;
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(check.fix_available, "the manual fix stays available");
+        assert!(
+            !check.detail.contains("Automatic alignment"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// Automatic alignment and the check must never disagree about whether
+    /// an interval is out of phase.
+    #[test]
+    fn phase_judgment_agrees_with_the_verdict() {
+        let cases: Vec<Vec<OutputTiming>> = vec![
+            vec![timing("A", Some(0.0)), timing("B", Some(0.04))],
+            vec![timing("A", Some(0.0)), timing("B", Some(1.0))],
+            vec![timing("A", Some(0.0)), timing("B", Some(-1.01))],
+            vec![
+                timing("A", Some(0.0)),
+                timing("B", Some(7.1)),
+                timing("C", Some(7.2)),
+            ],
+            vec![
+                timing("A", Some(0.0)),
+                timing("B", Some(0.02)),
+                timing("C", Some(-3.4)),
+            ],
+            vec![timing("A", Some(0.0)), timing("B", None)],
+        ];
+        for outputs in cases {
+            let stats = stats_with(true, outputs);
+            let (status, detail) = output_phase_verdict(true, Some(&stats));
+            let out = phase_judgment(&stats).is_some_and(|judgment| judgment.out_of_phase);
+            assert_eq!(out, status == CheckStatus::Warn, "{detail}");
+        }
+        assert_eq!(
+            phase_judgment(&stats_with(
+                false,
+                vec![timing("A", Some(0.0)), timing("B", Some(7.1))]
+            )),
+            None
+        );
     }
 
     #[tokio::test]

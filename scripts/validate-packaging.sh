@@ -220,9 +220,10 @@ echo
 echo "The login profile exports __GL_YIELD from suede.toml"
 # The GL_YIELD_EOF block runs before both exec sway branches, so it has to
 # agree with GlYieldMode::parse in src/config.rs about which values it acts
-# on: only "usleep" and "nothing" export anything; anything else (absent,
-# "default", commented out, or a typo) leaves the variable unset, since Mesa
-# ignores it anyway and NVIDIA's own default is what "unset" means.
+# on: absent (or commented out) and "usleep" export USLEEP, the recommended
+# NVIDIA profile; "nothing" exports NOTHING; "default" leaves the variable
+# unset, which is NVIDIA's own behavior. A typo exports nothing (the daemon
+# refuses to start on it anyway). Mesa ignores the variable.
 GL_YIELD_SNIPPET="$(sed -n "/<<'GL_YIELD_EOF'/,/^GL_YIELD_EOF$/p" packaging/provision.sh | sed '1d;$d')"
 [[ -n "$GL_YIELD_SNIPPET" ]] || bad "could not find the GL_YIELD_EOF block in provision.sh"
 gl_yield_for() {  # $1 = suede.toml contents, empty for no file at all
@@ -245,12 +246,46 @@ expect_gl_yield() {  # $1 = label, $2 = toml, $3 = expected value of the variabl
   got="$(gl_yield_for "$2")"
   if [[ "$got" == "$3" ]]; then ok "$1 -> $3"; else bad "$1 -> $got (expected $3)"; fi
 }
-expect_gl_yield "no suede.toml"           ""                     unset
+expect_gl_yield "no suede.toml"           ""                     USLEEP
 expect_gl_yield "gl_yield = \"default\""  'gl_yield = "default"'  unset
 expect_gl_yield "gl_yield = \"usleep\""   'gl_yield = "usleep"'   USLEEP
 expect_gl_yield "gl_yield = \"nothing\""  'gl_yield = "nothing"'  NOTHING
-expect_gl_yield "gl_yield commented out"  '# gl_yield = "usleep"' unset
+expect_gl_yield "gl_yield commented out"  '# gl_yield = "nothing"' USLEEP
 expect_gl_yield "an unrecognized value"   'gl_yield = "busy"'     unset
+
+echo
+echo "nvidia_uvm is configured at boot on NVIDIA machines only"
+UVM_FUNCTION="$(sed -n '/^# BEGIN NVIDIA_UVM_FUNCTION$/,/^# END NVIDIA_UVM_FUNCTION$/p' packaging/provision.sh)"
+[[ -n "$UVM_FUNCTION" ]] || bad "could not find the NVIDIA_UVM_FUNCTION block in provision.sh"
+# $1 = label, $2 = fake lspci output, $3 = 1 to fake /proc/driver/nvidia,
+# $4 = 1 to fake a working modinfo, $5 = 1 to fake /usr/bin/nvidia-modprobe,
+# $6 = expected: "none", "conf" or "conf+rule"
+expect_uvm() {
+  local root bin conf rule got
+  root="$(mktemp -d)"; bin="$(mktemp -d)"
+  printf '#!/bin/sh\n[ -n "%s" ] && echo "%s"\nexit 0\n' "$2" "$2" > "$bin/lspci"
+  printf '#!/bin/sh\nexit %s\n' "$([[ "$4" == 1 ]] && echo 0 || echo 1)" > "$bin/modinfo"
+  chmod +x "$bin/lspci" "$bin/modinfo"
+  if [[ "$3" == 1 ]]; then mkdir -p "$root/proc/driver/nvidia"; : > "$root/proc/driver/nvidia/version"; fi
+  if [[ "$5" == 1 ]]; then mkdir -p "$root/usr/bin"; printf '#!/bin/sh\n' > "$root/usr/bin/nvidia-modprobe"; chmod +x "$root/usr/bin/nvidia-modprobe"; fi
+  conf="$root/etc/modules-load.d/nvidia-uvm.conf"
+  rule="$root/etc/udev/rules.d/70-suede-nvidia-uvm.rules"
+  # Run twice: the second pass proves it is idempotent.
+  ( PATH="$bin:$PATH"; SUEDE_FAKE_ROOT="$root"; eval "$UVM_FUNCTION"; install_nvidia_uvm; install_nvidia_uvm ) >/dev/null 2>&1
+  if [[ ! -e "$conf" && ! -e "$rule" ]]; then got=none
+  elif [[ "$(cat "$conf" 2>/dev/null)" != "nvidia-uvm" ]]; then got="bad conf"
+  elif [[ ! -e "$rule" ]]; then got=conf
+  elif [[ "$(cat "$rule")" == 'KERNEL=="nvidia_uvm", RUN+="/usr/bin/nvidia-modprobe -c0 -u"' ]]; then got=conf+rule
+  else got="bad rule"; fi
+  if [[ "$got" == "$6" ]]; then ok "$1 -> $6"; else bad "$1 -> $got (expected $6)"; fi
+  rm -rf "$root" "$bin"
+}
+expect_uvm "no NVIDIA anywhere"                    ""                              0 0 0 none
+expect_uvm "PCI vendor 10de, nvidia-modprobe"      "01:00.0 0300: 10de:2204 (rev a1)" 0 0 1 conf+rule
+expect_uvm "PCI vendor 10de, no nvidia-modprobe"   "01:00.0 0300: 10de:2204 (rev a1)" 0 0 0 conf
+expect_uvm "loaded driver only"                    ""                              1 0 1 conf+rule
+expect_uvm "installed module only"                 ""                              0 1 0 conf
+expect_uvm "nvidia-modprobe alone is not NVIDIA"   ""                              0 0 1 none
 
 echo
 echo "Packaged assets exist"

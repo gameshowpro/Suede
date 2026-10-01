@@ -176,6 +176,10 @@ NVIDIA implements `VK_NV_present_barrier` as an NVKMS swap group
     under saturation (best 14.4 fps against about 21), and is not competitive
     on 615's open module. Direct's heads hold a fixed 2–8 ms offset; aligned
     Wayland holds 0.04–0.15 ms.
+- **Recommended setup today:** the
+  [recommended NVIDIA profile](../configuration.md#recommended-nvidia-profile)
+  (Wayland, outputs aligned at session start, `gl_yield = "usleep"`, driver
+  615.71.09 or newer) — these are Suede's defaults.
 - **Verdict: not the better path today; retest as drivers change.** On both
   tested NVIDIA cards — a large Turing card and a small Ampere card, on
   drivers 595 through 615 — direct presentation at best ties Wayland at light
