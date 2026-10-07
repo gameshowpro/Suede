@@ -566,13 +566,11 @@ mod supported {
             p.instance
                 .enumerate_device_extension_properties(p.physical)?
         };
-        for required in [ash::khr::swapchain::NAME] {
-            if !has_extension(&extensions, required) {
-                bail!(
-                    "device extension {} unavailable",
-                    required.to_string_lossy()
-                );
-            }
+        if !has_extension(&extensions, ash::khr::swapchain::NAME) {
+            bail!(
+                "device extension {} unavailable",
+                ash::khr::swapchain::NAME.to_string_lossy()
+            );
         }
         println!(
             "VK_GOOGLE_display_timing: {}",
