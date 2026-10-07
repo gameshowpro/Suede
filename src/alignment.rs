@@ -900,9 +900,11 @@ mod tests {
     #[tokio::test]
     async fn a_misaligned_report_leads_to_exactly_one_fix_and_a_reconcile() {
         use crate::audio::mock::MockAudio;
+        use crate::checks::CheckRunnerDeps;
         use crate::config::BootstrapConfig;
         use crate::events::EventHub;
         use crate::model::{OutputConfig, PresentationStatus};
+        use crate::supervisor::Supervisor;
         use crate::sway::{mock::MockSway, SwayClient};
 
         let dir = tempfile::tempdir().unwrap();
@@ -939,16 +941,17 @@ mod tests {
         });
         snapshot.set_slicer_running(true);
         let (trigger, mut receiver) = crate::reconciler::Reconciler::channel();
-        let checks = Arc::new(CheckRunner::new(
+        let checks = Arc::new(CheckRunner::new(CheckRunnerDeps {
             bootstrap,
-            sway.clone(),
-            Arc::new(MockAudio::default()),
+            sway: sway.clone(),
+            audio: Arc::new(MockAudio::default()),
             store,
-            EventHub::new(),
-            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
-            snapshot.clone(),
-            trigger.clone(),
-        ));
+            events: EventHub::new(),
+            capabilities: Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            snapshot: snapshot.clone(),
+            trigger: trigger.clone(),
+            supervisor: Arc::new(Supervisor::idle(dir.path())),
+        }));
         let mut aligner =
             Aligner::new(true, checks, snapshot.clone(), trigger).with_socket(|| None);
 

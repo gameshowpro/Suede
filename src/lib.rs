@@ -7,6 +7,7 @@
 pub mod alignment;
 pub mod api;
 pub mod audio;
+pub mod browser_gpu;
 pub mod capabilities;
 pub mod checks;
 pub mod config;
@@ -15,6 +16,7 @@ pub mod error;
 pub mod events;
 pub mod model;
 pub mod nvidia_driver;
+pub mod pcie;
 pub mod ports;
 pub mod presentation;
 pub mod probe;

@@ -3187,7 +3187,8 @@
           "heartbeatTimeout",
           "windowNeverAppeared",
           "configChanged",
-          "apiRequest"
+          "apiRequest",
+          "gpuFallback"
         ],
         "type": "string"
       },

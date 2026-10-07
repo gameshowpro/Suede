@@ -7,7 +7,7 @@
 pub mod config_block;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
@@ -24,6 +24,7 @@ use crate::model::{
 use crate::reconciler::plan::{plan_outputs, Capabilities};
 use crate::reconciler::ReconcileTrigger;
 use crate::snapshot::Snapshot;
+use crate::supervisor::Supervisor;
 use crate::sway::{SwayClient, SwayResult};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -85,6 +86,7 @@ pub const FIXABLE: &[&str] = &[
     ids::PIPEWIRE,
     ids::DIRECT_SCANOUT,
     ids::OUTPUT_PHASE,
+    ids::BROWSER_GPU,
 ];
 
 /// Check identifiers, also used as the `{id}` in the fix endpoint.
@@ -108,6 +110,8 @@ pub mod ids {
     pub const OUTPUT_PHASE: &str = "output-phase";
     pub const GSP_FIRMWARE: &str = "gsp-firmware";
     pub const NVIDIA_DRIVER_VERSION: &str = "nvidia-driver-version";
+    pub const PCIE_LINK: &str = "pcie-link";
+    pub const BROWSER_GPU: &str = "browser-gpu";
 
     /// Every check `run_all` runs, in the order it runs them — kept here so
     /// the count carried by `every_check_reports_something`,
@@ -134,6 +138,8 @@ pub mod ids {
         DECODE_MEASURED,
         GSP_FIRMWARE,
         NVIDIA_DRIVER_VERSION,
+        PCIE_LINK,
+        BROWSER_GPU,
     ];
 }
 
@@ -246,6 +252,25 @@ fn assess_reachability(
     }
 }
 
+/// What a [`CheckRunner`] is built from.
+///
+/// Named fields rather than positional arguments, like
+/// [`ReconcilerDeps`](crate::reconciler::ReconcilerDeps): the collaborators
+/// are mostly `Arc`s of distinct types, so a transposition would usually
+/// fail to compile, but not always, and nine are too many to keep straight
+/// by position.
+pub struct CheckRunnerDeps {
+    pub bootstrap: Arc<BootstrapConfig>,
+    pub sway: Arc<dyn SwayClient>,
+    pub audio: Arc<dyn AudioMonitor>,
+    pub store: Arc<crate::state::StateStore>,
+    pub events: EventHub,
+    pub capabilities: Arc<crate::capabilities::CapabilityStore>,
+    pub snapshot: Arc<Snapshot>,
+    pub trigger: ReconcileTrigger,
+    pub supervisor: Arc<Supervisor>,
+}
+
 pub struct CheckRunner {
     bootstrap: Arc<BootstrapConfig>,
     sway: Arc<dyn SwayClient>,
@@ -259,6 +284,10 @@ pub struct CheckRunner {
     /// re-enabled the outputs it disabled, so anything downstream of them
     /// (window placement, the applied-settings cache) catches up.
     trigger: ReconcileTrigger,
+    /// Which Chromium apps are running as which process, for the
+    /// `browser-gpu` check (it trusts only a watchdog report on an app's
+    /// current process), and the restart its fix performs.
+    supervisor: Arc<Supervisor>,
     results: RwLock<Vec<Check>>,
     /// Most recent client that was not on this machine. See [`note_client`].
     ///
@@ -277,26 +306,29 @@ pub struct CheckRunner {
     probed_versions: RwLock<HashMap<PathBuf, (SystemTime, String)>>,
     /// The last browser capability measurement, judged by `decode-measured`.
     capabilities: Arc<crate::capabilities::CapabilityStore>,
+    /// Earlier PCIe correctable-error samples, for the `pcie-link` check's
+    /// recent-rate rule. The rate needs two points in time, and the runner is
+    /// the only thing that lives between one run and the next.
+    pcie_history: std::sync::Mutex<crate::pcie::History>,
+    /// The `pcie-link` severity at the last run, so a change is logged once
+    /// with the live numbers the check's detail deliberately leaves out.
+    /// `None` before the first run, which logs only if the verdict is bad.
+    pcie_last_severity: std::sync::Mutex<Option<crate::pcie::Severity>>,
 }
 
 impl CheckRunner {
-    // Eight collaborators, all distinct types (`Arc<dyn Trait>`, `Arc<Store>`,
-    // `EventHub`, two `Arc<...>` stores, `Arc<Snapshot>`, `ReconcileTrigger`):
-    // a transposition would still compile, but wrongly, the same risk
-    // `ReconcilerDeps` exists to close off. Left positional rather than
-    // following that pattern here because every caller already spells out
-    // each argument on its own line; revisit if a ninth collaborator turns up.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        bootstrap: Arc<BootstrapConfig>,
-        sway: Arc<dyn SwayClient>,
-        audio: Arc<dyn AudioMonitor>,
-        store: Arc<crate::state::StateStore>,
-        events: EventHub,
-        capabilities: Arc<crate::capabilities::CapabilityStore>,
-        snapshot: Arc<Snapshot>,
-        trigger: ReconcileTrigger,
-    ) -> Self {
+    pub fn new(deps: CheckRunnerDeps) -> Self {
+        let CheckRunnerDeps {
+            bootstrap,
+            sway,
+            audio,
+            store,
+            events,
+            capabilities,
+            snapshot,
+            trigger,
+            supervisor,
+        } = deps;
         Self {
             bootstrap,
             sway,
@@ -305,10 +337,13 @@ impl CheckRunner {
             events,
             snapshot,
             trigger,
+            supervisor,
             results: RwLock::new(Vec::new()),
             last_remote_client: RwLock::new(None),
             probed_versions: RwLock::new(HashMap::new()),
             capabilities,
+            pcie_history: std::sync::Mutex::new(crate::pcie::History::default()),
+            pcie_last_severity: std::sync::Mutex::new(None),
         }
     }
 
@@ -358,6 +393,8 @@ impl CheckRunner {
             self.check_decode_measured(),
             self.check_gsp_firmware(),
             self.check_nvidia_driver_version(),
+            self.check_pcie_link(),
+            self.check_browser_gpu().await,
         ];
 
         let changed = {
@@ -806,6 +843,113 @@ impl CheckRunner {
                  `/etc/modprobe.d/` (e.g. `nvidia-gsp-off.conf`) and reboot. Only \
                  the proprietary kernel module supports disabling GSP firmware \
                  (verified on Turing and Ampere GPUs)."
+                    .to_string(),
+            );
+        }
+        check
+    }
+
+    /// Whether the PCIe link to each graphics card is taking errors, from the
+    /// kernel's AER counters. See [`crate::pcie::judge`] for the rule and
+    /// `troubleshooting/#pcie-errors` for what a person can do about it.
+    ///
+    /// No automatic fix: the remedies (reseating the card, another slot,
+    /// removing a riser) are physical.
+    fn check_pcie_link(&self) -> Check {
+        self.pcie_link_at(Path::new("/sys"), Path::new("/proc/uptime"))
+    }
+
+    /// [`check_pcie_link`](Self::check_pcie_link) against an injectable sysfs
+    /// root and uptime file, for tests.
+    fn pcie_link_at(&self, sysfs_root: &Path, uptime_file: &Path) -> Check {
+        let readings = crate::pcie::read_links(sysfs_root);
+        let uptime = crate::pcie::read_uptime(uptime_file);
+        let judgment = {
+            let mut history = self.pcie_history.lock().unwrap();
+            crate::pcie::judge_detailed(&readings, uptime, &mut history)
+        };
+        let (severity, detail) = (judgment.severity, judgment.detail);
+        {
+            let mut last = self.pcie_last_severity.lock().unwrap();
+            let changed = match *last {
+                Some(previous) => previous != severity,
+                None => severity != crate::pcie::Severity::Pass,
+            };
+            if changed {
+                tracing::warn!(
+                    ?severity,
+                    numbers = %judgment.numbers,
+                    "PCIe link check changed verdict"
+                );
+            }
+            *last = Some(severity);
+        }
+        let status = match severity {
+            crate::pcie::Severity::Pass => CheckStatus::Pass,
+            crate::pcie::Severity::Warn => CheckStatus::Warn,
+            crate::pcie::Severity::Fail => CheckStatus::Fail,
+        };
+        self.check(
+            ids::PCIE_LINK,
+            "PCIe link errors",
+            status,
+            detail,
+            Some("troubleshooting/#pcie-errors"),
+        )
+    }
+
+    /// Whether every running `chromium-kiosk` app is still rendering on the
+    /// GPU, from what [`crate::browser_gpu`]'s watchdog last saw of it. See
+    /// [`crate::browser_gpu::check_verdict`] for the decision and that
+    /// module's docs for the measured Chromium behavior behind it.
+    ///
+    /// The fix, offered only while failing, restarts the apps that fell
+    /// back; Chromium never returns to the GPU without one.
+    async fn check_browser_gpu(&self) -> Check {
+        let running: Vec<(String, u32)> = self
+            .supervisor
+            .statuses_with_chromium()
+            .await
+            .into_iter()
+            .filter(|(_, chromium)| *chromium)
+            .filter_map(|(status, _)| Some((status.id, status.pid?)))
+            .collect();
+        self.browser_gpu_check(&running, &self.snapshot.browser_gpu())
+    }
+
+    /// [`check_browser_gpu`](Self::check_browser_gpu) for these running
+    /// Chromium apps, as (id, pid), and these watchdog reports. A report on
+    /// any other process than the app's current one is stale (the app has
+    /// been restarted since) and ignored.
+    fn browser_gpu_check(
+        &self,
+        running: &[(String, u32)],
+        reports: &[crate::browser_gpu::AppGpuReport],
+    ) -> Check {
+        let apps: Vec<(&str, Option<&crate::browser_gpu::AppGpuReport>)> = running
+            .iter()
+            .map(|(id, pid)| {
+                let report = reports
+                    .iter()
+                    .find(|report| &report.app == id && report.pid == *pid);
+                (id.as_str(), report)
+            })
+            .collect();
+        let (status, detail) =
+            crate::browser_gpu::check_verdict(&apps, self.bootstrap.restart_on_gpu_fallback);
+        let mut check = self.check(
+            ids::BROWSER_GPU,
+            "Browser GPU acceleration",
+            status,
+            detail,
+            Some("troubleshooting/#browser-software-rendering"),
+        );
+        if check.status == CheckStatus::Fail {
+            check.fix_available = true;
+            check.fix_description = Some(
+                "Restart the Chromium apps that fell back to software rendering, so they \
+                 start again on the GPU. Their displays go dark for a few seconds. This does \
+                 not use up any of the automatic restarts."
                     .to_string(),
             );
         }
@@ -1570,6 +1714,7 @@ impl CheckRunner {
             ids::PIPEWIRE => self.fix_pipewire().await?,
             ids::DIRECT_SCANOUT => self.fix_direct_scanout().await?,
             ids::OUTPUT_PHASE => self.fix_output_phase().await?,
+            ids::BROWSER_GPU => self.fix_browser_gpu().await?,
             other => {
                 return Err(ApiError::NotFound(format!(
                     "no automated fix is available for check {other:?}"
@@ -1578,6 +1723,49 @@ impl CheckRunner {
         };
         self.run_all().await;
         Ok(outcome)
+    }
+
+    /// Restart every running Chromium app whose current process the
+    /// watchdog saw rendering in software — see
+    /// [`CheckRunner::check_browser_gpu`]. Stamped `gpuFallback` like an
+    /// automatic restart, but outside the watchdog's budget: an operator
+    /// asking is not a loop.
+    async fn fix_browser_gpu(&self) -> ApiResult<String> {
+        let reports = self.snapshot.browser_gpu();
+        let mut restarted = Vec::new();
+        for (status, chromium) in self.supervisor.statuses_with_chromium().await {
+            let Some(pid) = status.pid.filter(|_| chromium) else {
+                continue;
+            };
+            let software = reports.iter().any(|report| {
+                report.app == status.id
+                    && report.pid == pid
+                    && report.rendering == Some(crate::browser_gpu::Rendering::Software)
+            });
+            if software
+                && self
+                    .supervisor
+                    .restart_because(
+                        &status.id,
+                        crate::model::RestartReason::GpuFallback,
+                        Some(pid),
+                    )
+                    .await
+            {
+                tracing::info!(app = %status.id, "restarted to leave software rendering");
+                restarted.push(status.id);
+            }
+        }
+        if restarted.is_empty() {
+            return Err(ApiError::Validation(
+                "no running Chromium app is rendering in software; there is nothing to restart"
+                    .into(),
+            ));
+        }
+        Ok(format!(
+            "restarted {}; the browser-gpu check confirms whether it came back on the GPU",
+            restarted.join(", ")
+        ))
     }
 
     async fn fix_systemd_unit(&self) -> ApiResult<String> {
@@ -2908,16 +3096,18 @@ mod tests {
             &bootstrap.state_dir,
         ));
         let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
-        CheckRunner::new(
+        let supervisor = Arc::new(Supervisor::idle(&bootstrap.state_dir));
+        CheckRunner::new(CheckRunnerDeps {
             bootstrap,
-            Arc::new(MockSway::with_fixtures()),
-            Arc::new(MockAudio::with_devices()),
+            sway: Arc::new(MockSway::with_fixtures()),
+            audio: Arc::new(MockAudio::with_devices()),
             store,
-            EventHub::new(),
+            events: EventHub::new(),
             capabilities,
-            Arc::new(Snapshot::new()),
+            snapshot: Arc::new(Snapshot::new()),
             trigger,
-        )
+            supervisor,
+        })
     }
 
     /// The same runner, on an appliance that slices every layout, with
@@ -3461,6 +3651,36 @@ mod tests {
     }
 
     #[test]
+    fn pcie_link_check_judges_a_fake_sysfs_and_never_offers_a_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let gpu = dir
+            .path()
+            .join("devices/pci0000:00/0000:00:01.0/0000:01:00.0");
+        std::fs::create_dir_all(&gpu).unwrap();
+        std::fs::write(gpu.join("class"), "0x030000\n").unwrap();
+        std::fs::write(gpu.join("aer_dev_nonfatal"), "TOTAL_ERR_NONFATAL 3\n").unwrap();
+        let devices = dir.path().join("bus/pci/devices");
+        std::fs::create_dir_all(&devices).unwrap();
+        std::os::unix::fs::symlink(&gpu, devices.join("0000:01:00.0")).unwrap();
+        let uptime = dir.path().join("uptime");
+        std::fs::write(&uptime, "3600.00 100.00\n").unwrap();
+
+        let check = runner(dir.path().to_path_buf()).pcie_link_at(dir.path(), &uptime);
+        assert_eq!(check.id, ids::PCIE_LINK);
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert!(check.detail.contains("3 nonfatal"), "{}", check.detail);
+        assert!(!check.fix_available);
+        assert!(
+            check
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("#pcie-errors")),
+            "{:?}",
+            check.docs_url
+        );
+    }
+
+    #[test]
     fn nvidia_driver_version_check_never_offers_an_automatic_fix() {
         let dir = tempfile::tempdir().unwrap();
         let check = runner(dir.path().to_path_buf()).check_nvidia_driver_version();
@@ -3516,18 +3736,19 @@ mod tests {
             human_readable: None,
         });
         let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
-        let runner = CheckRunner::new(
+        let runner = CheckRunner::new(CheckRunnerDeps {
             bootstrap,
             sway,
-            Arc::new(MockAudio::default()),
-            Arc::new(crate::state::StateStore::ephemeral(
+            audio: Arc::new(MockAudio::default()),
+            store: Arc::new(crate::state::StateStore::ephemeral(
                 dir.path().to_path_buf(),
             )),
-            EventHub::new(),
-            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
-            Arc::new(Snapshot::new()),
+            events: EventHub::new(),
+            capabilities: Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            snapshot: Arc::new(Snapshot::new()),
             trigger,
-        );
+            supervisor: Arc::new(Supervisor::idle(dir.path())),
+        });
         let checks = runner.run_all().await;
         let check = checks.iter().find(|c| c.id == ids::SWAY_VERSION).unwrap();
         assert_eq!(check.status, CheckStatus::Warn);
@@ -3561,6 +3782,73 @@ mod tests {
         // Package installation needs root and is never offered.
         let browsers = checks.iter().find(|c| c.id == ids::BROWSERS).unwrap();
         assert!(!browsers.fix_available);
+    }
+
+    fn gpu_report(
+        rendering: Option<crate::browser_gpu::Rendering>,
+        crashes: u32,
+    ) -> crate::browser_gpu::AppGpuReport {
+        crate::browser_gpu::AppGpuReport {
+            app: "arena-fx".into(),
+            pid: 10,
+            rendering,
+            crashes,
+            software_since: Some(1_791_381_792),
+            seen_hardware: false,
+            restarts_this_hour: 0,
+            log_path: PathBuf::from("/var/lib/suede/logs/arena-fx.log"),
+        }
+    }
+
+    #[test]
+    fn browser_gpu_judges_the_current_process_and_offers_a_fix_only_when_failing() {
+        use crate::browser_gpu::Rendering;
+        let dir = tempfile::tempdir().unwrap();
+        let runner = runner(dir.path().to_path_buf());
+        let running = vec![("arena-fx".to_string(), 10)];
+
+        let none = runner.browser_gpu_check(&[], &[]);
+        assert_eq!(none.id, ids::BROWSER_GPU);
+        assert_eq!(none.status, CheckStatus::Pass);
+        assert!(none.detail.contains("not applicable"), "{}", none.detail);
+        assert!(!none.fix_available);
+
+        let cases = [
+            (gpu_report(Some(Rendering::Hardware), 0), CheckStatus::Pass),
+            (gpu_report(None, 0), CheckStatus::Pass),
+            (gpu_report(Some(Rendering::Hardware), 1), CheckStatus::Warn),
+            (gpu_report(Some(Rendering::Software), 3), CheckStatus::Fail),
+        ];
+        for (report, status) in cases {
+            let check = runner.browser_gpu_check(&running, std::slice::from_ref(&report));
+            assert_eq!(check.status, status, "{report:?}: {}", check.detail);
+            assert_eq!(
+                check.fix_available,
+                status == CheckStatus::Fail,
+                "{report:?}: the fix is offered exactly when failing"
+            );
+            assert_eq!(check.fix_description.is_some(), check.fix_available);
+            assert!(check
+                .docs_url
+                .as_deref()
+                .is_some_and(|url| url.ends_with("troubleshooting/#browser-software-rendering")));
+        }
+
+        // A report on an earlier process (the app restarted since) is stale.
+        let stale = gpu_report(Some(Rendering::Software), 3);
+        let check = runner.browser_gpu_check(&[("arena-fx".to_string(), 11)], &[stale]);
+        assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
+        assert!(!check.fix_available);
+    }
+
+    #[tokio::test]
+    async fn the_browser_gpu_fix_refuses_when_nothing_fell_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = runner(dir.path().to_path_buf())
+            .fix(ids::BROWSER_GPU)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::Validation(_)), "{error}");
     }
 
     #[tokio::test]
@@ -3601,16 +3889,17 @@ mod tests {
         let snapshot = Arc::new(Snapshot::new());
         snapshot.set_outputs(sway.get_outputs().await.unwrap());
         let (trigger, mut receiver) = crate::reconciler::Reconciler::channel();
-        let runner = CheckRunner::new(
+        let runner = CheckRunner::new(CheckRunnerDeps {
             bootstrap,
-            sway.clone(),
-            Arc::new(MockAudio::default()),
+            sway: sway.clone(),
+            audio: Arc::new(MockAudio::default()),
             store,
-            EventHub::new(),
-            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            events: EventHub::new(),
+            capabilities: Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
             snapshot,
             trigger,
-        );
+            supervisor: Arc::new(Supervisor::idle(dir.path())),
+        });
 
         let detail = runner.fix(ids::OUTPUT_PHASE).await.unwrap();
         assert!(detail.contains("HDMI-A-1"), "{detail}");
@@ -3665,18 +3954,19 @@ mod tests {
         let snapshot = Arc::new(Snapshot::new());
         snapshot.set_outputs(vec![output_running_at("DP-1", 60.0, &[])]);
         let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
-        let runner = CheckRunner::new(
+        let runner = CheckRunner::new(CheckRunnerDeps {
             bootstrap,
             sway,
-            Arc::new(MockAudio::default()),
-            Arc::new(crate::state::StateStore::ephemeral(
+            audio: Arc::new(MockAudio::default()),
+            store: Arc::new(crate::state::StateStore::ephemeral(
                 dir.path().to_path_buf(),
             )),
-            EventHub::new(),
-            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            events: EventHub::new(),
+            capabilities: Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
             snapshot,
             trigger,
-        );
+            supervisor: Arc::new(Supervisor::idle(dir.path())),
+        });
 
         let error = runner.fix(ids::OUTPUT_PHASE).await.unwrap_err();
         assert!(matches!(error, ApiError::Validation(_)));
@@ -4157,18 +4447,19 @@ mod tests {
             adaptive_sync_status: None,
         }]);
         let (trigger, _receiver) = crate::reconciler::Reconciler::channel();
-        let runner = CheckRunner::new(
+        let runner = CheckRunner::new(CheckRunnerDeps {
             bootstrap,
             sway,
-            Arc::new(MockAudio::default()),
-            Arc::new(crate::state::StateStore::ephemeral(
+            audio: Arc::new(MockAudio::default()),
+            store: Arc::new(crate::state::StateStore::ephemeral(
                 dir.path().to_path_buf(),
             )),
-            EventHub::new(),
-            Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
-            Arc::new(Snapshot::new()),
+            events: EventHub::new(),
+            capabilities: Arc::new(crate::capabilities::CapabilityStore::new(dir.path())),
+            snapshot: Arc::new(Snapshot::new()),
             trigger,
-        );
+            supervisor: Arc::new(Supervisor::idle(dir.path())),
+        });
         let checks = runner.run_all().await;
         let check = checks
             .iter()
@@ -4309,6 +4600,7 @@ mod tests {
                     ids::PIPEWIRE,
                     ids::DIRECT_SCANOUT,
                     ids::OUTPUT_PHASE,
+                    ids::BROWSER_GPU,
                 ]
                 .contains(id),
                 "{id} is advertised as fixable but not dispatched"

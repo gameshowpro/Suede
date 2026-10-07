@@ -52,6 +52,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `direct_scanout` | — | `true` | Whether the compositor may flip the slicer's buffers straight to the display controllers; only meaningful with `allow_overlaps = true` — see [Overlapping layouts and direct scanout](#direct-scanout) |
 | `presentation` | — | `"wayland"` | **Experimental.** `"wayland"` or `"direct"`: which display path the login session starts — see [Experimental: direct presentation](#experimental-direct-presentation). `"direct"` without `allow_overlaps = true` resolves to effective `wayland` with a reason instead of failing to start; an unrecognized value fails startup. `GET /api/v1/system` reports `requested`, `effective`, and why they differ, if they do |
 | `align_outputs` | `SUEDE_ALIGN_OUTPUTS` | `true` | Whether Suede re-aligns the displays' vblank phase itself when a Wayland session starts them out of phase, with the `output-phase` check's own fix — see [Automatic output phase alignment](#align-outputs) |
+| `restart_on_gpu_fallback` | `SUEDE_RESTART_ON_GPU_FALLBACK` | `true` | Whether Suede restarts a `chromium-kiosk` app itself once Chromium has fallen back to software rendering after its GPU process crashed, at most three times per app per hour — see [Automatic restart after a browser GPU fallback](#restart-on-gpu-fallback) |
 | `gl_yield` | — | `"usleep"` | **Experimental, NVIDIA-only.** `"usleep"` (the default), `"nothing"` or `"default"` (opt out; driver behavior): exports `__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into the login session's Sway environment (both the DRM Sway and direct presentation's headless one); Mesa ignores it. An unrecognized value fails startup. `GET /api/v1/system` reports `requested` and a live `effective` read from the running Sway's environment, so a session started before an edit shows the mismatch — see [NVIDIA `__GL_YIELD`](#gl-yield) |
 
 ### Host power control {: #host-power }
@@ -318,6 +319,31 @@ session, `lastResult` (`inPhase`, `outOfPhase`, `aligned`, `stillOutOfPhase`,
 The `output-phase` check's detail says when automatic alignment is on. See
 [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step)
 for the measurement behind the check.
+
+### Automatic restart after a browser GPU fallback {: #restart-on-gpu-fallback }
+
+When Chromium's GPU process crashes for the third time, Chromium relaunches
+it in software (`--use-gl=disabled`) and stays there until the browser
+restarts; on a large canvas that measured a few frames per second. See
+[A browser drops to a few frames per second](troubleshooting.md#browser-software-rendering)
+for the whole story.
+
+With `restart_on_gpu_fallback = true` (the default) Suede restarts the app
+itself:
+
+- only for a running `chromium-kiosk` app, once two looks five seconds apart
+  at the same browser process both find its GPU process in software;
+- only if the app's log shows its GPU process crashed since launch, since a
+  browser that started in software would start the same way again;
+- at most three times per app in any rolling hour; after that the
+  `browser-gpu` check fails saying the budget is used, until the oldest
+  restart is an hour old.
+
+Each restart is logged in Suede's journal and reported as restart reason
+`gpuFallback` in the app's status. Set `restart_on_gpu_fallback = false` (or
+`SUEDE_RESTART_ON_GPU_FALLBACK=false`) to leave it to an operator; the
+`browser-gpu` check still fails and its fix restarts the app on request,
+which never counts against the automatic budget.
 
 ### NVIDIA `__GL_YIELD` {: #gl-yield }
 

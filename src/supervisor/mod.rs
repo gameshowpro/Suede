@@ -132,6 +132,22 @@ impl Supervisor {
         }
     }
 
+    /// A supervisor managing nothing, with its profiles and logs under
+    /// `root`, for tests of the things that hold one.
+    #[cfg(test)]
+    pub(crate) fn idle(root: &std::path::Path) -> Self {
+        Self::new(
+            Arc::new(crate::sway::mock::MockSway::empty()),
+            EventHub::new(),
+            LaunchContext {
+                profiles_root: root.join("profiles"),
+                log_root: root.join("logs"),
+                api_base: "http://127.0.0.1:9088/api/v1".into(),
+            },
+            Vec::new(),
+        )
+    }
+
     /// Bring the managed set in line with desired state, then advance lifecycles.
     ///
     /// Returns divergences for apps that cannot run right now.
@@ -372,12 +388,33 @@ impl Supervisor {
 
     /// Kill and relaunch an app on request.
     pub async fn restart(&self, id: &str) -> bool {
+        self.restart_because(id, RestartReason::ApiRequest, None)
+            .await
+    }
+
+    /// Kill and relaunch an app, recording `reason` as why.
+    ///
+    /// With `only_pid`, only if the app is still that process: whoever
+    /// judged it (the browser GPU watchdog, or the `browser-gpu` check's
+    /// fix) judged that process, and an app that has already been
+    /// relaunched since — by a crash, say — must not be restarted again on
+    /// its predecessor's account. Returns false for an unknown app or a
+    /// different process.
+    pub async fn restart_because(
+        &self,
+        id: &str,
+        reason: RestartReason,
+        only_pid: Option<u32>,
+    ) -> bool {
         let mut apps = self.apps.lock().await;
         let Some(managed) = apps.get_mut(id) else {
             return false;
         };
+        if only_pid.is_some_and(|pid| managed.status.pid != Some(pid)) {
+            return false;
+        }
         stop(managed).await;
-        managed.status.last_restart_reason = Some(RestartReason::ApiRequest);
+        managed.status.last_restart_reason = Some(reason);
         managed.halted = false;
         managed.attempts = 0;
         managed.restart_at = Some(Instant::now());
@@ -385,6 +422,21 @@ impl Supervisor {
         self.publish(managed);
         self.advance(&mut apps).await;
         true
+    }
+
+    /// Every app's status, each paired with whether it is launched with the
+    /// `chromium-kiosk` preset — what [`crate::browser_gpu`] watches and the
+    /// `browser-gpu` check judges. Decided here because only the supervisor
+    /// holds the configuration the running process was actually started
+    /// from.
+    pub async fn statuses_with_chromium(&self) -> Vec<(AppStatus, bool)> {
+        let apps = self.apps.lock().await;
+        let mut statuses: Vec<(AppStatus, bool)> = apps
+            .values()
+            .map(|app| (app.status.clone(), app.config.launcher.is_chromium()))
+            .collect();
+        statuses.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+        statuses
     }
 
     pub async fn statuses(&self) -> Vec<AppStatus> {
@@ -1793,6 +1845,37 @@ mod tests {
         let status = supervisor.status("a").await.unwrap();
         assert_ne!(status.pid.unwrap(), first);
         assert_eq!(status.last_restart_reason, Some(RestartReason::ApiRequest));
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_restart_for_a_reason_stamps_it_and_respects_the_expected_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        supervisor
+            .reconcile(&[sleeper("a")], &[target("a", None)])
+            .await;
+        let first = supervisor.status("a").await.unwrap().pid.unwrap();
+
+        // A process that is no longer the app's is left alone.
+        assert!(
+            !supervisor
+                .restart_because("a", RestartReason::GpuFallback, Some(first + 1))
+                .await
+        );
+        assert_eq!(supervisor.status("a").await.unwrap().pid, Some(first));
+
+        assert!(
+            supervisor
+                .restart_because("a", RestartReason::GpuFallback, Some(first))
+                .await
+        );
+        let status = supervisor.status("a").await.unwrap();
+        assert_ne!(status.pid.unwrap(), first);
+        assert_eq!(status.last_restart_reason, Some(RestartReason::GpuFallback));
+        let statuses = supervisor.statuses_with_chromium().await;
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].1, "an exec launcher is not chromium-kiosk");
         supervisor.shutdown().await;
     }
 

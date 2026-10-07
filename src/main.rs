@@ -10,7 +10,7 @@ use tokio::sync::watch;
 
 use suede::api::{self, ApiState};
 use suede::audio::{mock::MockAudio, pw::PipeWireMonitor, AudioMonitor};
-use suede::checks::CheckRunner;
+use suede::checks::{CheckRunner, CheckRunnerDeps};
 use suede::config::BootstrapConfig;
 use suede::events::EventHub;
 use suede::reconciler::{Reconciler, ReconcilerDeps};
@@ -307,6 +307,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         direct_scanout = bootstrap.direct_scanout,
         presentation = bootstrap.presentation.as_str(),
         align_outputs = bootstrap.align_outputs,
+        restart_on_gpu_fallback = bootstrap.restart_on_gpu_fallback,
         mock = args.mock,
         "starting suede"
     );
@@ -414,16 +415,17 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         &bootstrap.state_dir,
     ));
     let (trigger, trigger_rx) = Reconciler::channel();
-    let checks = Arc::new(CheckRunner::new(
-        bootstrap.clone(),
-        sway.clone(),
-        audio.clone(),
-        store.clone(),
-        events.clone(),
-        capability_store.clone(),
-        snapshot.clone(),
-        trigger.clone(),
-    ));
+    let checks = Arc::new(CheckRunner::new(CheckRunnerDeps {
+        bootstrap: bootstrap.clone(),
+        sway: sway.clone(),
+        audio: audio.clone(),
+        store: store.clone(),
+        events: events.clone(),
+        capabilities: capability_store.clone(),
+        snapshot: snapshot.clone(),
+        trigger: trigger.clone(),
+        supervisor: supervisor.clone(),
+    }));
 
     // --- background tasks ---
     tokio::spawn(Reconciler::forward_sway_events(
@@ -445,6 +447,15 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
             checks.clone(),
             snapshot.clone(),
             trigger.clone(),
+        )
+        .run(shutdown_rx.clone()),
+    );
+    tokio::spawn(
+        suede::browser_gpu::Watchdog::new(
+            bootstrap.restart_on_gpu_fallback,
+            supervisor.clone(),
+            checks.clone(),
+            snapshot.clone(),
         )
         .run(shutdown_rx.clone()),
     );

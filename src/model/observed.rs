@@ -185,6 +185,10 @@ pub enum RestartReason {
     WindowNeverAppeared,
     ConfigChanged,
     ApiRequest,
+    /// Chromium's GPU process crashed until Chromium fell back to software
+    /// rendering, which only a browser restart undoes — restarted by
+    /// [`crate::browser_gpu`] or by the `browser-gpu` check's fix.
+    GpuFallback,
 }
 
 /// Runtime status of a supervised application.
@@ -1484,6 +1488,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(RestartReason::HeartbeatTimeout).unwrap(),
             "heartbeatTimeout"
+        );
+        assert_eq!(
+            serde_json::to_value(RestartReason::GpuFallback).unwrap(),
+            "gpuFallback"
         );
     }
 

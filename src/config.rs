@@ -52,6 +52,7 @@ struct FileConfig {
     /// whatever wording `toml`'s enum deserialization happens to produce.
     gl_yield: Option<String>,
     align_outputs: Option<bool>,
+    restart_on_gpu_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +158,19 @@ pub struct BootstrapConfig {
     /// not a fact about how the compositor was started, so
     /// `SUEDE_ALIGN_OUTPUTS` overrides it like any other value.
     pub align_outputs: bool,
+    /// Whether the daemon restarts a `chromium-kiosk` app itself once
+    /// Chromium has fallen back to software rendering after its GPU process
+    /// crashed — see [`crate::browser_gpu`].
+    ///
+    /// Defaults to `true`: Chromium never returns to the GPU without a
+    /// browser restart, and software compositing on a large canvas measured
+    /// a few frames per second. The restart is budgeted (at most
+    /// [`crate::browser_gpu::MAX_RESTARTS_PER_HOUR`] per app per rolling
+    /// hour), so a GPU that keeps failing cannot blank the wall in a loop.
+    /// `false` leaves it to an operator, through the `browser-gpu` check's
+    /// fix. Daemon behavior like [`Self::align_outputs`], so
+    /// `SUEDE_RESTART_ON_GPU_FALLBACK` overrides it.
+    pub restart_on_gpu_fallback: bool,
 }
 
 impl Default for BootstrapConfig {
@@ -175,6 +189,7 @@ impl Default for BootstrapConfig {
             presentation: PresentationMode::Wayland,
             gl_yield: GlYieldMode::Usleep,
             align_outputs: true,
+            restart_on_gpu_fallback: true,
         }
     }
 }
@@ -261,10 +276,13 @@ pub enum ConfigError {
         GlYieldMode::ALL.iter().map(GlYieldMode::as_str).collect::<Vec<_>>().join(", ")
     )]
     GlYield { value: String },
-    /// Same reasoning as [`ConfigError::PowerVerb`], for the one boolean that
+    /// Same reasoning as [`ConfigError::PowerVerb`], for a boolean that
     /// an environment variable can set: a typo must not silently pick a side.
     #[error("invalid SUEDE_ALIGN_OUTPUTS {value:?}; accepted values are true, false")]
     AlignOutputs { value: String },
+    /// Same reasoning as [`ConfigError::AlignOutputs`].
+    #[error("invalid SUEDE_RESTART_ON_GPU_FALLBACK {value:?}; accepted values are true, false")]
+    RestartOnGpuFallback { value: String },
 }
 
 impl BootstrapConfig {
@@ -347,6 +365,17 @@ impl BootstrapConfig {
                 _ => return Err(ConfigError::AlignOutputs { value }),
             },
             None => file.align_outputs.unwrap_or(true),
+        };
+        config.restart_on_gpu_fallback = match std::env::var("SUEDE_RESTART_ON_GPU_FALLBACK")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(value) => match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(ConfigError::RestartOnGpuFallback { value }),
+            },
+            None => file.restart_on_gpu_fallback.unwrap_or(true),
         };
 
         Ok(config)
@@ -819,6 +848,50 @@ mod tests {
         assert!(error.contains("true, false"), "{error}");
 
         unsafe { std::env::remove_var("SUEDE_ALIGN_OUTPUTS") };
+    }
+
+    /// One test, like the alignment test, because
+    /// `SUEDE_RESTART_ON_GPU_FALLBACK` is process-wide state.
+    #[test]
+    fn restart_on_gpu_fallback_defaults_to_on_and_is_read_from_file_and_env() {
+        let _guard = env_lock();
+        // Safety: the whole test holds `env_lock`.
+        unsafe { std::env::remove_var("SUEDE_RESTART_ON_GPU_FALLBACK") };
+
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(config.restart_on_gpu_fallback, "absent means on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+        std::fs::write(&path, "restart_on_gpu_fallback = false\n").unwrap();
+        assert!(
+            !BootstrapConfig::load(Some(&path))
+                .unwrap()
+                .restart_on_gpu_fallback
+        );
+        std::fs::write(&path, "restart_on_gpu_fallback = true\n").unwrap();
+        assert!(
+            BootstrapConfig::load(Some(&path))
+                .unwrap()
+                .restart_on_gpu_fallback
+        );
+
+        // The environment wins over the file, like every other override.
+        unsafe { std::env::set_var("SUEDE_RESTART_ON_GPU_FALLBACK", "false") };
+        assert!(
+            !BootstrapConfig::load(Some(&path))
+                .unwrap()
+                .restart_on_gpu_fallback
+        );
+
+        // A typo fails loudly rather than silently picking a side.
+        unsafe { std::env::set_var("SUEDE_RESTART_ON_GPU_FALLBACK", "yes") };
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("yes"), "{error}");
+        assert!(error.contains("SUEDE_RESTART_ON_GPU_FALLBACK"), "{error}");
+        assert!(error.contains("true, false"), "{error}");
+
+        unsafe { std::env::remove_var("SUEDE_RESTART_ON_GPU_FALLBACK") };
     }
 
     #[test]

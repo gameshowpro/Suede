@@ -36,6 +36,11 @@ pub struct Snapshot {
     /// session, as [`crate::alignment`] last published it. `enabled` here is
     /// only what that task wrote; `GET /system` reports the bootstrap key.
     output_alignment: RwLock<crate::model::OutputAlignmentStatus>,
+    /// What the browser GPU watchdog last saw of each running
+    /// `chromium-kiosk` app, as [`crate::browser_gpu`] last published it.
+    /// Each report names the process it was judged for, so a reader can
+    /// tell a stale one (an app restarted since) from the current one.
+    browser_gpu: RwLock<Vec<crate::browser_gpu::AppGpuReport>>,
 }
 
 impl Snapshot {
@@ -61,6 +66,21 @@ impl Snapshot {
     /// Record what automatic output phase alignment has done this session.
     pub fn set_output_alignment(&self, status: crate::model::OutputAlignmentStatus) {
         *self.output_alignment.write().unwrap() = status;
+    }
+
+    /// What the browser GPU watchdog last saw, per Chromium app.
+    pub fn browser_gpu(&self) -> Vec<crate::browser_gpu::AppGpuReport> {
+        self.browser_gpu.read().unwrap().clone()
+    }
+
+    /// Record what the browser GPU watchdog saw. Returns whether it changed.
+    pub fn set_browser_gpu(&self, reports: Vec<crate::browser_gpu::AppGpuReport>) -> bool {
+        let mut guard = self.browser_gpu.write().unwrap();
+        if *guard == reports {
+            return false;
+        }
+        *guard = reports;
+        true
     }
 
     pub fn outputs(&self) -> Vec<Output> {

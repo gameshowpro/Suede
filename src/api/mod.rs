@@ -695,6 +695,7 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
 pub mod test_support {
     use super::*;
     use crate::audio::mock::MockAudio;
+    use crate::checks::CheckRunnerDeps;
     use crate::reconciler::{ReconcileRequests, ReconcilerDeps};
     use crate::supervisor::LaunchContext;
     use crate::sway::mock::MockSway;
@@ -763,16 +764,17 @@ pub mod test_support {
         }));
         let capability_store = Arc::new(crate::capabilities::CapabilityStore::new(dir.path()));
         let (trigger, requests) = Reconciler::channel();
-        let checks = Arc::new(CheckRunner::new(
-            bootstrap.clone(),
-            sway.clone(),
-            audio.clone(),
-            store.clone(),
-            hub.clone(),
-            capability_store.clone(),
-            snapshot.clone(),
-            trigger.clone(),
-        ));
+        let checks = Arc::new(CheckRunner::new(CheckRunnerDeps {
+            bootstrap: bootstrap.clone(),
+            sway: sway.clone(),
+            audio: audio.clone(),
+            store: store.clone(),
+            events: hub.clone(),
+            capabilities: capability_store.clone(),
+            snapshot: snapshot.clone(),
+            trigger: trigger.clone(),
+            supervisor: supervisor.clone(),
+        }));
 
         let power = Arc::new(observed::power_mock::MockPower::default());
 

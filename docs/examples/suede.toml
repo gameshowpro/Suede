@@ -87,3 +87,14 @@ docs_base_url = "https://suede.gameshow.pro/"
 # per compositor session, and never in a direct session or on static content.
 # Set false to leave the fix to an operator. See configuration.md#align-outputs.
 # align_outputs = true
+
+# Whether Suede restarts a chromium-kiosk app itself once Chromium has fallen
+# back to software rendering after its GPU process crashed.
+# Env: SUEDE_RESTART_ON_GPU_FALLBACK
+#
+# On by default: Chromium never returns to the GPU without a browser restart,
+# and software compositing on a large canvas runs at a few frames per second.
+# At most three automatic restarts per app in any hour. Set false to leave
+# the restart to an operator through the browser-gpu health check's fix.
+# See configuration.md#restart-on-gpu-fallback.
+# restart_on_gpu_fallback = true

@@ -410,6 +410,65 @@ Without heartbeats there is nothing to detect: from the outside, a frozen page a
 
 If the watchdog is firing when it should not, check that the page is actually posting — `lastHeartbeat` in the app status shows the last one received.
 
+## A browser drops to a few frames per second {: #browser-software-rendering }
+
+The symptom: a Chromium app that was smooth slows to a few frames per second,
+usually after a while, with nothing else wrong. On a large canvas the measured
+rate was 1–3 fps. The **Browser GPU acceleration** health check fails and
+says since when.
+
+The cause is Chromium's GPU process. When it crashes, Chromium relaunches it.
+After the first and second crash the GPU process comes back on the GPU; from
+the third crash on, Chromium relaunches it with `--use-gl=disabled`, which is
+software compositing, and it never returns to the GPU until the browser
+itself restarts. After the sixth crash the browser gives up and exits, and
+Suede restarts it as it would any app that exited. Each crash leaves a line
+like this in the app's log, `<state_dir>/logs/<app>.log`, which starts
+afresh at every launch:
+
+```text
+ERROR:content/browser/gpu/gpu_process_host.cc:NNNN] GPU process exited unexpectedly: exit_code=8704
+```
+
+The check warns from the first crash, while Chromium is still on the GPU,
+and gives the log path. Frame rate is not what it judges: a static page
+legitimately draws nothing for minutes. It reads the GPU process's own
+command line under `/proc`, as you can by hand:
+
+```bash
+pgrep -af -- '--type=gpu-process' | grep -oE -- '--use-(gl|angle)=[^ ]*'
+grep -c 'GPU process exited unexpectedly' ~/.local/state/suede/logs/<app>.log
+```
+
+What Suede does about it: with
+[`restart_on_gpu_fallback = true`](configuration.md#restart-on-gpu-fallback)
+(the default), it restarts the app itself once two looks five seconds apart
+both find the GPU process in software, with restart reason `gpuFallback`. It
+does that at most three times per app in any hour, so a GPU that keeps
+failing cannot blank the displays in a loop; once those are used, the check
+fails saying so, and its fix restarts the app on request (that does not use
+up an automatic restart). Every automatic restart, and every fallback it
+declines to restart, is logged in Suede's journal. Suede does not restart an
+app that has rendered in software since launch, with no GPU process crash and
+no earlier sign of the GPU: that browser started in software, and a restart
+would start it the same way. Look at the app's `extraArgs` and the graphics
+driver instead.
+
+Set `restart_on_gpu_fallback = false` (or `SUEDE_RESTART_ON_GPU_FALLBACK=false`)
+to leave the restart to an operator; the check still fails and still offers
+its fix.
+
+A restart only buys time if the GPU process keeps crashing. Find out why
+from the lines just before each crash in the app's log. One cause seen on an
+NVIDIA appliance was hardware video decode: the GPU process died importing a
+decoded frame. The `chromium-kiosk` preset turns on NVIDIA hardware decode
+with `VaapiOnNvidiaGPUs`; to turn it off for one app, repeat
+`--enable-features` in its `extraArgs` without that feature (the later flag
+wins), for example
+`--enable-features=VaapiVideoDecoder,CanvasOopRasterization`. Video then
+decodes on the processor, which is slower but no longer takes the GPU process
+down. See [Environment and hardware acceleration](configuration.md#environment-and-hardware-acceleration).
+
 ## Suede itself stops answering, but the process is still there
 
 There are two ways a daemon can stop working, and only one of them is
@@ -633,6 +692,49 @@ misconfigured; it is one restart away from losing exactly that change, so
 treat this the same as a low-disk-space warning: free space or fix the
 directory's permissions, then repeat the write (or any write — the next
 successful save clears the divergence regardless of which one it was).
+
+## The PCIe link reports errors {: #pcie-errors }
+
+The **PCIe link errors** health check warns when the link between a graphics
+card and the motherboard keeps corrupting packets. The card still works: the
+link layer notices each bad packet, rejects it and asks for it again, and the
+kernel counts that as a *correctable* error. The only symptom is lost
+throughput and extra latency, which on a show machine looks like a wall that
+is slower than the hardware should manage, with nothing else wrong.
+
+A healthy machine shows zero, or a handful over weeks. Suede warns when the
+card has counted at least 100 correctable errors since boot at an average of
+10 an hour or more, or at least 5 in the last ten minutes at a rate of 60 an
+hour or more. It fails on any *nonfatal* or *fatal* error, which are
+uncorrectable and can corrupt data. Link speed and width are shown for
+information only and are never judged: the speed drops at idle by design, and
+a board wired for x8 can carry an x16-capable card.
+
+Suede cannot fix this, because the remedies are physical:
+
+- Power off, then reseat the card firmly in its slot.
+- Try another slot, ideally one wired directly to the processor.
+- Remove any riser cable or extender, or replace it with a better one.
+- If one specific machine keeps showing it across drivers and operating
+  systems, suspect the slot or the card itself.
+
+To read the counters by hand, find the card's address and read its AER files.
+The errors are counted on the end of the link that received the bad packet,
+which is usually the card, so check the port above it too:
+
+```bash
+lspci -D | grep -Ei 'vga|3d|display'      # e.g. 0000:01:00.0
+cd /sys/bus/pci/devices/0000:01:00.0
+cat aer_dev_correctable aer_dev_nonfatal aer_dev_fatal
+cat current_link_speed current_link_width max_link_speed max_link_width
+cat ../aer_dev_correctable                # the upstream port (path is a symlink)
+uptime
+```
+
+The `TOTAL_ERR_COR` line is the one Suede reads. Counters start at zero at
+boot, so divide by the uptime to get a rate. A machine with no `aer_dev_*`
+files has AER switched off, or firmware that handles PCIe errors itself;
+Suede passes the check there and says it could not measure.
 
 ## Everything reconciles constantly
 
