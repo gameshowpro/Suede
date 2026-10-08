@@ -185,19 +185,39 @@ pub fn read_links(sysfs_root: &Path) -> Vec<LinkReading> {
                 fatal: add(counters.fatal, port.fatal),
             };
         }
+        let link = LinkInfo {
+            speed: link_speed(&path.join("current_link_speed")),
+            width: link_width(&path.join("current_link_width")),
+            max_speed: link_speed(&path.join("max_link_speed")),
+            max_width: link_width(&path.join("max_link_width")),
+        };
+        // An integrated GPU sits on the root complex with no PCIe link: the
+        // kernel reports its speed as `Unknown` and its width as 0 or 255,
+        // and it has no error counters. There is no link to judge, and
+        // listing it as "cannot be read" would only be noise beside the
+        // discrete card that does have one.
+        if !counters.measurable() && link.speed.is_none() && link.max_speed.is_none() {
+            continue;
+        }
         links.push(LinkReading {
             address: entry.file_name().to_string_lossy().into_owned(),
             counters,
-            link: LinkInfo {
-                speed: read_trimmed(&path.join("current_link_speed")),
-                width: read_trimmed(&path.join("current_link_width")),
-                max_speed: read_trimmed(&path.join("max_link_speed")),
-                max_width: read_trimmed(&path.join("max_link_width")),
-            },
+            link,
         });
     }
     links.sort_by(|a, b| a.address.cmp(&b.address));
     links
+}
+
+/// A link speed, `None` when absent or `Unknown` (no PCIe link).
+fn link_speed(path: &Path) -> Option<String> {
+    read_trimmed(path).filter(|speed| !speed.starts_with("Unknown"))
+}
+
+/// A link width, `None` when absent, 0 (no link trained) or 255 (the
+/// kernel's "not a PCIe link" value).
+fn link_width(path: &Path) -> Option<String> {
+    read_trimmed(path).filter(|width| width != "0" && width != "255")
 }
 
 /// `16.0 GT/s PCIe` becomes `16.0 GT/s`.
@@ -592,6 +612,36 @@ mod tests {
             run(dir.path(), HOUR, &mut History::default()).0,
             Severity::Pass
         );
+    }
+
+    /// An integrated GPU on the root complex, as the kernel shows one: no
+    /// PCIe link and no error counters.
+    fn fake_integrated(root: &Path) {
+        let igpu = root.join("devices/pci0000:00/0000:00:02.0");
+        write(&igpu.join("class"), "0x030000\n");
+        write(&igpu.join("current_link_speed"), "Unknown\n");
+        write(&igpu.join("current_link_width"), "0\n");
+        write(&igpu.join("max_link_speed"), "Unknown\n");
+        write(&igpu.join("max_link_width"), "255\n");
+        let devices = root.join("bus/pci/devices");
+        fs::create_dir_all(&devices).unwrap();
+        symlink(&igpu, devices.join("0000:00:02.0")).unwrap();
+    }
+
+    #[test]
+    fn an_integrated_gpu_without_a_link_is_left_out() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_integrated(dir.path());
+        assert!(read_links(dir.path()).is_empty());
+        let (severity, detail) = run(dir.path(), HOUR, &mut History::default());
+        assert_eq!(severity, Severity::Pass);
+        assert_eq!(detail, "no PCIe graphics card");
+
+        fake_sys(dir.path(), Some((0, 0, 0)), Some((0, 0, 0)));
+        let (_, detail) = run(dir.path(), HOUR, &mut History::default());
+        assert!(!detail.contains("0000:00:02.0"), "{detail}");
+        assert!(!detail.contains("Unknown"), "{detail}");
+        assert!(detail.contains(GPU), "{detail}");
     }
 
     #[test]
