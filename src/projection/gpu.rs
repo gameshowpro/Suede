@@ -102,6 +102,7 @@ use anyhow::{anyhow, bail, Context};
 use ash::vk;
 
 pub mod display;
+mod meter;
 
 const VERT_SPV: &[u8] = include_bytes!("shaders/blend.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("shaders/blend.frag.spv");
@@ -445,6 +446,7 @@ struct DeviceState {
     queue: vk::Queue,
     queue_family: u32,
     external_memory_fd: ash::khr::external_memory_fd::Device,
+    calibrated_timestamps: bool,
     drm_format_modifier: ash::ext::image_drm_format_modifier::Device,
     /// What `create_device`'s global-priority ladder granted `queue` — see
     /// `QueuePriority` and the module doc's "Queue priority" section.
@@ -875,6 +877,8 @@ pub struct Gpu {
     /// set and readback buffer all belong to the GPU, so no second
     /// measurement may be recorded — see [`Gpu::submit_luminance_measurement`].
     measurement_flight: Option<PendingMeasurement>,
+    /// Optional sampled query pool; does not add waits to rendering.
+    meter: meter::Meter,
     /// Deterministic post-stage failure used only by the hardware readback
     /// transaction test. `Some(n)` fails just before staging item `n`, after
     /// the preceding inactive tables have proved their cleanup path.
@@ -975,6 +979,17 @@ impl Gpu {
             .iter()
             .map(|name| name.as_ptr())
             .collect();
+        // Optional timestamps must not make the ordinary compositor path
+        // dependent on the calibration extension's availability.
+        let extensions =
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
+        let calibrated_timestamps = extensions.iter().any(|extension| unsafe {
+            CStr::from_ptr(extension.extension_name.as_ptr())
+                == ash::khr::calibrated_timestamps::NAME
+        });
+        if calibrated_timestamps && direct_primary.is_none() {
+            device_extensions.push(ash::khr::calibrated_timestamps::NAME.as_ptr());
+        }
         if direct_primary.is_some() {
             device_extensions.extend(display::DEVICE_EXTENSIONS.iter().map(|name| name.as_ptr()));
         }
@@ -1071,6 +1086,7 @@ impl Gpu {
             queue,
             queue_family,
             external_memory_fd,
+            calibrated_timestamps,
             drm_format_modifier,
             queue_priority,
             direct_mode: direct_primary.is_some(),
@@ -1248,6 +1264,7 @@ impl Gpu {
         let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
             .context("vkCreateFence")?;
 
+        let meter = meter::Meter::new(&device_state);
         Ok(Gpu {
             device: device_state,
             direct: None,
@@ -1271,9 +1288,15 @@ impl Gpu {
             dynamic_maximum: 0,
             measurement: None,
             measurement_flight: None,
+            meter,
             #[cfg(test)]
             transfer_stage_fail_after: None,
         })
+    }
+
+    /// Drain sampled submission/GPU/completion timings for the stats interval.
+    pub fn take_timing_stats(&mut self) -> crate::model::ProjectionGpuTiming {
+        self.meter.drain()
     }
 
     /// Human-readable device name and driver version, for a log line.
@@ -3781,6 +3804,11 @@ impl Gpu {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
             .context("vkBeginCommandBuffer")?;
+        let mut sample = self.meter.begin(
+            device,
+            self.command_buffer,
+            jobs.iter().map(|job| job.output),
+        );
 
         // Acquire the canvas from the compositor's queue family — see the
         // module doc: layout stays GENERAL on both sides, only ownership
@@ -3838,7 +3866,10 @@ impl Gpu {
             }
         }
 
-        for job in jobs {
+        for (job_index, job) in jobs.iter().enumerate() {
+            if let Some(sample) = &sample {
+                sample.output_start(device, self.command_buffer, job_index);
+            }
             let output = self.outputs[job.output]
                 .as_ref()
                 .expect("validated before recording");
@@ -3961,6 +3992,9 @@ impl Gpu {
                     &[release_target],
                 );
             }
+            if let Some(sample) = &sample {
+                sample.output_end(device, self.command_buffer, job_index);
+            }
         }
 
         // The other half of the acquire above, and skipped for the same
@@ -3988,6 +4022,9 @@ impl Gpu {
             }
         }
 
+        if let Some(sample) = &sample {
+            sample.end(device, self.command_buffer);
+        }
         unsafe { device.end_command_buffer(self.command_buffer) }.context("vkEndCommandBuffer")?;
 
         // Safety: `self.fence` was last waited on by the previous `blend()`
@@ -4004,8 +4041,14 @@ impl Gpu {
             .signal_semaphores(signal_semaphores);
         // Safety: `self.command_buffer` finished recording above; `self.fence`
         // was just reset and is used by nothing else.
+        if let Some(sample) = &mut sample {
+            self.meter.before_submit(sample);
+        }
         unsafe { device.queue_submit(self.device.queue, &[submit_info], self.fence) }
             .context("vkQueueSubmit")?;
+        if let Some(sample) = &mut sample {
+            sample.submitted();
+        }
         self.fence_in_flight = true;
 
         let wait_from = Instant::now();
@@ -4026,8 +4069,12 @@ impl Gpu {
             )
         }
         .context("vkWaitForFences")?;
+        let wait_duration = wait_from.elapsed();
         self.fence_in_flight = false;
-        Ok(wait_from.elapsed())
+        if let Some(sample) = sample {
+            self.meter.complete(device, sample);
+        }
+        Ok(wait_duration)
     }
 }
 
@@ -4082,6 +4129,7 @@ impl Drop for Gpu {
         // and is owned exclusively by it — nothing else holds a copy.
         // Destroying the command pool frees `self.command_buffer` with it.
         unsafe {
+            self.meter.destroy(device);
             if let Some(pipeline) = self.pipeline.take() {
                 device.destroy_pipeline(pipeline.pipeline, None);
             }

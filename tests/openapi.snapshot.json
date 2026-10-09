@@ -2018,6 +2018,17 @@
       "OutputTiming": {
         "description": "One output's presentation tally for the interval.",
         "properties": {
+          "commitToPresentMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Request/submission-to-display time measured with validated protocol\ntimestamps: from immediately before the Wayland feedback request or\ndirect queue_present through the display timestamp. Uses the announced\nWayland clock or CLOCK_MONOTONIC for direct presentation. This is not\ncapture-to-display or photon latency. Null when timestamps are absent,\nunsupported, invalid, or from an unknown clock."
+              }
+            ]
+          },
           "discarded": {
             "format": "int32",
             "minimum": 0,
@@ -2805,6 +2816,149 @@
         ],
         "type": "object"
       },
+      "ProjectionGpuOutputTiming": {
+        "description": "GPU timestamp span for one physical output index.",
+        "properties": {
+          "gpuSpanMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Null means this output had no valid timestamp samples."
+              }
+            ]
+          },
+          "index": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "type": "object"
+      },
+      "ProjectionGpuTiming": {
+        "description": "Vulkan submission, execution, and completion measurements for an interval.\nDurations are milliseconds. GPU spans can overlap between outputs and may\ninclude GPU scheduling or preemption, so they are not additive.",
+        "properties": {
+          "calibrationDeviationMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Vulkan-reported calibration sample deviation; not a total accuracy bound."
+              }
+            ]
+          },
+          "completionMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Host wall time from entering submission through observing fence completion."
+              }
+            ]
+          },
+          "completionObservationMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Calibrated time from the final GPU timestamp to host observation of\nfence completion. This is post-completion scheduling and wakeup delay,\nnot submission-to-completion time."
+              }
+            ]
+          },
+          "gpuSpanMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "GPU timestamp span. Null means no valid GPU timestamp samples."
+              }
+            ]
+          },
+          "outputs": {
+            "description": "Timestamp span per presented output index; can include earlier outputs'\npipeline backlog and is not an isolated per-pass cost.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectionGpuOutputTiming"
+            },
+            "type": "array"
+          },
+          "outsideGpuSpanMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Completion time minus GPU span; includes queueing, host, and other time."
+              }
+            ]
+          },
+          "queryFailures": {
+            "description": "GPU timestamp query failures in the interval.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queueDelayMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Calibrated time from entering `vkQueueSubmit` to the first TOP_OF_PIPE\ntimestamp. Includes submit-call and driver scheduling time; it is not\na measure of time spent waiting on a busy GPU queue."
+              }
+            ]
+          },
+          "sampleEvery": {
+            "description": "Number of submissions between GPU timestamp samples; zero when disabled.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "description": "One of `sampled`, `full`, `disabled`, `unsupported`, or `unavailable`.",
+            "type": "string"
+          },
+          "submissions": {
+            "description": "Vulkan queue submissions in the interval.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "submitMs": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TimingDistribution",
+                "description": "Host wall time spent inside queue submission."
+              }
+            ]
+          }
+        },
+        "required": [
+          "status",
+          "sampleEvery",
+          "submissions",
+          "queryFailures",
+          "outputs"
+        ],
+        "type": "object"
+      },
       "ProjectionMode": {
         "description": "The selected projection pipeline.",
         "enum": [
@@ -2872,6 +3026,17 @@
             "format": "int32",
             "minimum": 0,
             "type": "integer"
+          },
+          "gpuTiming": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ProjectionGpuTiming",
+                "description": "Detailed Vulkan timing for this interval. Missing on reports from\nolder slicers; null means this slicer did not report GPU timing."
+              }
+            ]
           },
           "intervalSeconds": {
             "format": "double",
@@ -3461,6 +3626,35 @@
           "warp-alignment"
         ],
         "type": "string"
+      },
+      "TimingDistribution": {
+        "description": "Distribution of sampled durations, in milliseconds. At most 4096 valid\nsamples are retained per distribution per reporting interval.",
+        "properties": {
+          "max": {
+            "format": "double",
+            "type": "number"
+          },
+          "mean": {
+            "format": "double",
+            "type": "number"
+          },
+          "p95": {
+            "format": "double",
+            "type": "number"
+          },
+          "samples": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "samples",
+          "mean",
+          "p95",
+          "max"
+        ],
+        "type": "object"
       },
       "Transform": {
         "description": "Output rotation and flipping, as accepted by `sway-output(5)`.",

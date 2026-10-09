@@ -264,7 +264,7 @@ use super::pattern::{SyncGroup, SyncRect};
 use super::{dmabuf, gpu};
 use crate::model::{
     CaptureIntervals, FrameCost, LagFrames, OutputTiming, PresentationOffset, ProjectionStats,
-    Renderer, TestPattern,
+    Renderer, TestPattern, TimingDistribution,
 };
 
 /// DRM fourccs the GPU present path asks for, in preference order — see the
@@ -693,6 +693,10 @@ struct Timing {
     /// One entry per snapshot with at least one outstanding or answered
     /// feedback request, oldest first (`BTreeMap` over an incrementing key).
     pending: BTreeMap<u64, Vec<Slot>>,
+    /// Request timestamps use the presentation protocol clock, never `Instant`.
+    clock_id: Option<libc::clockid_t>,
+    requested_at: BTreeMap<(u64, usize), u64>,
+    latency_ms: Vec<Vec<f64>>,
     /// Running per-output tallies for the current report interval; `refresh`
     /// is the latest known rate and is *not* reset between intervals, since
     /// it is a measurement, not a count.
@@ -979,6 +983,7 @@ struct IntervalTiming {
     outputs: Vec<OutputAccum>,
     /// Same order as `outputs`: `(phase_ms, phase_spread_ms)`.
     phases: Vec<(Option<f64>, Option<f64>)>,
+    latency: Vec<Option<TimingDistribution>>,
 }
 
 impl Timing {
@@ -986,6 +991,9 @@ impl Timing {
         Self {
             snapshot_id: 0,
             pending: BTreeMap::new(),
+            clock_id: None,
+            requested_at: BTreeMap::new(),
+            latency_ms: vec![Vec::new(); presenter_count],
             per_output: vec![OutputAccum::default(); presenter_count],
             offset_sum_ms: 0.0,
             offset_max_ms: 0.0,
@@ -1000,6 +1008,13 @@ impl Timing {
     /// arrives before `commit` returns still has somewhere to land.
     fn request(&mut self, id: u64, index: usize) {
         let count = self.per_output.len();
+        if index >= count {
+            return;
+        }
+        self.requested_at.remove(&(id, index));
+        if let Some(at_ns) = self.clock_id.and_then(presentation_clock_ns) {
+            self.requested_at.insert((id, index), at_ns);
+        }
         let slots = self
             .pending
             .entry(id)
@@ -1019,6 +1034,7 @@ impl Timing {
         }
     }
 
+    #[cfg(test)]
     fn presented(&mut self, id: u64, index: usize, at_ns: u64, refresh_ns: u32, zero_copy: bool) {
         self.presented_optional(id, index, Some(at_ns), refresh_ns, zero_copy);
     }
@@ -1031,6 +1047,19 @@ impl Timing {
         refresh_ns: u32,
         zero_copy: bool,
     ) {
+        let waiting = self.pending.get(&id).and_then(|s| s.get(index)) == Some(&Slot::Waiting);
+        if let Some(request_ns) = self.requested_at.remove(&(id, index)) {
+            if waiting {
+                if let Some(delta) = at_ns.and_then(|at| at.checked_sub(request_ns)) {
+                    let samples = &mut self.latency_ms[index];
+                    // Covers a ten-second interval at high refresh rates without
+                    // unbounded growth if feedback arrives faster than reporting.
+                    if samples.len() < 4096 {
+                        samples.push(delta as f64 / 1_000_000.0);
+                    }
+                }
+            }
+        }
         if let Some(slot) = self.pending.get_mut(&id).and_then(|s| s.get_mut(index)) {
             *slot = Slot::Presented {
                 at_ns,
@@ -1042,6 +1071,7 @@ impl Timing {
     }
 
     fn discarded(&mut self, id: u64, index: usize) {
+        self.requested_at.remove(&(id, index));
         if let Some(slot) = self.pending.get_mut(&id).and_then(|s| s.get_mut(index)) {
             *slot = Slot::Discarded;
         }
@@ -1061,6 +1091,7 @@ impl Timing {
     /// Fold a snapshot's slots into the running tallies and drop it,
     /// whether every presenter answered or it was evicted as-is.
     fn finalize(&mut self, id: u64) {
+        self.requested_at.retain(|&(snapshot, _), _| snapshot != id);
         let Some(slots) = self.pending.remove(&id) else {
             return;
         };
@@ -1164,8 +1195,56 @@ impl Timing {
             straddles,
             outputs,
             phases,
+            latency: self
+                .latency_ms
+                .iter_mut()
+                .map(|samples| {
+                    let distribution = timing_distribution(samples);
+                    samples.clear();
+                    distribution
+                })
+                .collect(),
         }
     }
+}
+
+/// Only POSIX clocks with a presentation-compatible, system-wide domain.
+fn presentation_clock_ns(clock: libc::clockid_t) -> Option<u64> {
+    if !matches!(
+        clock,
+        libc::CLOCK_MONOTONIC
+            | libc::CLOCK_MONOTONIC_RAW
+            | libc::CLOCK_BOOTTIME
+            | libc::CLOCK_REALTIME
+    ) {
+        return None;
+    }
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(clock, &mut time) } != 0 {
+        return None;
+    }
+    let seconds = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u64::try_from(time.tv_nsec).ok()?;
+    if nanos >= 1_000_000_000 {
+        return None;
+    }
+    seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+}
+
+fn timing_distribution(samples: &mut [f64]) -> Option<TimingDistribution> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f64::total_cmp);
+    Some(TimingDistribution {
+        samples: samples.len() as u32,
+        mean: samples.iter().sum::<f64>() / samples.len() as f64,
+        p95: samples[(samples.len() * 95).div_ceil(100) - 1],
+        max: samples[samples.len() - 1],
+    })
 }
 
 /// Whether one report interval, taken alone, is the "every frame is going
@@ -1942,6 +2021,17 @@ fn free_present_slot(busy: &[bool], next: usize) -> Option<usize> {
 }
 
 impl State {
+    fn set_presentation_clock(&mut self, clock_id: u32) {
+        // Direct display feedback always uses CLOCK_MONOTONIC, independent
+        // of the compositor clock advertised by the optional Wayland binding.
+        if self.direct {
+            return;
+        }
+        // Changing domains invalidates requests sampled in the old clock.
+        self.timing.requested_at.clear();
+        self.timing.clock_id = libc::clockid_t::try_from(clock_id).ok();
+    }
+
     fn should_stop(&self) -> bool {
         self.closed
             || SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
@@ -2112,8 +2202,9 @@ impl State {
             .iter()
             .zip(interval.outputs.iter())
             .zip(interval.phases.iter())
+            .zip(interval.latency.iter())
             .map(
-                |((presenter, accum), &(phase_ms, phase_spread_ms))| OutputTiming {
+                |(((presenter, accum), &(phase_ms, phase_spread_ms)), &latency)| OutputTiming {
                     name: presenter.name.clone(),
                     presented: accum.presented,
                     discarded: accum.discarded,
@@ -2122,6 +2213,7 @@ impl State {
                     phase_ms,
                     phase_spread_ms,
                     lag_frames: accum.lag_frames,
+                    commit_to_present_ms: latency,
                 },
             )
             .collect();
@@ -2223,6 +2315,7 @@ impl State {
                 gpu: per_ms(self.stats.gpu),
             },
             presentation_feedback,
+            gpu_timing: self.gpu.as_mut().map(|gpu| gpu.take_timing_stats()),
             offset_ms: interval
                 .offset
                 .map(|(mean, max)| PresentationOffset { mean, max }),
@@ -2313,6 +2406,21 @@ pub fn run_with_presentation_until(
     deadline: Option<Instant>,
 ) -> anyhow::Result<()> {
     install_shutdown_signal_handler();
+    let selection = std::env::var("SUEDE_TEST_OUTPUTS");
+    let selected_spec = match selection {
+        Ok(names) => {
+            anyhow::ensure!(
+                direct.is_none(),
+                "SUEDE_TEST_OUTPUTS requires Wayland presentation"
+            );
+            let selected = select_test_outputs(spec, &names)?;
+            eprintln!("slicer: TEST OUTPUT SELECTION SUEDE_TEST_OUTPUTS={names}: presenting {} of {} slices; full canvas, participant layout, and physical display configuration retained", selected.slices.len(), spec.slices.len());
+            Some(selected)
+        }
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => return Err(anyhow::anyhow!("invalid SUEDE_TEST_OUTPUTS: {error}")),
+    };
+    let spec = selected_spec.as_ref().unwrap_or(spec);
     if direct.is_some() {
         anyhow::ensure!(
             spec.renderer != Renderer::Cpu,
@@ -2366,7 +2474,13 @@ pub fn run_with_presentation_until(
         free_run: spec.free_run,
         renderer: spec.renderer,
         presentation,
-        timing: Timing::new(spec.slices.len()),
+        timing: {
+            let mut timing = Timing::new(spec.slices.len());
+            if direct.is_some() {
+                timing.clock_id = Some(libc::CLOCK_MONOTONIC);
+            }
+            timing
+        },
         stats: FrameStats::new(),
         gpu: None,
         gpu_formats: DmabufFormats::default(),
@@ -2927,6 +3041,31 @@ pub fn run_with_presentation_until(
             return state.finish();
         }
     }
+}
+
+/// Testbed-only presentation selection: preserve full blend participants and
+/// canvas dimensions while retaining the original order of selected slices.
+pub(super) fn select_test_outputs(spec: &SlicerSpec, names: &str) -> anyhow::Result<SlicerSpec> {
+    let names: Vec<&str> = names.split(',').map(str::trim).collect();
+    anyhow::ensure!(
+        !names.iter().any(|name| name.is_empty()),
+        "SUEDE_TEST_OUTPUTS contains an empty output name"
+    );
+    for (index, name) in names.iter().enumerate() {
+        anyhow::ensure!(
+            !names[..index].contains(name),
+            "SUEDE_TEST_OUTPUTS repeats output {name}"
+        );
+        anyhow::ensure!(
+            spec.slices.iter().any(|slice| slice.output == *name),
+            "SUEDE_TEST_OUTPUTS names unknown output {name}"
+        );
+    }
+    let mut selected = spec.clone();
+    selected
+        .slices
+        .retain(|slice| names.contains(&slice.output.as_str()));
+    Ok(selected)
 }
 
 fn validate_direct_outputs(
@@ -4406,6 +4545,9 @@ fn present_frame_direct(state: &mut State, capture_slot: Option<usize>) -> anyho
             .blend_direct(canvas, state.capture.y_invert, &jobs)
             .context("direct blend failed")?;
         state.stats.gpu += frame.gpu_wait;
+        for &index in &due {
+            state.timing.request(snapshot_id, index);
+        }
         gpu.present_direct(frame, snapshot_id)
             .context("direct present failed")?;
         state.capture.last_blended_slot = Some(slot);
@@ -4419,6 +4561,7 @@ fn present_frame_direct(state: &mut State, capture_slot: Option<usize>) -> anyho
                 .blend_static_direct(canvas, std::slice::from_ref(job))
                 .context("direct static blend failed")?;
             state.stats.gpu += frame.gpu_wait;
+            state.timing.request(snapshot_id, job.output);
             gpu.present_direct(frame, snapshot_id)
                 .context("direct static present failed")?;
         }
@@ -4426,7 +4569,6 @@ fn present_frame_direct(state: &mut State, capture_slot: Option<usize>) -> anyho
     for index in due {
         let p = &mut state.presenters[index];
         p.stale = false;
-        state.timing.request(snapshot_id, index);
         p.commit_sent(snapshot_id, true);
         p.direct_pending_warp.insert(snapshot_id, p.warp_revision);
         while p.direct_pending_warp.len() > 16 {
@@ -5465,12 +5607,14 @@ fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
         .collect();
     let frame = gpu.sync_direct(&jobs).context("direct sync blend failed")?;
     state.stats.gpu += frame.gpu_wait;
+    for &index in &due {
+        state.timing.request(snapshot_id, index);
+    }
     gpu.present_direct(frame, snapshot_id)
         .context("direct sync present failed")?;
     for index in due {
         let p = &mut state.presenters[index];
         p.stale = false;
-        state.timing.request(snapshot_id, index);
         p.commit_sent(snapshot_id, true);
         p.direct_pending_warp.insert(snapshot_id, p.warp_revision);
         while p.direct_pending_warp.len() > 16 {
@@ -6269,17 +6413,16 @@ impl Dispatch<WlBuffer, (usize, usize)> for State {
 
 impl Dispatch<WpPresentation, ()> for State {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &WpPresentation,
-        _: wp_presentation::Event,
+        event: wp_presentation::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // The only event (`ClockId`) says which clock domain the feedback
-        // timestamps use. They are only ever compared against each other
-        // here (the inter-output offset), never against wall time, so which
-        // clock it is does not change anything this module does with it.
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.set_presentation_clock(clk_id);
+        }
     }
 }
 
@@ -6327,8 +6470,10 @@ impl Dispatch<WpPresentationFeedback, (usize, u64, u64)> for State {
                 flags,
                 ..
             } => {
-                let at_ns = ((u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo)) * 1_000_000_000
-                    + u64::from(tv_nsec);
+                let at_ns = (tv_nsec < 1_000_000_000)
+                    .then(|| (u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo))
+                    .and_then(|seconds| seconds.checked_mul(1_000_000_000))
+                    .and_then(|nanos| nanos.checked_add(u64::from(tv_nsec)));
                 // Only the `zero_copy` bit (3) is counted today. `flags` is
                 // decoded as the full `Kind` bitfield rather than masked by
                 // hand, so `vsync` (bit 0) and `hw_completion` (bit 2) stay
@@ -6357,7 +6502,7 @@ impl Dispatch<WpPresentationFeedback, (usize, u64, u64)> for State {
                 }
                 state
                     .timing
-                    .presented(snapshot_id, index, at_ns, refresh, zero_copy);
+                    .presented_optional(snapshot_id, index, at_ns, refresh, zero_copy);
             }
             wp_presentation_feedback::Event::Discarded => {
                 state.timing.discarded(snapshot_id, index);
@@ -8053,6 +8198,111 @@ mod tests {
         busy[0] = false;
         assert_eq!(free_present_slot(&busy, 2), Some(0));
         assert_eq!(free_present_slot(&[], 0), None);
+    }
+
+    #[test]
+    fn compositor_clock_preserves_direct_domain_and_updates_wayland_domain() {
+        let mut state = bare_state(vec![]);
+        state.timing = Timing::new(1);
+        state.direct = true;
+        state.timing.clock_id = Some(libc::CLOCK_MONOTONIC);
+        state.timing.request(1, 0);
+        let request_ns = state.timing.requested_at[&(1, 0)];
+
+        state.set_presentation_clock(libc::CLOCK_REALTIME as u32);
+        assert_eq!(state.timing.clock_id, Some(libc::CLOCK_MONOTONIC));
+        assert_eq!(state.timing.requested_at[&(1, 0)], request_ns);
+
+        state.direct = false;
+        state.set_presentation_clock(libc::CLOCK_REALTIME as u32);
+        assert_eq!(state.timing.clock_id, Some(libc::CLOCK_REALTIME));
+        assert!(state.timing.requested_at.is_empty());
+        assert_eq!(state.timing.pending[&1][0], Slot::Waiting);
+        state
+            .timing
+            .presented(1, 0, request_ns + 1_000_000, 0, false);
+        assert!(state.timing.drain_interval().latency[0].is_none());
+    }
+
+    #[test]
+    fn request_latency_uses_matching_clock_and_rejects_missing_or_negative_time() {
+        let mut timing = Timing::new(1);
+        timing.request(1, 0);
+        timing.presented(1, 0, 50_000_000, 16_000_000, false);
+        assert!(timing.drain_interval().latency[0].is_none());
+        timing.request(2, 0);
+        timing.requested_at.insert((2, 0), 20_000_000);
+        timing.presented(2, 0, 15_000_000, 16_000_000, false);
+        assert!(timing.drain_interval().latency[0].is_none());
+        timing.request(3, 0);
+        timing.requested_at.insert((3, 0), 20_000_000);
+        timing.presented(3, 0, 25_000_000, 16_000_000, false);
+        let sample = timing.drain_interval().latency[0].unwrap();
+        assert_eq!(sample.samples, 1);
+        assert_eq!((sample.mean, sample.p95, sample.max), (5.0, 5.0, 5.0));
+        assert!(timing.drain_interval().latency[0].is_none());
+        assert!(presentation_clock_ns(libc::CLOCK_THREAD_CPUTIME_ID).is_none());
+        assert!(presentation_clock_ns(libc::CLOCK_MONOTONIC).is_some());
+    }
+
+    #[test]
+    fn request_latency_handles_out_of_order_duplicates_discards_and_eviction() {
+        let mut timing = Timing::new(2);
+        for id in 1..=2 {
+            for index in 0..2 {
+                timing.request(id, index);
+                timing.requested_at.insert((id, index), 1_000_000);
+            }
+        }
+        timing.presented(2, 1, 4_000_000, 0, false);
+        timing.presented(2, 1, 9_000_000, 0, false);
+        timing.discarded(2, 0);
+        timing.presented(1, 0, 3_000_000, 0, false);
+        timing.discarded(1, 1);
+        let interval = timing.drain_interval();
+        assert_eq!(interval.latency[0].unwrap().mean, 2.0);
+        assert_eq!(interval.latency[1].unwrap().mean, 3.0);
+        assert!(timing.requested_at.is_empty());
+        for id in 3..30 {
+            timing.request(id, 0);
+            timing.requested_at.insert((id, 0), id);
+        }
+        assert_eq!(timing.pending.len(), 16);
+        assert_eq!(timing.requested_at.len(), 16);
+        timing.presented(3, 0, 100, 0, false);
+        assert!(timing.drain_interval().latency[0].is_none());
+    }
+
+    #[test]
+    fn request_latency_distribution_is_bounded_and_reports_nearest_rank_p95() {
+        let mut timing = Timing::new(1);
+        for id in 1..=5000 {
+            timing.request(id, 0);
+            timing.requested_at.insert((id, 0), 1_000_000);
+            timing.presented(id, 0, 1_000_000 + id * 1_000_000, 0, false);
+        }
+        let distribution = timing.drain_interval().latency[0].unwrap();
+        assert_eq!(distribution.samples, 4096);
+        assert_eq!(distribution.mean, 2048.5);
+        assert_eq!(distribution.p95, 3892.0);
+        assert_eq!(distribution.max, 4096.0);
+    }
+
+    #[test]
+    fn test_output_selection_preserves_canvas_and_layout_and_slice_order() {
+        let mut spec = pattern_spec();
+        let mut second = spec.slices[0].clone();
+        second.output = "DP-2".into();
+        spec.slices.push(second);
+        spec.coverage_rects = vec![spec.slices[0].slice, spec.slices[1].slice];
+        let selected = select_test_outputs(&spec, " DP-2 ").unwrap();
+        let mut expected = spec.clone();
+        expected.slices.remove(0);
+        assert_eq!(selected, expected);
+        assert_eq!(select_test_outputs(&spec, "DP-2,DP-1").unwrap(), spec);
+        for invalid in ["", "DP-1,", ",DP-1", "missing", "DP-1,DP-1"] {
+            assert!(select_test_outputs(&spec, invalid).is_err(), "{invalid}");
+        }
     }
 
     fn pattern_spec() -> SlicerSpec {

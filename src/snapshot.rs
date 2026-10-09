@@ -338,6 +338,7 @@ mod tests {
             timestamp_source: None,
             capture_intervals: CaptureIntervals::default(),
             outputs: Vec::new(),
+            gpu_timing: None,
         };
         assert!(snapshot.set_projection_stats(Some(stats.clone())));
         assert!(
@@ -411,6 +412,7 @@ mod tests {
             timestamp_source: None,
             capture_intervals: CaptureIntervals::default(),
             outputs: Vec::new(),
+            gpu_timing: None,
         };
         snapshot.set_projection_stats(Some(stats.clone()));
         let report = snapshot.projection_report();

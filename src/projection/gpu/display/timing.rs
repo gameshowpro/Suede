@@ -562,6 +562,16 @@ impl CalibrationApi {
             domains.contains(&MONOTONIC_DOMAIN),
             "CLOCK_MONOTONIC calibration domain unavailable"
         );
+        self.sample_known_device_monotonic()
+    }
+
+    /// Sample domains already checked by `sample_device_monotonic` at startup,
+    /// without re-enumerating physical-device capabilities on every frame.
+    ///
+    /// # Safety
+    /// DEVICE and CLOCK_MONOTONIC must be supported. The same instance and
+    /// device liveness requirements as `sample_device_monotonic` apply.
+    pub(crate) unsafe fn sample_known_device_monotonic(&self) -> anyhow::Result<CalibrationSample> {
         let infos = [
             vk::CalibratedTimestampInfoKHR::default().time_domain(vk::TimeDomainKHR::DEVICE),
             vk::CalibratedTimestampInfoKHR::default()

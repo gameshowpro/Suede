@@ -506,8 +506,10 @@ mod tests {
                     phase_ms: Some(*phase),
                     phase_spread_ms: Some(0.1),
                     lag_frames: LagFrames::default(),
+                    commit_to_present_ms: None,
                 })
                 .collect(),
+            gpu_timing: None,
         }
     }
 

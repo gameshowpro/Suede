@@ -1246,6 +1246,67 @@ pub struct ProjectionStats {
     /// keeping up with every canvas frame or only every second one.
     pub capture_intervals: CaptureIntervals,
     pub outputs: Vec<OutputTiming>,
+    /// Detailed Vulkan timing for this interval. Missing on reports from
+    /// older slicers; null means this slicer did not report GPU timing.
+    #[serde(default)]
+    pub gpu_timing: Option<ProjectionGpuTiming>,
+}
+
+/// Vulkan submission, execution, and completion measurements for an interval.
+/// Durations are milliseconds. GPU spans can overlap between outputs and may
+/// include GPU scheduling or preemption, so they are not additive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGpuTiming {
+    /// One of `sampled`, `full`, `disabled`, `unsupported`, or `unavailable`.
+    pub status: String,
+    /// Number of submissions between GPU timestamp samples; zero when disabled.
+    pub sample_every: u32,
+    /// Vulkan queue submissions in the interval.
+    pub submissions: u32,
+    /// GPU timestamp query failures in the interval.
+    pub query_failures: u32,
+    /// GPU timestamp span. Null means no valid GPU timestamp samples.
+    pub gpu_span_ms: Option<TimingDistribution>,
+    /// Host wall time spent inside queue submission.
+    pub submit_ms: Option<TimingDistribution>,
+    /// Host wall time from entering submission through observing fence completion.
+    pub completion_ms: Option<TimingDistribution>,
+    /// Completion time minus GPU span; includes queueing, host, and other time.
+    pub outside_gpu_span_ms: Option<TimingDistribution>,
+    /// Calibrated time from entering `vkQueueSubmit` to the first TOP_OF_PIPE
+    /// timestamp. Includes submit-call and driver scheduling time; it is not
+    /// a measure of time spent waiting on a busy GPU queue.
+    pub queue_delay_ms: Option<TimingDistribution>,
+    /// Calibrated time from the final GPU timestamp to host observation of
+    /// fence completion. This is post-completion scheduling and wakeup delay,
+    /// not submission-to-completion time.
+    pub completion_observation_ms: Option<TimingDistribution>,
+    /// Vulkan-reported calibration sample deviation; not a total accuracy bound.
+    pub calibration_deviation_ms: Option<TimingDistribution>,
+    /// Timestamp span per presented output index; can include earlier outputs'
+    /// pipeline backlog and is not an isolated per-pass cost.
+    pub outputs: Vec<ProjectionGpuOutputTiming>,
+}
+
+/// GPU timestamp span for one physical output index.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectionGpuOutputTiming {
+    pub index: usize,
+    /// Null means this output had no valid timestamp samples.
+    pub gpu_span_ms: Option<TimingDistribution>,
+}
+
+/// Distribution of sampled durations, in milliseconds. At most 4096 valid
+/// samples are retained per distribution per reporting interval.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TimingDistribution {
+    pub samples: u32,
+    pub mean: f64,
+    pub p95: f64,
+    pub max: f64,
 }
 
 /// Where a captured frame's time went in the slicer, in ms, averaged over
@@ -1319,6 +1380,14 @@ pub struct OutputTiming {
     /// visibly behind while this reads all-zero, the lag is in the display,
     /// not the presentation path.
     pub lag_frames: LagFrames,
+    /// Request/submission-to-display time measured with validated protocol
+    /// timestamps: from immediately before the Wayland feedback request or
+    /// direct queue_present through the display timestamp. Uses the announced
+    /// Wayland clock or CLOCK_MONOTONIC for direct presentation. This is not
+    /// capture-to-display or photon latency. Null when timestamps are absent,
+    /// unsupported, invalid, or from an unknown clock.
+    #[serde(default)]
+    pub commit_to_present_ms: Option<TimingDistribution>,
 }
 
 /// Histogram of a per-snapshot lag, in whole refresh periods, behind the
@@ -1361,9 +1430,11 @@ mod tests {
         let stats: ProjectionStats = serde_json::from_value(legacy).unwrap();
         assert_eq!(stats.presentation_backend, None);
         assert_eq!(stats.timestamp_source, None);
+        assert_eq!(stats.gpu_timing, None);
         let serialized = serde_json::to_value(&stats).unwrap();
         assert!(serialized.get("presentationBackend").is_none());
         assert!(serialized.get("timestampSource").is_none());
+        assert_eq!(serialized["gpuTiming"], serde_json::Value::Null);
 
         let stats = ProjectionStats {
             presentation_backend: Some("vulkan-display".into()),
@@ -1373,6 +1444,71 @@ mod tests {
         let serialized = serde_json::to_value(stats).unwrap();
         assert_eq!(serialized["presentationBackend"], "vulkan-display");
         assert_eq!(serialized["timestampSource"], "VK_EXT_present_timing");
+    }
+
+    #[test]
+    fn gpu_timing_keeps_unavailable_distinct_from_measured_zero() {
+        let measured = ProjectionGpuTiming {
+            status: "sampled".into(),
+            sample_every: 16,
+            submissions: 32,
+            query_failures: 0,
+            gpu_span_ms: Some(TimingDistribution {
+                samples: 2,
+                mean: 0.0,
+                p95: 0.0,
+                max: 0.0,
+            }),
+            submit_ms: None,
+            completion_ms: None,
+            outside_gpu_span_ms: None,
+            queue_delay_ms: None,
+            completion_observation_ms: None,
+            calibration_deviation_ms: None,
+            outputs: vec![ProjectionGpuOutputTiming {
+                index: 0,
+                gpu_span_ms: None,
+            }],
+        };
+        let json = serde_json::to_value(&measured).unwrap();
+        assert_eq!(json["gpuSpanMs"]["mean"], 0.0);
+        assert_eq!(json["submitMs"], serde_json::Value::Null);
+        assert_eq!(json["outputs"][0]["index"], 0);
+        assert_eq!(json["outputs"][0]["gpuSpanMs"], serde_json::Value::Null);
+
+        let decoded: ProjectionGpuTiming = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.gpu_span_ms.unwrap().mean, 0.0);
+        assert_eq!(decoded.submit_ms, None);
+    }
+
+    #[test]
+    fn output_commit_to_present_timing_is_backward_compatible_and_nullable() {
+        let legacy: OutputTiming = serde_json::from_value(serde_json::json!({
+            "name": "DP-1",
+            "presented": 1,
+            "discarded": 0,
+            "zeroCopyPresented": 0,
+            "refreshHz": 60.0,
+            "phaseMs": null,
+            "phaseSpreadMs": null,
+            "lagFrames": {"zero": 0, "one": 0, "two": 0, "more": 0}
+        }))
+        .unwrap();
+        assert_eq!(legacy.commit_to_present_ms, None);
+
+        let measured = OutputTiming {
+            commit_to_present_ms: Some(TimingDistribution {
+                samples: 1,
+                mean: 0.0,
+                p95: 0.0,
+                max: 0.0,
+            }),
+            ..legacy
+        };
+        let json = serde_json::to_value(&measured).unwrap();
+        assert_eq!(json["commitToPresentMs"]["mean"], 0.0);
+        let decoded: OutputTiming = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.commit_to_present_ms.unwrap().samples, 1);
     }
 
     #[test]

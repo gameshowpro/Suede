@@ -541,10 +541,12 @@ window.addEventListener("error", (event) => {
           content is drawing.</p>
         <table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table>
         <table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
-          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th>
+          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th><th>Request to present</th><th>GPU span</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
         <p class="hint" id="pj-timing-hint">Measured by the slicer over each
-          10 s interval from the compositor's presentation timestamps.
+          10 s interval using validated protocol display timestamps. Request to
+          present starts immediately before the Wayland feedback request or
+          direct submission; it is not capture-to-glass or photon latency.
           Offset is how far apart the displays showed the same frame; a
           straddle is a frame they showed on different refreshes. A gate
           hold is a commit the wall delayed past a canvas period waiting for
@@ -3372,6 +3374,36 @@ function renderProjectionTiming() {
   ].filter(([n]) => n > 0).map(([n, label]) => `${n} ${label}`);
   const cadence = cadenceParts.length ? cadenceParts.join(", ") : "—";
 
+  const gpuTiming = s.gpuTiming;
+  const timingSummary = (d, digits = 3) => d == null
+    ? "not measured"
+    : `${num(d.mean, digits)} ms mean / ${num(d.p95, digits)} ms p95 (${d.samples} samples)`;
+  const gpuDistribution = (d) => d == null ? "—" : timingSummary(d);
+  let gpuStatusText = "not reported by this slicer version";
+  let gpuSpanText = "—";
+  let gpuCompletionText = "—";
+  let gpuDetails = "";
+  if (gpuTiming != null) {
+    const statusDetails = gpuTiming.status === "sampled" || gpuTiming.status === "full"
+      ? `every ${gpuTiming.sampleEvery} submission(s)`
+      : escape(gpuTiming.status);
+    gpuStatusText = `${statusDetails} · ${gpuTiming.submissions} submissions · ${gpuTiming.queryFailures} query failures`;
+    gpuSpanText = gpuTiming.status === "disabled" || gpuTiming.status === "unsupported" || gpuTiming.status === "unavailable"
+      ? `not measured (${escape(gpuTiming.status)})`
+      : timingSummary(gpuTiming.gpuSpanMs);
+    gpuCompletionText = timingSummary(gpuTiming.completionMs);
+    const timingNames = [
+      ["Host queue-submit time", gpuTiming.submitMs],
+      ["Completion outside GPU span", gpuTiming.outsideGpuSpanMs],
+      ["Calibrated queue delay (submit entry to first GPU timestamp)", gpuTiming.queueDelayMs],
+      ["Post-completion observation delay (last GPU timestamp to fence observation)", gpuTiming.completionObservationMs],
+      ["Reported calibration sample deviation", gpuTiming.calibrationDeviationMs],
+    ];
+    const measuredDetails = timingNames.filter(([, value]) => value != null)
+      .map(([label, value]) => `<div>${label}: ${timingSummary(value)}</div>`).join("");
+    if (measuredDetails) gpuDetails = `<details><summary>Additional GPU timing details</summary>${measuredDetails}</details>`;
+  }
+
   const rows = [
     ["Canvas", `${num(s.canvasFps)} fps captured, ${num(s.presentedFps)} presented`],
     ["Mode", s.freeRun ? "free-run" : "locked"],
@@ -3389,7 +3421,10 @@ function renderProjectionTiming() {
       `snapshot ${num(s.perFrameMs.snapshot)} ms · ` +
       `request ${num(s.perFrameMs.requesting)} ms · ` +
       `blend ${num(s.perFrameMs.blending)} ms` +
-      (s.perFrameMs.gpu > 0 ? ` · gpu ${num(s.perFrameMs.gpu)} ms` : "")],
+      (s.perFrameMs.gpu > 0 ? ` · fence wait ${num(s.perFrameMs.gpu)} ms` : "")],
+    ["GPU execution span", gpuSpanText],
+    ["Submission to completion (host)", gpuCompletionText],
+    ["GPU timing", `${gpuStatusText}<br><span class="hint">GPU span includes scheduling stalls; per-output GPU spans overlap and should not be summed.</span>${gpuDetails}`],
     ["Measured at", new Date(s.measuredAt * 1000).toLocaleTimeString()],
   ];
   $("pj-timing-rows").innerHTML = rows
@@ -3408,12 +3443,14 @@ function renderProjectionTiming() {
     const total = lag.zero + lag.one + lag.two + lag.more;
     return total === 0 ? "—" : `${lag.zero}·${lag.one}·${lag.two}·${lag.more}`;
   };
-  $("pj-timing-outputs").innerHTML = s.outputs.map((o) =>
+  $("pj-timing-outputs").innerHTML = s.outputs.map((o, index) =>
     `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
     `<td>${o.discarded}</td><td class="mono">${o.zeroCopyPresented}/${o.presented}</td>` +
     `<td class="mono">${trimHz(o.refreshHz)}</td>` +
     `<td class="mono">${phaseCell(o)}</td>` +
-    `<td class="mono">${lagCell(o.lagFrames)}</td></tr>`).join("");
+    `<td class="mono">${lagCell(o.lagFrames)}</td>` +
+    `<td class="mono">${timingSummary(o.commitToPresentMs)}</td>` +
+    `<td class="mono">${gpuDistribution(gpuTiming?.outputs?.find((timing) => timing.index === index)?.gpuSpanMs)}</td></tr>`).join("");
 }
 
 for (const id of ["pj-blend", "pj-highlight-overlaps", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-renderer", "tp-pattern"]) {

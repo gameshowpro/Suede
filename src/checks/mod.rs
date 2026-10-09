@@ -4182,6 +4182,7 @@ mod tests {
             phase_ms,
             phase_spread_ms: Some(0.1),
             lag_frames: LagFrames::default(),
+            commit_to_present_ms: None,
         }
     }
 
@@ -4210,6 +4211,7 @@ mod tests {
             timestamp_source: None,
             capture_intervals: crate::model::CaptureIntervals::default(),
             outputs,
+            gpu_timing: None,
         }
     }
 

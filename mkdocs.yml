@@ -56,6 +56,7 @@ nav:
   - Troubleshooting: troubleshooting.md
   - Developer:
       - Architecture: developer/architecture.md
+      - GPU timing: developer/gpu-timing.md
       - VK_KHR direct display: developer/vk-khr.md
       - Test systems: developer/test-systems.md
       - Deployment: developer/deployment.md

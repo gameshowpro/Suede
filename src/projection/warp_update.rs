@@ -325,6 +325,22 @@ impl Controller {
     }
 
     fn request(&mut self, update: ControlUpdate) {
+        let selection = std::env::var("SUEDE_TEST_OUTPUTS").ok();
+        self.request_with_selection(update, selection.as_deref());
+    }
+
+    fn request_with_selection(&mut self, mut update: ControlUpdate, selection: Option<&str>) {
+        // The testbed selects presenters, while each incoming layout still
+        // carries the full configured blend-participant roster.
+        if let Some(names) = selection {
+            match super::slicer::select_test_outputs(&update.spec, names) {
+                Ok(spec) => update.spec = spec,
+                Err(error) => {
+                    self.reject(update.generation, error.to_string());
+                    return;
+                }
+            }
+        }
         let reason = if update.version != CONTROL_VERSION {
             Some("control version mismatch; restart required".to_string())
         } else if update.session != self.session() {
@@ -1027,6 +1043,34 @@ mod tests {
                 .collect(),
         });
         spec
+    }
+
+    #[test]
+    fn test_output_selection_retains_full_layout_through_live_control() {
+        let full = public_layout_fixture();
+        let selected = super::super::slicer::select_test_outputs(&full, "P1").unwrap();
+        assert_eq!(selected.layout, full.layout);
+        assert_eq!(selected.layout.as_ref().unwrap().participants.len(), 3);
+        assert_eq!((selected.canvas_width, selected.canvas_height), (14, 8));
+        let mut controller = Controller::new(&selected, vec![(6, 8)], 2).unwrap();
+        let initial = complete(&mut controller);
+        controller.installed(&initial);
+        let mut update = full.clone();
+        update.gamma = 2.4;
+        controller.request_with_selection(
+            ControlUpdate::new(controller.session().into(), 1, update.clone()),
+            Some("P1"),
+        );
+        let prepared = complete(&mut controller);
+        assert_eq!(prepared.spec.layout, update.layout);
+        assert_eq!(prepared.spec.canvas_width, full.canvas_width);
+        assert_eq!(prepared.outputs.len(), 1);
+        assert_eq!(prepared.outputs[0].name, "P1");
+        assert_eq!(prepared.outputs[0].index, 0);
+        assert_eq!(prepared.spec.slices[0], update.slices[1]);
+        assert_eq!(prepared.spec.gamma, 2.4);
+        controller.installed(&prepared);
+        assert!(!controller.requires_restart());
     }
 
     #[test]
