@@ -89,6 +89,46 @@ as a frame-index-matched UE CSV range. Report those windows separately. Neither
 higher engine FPS without Suede nor a smaller fence wait alone proves an
 end-to-end improvement.
 
+## GPU table memory
+
+Projection storage buffers prefer coherent, CPU-mappable device-local memory
+by default. This keeps frequently read per-pixel transfer tables close to the
+GPU. The same policy applies to the small sync-pattern shape buffers. Image
+uploads and GPU readback buffers keep their existing placement.
+
+`SUEDE_GPU_TABLE_MEMORY` is a runtime diagnostic setting inherited by the slicer:
+
+- `auto` (default): prefer mapped device-local storage, retain CPU table copies,
+  and fall back to compatible coherent host-visible memory when necessary.
+- `host`: restore the original first-compatible-host-memory policy and mapped
+  table comparisons, without CPU copies, for diagnosis and baseline comparisons.
+
+An invalid value logs a warning and uses `auto`. Restart the Suede service after
+changing the setting; it is applied when the Vulkan device is created.
+
+The preferred heap can be much smaller than total VRAM. Allocation or mapping
+failures fall back to compatible coherent host-visible memory; device-loss errors
+still propagate. Allocation logs report the actual memory type, heap, flags,
+size, and fallback, so the policy alone does not prove local placement.
+`fallback` reports a retry after an allocation or mapping failure; a device
+with no eligible local type can select host memory directly with `fallback=false`.
+The automatic policy retains packed CPU copies for table equality checks,
+avoiding slow CPU reads of mapped device memory. This adds about 31.6 MiB of
+live CPU table storage for four 1080p outputs. Table replacement temporarily
+retains both old and new GPU allocations and CPU copies to preserve atomic
+updates. On unified-memory GPUs, device-local memory may share physical memory
+with the CPU. Performance gains and memory costs depend on the device; the
+measurements below cover one discrete GPU.
+
+The campaigns below used an earlier experimental binary whose equivalent
+opt-in was `SUEDE_TEST_LOCAL_TABLES=1`. That experimental variable has been
+replaced by the default automatic policy and the `host` diagnostic override.
+
+The promoted default passed all seven offscreen rendering and table-update
+tests with the setting unset, and again with `host`. It also passed the actual
+heap-exhaustion test with the setting unset. All hardware runs enabled the
+Khronos validation layer and reported no validation errors.
+
 ## Measurements on October 9, 2026
 
 The baseline on [System A](test-systems.md#system-a) used Electric Dreams on
@@ -145,6 +185,273 @@ GPU and workload, not a universal overhead bound; qualify other hardware and
 high-frame-rate workloads separately. The comparison does not isolate the
 always-enabled presentation-latency bookkeeping.
 
+### Table placement and CPU comparisons
+
+The device-span result suggested testing the transfer-table memory placement.
+Four 1080p tables contain 33.18 MB of packed entries. This system selected system
+memory (type 3, heap 1) by default; the experiment selected device-local mapped
+memory (type 5, heap 2). The GPU's PCIe link was Gen 3 x16.
+
+Moving the buffers alone was insufficient: the first candidate's packed-table
+no-op comparison took about 1,002 ms, versus 126 ms with the original placement.
+CPU reads of the device mapping made unchanged-table checks substantially worse.
+The revised candidate keeps a CPU copy atomically with the GPU buffer. Means
+from three optimized, idle hardware benchmark runs per condition were:
+
+| Four-output host operation | Original placement (ms) | Local placement + CPU copy (ms) |
+| --- | --- | --- |
+| Fixed-table no-op | 637.10 | 4.78 |
+| Fixed-table replacement | 25.01 | 19.64 |
+| Packed-table no-op | 126.31 | 1.71 |
+| Packed-table replacement | 10.62 | 17.13 |
+
+The scene uses the fixed-table path. Fixed replacement reuses the packed CPU
+buffer it already creates; borrowed packed replacement must make an extra copy,
+which explains the observed tradeoff. These are table-operation timings, not
+frame times or complete UI-edit latencies. Pixel-content assertions ran after
+timing, and validation layers were disabled for these benchmarks.
+
+Separate readback runs with the Khronos validation layer explicitly enabled
+passed all seven tests in both modes, with no validation errors. They covered
+144 shader cases (exact identity pixels, at most one byte of warped-channel
+error), 864,000 dynamic pixels, cross-API no-ops, sparse outputs, and failed
+replacement preserving both active table bytes and rendered pixels.
+
+The final rendering comparison used the revised binary for both variants,
+three paired repetitions, full metering, and the same 60-second warmup and
+60-second measurement periods. Pair order alternated. Every trial verified
+the actual memory type in allocation logs, with no fallback, and all timestamp
+queries succeeded. Source and runtime fingerprints matched within each pair.
+
+| Four-output measurement | Original placement | Local placement + CPU copy |
+| --- | --- | --- |
+| GPU span | 3.008 ms | 0.241 ms |
+| Host submission-to-completion | 3.362 ms | 0.566 ms |
+| Calibrated queue delay | 0.286 ms | 0.272 ms |
+| Request to present, across output feedback samples | 11.776 ms | 11.541 ms |
+| UE FPS, early cycle | 39.09 | 43.83 |
+| UE FPS, late cycle | 38.27 | 43.06 |
+| Presented cycles/s | 37.97 | 40.87 |
+
+Mean paired improvements were **92.0% less GPU span**, **12.5% higher late-cycle
+engine FPS**, and **7.6% more presented cycles/s**. The late engine gain ranged
+from 12.3% to 12.6% across pairs; the presented-rate gain ranged from 7.1% to
+8.3%. All six trials contained both complete 900-frame CSV windows, and the
+early cycle also improved (12.2% mean paired gain). These are descriptive
+results from three pairs, not a universal performance guarantee.
+
+The nearly unchanged calibrated queue delay and much shorter device span
+support transfer-table placement as a concrete bottleneck in this workload.
+The change improves Suede's existing Wayland projection path. Request-to-present
+latency changed only slightly, and remains distinct from capture-to-display
+latency. A 92% reduction in projection span does not imply a 92% reduction in
+the whole rendering pipeline.
+
+Higher throughput also consumed more producer CPU: about 405% to 438% of one
+core, while slicer CPU fell from 2.90% to 2.81%. GPU power stayed close to the
+same level (254.1 to 255.7 W). The experiment demonstrates higher throughput,
+not lower total machine resource use at a fixed frame rate.
+
+The automatic policy adds CPU table storage, makes borrowed packed replacements
+slower, and uses a small mapped device-local heap (246 MiB on this GPU), so
+larger layouts can fall back to system memory. Allocation-failure fallback is
+covered by unit tests and the hardware qualification below. Other GPU families
+still need performance qualification; the measured speedup is not universal.
+The campaign appliance was restored to its original idle configuration with
+the experimental binary, default sampled metering, and storage and
+output-selection overrides removed.
+
+### Follow-up: output cost after local placement
+
+A subsequent exploratory pass repeated the one-, two-, and four-output
+conditions with local tables, one trial per condition in that order. The
+binary, camera, source dimensions, physical scanout configuration, full
+metering, and 60-second warmup/60-second collection recipe were unchanged.
+
+| Presented outputs | GPU span (ms) | Host completion (ms) | UE FPS, late cycle | Presented cycles/s |
+| --- | --- | --- | --- | --- |
+| 1 | 0.065 | 0.385 | 45.66 | 42.41 |
+| 2 | 0.123 | 0.458 | 44.56 | 41.96 |
+| 4 | 0.239 | 0.571 | 43.14 | 41.04 |
+
+The device-span increment from one to four outputs was 0.174 ms, versus
+2.253 ms in the original system-memory baseline. Calibrated queue delay stayed
+between 0.271 and 0.279 ms, and completion observation between 0.049 and
+0.056 ms. No timestamp-query failures, superseded frames, stalls, or discarded
+output frames occurred in the included collection intervals.
+
+This supports transfer-table placement as the dominant measured projection
+cost. It does not identify the remaining output-dependent engine cost:
+the run order was not counterbalanced, GPU temperature rose during the pass,
+and engine CSV and presentation telemetry still cover different windows.
+Compositor work and capture scheduling remain candidates for a separate
+experiment. Request-to-present latency was 10.11, 10.57, and 11.57 ms; this
+elapsed display latency is not GPU processing time or evidence of an equivalent
+amount of removable pipeline work.
+
+### Follow-up: actual mapped-heap exhaustion
+
+The ignored `local_table_fallback_under_small_heap_pressure` test qualified
+the storage fallback on the same GPU, separately from timing campaigns and
+with `VK_LAYER_KHRONOS_validation` enabled. It retained bounded production
+buffer allocations, confirmed an actual `ERROR_OUT_OF_DEVICE_MEMORY` from
+the preferred mapped-local type, and then replaced a 1024x1024 transfer table.
+Allocation logs verified `fallback=true`, system-memory type 3 on heap 1,
+and the complete 4 MiB replacement allocation. Exact shader pixels matched
+both while the preferred heap was exhausted and after pressure was released.
+No Vulkan validation errors were reported.
+
+The test fails explicitly on unsupported layouts or drivers that permit
+overcommit instead of producing the required exhaustion evidence. It covers
+offscreen allocation, replacement, and rendering; it does not establish
+compositor behavior or the performance of a large layout after fallback.
+
+### Follow-up: matched 30 FPS resource use
+
+Three four-output baseline/local pairs tested whether the shorter projection
+span also reduces resource use at the same delivered rate. Pair order was
+baseline/local, local/baseline, baseline/local. Both conditions used
+`t.MaxFPS 30`, with `-UseFixedTimeStep` and `-fps=60` removed so the real-time
+cap could operate. The frame-index camera loop still contained 900 frames.
+These capped conditions are compared with each other, separately from the
+uncapped fixed-step throughput trials.
+
+Each trial used 60 seconds of warmup and 60 seconds of collection. The engine
+window was frames 2700–3599, a complete later camera cycle; it is a separate
+window from the wall-clock power and presentation telemetry. GPU timings pool
+only complete reporting intervals inside collection. Other values below are
+means of the three trial means.
+
+| Four-output measurement at a 30 FPS cap | Original placement | Local placement + CPU copy |
+| --- | --- | --- |
+| UE FPS, later cycle | 29.998 | 29.999 |
+| Presented cycles/s | 29.999 | 29.993 |
+| GPU span | 3.009 ms | 0.235 ms |
+| Host submission-to-completion | 3.276 ms | 0.493 ms |
+| Calibrated queue delay | 0.165 ms | 0.164 ms |
+| Request to present | 10.339 ms | 10.304 ms |
+| GPU utilization | 69.16% | 60.36% |
+| GPU board power | 232.25 W | 228.88 W |
+| UE CPU, percent of one core | 332.06% | 331.72% |
+| Slicer CPU, percent of one core | 2.921% | 2.661% |
+
+The **8.8 percentage-point utilization reduction** is consistent with reducing
+the measured device span by about 2.77 ms per submission, or roughly 83 ms per
+second at 30 submissions/s. These spans include stalls, not just shader work.
+Board power fell by only **3.37 W (about 1.4%)**. All three pairs
+showed a reduction, ranging from 2.10 to 4.16 W (0.9% to 1.8%). Graphics clocks
+were similar, averaging 1869 and 1873 MHz. This is a modest observed reduction
+in total GPU board power, not a measurement of Suede-only power or whole-machine
+energy savings. Producer CPU and display latency barely changed.
+
+Every trial verified the requested storage type without fallback, used the
+same binary and app arguments, and had zero timestamp-query failures. The
+included presentation intervals had no superseded frames, stalls, or discarded
+output frames. The original idle configuration and service environment were
+restored afterward, with all 21 system checks passing.
+
+The strongest supported improvement is to keep the frequently read transfer
+tables in device-local memory and keep CPU-owned bytes for equality checks.
+It recovers GPU headroom and increases uncapped throughput; it does not yield
+an equally large power saving at a fixed rate. With four-output projection
+below 0.25 ms, subsequent throughput investigations should isolate source
+capture and compositor scheduling. The measured completion-observation delay
+alone does not justify removing the fence that protects the Wayland handoff.
+
 The timestamp semantics follow the
 [Vulkan timestamp command specification](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp.html)
 and the [Khronos timestamp-query example](https://docs.vulkan.org/samples/latest/samples/api/timestamp_queries/README.html).
+
+### Raspberry Pi shared-memory qualification (2026-10-09)
+
+On [System C](test-systems.md#system-c), the Pi 5's V3DV driver (Mesa
+26.2.0, Vulkan 1.3.354) exposed one 4 GiB Vulkan heap and one memory type:
+`DEVICE_LOCAL | HOST_VISIBLE | HOST_COHERENT`. Both policies selected type 0
+on heap 0 without fallback. The default therefore works directly on this
+unified-memory device; it does not fail over from dedicated GPU memory to
+CPU memory. There is no second memory heap to rescue an exhausted allocation.
+
+Release-mode table benchmarks used three counterbalanced pairs, separately
+from presentation trials, after compilation finished. The same binary ran with
+`SUEDE_GPU_TABLE_MEMORY` unset or set to `host`. Each operation updated four
+1920x1080 tables; these measure host elapsed time for offscreen updates,
+not four-display Pi playback. Values below are means of the three runs.
+
+| Four-output table operation | Host policy | Default policy |
+| --- | --- | --- |
+| Fixed-table initial installation | 44.94 ms | 42.16 ms |
+| Fixed-table unchanged-content check | 198.51 ms | 12.73 ms |
+| Fixed-table replacement | 46.76 ms | 52.59 ms |
+| Packed-table initial installation | 19.38 ms | 37.16 ms |
+| Packed-table unchanged-content check | 32.23 ms | 8.37 ms |
+| Packed-table replacement | 22.56 ms | 33.55 ms |
+
+CPU copies made the production fixed-table equality check about **15.6 times
+faster**, with a roughly 5.8 ms replacement penalty in this benchmark. Packed
+updates also had faster equality checks, but initial installation and replacement
+paid for copying the bytes. Four outputs retained 31.6 MiB of CPU shadow data;
+two outputs retain 15.8 MiB. These are logical allocation sizes, not predicted
+changes in RSS or proportional set size (PSS), which also depend on allocator
+retention and shared mappings.
+
+The presentation campaign kept a 3740x1080 source canvas and two 1920x1080
+outputs at 60 Hz, with a 100-pixel logical overlap. It used a frozen Mystify
+fixture with seeded initial geometry and inline canvas styles; the external CEF
+overlay stylesheet was omitted. Chromium 151 and Sway 1.10.1 were unchanged.
+The existing direct-scanout-disable setting stayed in effect. Automatic output
+realignment was disabled for every trial so it could not restart the slicer.
+
+Three pairs ran in host/default, default/host, host/default order using build
+`b0bb768-local-tables-pi`, full GPU timing, 30 seconds of warmup, and six complete
+reporting intervals per trial. Compilation, validation layers, and screenshots
+were excluded from these windows. FPS is weighted by interval duration; GPU
+spans are weighted by valid sample count. Process CPU and memory were sampled
+throughout the surrounding collection window, including the wait for a complete
+first interval.
+
+| Two-output Mystify measurement | Host policy | Default policy |
+| --- | --- | --- |
+| Captured canvas frames/s | 9.033 | 8.996 |
+| Presented cycles/s | 5.547 | 5.528 |
+| Projection GPU span | 24.096 ms | 23.792 ms |
+| Host submission-to-completion | 24.238 ms | 23.927 ms |
+| Slicer CPU, percent of one core | 0.369% | 0.358% |
+| Sway CPU, percent of one core | 97.07% | 96.95% |
+| Slicer PSS | 54.16 MiB | 62.23 MiB |
+
+There was no consistent playback benefit: paired presented-rate changes were
+-0.66%, +0.33%, and -0.69%. GPU-span changes also reversed direction between
+pairs. All 2,005 timestamp samples were valid, and neither policy had a stall
+or discarded output frame in the included intervals. Superseded frames remained
+similar (631 host, 629 default), as did presentation gate holds (848 and 852).
+No thermal throttling was reported; peak recorded temperature was 71.4 degrees C.
+Calibrated queue-delay measurements were unavailable on this driver.
+
+Sway consumed nearly one CPU core while the slicer consumed less than 0.4%.
+Together with the much longer presentation cycle than projection GPU span,
+this makes compositor and source-capture work a useful next profiling target.
+These measurements do not identify a particular Sway function as the bottleneck.
+Early online Seascape and Mystify readiness runs overlapped compilation and
+were excluded; their long waits are not a controlled workload or metering result.
+
+The Pi results support keeping the default without a Pi-specific allocation
+rule. The benefit here is faster table comparisons, with additional memory and
+some replacement cost; this does not reproduce the discrete GPU's placement
+speedup. `SUEDE_GPU_TABLE_MEMORY=host` remains available for memory-constrained
+installations or workloads dominated by frequent packed-table replacements.
+
+The offscreen suite ran against the hardware V3DV driver with Khronos validation
+enabled under both policies. Six of seven tests passed, including the new atomic
+replacement, no-op, rollback, and shader-visible table checks. The existing
+`shipped_shader_matches_reference_pixels` test stopped at the same one-level
+RGB mismatch under both policies: case 1, RGBA source and target, pixel 48,
+green channel, actual 1 versus expected 0. No Vulkan validation errors occurred.
+This remains an unresolved exact-pixel parity issue; these results do not claim
+that the entire cross-driver pixel suite passed. The separate-small-heap
+exhaustion test is not applicable to this single-heap device.
+
+The original installed binary, saved configuration, and active test-card app were
+restored and verified afterward. The original 15 passing checks and two warnings
+(direct scanout and output phase) remained, with no failed checks. The temporary
+fixture server was stopped. Raw campaign, qualification, and restoration evidence
+is retained under `/var/tmp/suede-pi-tables-20261009` on the test appliance.

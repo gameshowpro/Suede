@@ -427,6 +427,36 @@ pub struct PackedTransferUpdate<'a> {
     pub table: &'a [u32],
 }
 
+/// Placement policy for CPU-written GPU storage and transfer-table shadows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GpuTableMemory {
+    Auto,
+    Host,
+}
+
+/// Parse the policy without reading process state so defaults and invalid
+/// values can be checked independently of GPU availability.
+fn parse_gpu_table_memory(value: Option<&std::ffi::OsStr>) -> Result<GpuTableMemory, ()> {
+    match value {
+        None => Ok(GpuTableMemory::Auto),
+        Some(value) => match value.to_str() {
+            Some("auto") => Ok(GpuTableMemory::Auto),
+            Some("host") => Ok(GpuTableMemory::Host),
+            _ => Err(()),
+        },
+    }
+}
+
+fn gpu_table_memory_from_env() -> GpuTableMemory {
+    let value = std::env::var_os("SUEDE_GPU_TABLE_MEMORY");
+    parse_gpu_table_memory(value.as_deref()).unwrap_or_else(|()| {
+        eprintln!(
+            "Warning: invalid SUEDE_GPU_TABLE_MEMORY={value:?}; expected auto or host; using auto"
+        );
+        GpuTableMemory::Auto
+    })
+}
+
 /// Everything that outlives a single `Gpu::new()` call's setup and is shared
 /// with every `DmabufImage` it creates, via `Arc`. Kept separate from `Gpu`
 /// itself (which holds the pipeline, descriptor pool, and per-frame command
@@ -447,6 +477,8 @@ struct DeviceState {
     queue_family: u32,
     external_memory_fd: ash::khr::external_memory_fd::Device,
     calibrated_timestamps: bool,
+    /// Prefer coherent CPU-mappable device-local storage and CPU table shadows.
+    prefer_local_tables: bool,
     drm_format_modifier: ash::ext::image_drm_format_modifier::Device,
     /// What `create_device`'s global-priority ladder granted `queue` — see
     /// `QueuePriority` and the module doc's "Queue priority" section.
@@ -581,6 +613,9 @@ struct OutputResources {
     /// no repeated map/unmap is needed to update it.
     #[allow(dead_code)]
     mapped: *mut u8,
+    /// Auto mode compares CPU-owned bytes to avoid reading the BAR mapping.
+    /// Installed atomically with the corresponding buffer.
+    packed_shadow: Option<Vec<u32>>,
     /// The `sync` pattern's shape buffer for this output, bound at 3 and
     /// [`SYNC_SHAPE_SLOTS`] long for the life of the output — created
     /// alongside the first transfer table and carried across every later
@@ -590,6 +625,24 @@ struct OutputResources {
     /// push constants.
     sync_groups: u32,
     descriptor_set: vk::DescriptorSet,
+}
+
+impl OutputResources {
+    fn transfer_entries(&self) -> &[u32] {
+        match &self.packed_shadow {
+            Some(bytes) => bytes,
+            None => {
+                // Safety: the active table is persistently mapped for its
+                // capacity. Its bytes change only during atomic replacement.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        self.mapped.cast::<u32>(),
+                        self.capacity as usize / std::mem::size_of::<u32>(),
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// A host-visible, host-coherent, persistently mapped buffer — what both
@@ -608,6 +661,7 @@ struct StagedTransfer {
     width: u32,
     height: u32,
     table: HostBuffer,
+    packed_shadow: Option<Vec<u32>>,
     /// Present only when this is a previously unseen sparse output index.
     shapes: Option<HostBuffer>,
     descriptor_set: vk::DescriptorSet,
@@ -1087,6 +1141,7 @@ impl Gpu {
             queue_family,
             external_memory_fd,
             calibrated_timestamps,
+            prefer_local_tables: gpu_table_memory_from_env() == GpuTableMemory::Auto,
             drm_format_modifier,
             queue_priority,
             direct_mode: direct_primary.is_some(),
@@ -2071,9 +2126,9 @@ impl Gpu {
             // before packing or allocating: a no-op re-apply (an unrelated
             // field changed elsewhere in the generation) is common, and the
             // whole point of comparing first is not to pay for a ~33 MB pack
-            // and copy at 4K only to throw it away. `output.mapped` only
-            // ever holds bytes this same validation already accepted, so an
-            // exact match needs no revalidation.
+            // and copy at 4K only to throw it away. The active table (and
+            // its optional CPU shadow) holds previously validated bytes, so
+            // an exact match needs no revalidation.
             let unchanged = self
                 .outputs
                 .get(update.index)
@@ -2084,14 +2139,11 @@ impl Gpu {
                             == (entries * std::mem::size_of::<u32>()) as vk::DeviceSize
                 })
                 .is_some_and(|output| {
-                    // Safety: `output.mapped` covers the active table's
-                    // complete capacity and remains mapped for its life.
-                    let mapped =
-                        unsafe { std::slice::from_raw_parts(output.mapped.cast::<u32>(), entries) };
+                    let current = output.transfer_entries();
                     update
                         .table
                         .iter()
-                        .zip(mapped)
+                        .zip(current)
                         .all(|(&(a, b), &packed)| pack_transfer(a, b) == packed)
                 });
             if unchanged {
@@ -2195,12 +2247,7 @@ impl Gpu {
                         && output.capacity
                             == (entries * std::mem::size_of::<u32>()) as vk::DeviceSize
                 })
-                .is_some_and(|output| {
-                    // Safety: the active persistently-mapped table covers its capacity.
-                    let mapped =
-                        unsafe { std::slice::from_raw_parts(output.mapped.cast::<u32>(), entries) };
-                    update.table == mapped
-                });
+                .is_some_and(|output| update.table == output.transfer_entries());
             if unchanged {
                 continue;
             }
@@ -2242,6 +2289,13 @@ impl Gpu {
         let dev = &device.device;
         let mut staged: Vec<StagedTransfer> = Vec::with_capacity(prepared.len());
         for (index, width, height, packed) in prepared {
+            // Acquire any CPU shadow before Vulkan resources. Fixed-table
+            // packing already owns a Vec; into_owned moves it without a copy.
+            let packed = if device.prefer_local_tables {
+                Cow::Owned(packed.into_owned())
+            } else {
+                packed
+            };
             #[cfg(test)]
             if self.transfer_stage_fail_after == Some(staged.len()) {
                 self.transfer_stage_fail_after = None;
@@ -2299,6 +2353,10 @@ impl Gpu {
                 width,
                 height,
                 table,
+                packed_shadow: match packed {
+                    Cow::Owned(bytes) if device.prefer_local_tables => Some(bytes),
+                    _ => None,
+                },
                 shapes: fresh_shapes,
                 descriptor_set: vk::DescriptorSet::null(),
             });
@@ -2418,6 +2476,7 @@ impl Gpu {
                 capacity: item.table.bytes,
                 size: [item.width, item.height],
                 mapped: item.table.mapped,
+                packed_shadow: item.packed_shadow,
                 shapes,
                 sync_groups,
                 descriptor_set: item.descriptor_set,
@@ -4396,57 +4455,164 @@ fn allocate_host_buffer_with_usage(
             .instance
             .get_physical_device_memory_properties(device.physical_device)
     };
-    let memory_type_index = match memory_type_index(
+    let storage = usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER);
+    let prefer_local = storage && device.prefer_local_tables;
+    let candidates = host_buffer_memory_types(
         &memory_properties,
         requirements.memory_type_bits,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    ) {
-        Some(index) => index,
-        None => {
-            // Safety: `buffer` was just created and is not bound to anything.
-            unsafe { dev.destroy_buffer(buffer, None) };
-            bail!("no HOST_VISIBLE|HOST_COHERENT memory type for a {bytes}-byte storage buffer");
-        }
-    };
-    let allocate_info = vk::MemoryAllocateInfo::default()
-        .allocation_size(requirements.size)
-        .memory_type_index(memory_type_index);
-    let memory = match unsafe { dev.allocate_memory(&allocate_info, None) } {
-        Ok(memory) => memory,
-        Err(error) => {
-            // Safety: `buffer` was just created and is not bound to anything.
-            unsafe { dev.destroy_buffer(buffer, None) };
-            return Err(error).context("vkAllocateMemory");
-        }
-    };
-    if let Err(error) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
-        // Safety: both were just created and neither is referenced anywhere
-        // else yet.
-        unsafe {
-            dev.destroy_buffer(buffer, None);
-            dev.free_memory(memory, None);
-        }
-        return Err(error).context("vkBindBufferMemory");
+        prefer_local,
+    );
+    if candidates.is_empty() {
+        unsafe { dev.destroy_buffer(buffer, None) };
+        bail!("no HOST_VISIBLE|HOST_COHERENT memory type for a {bytes}-byte storage buffer");
     }
-    let mapped = match unsafe { dev.map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty()) } {
-        Ok(ptr) => ptr.cast::<u8>(),
-        Err(error) => {
-            // Safety: both were just created and neither is referenced
-            // anywhere else yet.
-            unsafe {
-                dev.destroy_buffer(buffer, None);
-                dev.free_memory(memory, None);
+    let mut initial_buffer = Some(buffer);
+    let ((allocation, allocated_bytes), memory_type, fallback) =
+        try_host_buffer_memory_types(&candidates, |memory_type| {
+            // A failed mapping follows binding, so each retry needs a fresh
+            // buffer. Vulkan does not allow rebinding a previously bound one.
+            let buffer = match initial_buffer.take() {
+                Some(buffer) => buffer,
+                None => unsafe { dev.create_buffer(&buffer_info, None) }
+                    .map_err(HostBufferFailure::Create)?,
+            };
+            let requirements = unsafe { dev.get_buffer_memory_requirements(buffer) };
+            let allocate_info = vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(memory_type);
+            let memory = match unsafe { dev.allocate_memory(&allocate_info, None) } {
+                Ok(memory) => memory,
+                Err(error) => {
+                    unsafe { dev.destroy_buffer(buffer, None) };
+                    return Err(HostBufferFailure::Allocate(error));
+                }
+            };
+            if let Err(error) = unsafe { dev.bind_buffer_memory(buffer, memory, 0) } {
+                unsafe {
+                    dev.destroy_buffer(buffer, None);
+                    dev.free_memory(memory, None);
+                }
+                return Err(HostBufferFailure::Bind(error));
             }
-            return Err(error).context("vkMapMemory");
+            let mapped =
+                match unsafe { dev.map_memory(memory, 0, bytes, vk::MemoryMapFlags::empty()) } {
+                    Ok(ptr) => ptr.cast::<u8>(),
+                    Err(error) => {
+                        unsafe {
+                            dev.destroy_buffer(buffer, None);
+                            dev.free_memory(memory, None);
+                        }
+                        return Err(HostBufferFailure::Map(error));
+                    }
+                };
+            Ok((
+                HostBuffer {
+                    buffer,
+                    memory,
+                    mapped,
+                    bytes,
+                    coherent: true,
+                },
+                requirements.size,
+            ))
+        })
+        .map_err(HostBufferFailure::into_error)?;
+    if storage {
+        let memory_type_properties = memory_properties.memory_types[memory_type as usize];
+        eprintln!(
+            "GPU storage allocation: prefer_device_local={prefer_local} fallback={fallback} \
+             memory_type={memory_type} heap={} flags={:?} requested_bytes={bytes} \
+             allocated_bytes={allocated_bytes}",
+            memory_type_properties.heap_index, memory_type_properties.property_flags,
+        );
+    }
+    Ok(allocation)
+}
+
+/// Auto mode prefers CPU-mappable device-local storage and retains eligible
+/// coherent host-memory fallback types if staging old and new tables exhausts
+/// the local heap. Host mode keeps the original first-match policy.
+fn host_buffer_memory_types(
+    properties: &vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    prefer_local: bool,
+) -> Vec<u32> {
+    let required = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+    let baseline = memory_type_index(properties, type_bits, required);
+    if !prefer_local {
+        return baseline.into_iter().collect();
+    }
+    let preferred = memory_type_index(
+        properties,
+        type_bits,
+        required | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    );
+    let mut candidates: Vec<_> = preferred.into_iter().collect();
+    for index in 0..properties.memory_type_count {
+        if type_bits & (1 << index) != 0
+            && properties.memory_types[index as usize]
+                .property_flags
+                .contains(required)
+            && !candidates.contains(&index)
+        {
+            candidates.push(index);
         }
-    };
-    Ok(HostBuffer {
-        buffer,
-        memory,
-        mapped,
-        bytes,
-        coherent: true,
-    })
+    }
+    candidates
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HostBufferFailure {
+    Create(vk::Result),
+    Allocate(vk::Result),
+    Bind(vk::Result),
+    Map(vk::Result),
+}
+
+impl HostBufferFailure {
+    fn allows_fallback(self) -> bool {
+        match self {
+            Self::Allocate(error) => matches!(
+                error,
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            ),
+            Self::Map(error) => matches!(
+                error,
+                vk::Result::ERROR_MEMORY_MAP_FAILED
+                    | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                    | vk::Result::ERROR_OUT_OF_HOST_MEMORY
+            ),
+            _ => false,
+        }
+    }
+
+    fn into_error(self) -> anyhow::Error {
+        let (error, operation) = match self {
+            Self::Create(error) => (error, "vkCreateBuffer"),
+            Self::Allocate(error) => (error, "vkAllocateMemory"),
+            Self::Bind(error) => (error, "vkBindBufferMemory"),
+            Self::Map(error) => (error, "vkMapMemory"),
+        };
+        anyhow::Error::new(error).context(operation)
+    }
+}
+
+/// The attempt owns cleanup before returning an error; fallback must never
+/// retain the failed buffer or reuse a memory binding from the prior attempt.
+fn try_host_buffer_memory_types<T>(
+    candidates: &[u32],
+    mut attempt: impl FnMut(u32) -> Result<T, HostBufferFailure>,
+) -> Result<(T, u32, bool), HostBufferFailure> {
+    for (position, &index) in candidates.iter().enumerate() {
+        match attempt(index) {
+            Ok(buffer) => return Ok((buffer, index, position != 0)),
+            Err(error) if error.allows_fallback() && position + 1 < candidates.len() => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(HostBufferFailure::Allocate(
+        vk::Result::ERROR_FEATURE_NOT_PRESENT,
+    ))
 }
 
 /// Readback may use noncoherent host-visible memory on small Vulkan devices.
@@ -5044,6 +5210,134 @@ mod tests {
         assert_eq!(readback_memory_type_index(&properties, 0b111), Some(2));
         assert_eq!(readback_memory_type_index(&properties, 0b011), Some(0));
         assert_eq!(readback_memory_type_index(&properties, 0b010), None);
+    }
+
+    #[test]
+    fn table_memory_policy_defaults_to_auto_and_accepts_explicit_modes() {
+        assert_eq!(parse_gpu_table_memory(None), Ok(GpuTableMemory::Auto));
+        assert_eq!(
+            parse_gpu_table_memory(Some(std::ffi::OsStr::new("auto"))),
+            Ok(GpuTableMemory::Auto)
+        );
+        assert_eq!(
+            parse_gpu_table_memory(Some(std::ffi::OsStr::new("host"))),
+            Ok(GpuTableMemory::Host)
+        );
+    }
+
+    #[test]
+    fn table_memory_policy_rejects_invalid_values() {
+        for value in ["", "1", "local", "AUTO", "Host", " auto", "host "] {
+            assert_eq!(
+                parse_gpu_table_memory(Some(std::ffi::OsStr::new(value))),
+                Err(()),
+                "unexpected policy accepted: {value:?}"
+            );
+        }
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            parse_gpu_table_memory(Some(std::ffi::OsStr::from_bytes(&[0xff]))),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn local_storage_preference_retains_only_compatible_coherent_fallbacks() {
+        let coherent =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 4,
+            ..Default::default()
+        };
+        properties.memory_types[0].property_flags = coherent;
+        properties.memory_types[1].property_flags = vk::MemoryPropertyFlags::HOST_VISIBLE;
+        properties.memory_types[2].property_flags =
+            coherent | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        properties.memory_types[3].property_flags = coherent;
+        assert_eq!(
+            host_buffer_memory_types(&properties, 0b1111, false),
+            vec![0]
+        );
+        assert_eq!(
+            host_buffer_memory_types(&properties, 0b1111, true),
+            vec![2, 0, 3]
+        );
+        assert_eq!(
+            host_buffer_memory_types(&properties, 0b1011, true),
+            vec![0, 3]
+        );
+        assert_eq!(host_buffer_memory_types(&properties, 0b0100, true), vec![2]);
+        assert!(host_buffer_memory_types(&properties, 0b0010, true).is_empty());
+    }
+
+    #[test]
+    fn auto_storage_supports_host_only_and_unified_cached_memory() {
+        let coherent =
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let mut properties = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 2,
+            ..Default::default()
+        };
+        properties.memory_types[0].property_flags = coherent;
+        properties.memory_types[1].property_flags = coherent | vk::MemoryPropertyFlags::HOST_CACHED;
+        // With no local type, auto preserves eligible host types in order.
+        assert_eq!(
+            host_buffer_memory_types(&properties, 0b11, true),
+            vec![0, 1]
+        );
+        assert_eq!(host_buffer_memory_types(&properties, 0b11, false), vec![0]);
+        // Unified cached memory is eligible for local preference; no separate
+        // BAR or uncached-memory requirement is imposed by auto mode.
+        properties.memory_types[1].property_flags |= vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        assert_eq!(
+            host_buffer_memory_types(&properties, 0b11, true),
+            vec![1, 0]
+        );
+        assert_eq!(host_buffer_memory_types(&properties, 0b10, true), vec![1]);
+        assert_eq!(host_buffer_memory_types(&properties, 0b11, false), vec![0]);
+    }
+
+    #[test]
+    fn storage_allocation_exhaustion_and_mapping_failure_use_host_fallback() {
+        for failure in [
+            HostBufferFailure::Allocate(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+            HostBufferFailure::Allocate(vk::Result::ERROR_OUT_OF_HOST_MEMORY),
+            HostBufferFailure::Map(vk::Result::ERROR_MEMORY_MAP_FAILED),
+        ] {
+            let mut attempted = Vec::new();
+            let (_, selected, fallback) = try_host_buffer_memory_types(&[2, 0, 3], |index| {
+                attempted.push(index);
+                if index == 2 {
+                    Err(failure)
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+            assert_eq!(attempted, vec![2, 0]);
+            assert_eq!(selected, 0);
+            assert!(fallback);
+            // Diagnostic host mode supplies only its original first type.
+            let result = try_host_buffer_memory_types::<()>(&[0], |_| Err(failure));
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn storage_allocation_does_not_hide_device_loss_or_binding_errors() {
+        for failure in [
+            HostBufferFailure::Allocate(vk::Result::ERROR_DEVICE_LOST),
+            HostBufferFailure::Map(vk::Result::ERROR_DEVICE_LOST),
+            HostBufferFailure::Bind(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+        ] {
+            let mut attempted = Vec::new();
+            let result = try_host_buffer_memory_types::<()>(&[2, 0], |index| {
+                attempted.push(index);
+                Err(failure)
+            });
+            assert!(result.is_err());
+            assert_eq!(attempted, vec![2]);
+        }
     }
 
     #[test]

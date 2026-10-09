@@ -1005,6 +1005,31 @@ fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()>
     let old_output = gpu.outputs[2].as_ref().unwrap().buffer;
     let old_untouched = gpu.outputs[5].as_ref().unwrap().buffer;
     let old_first = unsafe { *(gpu.outputs[2].as_ref().unwrap().mapped as *const u32) };
+    let old_shadow = gpu.outputs[2].as_ref().unwrap().packed_shadow.clone();
+    let untouched_shadow = gpu.outputs[5].as_ref().unwrap().packed_shadow.clone();
+    let shadow_pointer = gpu.outputs[2]
+        .as_ref()
+        .unwrap()
+        .packed_shadow
+        .as_ref()
+        .map(|bytes| bytes.as_ptr());
+    assert_eq!(old_shadow.is_some(), gpu.device.prefer_local_tables);
+    if let Some(bytes) = &old_shadow {
+        assert_eq!(bytes, &vec![pack_transfer(256, 0); 16]);
+    }
+    let pixels: Vec<u8> = fixture(size, false)
+        .into_iter()
+        .flat_map(|pixel| pixel.into_iter())
+        .collect();
+    let constants = PushConstants::canvas([0, 0], size, size[1], false, None);
+    let original_pixels = draw_installed(
+        &mut gpu,
+        TestCanvas::Pixels(&canvas, &pixels),
+        &target,
+        constants,
+        format,
+    )?;
+
     gpu.replace_transfers(&[
         TransferUpdate {
             index: 2,
@@ -1021,6 +1046,20 @@ fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()>
     ])?;
     assert_eq!(gpu.outputs[2].as_ref().unwrap().buffer, old_output);
     assert_eq!(gpu.outputs[5].as_ref().unwrap().buffer, old_untouched);
+    let packed_original = vec![pack_transfer(256, 0); 16];
+    gpu.set_packed_transfer(2, size[0], size[1], &packed_original)?;
+    assert_eq!(gpu.outputs[2].as_ref().unwrap().buffer, old_output);
+    assert_eq!(gpu.outputs[2].as_ref().unwrap().packed_shadow, old_shadow);
+    assert_eq!(
+        gpu.outputs[2]
+            .as_ref()
+            .unwrap()
+            .packed_shadow
+            .as_ref()
+            .map(|bytes| bytes.as_ptr()),
+        shadow_pointer,
+        "fixed-to-packed no-op retains the same CPU shadow allocation"
+    );
 
     // The invalid member is discovered during the all-input validation pass,
     // before output 2 is allocated, uploaded, rebound, or retired.
@@ -1048,6 +1087,22 @@ fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()>
         old_first
     );
     assert!(gpu.outputs.get(6).and_then(Option::as_ref).is_none());
+    assert_eq!(gpu.outputs[2].as_ref().unwrap().packed_shadow, old_shadow);
+    assert_eq!(
+        gpu.outputs[5].as_ref().unwrap().packed_shadow,
+        untouched_shadow
+    );
+    assert_eq!(
+        draw_installed(
+            &mut gpu,
+            TestCanvas::Pixels(&canvas, &pixels),
+            &target,
+            constants,
+            format,
+        )?,
+        original_pixels,
+        "failed replacement preserves pixels as well as resource identity"
+    );
 
     // This is deliberately later than validation: allocation of output 2's
     // inactive replacement has already succeeded, then a deterministic
@@ -1080,6 +1135,22 @@ fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()>
         old_first
     );
     assert!(gpu.outputs.get(6).and_then(Option::as_ref).is_none());
+    assert_eq!(gpu.outputs[2].as_ref().unwrap().packed_shadow, old_shadow);
+    assert_eq!(
+        gpu.outputs[5].as_ref().unwrap().packed_shadow,
+        untouched_shadow
+    );
+    assert_eq!(
+        draw_installed(
+            &mut gpu,
+            TestCanvas::Pixels(&canvas, &pixels),
+            &target,
+            constants,
+            format,
+        )?,
+        original_pixels,
+        "failed replacement preserves pixels as well as resource identity"
+    );
 
     gpu.replace_transfers(&[
         TransferUpdate {
@@ -1098,21 +1169,22 @@ fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()>
     assert_ne!(gpu.outputs[2].as_ref().unwrap().buffer, old_output);
     assert_eq!(gpu.outputs[5].as_ref().unwrap().buffer, old_untouched);
     let high_output = gpu.outputs[6].as_ref().unwrap().buffer;
+    let high_shadow = gpu.outputs[6].as_ref().unwrap().packed_shadow.clone();
     let low_index_followup = vec![(0, 1); 16];
-    gpu.replace_transfers(&[TransferUpdate {
-        index: 2,
-        width: size[0],
-        height: size[1],
-        table: &low_index_followup,
-    }])?;
+    gpu.set_packed_transfer(2, size[0], size[1], &[pack_transfer(0, 1); 16])?;
+    let low_buffer = gpu.outputs[2].as_ref().unwrap().buffer;
+    gpu.set_transfer(2, size[0], size[1], &low_index_followup)?;
+    assert_eq!(gpu.outputs[2].as_ref().unwrap().buffer, low_buffer);
+    if let Some(bytes) = &gpu.outputs[2].as_ref().unwrap().packed_shadow {
+        assert_eq!(bytes, &vec![pack_transfer(0, 1); 16]);
+    }
     assert_eq!(gpu.outputs[5].as_ref().unwrap().buffer, old_untouched);
     assert_eq!(gpu.outputs[6].as_ref().unwrap().buffer, high_output);
-
-    let pixels: Vec<u8> = fixture(size, false)
-        .into_iter()
-        .flat_map(|pixel| pixel.into_iter())
-        .collect();
-    let constants = PushConstants::canvas([0, 0], size, size[1], false, None);
+    assert_eq!(
+        gpu.outputs[5].as_ref().unwrap().packed_shadow,
+        untouched_shadow
+    );
+    assert_eq!(gpu.outputs[6].as_ref().unwrap().packed_shadow, high_shadow);
     let got = draw_installed(
         &mut gpu,
         TestCanvas::Pixels(&canvas, &pixels),
@@ -1241,5 +1313,386 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         .contains("dimensions"));
     // Each failure above occurs before recording/submission: the capture is
     // deliberately never initialized by a compositor or sampled in this test.
+    Ok(())
+}
+
+/// Isolated hardware qualification, not a benchmark. The child captures the
+/// production allocator's selected memory type without changing its API or
+/// redirecting stderr in the parent test process. Run with --test-threads=1
+/// and no other GPU workload; unsupported/overcommitting devices fail clearly.
+#[test]
+#[ignore = "requires auto table memory and a mapped local heap <=512 MiB; run alone"]
+fn local_table_fallback_under_small_heap_pressure() -> anyhow::Result<()> {
+    const CHILD: &str = "SUEDE_LOCAL_HEAP_QUALIFICATION_CHILD";
+    const MIB: u64 = 1024 * 1024;
+    const TABLE_BYTES: u64 = 4 * MIB;
+    anyhow::ensure!(
+        gpu_table_memory_from_env() == GpuTableMemory::Auto,
+        "qualification requires auto table memory (the default); unset SUEDE_GPU_TABLE_MEMORY=host or set it to auto"
+    );
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        // A file avoids pipe backpressure while the parent enforces a timeout.
+        struct Log(std::path::PathBuf);
+        impl Drop for Log {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // Also reap the child if polling or log reading fails.
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let log = Log(std::env::temp_dir().join(format!(
+            "suede-local-heap-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos()
+        )));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log.0)?;
+        let module = module_path!().split_once("::").unwrap().1;
+        let mut child = Child(
+            std::process::Command::new(std::env::current_exe()?)
+                .args([
+                    "--exact",
+                    &format!("{module}::local_table_fallback_under_small_heap_pressure"),
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::from(file.try_clone()?))
+                .stderr(std::process::Stdio::from(file))
+                .spawn()?,
+        );
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.0.try_wait()? {
+                break status;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(120) {
+                let _ = child.0.kill();
+                let _ = child.0.wait();
+                bail!(
+                    "qualification child timed out after 120 seconds; partial output:\n{}",
+                    std::fs::read_to_string(&log.0).unwrap_or_default()
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let output = std::fs::read_to_string(&log.0)?;
+        eprintln!("{output}");
+        anyhow::ensure!(status.success(), "qualification child failed: {status}");
+        let types = output
+            .lines()
+            .find_map(|line| line.strip_prefix("qualification_nonlocal_types="))
+            .context("child did not report compatible nonlocal memory types")?;
+        let rendering = output
+            .split_once("qualification_pressure_replacement_begin\n")
+            .and_then(|(_, tail)| tail.split_once("qualification_pressure_replacement_end"))
+            .map(|(allocation, _)| allocation)
+            .context("child did not complete the replacement under pressure")?;
+        anyhow::ensure!(
+            rendering.lines().any(|line| {
+                line.starts_with("GPU storage allocation: ")
+                    && line.contains("prefer_device_local=true fallback=true ")
+                    && line.contains(&format!("requested_bytes={TABLE_BYTES} "))
+                    && types
+                        .split(',')
+                        .any(|ty| line.contains(&format!("memory_type={ty} ")))
+            }),
+            "inconclusive: replacement did not select a nonlocal fallback memory type"
+        );
+        anyhow::ensure!(
+            output.contains("qualification_pixels_under_pressure_and_after_release=ok"),
+            "child did not verify pixels under pressure and after release"
+        );
+        return Ok(());
+    }
+
+    let mut gpu = Gpu::new(None)?;
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let size = [1024, 1024];
+    let target = Image::new(&gpu, size, format)?;
+    // The spectrum fixture assumes width <=256; this allocation-pressure
+    // case needs a full 4 MiB table and only distinguishes old/new pixels.
+    let pixels = [23, 57, 129, 255].repeat((size[0] * size[1]) as usize);
+    let canvas = gpu.upload_static_canvas_rgba(size[0], size[1], &pixels)?;
+    let table = vec![(256, 0); (size[0] * size[1]) as usize];
+    gpu.set_transfer(2, size[0], size[1], &table)?;
+    let constants = PushConstants::canvas([0, 0], size, size[1], false, None);
+    let mut expected = pixels;
+    for pixel in expected.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
+    assert_eq!(
+        draw_installed(
+            &mut gpu,
+            TestCanvas::Static(&canvas),
+            &target,
+            constants,
+            format
+        )?,
+        expected,
+        "baseline identity transfer"
+    );
+    let requirements = unsafe {
+        gpu.device
+            .device
+            .get_buffer_memory_requirements(gpu.outputs[2].as_ref().unwrap().buffer)
+    };
+    let properties = unsafe {
+        gpu.device
+            .instance
+            .get_physical_device_memory_properties(gpu.device.physical_device)
+    };
+    let candidates = host_buffer_memory_types(&properties, requirements.memory_type_bits, true);
+    let required = vk::MemoryPropertyFlags::HOST_VISIBLE
+        | vk::MemoryPropertyFlags::HOST_COHERENT
+        | vk::MemoryPropertyFlags::DEVICE_LOCAL;
+    let preferred = *candidates
+        .first()
+        .context("unsupported: no compatible host storage type")?;
+    let preferred_type = properties.memory_types[preferred as usize];
+    let heap = preferred_type.heap_index;
+    let heap_bytes = properties.memory_heaps[heap as usize].size;
+    let nonlocal: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|&ty| {
+            !properties.memory_types[ty as usize]
+                .property_flags
+                .contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                && properties.memory_types[ty as usize].heap_index != heap
+        })
+        .collect();
+    anyhow::ensure!(
+        preferred_type.property_flags.contains(required)
+            && heap_bytes <= 512 * MIB
+            && !nonlocal.is_empty()
+            && candidates.iter().all(|&ty| {
+                let memory = properties.memory_types[ty as usize];
+                !memory.property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                    || memory.heap_index == heap
+            }),
+        "unsupported: requires one compatible mapped local heap <=512 MiB and a separate nonlocal coherent fallback; heap={heap}, heap_bytes={heap_bytes}"
+    );
+    anyhow::ensure!(
+        requirements.size <= 8 * MIB,
+        "unsupported: unexpectedly large table allocation alignment"
+    );
+    eprintln!(
+        "qualification_nonlocal_types={}",
+        nonlocal
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut pressure = Vec::new();
+    let mut retained_bytes = 0;
+    // <=552 MiB of pressure allocations even with rounding, leaving room
+    // below 768 MiB for images, old/new tables, upload/readback, and CPU data.
+    while retained_bytes <= heap_bytes + 32 * MIB {
+        pressure.push(Buffer(
+            Some(allocate_host_buffer(&gpu.device, TABLE_BYTES)?),
+            Arc::clone(&gpu.device),
+        ));
+        retained_bytes += requirements.size;
+    }
+    // Reported heap sizes alone cannot prove exhaustion on drivers that
+    // overcommit. Require a real preferred-type allocation OOM as evidence.
+    match unsafe {
+        gpu.device.device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(requirements.size)
+                .memory_type_index(preferred),
+            None,
+        )
+    } {
+        Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) => {}
+        Ok(memory) => {
+            unsafe { gpu.device.device.free_memory(memory, None) };
+            bail!("inconclusive: preferred heap permits overcommit; retained_bytes={retained_bytes}, heap_bytes={heap_bytes}");
+        }
+        Err(error) => {
+            bail!("inconclusive: preferred allocation failed without device OOM: {error:?}")
+        }
+    }
+    eprintln!("qualification_pressure_replacement_begin");
+    gpu.set_transfer(2, size[0], size[1], &vec![(0, 17); table.len()])?;
+    eprintln!("qualification_pressure_replacement_end");
+    let expected = [17, 17, 17, 255].repeat(table.len());
+    assert_eq!(
+        draw_installed(
+            &mut gpu,
+            TestCanvas::Static(&canvas),
+            &target,
+            constants,
+            format
+        )?,
+        expected,
+        "replacement pixels with the preferred heap exhausted"
+    );
+    drop(pressure);
+    assert_eq!(
+        draw_installed(
+            &mut gpu,
+            TestCanvas::Static(&canvas),
+            &target,
+            constants,
+            format
+        )?,
+        expected,
+        "fallback table pixels after releasing heap pressure"
+    );
+    eprintln!("qualification_pixels_under_pressure_and_after_release=ok");
+    Ok(())
+}
+
+/// Run separately from the presentation campaign with the default auto policy
+/// and SUEDE_GPU_TABLE_MEMORY=host for comparison. Measures CPU time spent on
+/// table updates, including no-op comparisons, without a shared-hardware target.
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain outside timing campaigns"]
+fn benchmark_four_output_transfer_replacement_and_noop() -> anyhow::Result<()> {
+    let mut gpu = Gpu::new(None)?;
+    let size = [1920, 1080];
+    let mut table = vec![pack_transfer(256, 0); size[0] as usize * size[1] as usize];
+    fn updates(table: &[u32], size: [u32; 2]) -> Vec<PackedTransferUpdate<'_>> {
+        (0..4)
+            .map(|index| PackedTransferUpdate {
+                index,
+                width: size[0],
+                height: size[1],
+                table,
+            })
+            .collect()
+    }
+    let start = std::time::Instant::now();
+    gpu.replace_packed_transfers(&updates(&table, size))?;
+    let initial_ms = start.elapsed().as_secs_f64() * 1000.0;
+    for index in 0..4 {
+        let shadow = &gpu.outputs[index].as_ref().unwrap().packed_shadow;
+        assert_eq!(shadow.is_some(), gpu.device.prefer_local_tables);
+        if let Some(bytes) = shadow {
+            assert_eq!(bytes.len(), table.len());
+        }
+    }
+    let original: Vec<_> = (0..4)
+        .map(|index| gpu.outputs[index].as_ref().unwrap().buffer)
+        .collect();
+    let start = std::time::Instant::now();
+    gpu.replace_packed_transfers(&updates(&table, size))?;
+    let noop_ms = start.elapsed().as_secs_f64() * 1000.0;
+    for (index, buffer) in original.iter().enumerate() {
+        assert_eq!(gpu.outputs[index].as_ref().unwrap().buffer, *buffer);
+    }
+    table.fill(pack_transfer(128, 7));
+    let start = std::time::Instant::now();
+    gpu.replace_packed_transfers(&updates(&table, size))?;
+    let replacement_ms = start.elapsed().as_secs_f64() * 1000.0;
+    for (index, buffer) in original.iter().enumerate() {
+        let output = gpu.outputs[index].as_ref().unwrap();
+        assert_ne!(output.buffer, *buffer);
+        if let Some(bytes) = &output.packed_shadow {
+            assert_eq!(bytes.as_slice(), table.as_slice());
+        }
+    }
+    let live_shadow_bytes: usize = gpu
+        .outputs
+        .iter()
+        .filter_map(|output| output.as_ref()?.packed_shadow.as_ref())
+        .map(|bytes| bytes.len() * std::mem::size_of::<u32>())
+        .sum();
+    println!(
+        "four_output_transfer_host_ms: table_memory={} initial={initial_ms:.3} \
+         exact_noop={noop_ms:.3} replacement={replacement_ms:.3} \
+         live_table_bytes={} peak_table_bytes={} live_shadow_bytes={live_shadow_bytes}",
+        if gpu.device.prefer_local_tables {
+            "auto"
+        } else {
+            "host"
+        },
+        4 * table.len() * std::mem::size_of::<u32>(),
+        8 * table.len() * std::mem::size_of::<u32>(),
+    );
+    Ok(())
+}
+
+/// Qualify the fixed-table path used by the production campaign, including
+/// its per-pixel no-op packing comparison and ownership reuse on replacement.
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain outside timing campaigns"]
+fn benchmark_four_output_fixed_transfer_replacement_and_noop() -> anyhow::Result<()> {
+    let mut gpu = Gpu::new(None)?;
+    let size = [1920, 1080];
+    let entries = size[0] as usize * size[1] as usize;
+    let original_table = vec![(256, 0); entries];
+    let replacement_table = vec![(128, 7); entries];
+    fn updates(table: &[(u16, u8)], size: [u32; 2]) -> Vec<TransferUpdate<'_>> {
+        (0..4)
+            .map(|index| TransferUpdate {
+                index,
+                width: size[0],
+                height: size[1],
+                table,
+            })
+            .collect()
+    }
+    let initial_updates = updates(&original_table, size);
+    let replacement_updates = updates(&replacement_table, size);
+    let start = std::time::Instant::now();
+    gpu.replace_transfers(&initial_updates)?;
+    let initial_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let original_buffers: Vec<_> = (0..4)
+        .map(|index| gpu.outputs[index].as_ref().unwrap().buffer)
+        .collect();
+    let start = std::time::Instant::now();
+    gpu.replace_transfers(&initial_updates)?;
+    let noop_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let noop_buffers: Vec<_> = (0..4)
+        .map(|index| gpu.outputs[index].as_ref().unwrap().buffer)
+        .collect();
+    let start = std::time::Instant::now();
+    gpu.replace_transfers(&replacement_updates)?;
+    let replacement_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    // Content checks stay outside all timed operations and cannot warm the
+    // mapping or CPU shadow before the no-op measurement.
+    assert_eq!(original_buffers, noop_buffers);
+    let mut live_shadow_bytes = 0;
+    for (index, buffer) in noop_buffers.iter().enumerate() {
+        let output = gpu.outputs[index].as_ref().unwrap();
+        assert_ne!(output.buffer, *buffer);
+        assert_eq!(
+            output.packed_shadow.is_some(),
+            gpu.device.prefer_local_tables
+        );
+        if let Some(bytes) = &output.packed_shadow {
+            assert_eq!(bytes.len(), entries);
+            assert!(bytes.iter().all(|&entry| entry == pack_transfer(128, 7)));
+            live_shadow_bytes += bytes.len() * std::mem::size_of::<u32>();
+        }
+    }
+    println!(
+        "four_output_fixed_transfer_host_ms: table_memory={} initial={initial_ms:.3} \
+         exact_noop={noop_ms:.3} replacement={replacement_ms:.3} \
+         live_table_bytes={} peak_table_bytes={} live_shadow_bytes={live_shadow_bytes}",
+        if gpu.device.prefer_local_tables {
+            "auto"
+        } else {
+            "host"
+        },
+        4 * entries * std::mem::size_of::<u32>(),
+        8 * entries * std::mem::size_of::<u32>(),
+    );
     Ok(())
 }
