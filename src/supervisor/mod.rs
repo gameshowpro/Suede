@@ -66,6 +66,8 @@ struct ManagedApp {
     /// halted app goes through, so a later, unrelated failure cannot inherit
     /// a stale reason.
     program_not_allowed: bool,
+    /// A stopped process must wait for a current reconciliation before launch.
+    launch_pending: bool,
 }
 
 impl ManagedApp {
@@ -86,6 +88,7 @@ impl ManagedApp {
             last_probe: None,
             waiting_since: None,
             program_not_allowed: false,
+            launch_pending: false,
         }
     }
 
@@ -178,8 +181,24 @@ impl Supervisor {
     }
 
     pub async fn reconcile(&self, desired: &[AppConfig], targets: &[AppTarget]) -> Vec<Divergence> {
+        self.reconcile_if_current(desired, targets, || true)
+            .await
+            .expect("unconditional reconciliation is always current")
+    }
+
+    /// Abort a superseded pass before it relaunches processes. Configuration
+    /// may change while SIGTERM shutdown is awaited with the app lock held.
+    pub async fn reconcile_if_current(
+        &self,
+        desired: &[AppConfig],
+        targets: &[AppTarget],
+        is_current: impl Fn() -> bool,
+    ) -> Option<Vec<Divergence>> {
         let mut apps = self.apps.lock().await;
         let mut divergences = Vec::new();
+        if !reconcile_is_current(&mut apps, &is_current) {
+            return None;
+        }
 
         // Apps that vanished from desired state are terminated and forgotten.
         let desired_ids: Vec<&str> = desired.iter().map(|app| app.id.as_str()).collect();
@@ -192,6 +211,9 @@ impl Supervisor {
             if let Some(mut managed) = apps.remove(&id) {
                 tracing::info!(app = %id, "app removed from configuration");
                 stop(&mut managed).await;
+            }
+            if !reconcile_is_current(&mut apps, &is_current) {
+                return None;
             }
         }
 
@@ -211,6 +233,10 @@ impl Supervisor {
                 if managed.is_running() {
                     tracing::info!(app = %config.id, "configuration changed; restarting");
                     stop(managed).await;
+                    if !is_current() {
+                        reconcile_is_current(&mut apps, &|| false);
+                        return None;
+                    }
                     // A pure deactivation (the synthesized `enabled` flag
                     // going false because `activeApp` moved on) is not a
                     // restart of this app's own config, so it must not
@@ -236,9 +262,16 @@ impl Supervisor {
             }
             managed.config = config.clone();
             managed.target = target;
+            managed.launch_pending = false;
         }
 
-        self.advance(&mut apps).await;
+        if !reconcile_is_current(&mut apps, &is_current) {
+            return None;
+        }
+        if !self.advance_if_current(&mut apps, &is_current).await {
+            reconcile_is_current(&mut apps, &|| false);
+            return None;
+        }
 
         // An app that cannot run is a fault in the appliance, not a private
         // matter between the supervisor and the process table. Without this
@@ -271,7 +304,7 @@ impl Supervisor {
                 _ => {}
             }
         }
-        divergences
+        Some(divergences)
     }
 
     /// Reap exits, run the watchdog, place new windows, and honor restart timers.
@@ -629,8 +662,19 @@ impl Supervisor {
 
     /// Start anything that should be running and is not.
     async fn advance(&self, apps: &mut HashMap<String, ManagedApp>) {
+        self.advance_if_current(apps, &|| true).await;
+    }
+
+    async fn advance_if_current(
+        &self,
+        apps: &mut HashMap<String, ManagedApp>,
+        is_current: &impl Fn() -> bool,
+    ) -> bool {
         let now = Instant::now();
         for managed in apps.values_mut() {
+            if !is_current() {
+                return false;
+            }
             let runnable = managed.config.enabled
                 && managed
                     .target
@@ -641,6 +685,9 @@ impl Supervisor {
             if !runnable {
                 if managed.is_running() {
                     stop(managed).await;
+                    if !is_current() {
+                        return false;
+                    }
                 }
                 let state = if !managed.config.enabled {
                     AppState::Stopped
@@ -659,7 +706,7 @@ impl Supervisor {
                 continue;
             }
 
-            if managed.is_running() || managed.halted {
+            if managed.is_running() || managed.halted || managed.launch_pending {
                 continue;
             }
             // An app whose dependency has never answered must not be launched:
@@ -672,8 +719,9 @@ impl Supervisor {
                 continue;
             }
 
-            match self.spawn(managed).await {
-                Ok(()) => self.publish(managed),
+            match self.spawn(managed, is_current).await {
+                Ok(true) => self.publish(managed),
+                Ok(false) => return false,
                 // A program that is not allowed will never become allowed
                 // without a daemon restart — `allowed_programs` is bootstrap
                 // config, read once at startup — so the usual backoff timer
@@ -702,9 +750,14 @@ impl Supervisor {
                 }
             }
         }
+        is_current()
     }
 
-    async fn spawn(&self, managed: &mut ManagedApp) -> std::io::Result<()> {
+    async fn spawn(
+        &self,
+        managed: &mut ManagedApp,
+        is_current: &impl Fn() -> bool,
+    ) -> std::io::Result<bool> {
         // Resolve first, then describe: the profile directory depends on
         // which program won, and only one of the two touches the disk.
         let chosen = launcher::choose_program(&managed.config);
@@ -826,6 +879,11 @@ impl Supervisor {
         #[cfg(unix)]
         command.process_group(0);
 
+        // Profile and log preparation await filesystem work; activation may
+        // have changed while those tasks ran. Check at the actual launch.
+        if !is_current() {
+            return Ok(false);
+        }
         let child = command.spawn()?;
         let pid = child.id();
 
@@ -857,7 +915,7 @@ impl Supervisor {
             AppState::Running
         };
         set_state(&mut managed.status, state, None);
-        Ok(())
+        Ok(true)
     }
 
     fn publish(&self, managed: &ManagedApp) {
@@ -865,6 +923,24 @@ impl Supervisor {
             managed.status.clone(),
         )));
     }
+}
+
+/// Keep ticks from relaunching processes stopped by a stale reconciliation.
+/// The next current reconciliation installs the desired config and clears the
+/// hold; processes that are still running keep their existing lifecycle.
+fn reconcile_is_current(
+    apps: &mut HashMap<String, ManagedApp>,
+    is_current: &impl Fn() -> bool,
+) -> bool {
+    if is_current() {
+        return true;
+    }
+    for managed in apps.values_mut() {
+        if managed.config.enabled && !managed.is_running() {
+            managed.launch_pending = true;
+        }
+    }
+    false
 }
 
 fn set_state(status: &mut AppStatus, state: AppState, detail: Option<String>) {
@@ -1023,6 +1099,151 @@ mod tests {
             log_root: root.join("logs"),
             api_base: "http://127.0.0.1:9088/api/v1".into(),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deactivation_during_sigterm_prevents_stale_window_app_relaunch() {
+        assert_deactivation_during_shutdown_prevents_relaunch(true).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deactivation_during_output_shutdown_prevents_stale_window_app_relaunch() {
+        assert_deactivation_during_shutdown_prevents_relaunch(false).await;
+    }
+
+    #[cfg(unix)]
+    async fn assert_deactivation_during_shutdown_prevents_relaunch(change_config: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(directory.path());
+        let store = crate::state::StateStore::ephemeral(directory.path().to_path_buf());
+        let ready = directory.path().join("ready");
+        let stopping = directory.path().join("stopping");
+        let exit_allowed = directory.path().join("exit-allowed");
+        let launches = directory.path().join("launches");
+        let mut app = sleeper("window");
+        app.output = Some(OutputMatch::by_name("HEADLESS-1"));
+        app.launcher = Launcher::Exec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "trap 'echo stopping > \"$STOPPING\"; while [ ! -f \"$EXIT_ALLOWED\" ]; do sleep 0.01; done; exit 0' TERM; echo launched >> \"$LAUNCHES\"; echo ready > \"$READY\"; while :; do sleep 0.01; done".into(),
+            ],
+        };
+        for (key, path) in [
+            ("READY", &ready),
+            ("STOPPING", &stopping),
+            ("EXIT_ALLOWED", &exit_allowed),
+            ("LAUNCHES", &launches),
+        ] {
+            app.env.insert(key.into(), path.display().to_string());
+        }
+        assert!(app.expects_window());
+        store
+            .update(|state| {
+                state.apps.push(app.clone());
+                state.active_app = Some(app.id.clone());
+            })
+            .unwrap();
+        supervisor.reconcile(&[app.clone()], &[]).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let targets = if change_config {
+            app.env.insert("CONFIG_CHANGED".into(), "1".into());
+            vec![]
+        } else {
+            let mut blocked = target("window", None);
+            blocked.blocked = Some(Divergence::new(
+                "output_missing",
+                "window",
+                "configured output is unavailable",
+            ));
+            vec![blocked]
+        };
+        let generation = store.generation();
+        let stale_apps = [app.clone()];
+        let stale_reconcile = supervisor
+            .reconcile_if_current(&stale_apps, &targets, || store.generation() == generation);
+        let deactivate = async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !stopping.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            store.update(|state| state.active_app = None).unwrap();
+            std::fs::write(&exit_allowed, "exit").unwrap();
+        };
+        let (result, ()) = tokio::join!(stale_reconcile, deactivate);
+        assert!(result.is_none(), "shutdown invalidated the old generation");
+        supervisor.tick(&[]).await;
+        assert!(
+            supervisor.status("window").await.unwrap().pid.is_none(),
+            "ticks cannot relaunch the old enabled config before the next pass"
+        );
+        app.enabled = false;
+        assert!(supervisor
+            .reconcile_if_current(&[app], &[], || true)
+            .await
+            .is_some());
+        supervisor.tick(&[]).await;
+        assert_eq!(
+            supervisor.status("window").await.unwrap().state,
+            AppState::Stopped
+        );
+        assert_eq!(
+            std::fs::read_to_string(launches).unwrap().lines().count(),
+            1
+        );
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_launch_preparation_prevents_a_stale_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(directory.path());
+        let store = crate::state::StateStore::ephemeral(directory.path().to_path_buf());
+        let mut app = sleeper("window");
+        store
+            .update(|state| {
+                state.apps.push(app.clone());
+                state.active_app = Some(app.id.clone());
+            })
+            .unwrap();
+        let generation = store.generation();
+        let log_path = supervisor.context.log_path(&app.id);
+        let log_directory = log_path.parent().unwrap();
+        assert!(!log_directory.exists());
+        let result = supervisor
+            .reconcile_if_current(&[app.clone()], &[], || {
+                // Log-directory creation is awaited before the actual spawn.
+                // Invalidate exactly after that preparation has completed.
+                if log_directory.exists() && store.generation() == generation {
+                    store.update(|state| state.active_app = None).unwrap();
+                }
+                store.generation() == generation
+            })
+            .await;
+        assert!(result.is_none());
+        supervisor.tick(&[]).await;
+        assert!(supervisor.status("window").await.unwrap().pid.is_none());
+        app.enabled = false;
+        supervisor.reconcile(&[app.clone()], &[]).await;
+        assert_eq!(
+            supervisor.status("window").await.unwrap().state,
+            AppState::Stopped
+        );
+        app.enabled = true;
+        supervisor.reconcile(&[app], &[]).await;
+        assert!(supervisor.status("window").await.unwrap().pid.is_some());
+        supervisor.shutdown().await;
     }
 
     fn supervisor(root: &std::path::Path) -> (Supervisor, Arc<MockSway>) {

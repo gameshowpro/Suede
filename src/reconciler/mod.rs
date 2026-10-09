@@ -366,7 +366,18 @@ impl Reconciler {
     /// Run one full reconciliation pass and return the resulting status.
     pub async fn reconcile(&self) -> Status {
         let _guard = self.pass.lock().await;
+        let mut topology_changed = false;
+        loop {
+            if let Some(status) = self.reconcile_once(&mut topology_changed).await {
+                return status;
+            }
+            tracing::debug!(
+                "desired state changed during reconciliation; applying the latest state"
+            );
+        }
+    }
 
+    async fn reconcile_once(&self, topology_changed: &mut bool) -> Option<Status> {
         // The effective document: a live preview when one is being tried out
         // in the UI, otherwise the persisted state.
         // Keep the document and working-copy identity from one StateStore
@@ -462,6 +473,9 @@ impl Reconciler {
             )
         };
         divergences.extend(output_plan.divergences.iter().cloned());
+        if self.store.generation() != config_generation {
+            return None;
+        }
 
         // Sent as one sway IPC message, not one `run_command` per line: on a
         // four-projector NVIDIA rig (RTX A1000, sway 1.10.1, 2026-09-15),
@@ -493,6 +507,7 @@ impl Reconciler {
         }
 
         *self.applied.lock().await = output_plan.applied.clone();
+        *topology_changed |= output_plan.topology_changed;
 
         // Enabling or disabling an output rearranges the layout; let it settle
         // before anything reads geometry or places a window.
@@ -516,18 +531,23 @@ impl Reconciler {
         // `output_plan.topology_changed` is passed through so the slicer can
         // be forced to restart even when its spec turns out unchanged — see
         // `sync_projection` and `BlendManager::restart_slicer`. It is true
-        // only for the pass that actually issued the enable/disable commands
-        // (freshly computed per call in `plan_outputs_with`, never carried
-        // over), so this cannot restart the slicer on every ordinary pass.
+        // for this reconciliation, including a superseded attempt that
+        // already issued commands. Clear it after projection consumes it so
+        // an ordinary later pass cannot restart the slicer unnecessarily.
+        if self.store.generation() != config_generation {
+            return None;
+        }
         let (canvas_output, projection_divergences) = self
-            .sync_projection(
-                &desired,
-                config_generation,
-                canvas_plan,
-                output_plan.topology_changed,
-            )
+            .sync_projection(&desired, config_generation, canvas_plan, *topology_changed)
             .await;
+        *topology_changed = false;
         divergences.extend(projection_divergences);
+
+        // Awaited compositor work may outlast an activation change.
+        // Never launch an app from the superseded snapshot in that case.
+        if self.store.generation() != config_generation {
+            return None;
+        }
 
         // --- apps ---
         // Exactly one app runs — desired.activeApp — and it always covers the
@@ -536,7 +556,16 @@ impl Reconciler {
         // means mechanically.
         let apps = Self::effective_apps(&desired, canvas_output.as_deref());
         let targets = resolve_app_targets(&apps, &self.snapshot.outputs(), &output_plan.workspaces);
-        divergences.extend(self.supervisor.reconcile(&apps, &targets).await);
+        let app_divergences = self
+            .supervisor
+            .reconcile_if_current(&apps, &targets, || {
+                self.store.generation() == config_generation
+            })
+            .await?;
+        divergences.extend(app_divergences);
+        if self.store.generation() != config_generation {
+            return None;
+        }
 
         // --- audio ---
         if apps.iter().any(|app| {
@@ -660,7 +689,7 @@ impl Reconciler {
             active_app: active_app_status(&self.supervisor, desired.active_app.as_deref()).await,
         };
         self.publish_status(status.clone());
-        status
+        Some(status)
     }
 
     /// Run the projection machinery for this pass's canvas plan.
@@ -2328,6 +2357,84 @@ mod tests {
             restart: RestartPolicy::default(),
             persist_profile: false,
         }
+    }
+
+    /// Observe the first compositor read without changing production clients.
+    struct OutputHook {
+        inner: Arc<MockSway>,
+        hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SwayClient for OutputHook {
+        async fn get_outputs(&self) -> crate::sway::SwayResult<Vec<Output>> {
+            let hook = self.hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+            self.inner.get_outputs().await
+        }
+        async fn get_windows(&self) -> crate::sway::SwayResult<Vec<crate::model::Window>> {
+            self.inner.get_windows().await
+        }
+        async fn run_command(&self, command: &str) -> crate::sway::SwayResult<()> {
+            self.inner.run_command(command).await
+        }
+        async fn get_version(&self) -> crate::sway::SwayResult<crate::sway::SwayVersion> {
+            self.inner.get_version().await
+        }
+        fn subscribe(&self) -> tokio::sync::broadcast::Receiver<crate::sway::SwayEvent> {
+            self.inner.subscribe()
+        }
+        fn is_connected(&self) -> bool {
+            self.inner.is_connected()
+        }
+    }
+
+    fn hook_outputs(harness: &mut Harness, hook: impl FnOnce() + Send + 'static) {
+        let sway = Arc::new(OutputHook {
+            inner: harness.sway.clone(),
+            hook: std::sync::Mutex::new(Some(Box::new(hook))),
+        });
+        harness.reconciler = Arc::new(Reconciler::new(ReconcilerDeps {
+            sway,
+            audio: harness.audio.clone(),
+            store: harness.store.clone(),
+            snapshot: harness.snapshot.clone(),
+            supervisor: harness.supervisor.clone(),
+            events: harness.events.clone(),
+            wallpapers: Arc::new(WallpaperStore::new(harness._dir.path().join("wallpapers"))),
+            docs_base_url: "https://suede.gameshow.pro/".into(),
+            allow_overlaps: false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn deactivation_during_a_pass_prevents_a_stale_launch() {
+        let mut harness = harness();
+        let source = app("window", Some("HDMI-A-1"), None);
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(source);
+                state.active_app = Some("window".into());
+            })
+            .unwrap();
+        let store = harness.store.clone();
+        hook_outputs(&mut harness, move || {
+            store.update(|state| state.active_app = None).unwrap();
+        });
+        let status = harness.reconciler.reconcile().await;
+        assert!(status.active_app.is_none());
+        assert_eq!(status.revision, harness.store.revision());
+        assert!(harness
+            .supervisor
+            .status("window")
+            .await
+            .unwrap()
+            .pid
+            .is_none());
+        harness.supervisor.shutdown().await;
     }
 
     #[tokio::test]
