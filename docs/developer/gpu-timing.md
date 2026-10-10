@@ -362,6 +362,134 @@ The timestamp semantics follow the
 [Vulkan timestamp command specification](https://docs.vulkan.org/refpages/latest/refpages/source/vkCmdWriteTimestamp.html)
 and the [Khronos timestamp-query example](https://docs.vulkan.org/samples/latest/samples/api/timestamp_queries/README.html).
 
+### Parked experiment: capture scheduling and doubled source refresh (2026-10-09)
+
+This section is the record of a parked line of work. It is kept so that the
+idea is not retried from scratch: the hypothesis, what was tested, what was
+measured, and why nothing shipped.
+
+#### Hypothesis
+
+With an uncapped Unreal Engine producer rendering about 44 FPS into a
+1920x1143 source canvas, each of four 1080p outputs presented only about 41
+updates/s. The projection GPU span was about 0.25 ms, while the wait from
+arming a capture to its ready event was about 24 ms. The gap was therefore
+suspected to be scheduling between producer, compositor capture, and
+presentation rather than GPU cost. The candidates were:
+
+- flush Wayland requests immediately after arming the next capture;
+- copy every capture, or flush after each commit, or free-run the output gate;
+- pin Sway's main thread to performance cores;
+- raise the virtual (headless) source output's refresh above the physical
+  59.939 Hz so the compositor would pick up new producer frames sooner, at
+  2× and 4× and later 1.5× and 3×.
+
+For the refresh change to be adopted it had to deliver distinct frames, not
+merely more presentation cycles, and it had to not regress browser producers,
+which are Suede's normal workload.
+
+#### Tests
+
+All trials ran on [System A](test-systems.md#system-a) (Quadro RTX 8000,
+driver 615.71.09 open module, Sway 1.11) with the 1920x1143 source, four
+1920x1080 outputs at 59.939 Hz, device-local tables, and full GPU timing.
+Research builds were derived from commit `0bf8a45` with runtime-gated
+selectors such as `SUEDE_TEST_SOURCE_RATE_MULTIPLIER`; the binaries, patches,
+and harnesses stayed outside this repository. Every trial recorded per-output
+presentation feedback, GPU telemetry, and for UE a CSV engine profile compared
+on a matched later frame window. Each campaign saved and restored the
+appliance's binary, configuration, and app state and requalified it with all
+checks passing.
+
+| Test | Workload | Design |
+| --- | --- | --- |
+| Early capture flush | UE uncapped | 3 counterbalanced pairs, 60 s warmup + 60 s collection |
+| Scheduling screen | UE uncapped | 8 arms: 3 baselines, source 2×, source 4×, copy every capture, flush after commit, free-run; 30 s + 30 s |
+| Sway affinity screen | UE uncapped | normal/P-core/P-core/normal, 30 s + 30 s |
+| Source 2× confirmation | UE uncapped | 3 pairs, 60 s + 60 s |
+| Source 2× at a 30 FPS cap | UE with `t.MaxFPS 30` | 2 pairs, 60 s + 60 s |
+| Nearby rates | UE uncapped | 2× / 1.5× / 3× / 2×, 30 s + 30 s |
+| Cross-workload | Chromium Seascape, Chromium test card, UE uncapped | 6 trials each in 1×/2×/2×/1×/1×/2× order, 60 s + 60 s |
+| Frame uniqueness | all three workloads at 1× and 2× | diagnostic readback build; 24 consecutive presented frames on one output per condition |
+
+The test card used `https://testpatterns.gameshow.pro/test-card/index.html`
+with its frame counter as changing content; Chromium ran with `--mute-audio`
+and no FPS overlay. UE ran Electric Dreams with `-ExecCmds=r.VSync 0,t.MaxFPS 0`,
+`-UseFixedTimeStep`, and `-fps=60`. The frame-uniqueness build read back the
+actual presentation image chosen by the blend pass, tied it to its surface
+commit and presentation feedback, and compared exact RGB pixels; its readback
+perturbs cadence, so it is not throughput evidence.
+
+#### Results
+
+Per-output presented updates/s unless stated. Changes are candidate versus
+control.
+
+| Test | Control | Candidate | Change |
+| --- | ---: | ---: | ---: |
+| Early capture flush | 40.541 | 40.323 | −0.54% (pairs −1.15, −0.65, +0.18%) |
+| Screen, source 2× | 40.55–41.24 (3 baselines) | 42.80 | above the baseline range |
+| Screen, source 4× | 40.55–41.24 | 40.77 | none; 21 superseded captures |
+| Screen, other arms | 40.55–41.24 | 40.20–41.16 | none |
+| Sway affinity | 41.995 / 40.917 | 40.535 / 40.945 | order-dependent, no gain |
+| Source 2× confirmation | 40.863 | 42.576 | +4.19% (pairs +4.24, +4.11, +4.22%) |
+| Source 2× at 30 FPS cap | 29.998 | 30.001 | none |
+| Nearby rates, 1.5× / 3× | 2×: 43.04, 42.96 | 43.16 / 43.05 | within 0.5% |
+| Cross-workload, Seascape | 59.93 | 54.78 | −8.60% (pairs −8.28, −8.64, −8.87%) |
+| Cross-workload, test card | 59.09 | 58.42 | −1.13% (pairs −1.26, −0.94, −1.21%) |
+| Cross-workload, UE | 40.87 | 43.01 | +5.24% (pairs +3.52, +6.07, +6.16%) |
+
+Supporting observations:
+
+- The UE gain was in presented updates only. Matched-window engine rate was
+  43.32 versus 43.17 FPS, projection GPU span 0.242 ms at both rates, GPU
+  utilization 96.7% at both, and board power 257.2 versus 257.5 W. There was
+  no power saving at the 30 FPS cap either.
+- At 2× the capture-ready wait shortened by about 1 ms (24.5 to 23.4 ms) and
+  request-to-present latency was unchanged at about 11.5 ms.
+- For Seascape at 2×, captured canvas frames fell from 59.9 to 56.2/s and
+  superseded captures rose from 2 to 209. For the test card, captures rose
+  from 59.1 to 65.5/s while presented updates fell, with superseded captures
+  rising from 6 to 1,055. Chromium paces its rendering to the output refresh,
+  so a 120 Hz virtual output asks it for more work; the exact mechanism of the
+  presented-rate loss was not identified.
+- Frame uniqueness: every condition yielded 24 of 24 distinct frames with no
+  adjacent duplicates, consecutive commit sequence numbers, and 24 zero-copy
+  `presented` outcomes. Seascape and UE changed across the whole picture
+  between frames; the test card changed only in its top-right counter, which
+  advanced on every presented frame. Under the instrumented cadence, 2×
+  skipped more source captures than 1× (UE: 11 skips in 23 pairs versus 1),
+  and pairs spanning a skip showed about 1.7 times the pixel delta, consistent
+  with one missing fixed-step engine frame.
+- No arm produced discarded output frames, stalls, or timestamp-query
+  failures. Across the source-refresh work, 26 timed trials and 1,080 GPU
+  telemetry samples used the same GPU, driver, and GSP state.
+
+#### Conclusions
+
+- **Doubling the virtual source refresh is a real but small gain for one
+  case.** Uncapped UE over Wayland capture gained a repeatable 4–5% in
+  presented updates, and those updates were distinct frames. It did not raise
+  engine throughput, reduce projection GPU work, or save power. A capped
+  producer gained nothing.
+- **It regresses the normal workload.** Both Chromium pages lost presented
+  updates, the heavier page by almost 9%. It cannot be a default.
+- **It is not worth shipping as an option.** About two extra frames per second
+  for one producer type, with an unexplained mechanism, does not justify a
+  config surface and a headless mode change on app switch. The native
+  texture-sharing work for UE bypasses screencopy and would make this effect
+  moot.
+- **The other scheduling candidates failed.** Early flushing, copying every
+  capture, flushing after commit, free-running the gate, and core pinning
+  showed no gain. The 24 ms capture wait against a 0.25 ms GPU span remains
+  unexplained; it includes source availability and event scheduling and is not
+  a measurement of compositor GPU cost.
+- **No production default or option changed.** Reopen only if an uncapped UE
+  producer over Wayland capture becomes a shipping configuration that texture
+  sharing has not superseded. In that case test 1.5× first, since it matched 2×
+  on UE and should cost browsers less, and add producer-frame identity to the
+  counters before measuring further.
+
 ### Raspberry Pi shared-memory qualification (2026-10-09)
 
 On [System C](test-systems.md#system-c), the Pi 5's V3DV driver (Mesa
