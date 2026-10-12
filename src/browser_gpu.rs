@@ -1316,6 +1316,7 @@ mod tests {
                 profiles_root: dir.join("profiles"),
                 log_root: dir.join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
+                browser_devtools: true,
             },
             vec!["*".to_string()],
         ));
