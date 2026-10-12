@@ -16,6 +16,7 @@ pub mod error;
 pub mod events;
 pub mod model;
 pub mod nvidia_driver;
+pub mod nvidia_smi;
 pub mod pcie;
 pub mod ports;
 pub mod presentation;
