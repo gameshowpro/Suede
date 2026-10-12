@@ -381,7 +381,7 @@ impl CheckRunner {
             self.check_real_displays().await,
             self.check_refresh_rates().await,
             self.check_output_phase().await,
-            self.check_video_decode(),
+            self.check_video_decode().await,
             self.check_swaybg().await,
             self.check_browsers().await,
             self.check_pipewire().await,
@@ -985,7 +985,13 @@ impl CheckRunner {
     /// Hardware video decode fails *silently*: Chromium asks for VA-API, finds
     /// no driver for the GPU, and quietly decodes on the CPU. Nothing errors,
     /// so the only symptom is a hot CPU and dropped frames on the displays.
-    fn check_video_decode(&self) -> Check {
+    ///
+    /// On NVIDIA the installed `nvidia-vaapi-driver` package version also
+    /// matters, because releases before 0.0.14 export frames NVIDIA's GBM
+    /// cannot import (see [`vaapi_driver_too_old`]). That is looked up through
+    /// `dpkg-query`; a machine without dpkg or without the package simply has
+    /// an unknown version, and the check behaves as it always did.
+    async fn check_video_decode(&self) -> Check {
         let vendors = gpu_vendors();
         if vendors.is_empty() {
             // Not every GPU is a PCI device. A Raspberry Pi's VideoCore is a
@@ -1027,6 +1033,21 @@ impl CheckRunner {
             // through a present, working driver. So when a measurement
             // exists, let it settle the question instead of hedging forever.
             if vendors.iter().any(|v| v.name == "NVIDIA") {
+                // A too-old driver wins over the measurement: a measurement
+                // can say "hardware" while every real playback still crashes
+                // the browser's GPU process, which is exactly what happened.
+                // The version only changes on a package operation, so the
+                // detail stays stable between runs.
+                let version = installed_vaapi_driver_version().await;
+                if let Some(version) = version.filter(|v| vaapi_driver_too_old(v) == Some(true)) {
+                    return self.check(
+                        ids::VIDEO_DECODE,
+                        "Hardware video decode",
+                        CheckStatus::Warn,
+                        old_vaapi_driver_detail(&satisfied.join(", "), &version),
+                        Some("troubleshooting/#browser-software-rendering"),
+                    );
+                }
                 let (status, verdict) = match self.measured_hardware() {
                     Some(families) if !families.is_empty() => (
                         CheckStatus::Pass,
@@ -2129,6 +2150,51 @@ async fn run(program: &str, args: &[&str]) -> std::io::Result<CommandOutput> {
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
+}
+
+/// The oldest `nvidia-vaapi-driver` whose exported frames NVIDIA's GBM can
+/// import. Debian 13 ships 0.0.13, whose NV12 export fails `gbm_bo_import`;
+/// every hardware-decoded video start then kills Chromium's GPU process.
+/// 0.0.14 reverted the single-plane export that caused it.
+const MIN_VAPI_DRIVER: [u64; 3] = [0, 0, 14];
+
+/// Whether a Debian package version of `nvidia-vaapi-driver` is older than
+/// [`MIN_VAPI_DRIVER`]. Only the upstream part (before the first `-`) is
+/// compared, as up to three numeric dotted components, so revisions such as
+/// `0.0.18-1~bpo13+1` do not matter. `None` when it does not parse, so an
+/// unfamiliar version string never produces a warning.
+fn vaapi_driver_too_old(version: &str) -> Option<bool> {
+    let upstream = version.trim().split('-').next()?;
+    let mut parts = [0u64; 3];
+    for (i, piece) in upstream.split('.').enumerate() {
+        *parts.get_mut(i)? = piece.parse().ok()?;
+    }
+    Some(parts < MIN_VAPI_DRIVER)
+}
+
+/// The detail for a present but too-old NVIDIA VA-API driver. `via` is the
+/// already-formatted "NVIDIA via nvidia_drv_video.so" list.
+fn old_vaapi_driver_detail(via: &str, version: &str) -> String {
+    format!(
+        "VA-API driver present for {via}, but nvidia-vaapi-driver {version} is older \
+         than 0.0.14: NVIDIA's GBM cannot import the frames it exports, so each \
+         video start can crash the browser's GPU process, and the third crash \
+         drops it to software rendering. Install 0.0.14 or newer (on Debian 13, \
+         the trixie-backports package)"
+    )
+}
+
+/// The installed `nvidia-vaapi-driver` package version, from dpkg. `None`
+/// when dpkg is absent, the package is not installed, or the answer is empty.
+async fn installed_vaapi_driver_version() -> Option<String> {
+    let output = run(
+        "dpkg-query",
+        &["-W", "-f=${Version}", "nvidia-vaapi-driver"],
+    )
+    .await
+    .ok()?;
+    let version = output.stdout.trim().to_string();
+    (output.success && !version.is_empty()).then_some(version)
 }
 
 fn first_line(text: &str) -> String {
@@ -3370,6 +3436,30 @@ mod tests {
             notes: vec![],
             codecs,
         }
+    }
+
+    #[test]
+    fn vaapi_driver_version_rule() {
+        assert_eq!(vaapi_driver_too_old("0.0.13-1"), Some(true));
+        assert_eq!(vaapi_driver_too_old("0.0.14-1"), Some(false));
+        assert_eq!(vaapi_driver_too_old("0.0.18-1~bpo13+1"), Some(false));
+        assert_eq!(vaapi_driver_too_old("0.1.0-1"), Some(false));
+        assert_eq!(vaapi_driver_too_old("garbage"), None);
+        assert_eq!(vaapi_driver_too_old(""), None);
+    }
+
+    #[test]
+    fn old_vaapi_driver_detail_names_driver_and_version() {
+        let detail = old_vaapi_driver_detail("NVIDIA via nvidia_drv_video.so", "0.0.13-1");
+        assert_eq!(
+            detail,
+            "VA-API driver present for NVIDIA via nvidia_drv_video.so, but \
+             nvidia-vaapi-driver 0.0.13-1 is older than 0.0.14: NVIDIA's GBM cannot \
+             import the frames it exports, so each video start can crash the \
+             browser's GPU process, and the third crash drops it to software \
+             rendering. Install 0.0.14 or newer (on Debian 13, the \
+             trixie-backports package)"
+        );
     }
 
     #[test]

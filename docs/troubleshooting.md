@@ -458,6 +458,16 @@ Set `restart_on_gpu_fallback = false` (or `SUEDE_RESTART_ON_GPU_FALLBACK=false`)
 to leave the restart to an operator; the check still fails and still offers
 its fix.
 
+A known cause on NVIDIA: `nvidia-vaapi-driver` older than 0.0.14 (Debian 13
+ships 0.0.13) exports decoded frames that NVIDIA's GBM cannot import, so each
+hardware-decoded video start crashes the GPU process, and the third crash
+drops Chromium to software rendering. This is expected on such a machine. The
+**Hardware video decode** health check names the installed version and warns
+before any video plays. The fix is 0.0.14 or newer; on Debian 13, install the
+`nvidia-vaapi-driver` package from trixie-backports (the `.deb` can be taken
+straight from the Debian pool and installed with `dpkg -i`; its dependencies
+are all in Debian 13).
+
 A restart only buys time if the GPU process keeps crashing. Find out why
 from the lines just before each crash in the app's log. One cause seen on an
 NVIDIA appliance was hardware video decode: the GPU process died importing a
