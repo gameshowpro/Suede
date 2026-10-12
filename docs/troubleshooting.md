@@ -523,10 +523,12 @@ DevTools is disabled, see
 | `VaapiVideoDecoder` | true | hardware, on the GPU |
 | `FFmpegVideoDecoder`, `Dav1dVideoDecoder`, `VpxVideoDecoder` | false | software, on the processor |
 
-A feature status of `video_decode: disabled_software` and an empty list of
-decode profiles say the same thing for the whole browser. Software decoding
-is not a fault by itself, but a 4K or several simultaneous streams may not
-keep up. If the **Hardware video decode** health check warns about
+A feature status of `video_decode: disabled_software` says the same thing
+for the whole browser. The decode profile list is not a signal: on Linux,
+Chromium leaves it empty even while VA-API decoding works (measured on
+System A with a 1080p H.264 stream on `VaapiVideoDecoder`), so read the
+player's decoder, not the list. Software decoding is not a fault by itself,
+but a 4K or several simultaneous streams may not keep up. If the **Hardware video decode** health check warns about
 `nvidia-vaapi-driver`, see [above](#browser-software-rendering).
 
 **Cross-checking with the GPU decoder percent.** While a player claims

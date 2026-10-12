@@ -1299,6 +1299,17 @@ fn apply_event(tracked: &mut Tracked, event: &Value, now: u64) {
             player.playing = Some(false);
             player.ended = true;
         }
+        // A `loop` video, or a page replaying one, logs `kEnded`, then
+        // `kSeek` to 0 and `kPipelineStateChange: kPlaying` with no second
+        // `kPlay` (measured on Chrome 151). The seek is what un-ends it; a
+        // seek while paused was preceded by `kPause`, so only a seek out of
+        // the ended state resumes `playing`.
+        "kSeek" => {
+            if player.ended {
+                player.ended = false;
+                player.playing = Some(true);
+            }
+        }
         "kPipelineStateChange" => {
             if let Some(state) = string_at(event, "pipeline_state") {
                 let state = state.strip_prefix('k').unwrap_or(&state).to_string();
@@ -1700,6 +1711,25 @@ mod tests {
         let p = &media.players(107)[0];
         assert_eq!(p.playing, Some(false));
         assert!(p.ended);
+
+        // The loop boundary: kEnded, kSeek 0, kPlaying, and no second kPlay.
+        media.apply(
+            Some("S1"),
+            "Media.playerEventsAdded",
+            &events(
+                "P1",
+                &[
+                    r#"{"event":"kSeek","seek_target":0.0}"#,
+                    r#"{"event":"kPipelineStateChange","pipeline_state":"kSeeking"}"#,
+                    r#"{"event":"kPipelineStateChange","pipeline_state":"kPlaying"}"#,
+                ],
+            ),
+            108,
+        );
+        let p = &media.players(108)[0];
+        assert_eq!(p.playing, Some(true));
+        assert!(!p.ended);
+        assert_eq!(p.pipeline_state.as_deref(), Some("Playing"));
 
         // Errors are kept as their JSON, the last five.
         for n in 0..7 {
