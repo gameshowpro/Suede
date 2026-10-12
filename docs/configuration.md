@@ -53,6 +53,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `presentation` | — | `"wayland"` | **Experimental.** `"wayland"` or `"direct"`: which display path the login session starts — see [Experimental: direct presentation](#experimental-direct-presentation). `"direct"` without `allow_overlaps = true` resolves to effective `wayland` with a reason instead of failing to start; an unrecognized value fails startup. `GET /api/v1/system` reports `requested`, `effective`, and why they differ, if they do |
 | `align_outputs` | `SUEDE_ALIGN_OUTPUTS` | `true` | Whether Suede re-aligns the displays' vblank phase itself when a Wayland session starts them out of phase, with the `output-phase` check's own fix — see [Automatic output phase alignment](#align-outputs) |
 | `restart_on_gpu_fallback` | `SUEDE_RESTART_ON_GPU_FALLBACK` | `true` | Whether Suede restarts a `chromium-kiosk` app itself once Chromium has fallen back to software rendering after its GPU process crashed, at most three times per app per hour — see [Automatic restart after a browser GPU fallback](#restart-on-gpu-fallback) |
+| `browser_devtools` | `SUEDE_BROWSER_DEVTOOLS` | `true` | Whether Suede launches `chromium-kiosk` apps with a private DevTools pipe to read the browser's own GPU view and media players for the web UI's Chromium panel; `false` removes the pipe and keeps the process table — see [Browser DevTools pipe](#browser-devtools) |
 | `gl_yield` | — | `"usleep"` | **Experimental, NVIDIA-only.** `"usleep"` (the default), `"nothing"` or `"default"` (opt out; driver behavior): exports `__GL_YIELD=USLEEP` or `__GL_YIELD=NOTHING` into the login session's Sway environment (both the DRM Sway and direct presentation's headless one); Mesa ignores it. An unrecognized value fails startup. `GET /api/v1/system` reports `requested` and a live `effective` read from the running Sway's environment, so a session started before an edit shows the mismatch — see [NVIDIA `__GL_YIELD`](#gl-yield) |
 
 ### Host power control {: #host-power }
@@ -344,6 +345,36 @@ Each restart is logged in Suede's journal and reported as restart reason
 `SUEDE_RESTART_ON_GPU_FALLBACK=false`) to leave it to an operator; the
 `browser-gpu` check still fails and its fix restarts the app on request,
 which never counts against the automatic budget.
+
+### Browser DevTools pipe {: #browser-devtools }
+
+The web UI's System tab has a Chromium panel for each running
+`chromium-kiosk` app. Part of it comes from `/proc`: the process table and the
+rendering verdict. The rest comes from Chromium itself, over a DevTools
+connection.
+
+With `browser_devtools = true` (the default) Suede launches Chromium with
+`--remote-debugging-pipe`. That is a pair of inherited file descriptors
+between Suede and the browser: no TCP port, no socket file, and nothing for
+another process or machine to connect to. Over it Suede reads:
+
+- facts once at launch, refreshed every 30 seconds: the browser version, the
+  GPU device and driver, the feature status (such as `video_decode`), and the
+  video decode profiles Chromium offers;
+- the Media domain's push events, which fire when a player is created, changes
+  state, or logs a message, never per frame.
+
+Chromium parks one thread on a blocking read of the pipe and does nothing
+else for it, so the measured cost is negligible. Suede deliberately does not
+poll the page for playback progress or dropped frames; see
+[Reading the GPU and Chromium panels](troubleshooting.md#gpu-and-chromium-panels).
+
+Set `browser_devtools = false` (or `SUEDE_BROWSER_DEVTOOLS=false`) to launch
+without the pipe. The Chromium panel then reports DevTools as disabled and
+loses its GPU view and media players, but keeps the process table, the
+rendering verdict and the GPU process crash count. The GPU panel does not
+depend on it. A change applies to browsers launched afterwards, so restart a
+running app to pick it up.
 
 ### NVIDIA `__GL_YIELD` {: #gl-yield }
 

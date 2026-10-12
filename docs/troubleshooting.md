@@ -458,6 +458,9 @@ Set `restart_on_gpu_fallback = false` (or `SUEDE_RESTART_ON_GPU_FALLBACK=false`)
 to leave the restart to an operator; the check still fails and still offers
 its fix.
 
+The System tab shows the same GPU process verdict beside the browser's own
+view; see [Reading the GPU and Chromium panels](#gpu-and-chromium-panels).
+
 A known cause on NVIDIA: `nvidia-vaapi-driver` older than 0.0.14 (Debian 13
 ships 0.0.13) exports decoded frames that NVIDIA's GBM cannot import, so each
 hardware-decoded video start crashes the GPU process, and the third crash
@@ -478,6 +481,68 @@ wins), for example
 `--enable-features=VaapiVideoDecoder,CanvasOopRasterization`. Video then
 decodes on the processor, which is slower but no longer takes the GPU process
 down. See [Environment and hardware acceleration](configuration.md#environment-and-hardware-acceleration).
+
+## Reading the GPU and Chromium panels {: #gpu-and-chromium-panels }
+
+The System tab has two panels between **System** and **Health checks**. They
+answer "is this video decoded on the GPU?" and "what is the browser doing?"
+without a terminal.
+
+**GPU.** Shown only on a machine with an NVIDIA driver and `nvidia-smi`; it
+is hidden otherwise. Every five seconds Suede runs `nvidia-smi` (about 80 ms
+of wall time, negligible processor use) and shows, per GPU, utilization for
+graphics, memory, decoder and encoder, memory used, temperature, power, clocks
+and the PCIe link. A field the driver does not support shows as empty. The
+process table lists each process using the GPU with its share of graphics
+(SM), memory, encoder and decoder, and its framebuffer in MiB. Each process
+is attributed to the Suede app whose process tree it belongs to, and for a
+`chromium-kiosk` app to its role (browser, GPU process, renderer, ...), so
+you can see which app is using the decoder.
+
+**Chromium.** One block per running `chromium-kiosk` app (not Firefox or
+`exec` apps):
+
+- the rendering verdict and GPU process crash count, from the same watch as
+  the **Browser GPU acceleration** check
+  (see [above](#browser-software-rendering));
+- the process table from `/proc`: role, process ID, processor use (percent of
+  one core) and resident memory;
+- the browser's own GPU view: version, GPU device and driver, feature status
+  such as `video_decode`, and the decode profiles it offers;
+- the media players Chromium reports: decoder, codec, resolution, duration,
+  pipeline state, and any warnings or errors.
+
+The GPU view and media players need the DevTools pipe. If the block says
+DevTools is disabled, see
+[Browser DevTools pipe](configuration.md#browser-devtools).
+
+**Hardware or software video decoding.** Read the player's video decoder:
+
+| Decoder | Platform decoder | Decoding is |
+| --- | --- | --- |
+| `VaapiVideoDecoder` | true | hardware, on the GPU |
+| `FFmpegVideoDecoder`, `Dav1dVideoDecoder`, `VpxVideoDecoder` | false | software, on the processor |
+
+A feature status of `video_decode: disabled_software` and an empty list of
+decode profiles say the same thing for the whole browser. Software decoding
+is not a fault by itself, but a 4K or several simultaneous streams may not
+keep up. If the **Hardware video decode** health check warns about
+`nvidia-vaapi-driver`, see [above](#browser-software-rendering).
+
+**Cross-checking with the GPU decoder percent.** While a player claims
+hardware decoding, the GPU panel's decoder utilization, and the decoder
+percent on that app's browser or GPU process, should be above zero. If a
+player says `VaapiVideoDecoder` but the decoder stays at zero, suspect the
+player has stopped or paused. If it says `FFmpegVideoDecoder` and the decoder
+is busy, something else is using it. The cross-check cannot tell you more when
+there is no `nvidia-smi` (no decoder number at all) or when several players
+or apps share the GPU: the utilization is per GPU, and the process table
+attributes it per process, not per player.
+
+**What is deliberately not collected.** Playback progress and dropped frames
+live in the page, and reading them would mean polling the page every
+interval, which costs the page's own thread time. Suede only reads what
+Chromium pushes. Use the page's own tooling if you need those numbers.
 
 ## Suede itself stops answering, but the process is still there
 
