@@ -819,6 +819,17 @@ window.addEventListener("error", (event) => {
         <span class="hint" id="power-note"></span>
       </div>
     </div>
+    <div class="panel" id="gpu-panel" hidden>
+      <h2>GPU</h2>
+      <table id="gpu"></table>
+      <p class="hint" id="gpu-note" hidden></p>
+      <h3>Processes on the GPU</h3>
+      <table id="gpu-processes"></table>
+    </div>
+    <div class="panel" id="browsers-panel" hidden>
+      <h2>Chromium</h2>
+      <div id="browsers"></div>
+    </div>
     <div class="panel">
       <h2>Health checks</h2>
       <p class="hint">Anything not passing also appears at the top of every tab,
@@ -892,7 +903,11 @@ let outputs = [], config = null, apps = [], sinks = [], checks = [], status = nu
     // is absent both when nothing is running and when one is running but
     // has reported no frames yet (a static page never damages, so the
     // frame loop never runs); `running` is what tells those two apart.
-    projectionStats = null;
+    projectionStats = null,
+    // GpuTelemetry from nvidia-smi, and one BrowserReport per running
+    // chromium-kiosk app. Both advisory; null/[] hides their panels.
+    gpuTelemetry = null,
+    browserReports = [];
 
 // Every display's background comes from here, so the lookup is shared.
 const presets = () => config?.backgrounds ?? [];
@@ -4077,6 +4092,191 @@ async function loadChecks() {
   status = await api("/status");
   renderChecks(); renderStatus();
 }
+// ---- GPU and Chromium panels (System tab) --------------------------------
+// Both are advisory: they come from /system/gpu and /system/browsers and
+// stay hidden when the host has no nvidia-smi or no running Chromium app.
+// Server strings are untrusted display text, so every one goes through
+// escape(). Nulls are real in this contract, and num(null) would print 0.0,
+// so values pass through fmt()/pct() first.
+const dash = "—";
+const fmt = (v, digits = 0, unit = "") =>
+  v == null || !Number.isFinite(Number(v)) ? dash : `${num(v, digits)}${unit}`;
+const pct = (v) => v == null ? dash : fmt(v, 0, " %");
+const clockTime = (seconds) => {
+  if (seconds == null || !Number.isFinite(Number(seconds))) return dash;
+  const total = Math.round(Number(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+};
+const GPU_KIND = { graphics: "G", compute: "C", both: "C+G" };
+
+function renderGpu() {
+  const g = gpuTelemetry;
+  $("gpu-panel").hidden = !g?.available;
+  if (!g?.available) return;
+  const gpus = g.gpus || [];
+  $("gpu").innerHTML = gpus.map((s) => {
+    const memory = s.memoryUsedMib == null && s.memoryTotalMib == null
+      ? dash : `${fmt(s.memoryUsedMib)} / ${fmt(s.memoryTotalMib)} MiB`;
+    const pcie = s.pcieGeneration == null && s.pcieWidth == null
+      ? dash : `Gen ${fmt(s.pcieGeneration)} ×${fmt(s.pcieWidth)}`;
+    const fan = s.fanPercent == null ? "" : ` · fan ${fmt(s.fanPercent, 0, " %")}`;
+    return `<tbody><tr><td colspan="2"><b>${escape(s.name)}</b>
+        <span class="hint">GPU ${escape(s.index)} · driver ${escape(s.driverVersion ?? dash)} ·
+        state ${escape(s.performanceState ?? dash)}</span></td></tr>
+      <tr><th>Utilization</th><td>graphics ${pct(s.utilizationGpuPercent)} ·
+        memory ${pct(s.utilizationMemoryPercent)} ·
+        decoder ${pct(s.utilizationDecoderPercent)} ·
+        encoder ${pct(s.utilizationEncoderPercent)}</td></tr>
+      <tr><th>Memory</th><td>${memory}</td></tr>
+      <tr><th>Temperature / power</th><td>${fmt(s.temperatureC, 0, " °C")} ·
+        ${fmt(s.powerDrawW, 1, " W")} of ${fmt(s.powerLimitW, 1, " W")}${fan}</td></tr>
+      <tr><th>Clocks</th><td>SM ${fmt(s.clockSmMhz, 0, " MHz")} ·
+        memory ${fmt(s.clockMemoryMhz, 0, " MHz")}</td></tr>
+      <tr><th>PCIe</th><td>${pcie}</td></tr></tbody>`;
+  }).join("") || `<tbody><tr><td class="hint">No GPUs reported.</td></tr></tbody>`;
+
+  // Attributed rows first (by app, then PID); the rest keep PID order.
+  const procs = [...(g.processes || [])].sort((a, b) =>
+    (a.app == null) - (b.app == null)
+    || String(a.app ?? "").localeCompare(String(b.app ?? ""))
+    || a.pid - b.pid);
+  $("gpu-processes").innerHTML = procs.length
+    ? `<thead><tr><th>PID</th><th>App</th><th>Role</th><th>Kind</th><th>SM</th>
+        <th>Memory</th><th>Decoder</th><th>Encoder</th><th>Framebuffer</th></tr></thead><tbody>${
+      procs.map((p) => `<tr><td class="mono">${escape(p.pid)}</td>
+        <td>${p.app == null ? dash : `<span class="mono">${escape(p.app)}</span>`}</td>
+        <td>${escape(p.role ?? (p.command || dash))}</td>
+        <td>${escape(GPU_KIND[p.kind] ?? p.kind ?? dash)}</td>
+        <td>${pct(p.smPercent)}</td><td>${pct(p.memoryPercent)}</td>
+        <td>${pct(p.decoderPercent)}</td><td>${pct(p.encoderPercent)}</td>
+        <td>${fmt(p.framebufferMib, 0, " MiB")}</td></tr>`).join("")}</tbody>`
+    : `<tbody><tr><td class="hint">No processes are using the GPU.</td></tr></tbody>`;
+  const note = $("gpu-note");
+  note.textContent = g.reason || "";
+  note.hidden = !g.reason;
+}
+
+const DEVTOOLS_PILL = { connected: "ok", connecting: "muted", failed: "bad", closed: "bad", disabled: "muted" };
+function featurePill(value) {
+  const v = String(value ?? "");
+  const cls = v.startsWith("enabled") ? "ok"
+    : /^(disabled|unavailable)_software/.test(v) ? "bad"
+    : /^(disabled|unavailable)/.test(v) ? "warn" : "muted";
+  return `<span class="pill ${cls}">${escape(v)}</span>`;
+}
+function baseName(url) {
+  const clean = String(url).split(/[?#]/)[0].replace(/\/+$/, "");
+  return clean.slice(clean.lastIndexOf("/") + 1) || String(url);
+}
+function playerState(p) {
+  if (p.destroyed) return "destroyed";
+  const parts = [];
+  if (p.pipelineState) parts.push(p.pipelineState);
+  if (p.ended) parts.push("ended");
+  else if (p.playing === true) parts.push("playing");
+  else if (p.playing === false) parts.push("paused");
+  return parts.join(" · ") || dash;
+}
+function renderPlayer(p) {
+  const src = p.sourceUrl ?? p.frameUrl;
+  const source = src
+    ? `<span title="${escape(src)}">${escape(baseName(src))}</span>` : dash;
+  const decoder = p.videoDecoder
+    ? `${escape(p.videoDecoder)} ${p.videoDecoderPlatform === true
+        ? `<span class="pill ok">hardware</span>`
+        : p.videoDecoderPlatform === false ? `<span class="pill warn">software</span>` : ""}`
+    : dash;
+  const codec = [p.videoCodec, p.audioCodec].filter(Boolean).map(escape).join(" + ") || dash;
+  const lastMessage = p.messages?.length ? p.messages[p.messages.length - 1] : null;
+  const latest = p.errors?.length
+    ? `<span class="pill bad">error</span> ${escape(p.errors[p.errors.length - 1])}`
+    : lastMessage
+      ? `<span class="pill ${lastMessage.level === "error" ? "bad" : "warn"}">${escape(lastMessage.level)}</span> ${escape(lastMessage.message)}`
+      : "";
+  const props = Object.entries(p.properties || {});
+  const raw = props.length
+    ? `<details><summary>${props.length} properties</summary><table>${
+        props.map(([k, v]) => `<tr><td class="mono">${escape(k)}</td><td class="mono">${escape(v)}</td></tr>`).join("")
+      }</table></details>` : "";
+  return `<tr${p.destroyed ? ' class="hint"' : ""}><td>${source}</td><td>${decoder}</td>
+    <td>${codec}</td><td>${escape(p.resolution ?? dash)}</td>
+    <td>${clockTime(p.durationSeconds)}</td><td>${escape(playerState(p))}</td>
+    <td>${latest || dash}${raw}</td></tr>`;
+}
+
+function renderBrowser(r) {
+  const gpuProcs = new Map((gpuTelemetry?.available ? gpuTelemetry.processes || [] : [])
+    .map((p) => [p.pid, p]));
+  const hasGpuCols = (r.processes || []).some((p) => gpuProcs.has(p.pid));
+  const dt = r.devtools || { state: "disabled", detail: null };
+  const rendering = r.rendering === "hardware" ? `<span class="pill ok">hardware</span>`
+    : r.rendering === "software" ? `<span class="pill bad">software</span>`
+    : `<span class="pill muted">${dash}</span>`;
+  const crashes = r.gpuProcessCrashes > 0
+    ? `<span class="pill bad">${escape(r.gpuProcessCrashes)} GPU process crash${r.gpuProcessCrashes === 1 ? "" : "es"}</span>`
+    : `<span class="pill muted">no GPU process crashes</span>`;
+  const head = `<div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+      <b class="mono">${escape(r.app)}</b>
+      <span class="hint" title="${escape(r.version?.userAgent ?? "")}">${escape(r.version?.product ?? dash)}</span>
+      ${rendering} ${crashes}
+      <span class="pill ${DEVTOOLS_PILL[dt.state] ?? "muted"}" title="${escape(dt.detail ?? "")}">DevTools ${escape(dt.state)}</span>
+    </div>`;
+
+  let gpuBlock = `<p class="hint">${dt.state === "connected" ? "Chromium has not reported its GPU yet."
+    : `DevTools not connected${dt.detail ? `: ${escape(dt.detail)}` : "."}`}</p>`;
+  const g = r.gpu;
+  if (g) {
+    const devices = (g.devices || []).map((d) =>
+      `${escape(d.device)} <span class="hint">(${escape(d.vendor)}${d.driverVendor || d.driverVersion
+        ? `, driver ${escape([d.driverVendor, d.driverVersion].filter(Boolean).join(" "))}` : ""})</span>`).join("<br>") || dash;
+    const features = Object.entries(g.featureStatus || {}).map(([k, v]) =>
+      `<span style="white-space:nowrap"><span class="mono">${escape(k)}</span>: ${featurePill(v)}</span>`).join(" ");
+    const profiles = (list) => (list || []).map((v) =>
+      `${escape(v.profile)} (max ${escape(v.maxWidth)}×${escape(v.maxHeight)})`).join(", ") || dash;
+    const workarounds = g.driverBugWorkarounds || [];
+    gpuBlock = `<h3>GPU in Chromium</h3><table>
+      <tr><th>Device</th><td>${devices}</td></tr>
+      <tr><th>Features</th><td>${features || dash}</td></tr>
+      <tr><th>Video decoding</th><td>${profiles(g.videoDecoding)}</td></tr>
+      <tr><th>Video encoding</th><td>${profiles(g.videoEncoding)}</td></tr></table>
+      <details><summary>Command line and driver bug workarounds</summary>
+        <p class="mono" style="word-break:break-all">${g.commandLine ? escape(g.commandLine) : dash}</p>
+        <p class="hint">Driver bug workarounds: ${workarounds.length ? escape(workarounds.join(", ")) : "none"}</p>
+      </details>`;
+  }
+
+  const procs = r.processes || [];
+  const procBlock = `<h3>Processes</h3>` + (procs.length
+    ? `<table><thead><tr><th>Role</th><th>PID</th><th>CPU</th><th>Memory</th>${
+        hasGpuCols ? "<th>GPU SM</th><th>GPU decoder</th>" : ""}</tr></thead><tbody>${
+      procs.map((p) => {
+        const gp = gpuProcs.get(p.pid);
+        return `<tr><td>${escape(p.role)}${p.subtype ? ` <span class="hint">${escape(p.subtype)}</span>` : ""}</td>
+          <td class="mono">${escape(p.pid)}</td><td>${fmt(p.cpuPercent, 1, " %")}</td>
+          <td>${fmt(p.rssMib, 0, " MiB")}</td>${hasGpuCols
+            ? `<td>${gp ? pct(gp.smPercent) : dash}</td><td>${gp ? pct(gp.decoderPercent) : dash}</td>` : ""}</tr>`;
+      }).join("")}</tbody></table>`
+    : `<p class="hint">No processes found.</p>`);
+
+  const players = r.mediaPlayers || [];
+  const playerBlock = `<h3>Media players</h3>` + (players.length
+    ? `<table><thead><tr><th>Source</th><th>Video decoder</th><th>Codec</th><th>Resolution</th>
+        <th>Duration</th><th>State</th><th>Latest warning or error</th></tr></thead><tbody>${
+      players.map(renderPlayer).join("")}</tbody></table>`
+    : `<p class="hint">${dt.state === "connected" ? "No media players reported yet."
+        : `DevTools not connected${dt.detail ? `: ${escape(dt.detail)}` : "."}`}</p>`);
+
+  return `<div style="margin-bottom:22px">${head}${gpuBlock}${procBlock}${playerBlock}</div>`;
+}
+
+function renderBrowsers() {
+  const list = Array.isArray(browserReports) ? browserReports : [];
+  $("browsers-panel").hidden = list.length === 0;
+  if (!list.length) return;
+  $("browsers").innerHTML = list.map(renderBrowser).join("");
+}
+function renderGpuAndBrowsers() { renderGpu(); renderBrowsers(); }
+
 async function loadAll() {
   lastLoadAt = Date.now();
   outputs = await api("/outputs");
@@ -4094,9 +4294,12 @@ async function loadAll() {
   const statsVersion = projectionEventVersion;
   const latestStats = await api("/projection/stats").catch(() => null);
   if (statsVersion === projectionEventVersion) projectionStats = latestStats;
+  gpuTelemetry = await api("/system/gpu").catch(() => null);
+  browserReports = await api("/system/browsers").catch(() => []);
   await loadConfig();
   renderAv(); renderOutputChoices();
   renderSystem(await api("/system"));
+  renderGpuAndBrowsers();
   await loadChecks();
 }
 
@@ -4266,6 +4469,16 @@ function connect() {
     // renderWarpStatus — otherwise recovered capability leaves the editor
     // hidden until something unrelated happens to redraw it.
     renderProjectionTiming(); renderWarpEditor();
+  });
+  source.addEventListener("gpu_changed", (e) => {
+    if (stream !== source) return;
+    gpuTelemetry = JSON.parse(e.data);
+    renderGpuAndBrowsers();
+  });
+  source.addEventListener("browsers_changed", (e) => {
+    if (stream !== source) return;
+    browserReports = JSON.parse(e.data);
+    renderGpuAndBrowsers();
   });
 }
 
