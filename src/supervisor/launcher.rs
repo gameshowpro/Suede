@@ -97,6 +97,10 @@ pub struct LaunchSpec {
     /// Whether that origin should be granted camera and microphone access in
     /// its profile. `false` for firefox and exec.
     pub grant_capture: bool,
+    /// Whether `args` carries [`crate::devtools::PIPE_FLAG`], so the spawner
+    /// must put the DevTools pipes on fds 3 and 4 — Chromium exits at once
+    /// if they are not there. Only ever true for chromium.
+    pub devtools_pipe: bool,
 }
 
 /// Deployment facts the launcher needs.
@@ -108,6 +112,9 @@ pub struct LaunchContext {
     pub log_root: PathBuf,
     /// Loopback base for the API, e.g. `http://127.0.0.1:9088/api/v1`.
     pub api_base: String,
+    /// Whether chromium apps get a DevTools pipe, from bootstrap's
+    /// `browser_devtools` — see [`crate::devtools`].
+    pub browser_devtools: bool,
 }
 
 impl LaunchContext {
@@ -333,6 +340,12 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
                     "--unsafely-treat-insecure-origin-as-secure={insecure}"
                 ));
             }
+            // Before `extra_args`, like everything the preset adds. The
+            // spawner wires fds 3 and 4 because of `devtools_pipe` below.
+            let devtools_pipe = context.browser_devtools;
+            if devtools_pipe {
+                args.push(crate::devtools::PIPE_FLAG.to_string());
+            }
             args.extend(extra_args.iter().cloned());
             args.push(address);
 
@@ -344,6 +357,7 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
                 wipe_profile: !app.persist_profile,
                 capture_origin: origin,
                 grant_capture: *grant_capture,
+                devtools_pipe,
             }
         }
         Launcher::FirefoxKiosk {
@@ -370,6 +384,7 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
                 wipe_profile: false,
                 capture_origin: None,
                 grant_capture: false,
+                devtools_pipe: false,
             }
         }
         Launcher::Exec { command, args } => LaunchSpec {
@@ -383,6 +398,7 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
             wipe_profile: false,
             capture_origin: None,
             grant_capture: false,
+            devtools_pipe: false,
         },
     }
 }
@@ -569,6 +585,7 @@ mod tests {
             profiles_root: PathBuf::from("/state/profiles"),
             log_root: PathBuf::from("/state/logs"),
             api_base: "http://127.0.0.1:9088/api/v1".into(),
+            browser_devtools: true,
         }
     }
 
@@ -1136,6 +1153,75 @@ exec /opt/google/chrome/chrome \"$@\"
             .args
             .iter()
             .any(|arg| arg.starts_with("--unsafely-treat-insecure-origin-as-secure")));
+    }
+
+    #[test]
+    fn chromium_gets_the_devtools_pipe_once_before_extra_args() {
+        let spec = build(
+            &app(
+                "r1",
+                Launcher::ChromiumKiosk {
+                    uri: "http://a".into(),
+                    show_fps_counter: false,
+                    extra_args: vec!["--mute-audio".into()],
+                    program: None,
+                    grant_capture: true,
+                },
+            ),
+            &context(),
+            None,
+        );
+        assert!(spec.devtools_pipe);
+        let flags: Vec<usize> = spec
+            .args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == crate::devtools::PIPE_FLAG)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(flags.len(), 1, "{:?}", spec.args);
+        let mute = spec.args.iter().position(|a| a == "--mute-audio").unwrap();
+        assert!(flags[0] < mute, "before extra_args: {:?}", spec.args);
+    }
+
+    #[test]
+    fn browser_devtools_false_launches_without_the_pipe() {
+        let mut context = context();
+        context.browser_devtools = false;
+        let spec = build(&app("r1", chromium("http://a")), &context, None);
+        assert!(!spec.devtools_pipe);
+        assert!(!spec.args.iter().any(|a| a == crate::devtools::PIPE_FLAG));
+    }
+
+    #[test]
+    fn only_chromium_gets_the_devtools_pipe() {
+        let firefox = build(
+            &app(
+                "r1",
+                Launcher::FirefoxKiosk {
+                    uri: "http://a".into(),
+                    extra_args: vec![],
+                    program: None,
+                },
+            ),
+            &context(),
+            None,
+        );
+        let exec = build(
+            &app(
+                "r1",
+                Launcher::Exec {
+                    command: "/usr/bin/mpv".into(),
+                    args: vec![],
+                },
+            ),
+            &context(),
+            None,
+        );
+        for spec in [firefox, exec] {
+            assert!(!spec.devtools_pipe);
+            assert!(!spec.args.iter().any(|a| a == crate::devtools::PIPE_FLAG));
+        }
     }
 
     #[test]

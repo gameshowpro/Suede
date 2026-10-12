@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::process::Child;
 use tokio::sync::Mutex;
 
+use crate::devtools;
 use crate::events::{EventHub, ServerEvent};
 use crate::model::{AppConfig, AppState, AppStatus, Divergence, RestartReason, Window};
 use crate::reconciler::plan::{desired_fullscreen_mode, placement_commands, AppTarget};
@@ -68,6 +69,14 @@ struct ManagedApp {
     program_not_allowed: bool,
     /// A stopped process must wait for a current reconciliation before launch.
     launch_pending: bool,
+    /// The DevTools session with a `chromium-kiosk` app's browser, when it
+    /// was launched with the pipe (or a failed placeholder saying why the
+    /// pipe could not be made).
+    ///
+    /// It owns the write end of Chromium's fd 3, and Chromium exits when
+    /// that closes, so it is dropped only where the browser is going anyway:
+    /// in [`stop`] just before SIGTERM, and when a new launch replaces it.
+    devtools: Option<devtools::Client>,
 }
 
 impl ManagedApp {
@@ -89,6 +98,7 @@ impl ManagedApp {
             waiting_since: None,
             program_not_allowed: false,
             launch_pending: false,
+            devtools: None,
         }
     }
 
@@ -146,6 +156,7 @@ impl Supervisor {
                 profiles_root: root.join("profiles"),
                 log_root: root.join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
+                browser_devtools: true,
             },
             Vec::new(),
         )
@@ -470,6 +481,24 @@ impl Supervisor {
             .collect();
         statuses.sort_by(|a, b| a.0.id.cmp(&b.0.id));
         statuses
+    }
+
+    /// What each running `chromium-kiosk` app's DevTools session has
+    /// learned, as `(app id, pid, internals)`, sorted by app id. Apps
+    /// launched without the pipe (`browser_devtools = false`) are absent.
+    pub async fn devtools_internals(&self) -> Vec<(String, u32, devtools::Internals)> {
+        let apps = self.apps.lock().await;
+        let mut internals: Vec<(String, u32, devtools::Internals)> = apps
+            .values()
+            .filter(|managed| managed.is_running() && managed.config.launcher.is_chromium())
+            .filter_map(|managed| {
+                let pid = managed.status.pid?;
+                let client = managed.devtools.as_ref()?;
+                Some((managed.config.id.clone(), pid, client.internals()))
+            })
+            .collect();
+        internals.sort_by(|a, b| a.0.cmp(&b.0));
+        internals
     }
 
     pub async fn statuses(&self) -> Vec<AppStatus> {
@@ -865,9 +894,43 @@ impl Supervisor {
             )
         })?;
 
+        // Whatever session the previous launch had is over: its browser is
+        // gone or about to be replaced.
+        managed.devtools = None;
+
+        // Created before the command is built, because failing to create
+        // them changes the arguments: Chromium given the flag without fds 3
+        // and 4 would exit at once, so it launches without it instead, and
+        // the failure is reported rather than the launch failing.
+        let mut args = spec.args.clone();
+        let mut devtools_failure: Option<String> = None;
+        #[cfg(unix)]
+        let mut devtools_pipes: Option<devtools::DevtoolsPipes> = None;
+        if spec.devtools_pipe {
+            #[cfg(unix)]
+            match devtools::DevtoolsPipes::new() {
+                Ok(pipes) => devtools_pipes = Some(pipes),
+                Err(error) => {
+                    tracing::warn!(
+                        app = %managed.config.id,
+                        %error,
+                        "cannot create the DevTools pipes; launching without them"
+                    );
+                    devtools_failure = Some(format!("cannot create the DevTools pipes: {error}"));
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                devtools_failure = Some("the DevTools pipe needs a Unix host".to_string());
+            }
+            if devtools_failure.is_some() {
+                args.retain(|arg| arg != devtools::PIPE_FLAG);
+            }
+        }
+
         let mut command = tokio::process::Command::new(&program);
         command
-            .args(&spec.args)
+            .args(&args)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::from(log))
@@ -884,8 +947,20 @@ impl Supervisor {
         if !is_current() {
             return Ok(false);
         }
-        let child = command.spawn()?;
+        #[cfg(unix)]
+        let (child, devtools_client) = match devtools_pipes {
+            Some(pipes) => {
+                let (child, sender, receiver) = pipes.spawn(&mut command)?;
+                let client = devtools::Client::spawn(managed.config.id.clone(), sender, receiver);
+                (child, Some(client))
+            }
+            None => (command.spawn()?, None),
+        };
+        #[cfg(not(unix))]
+        let (child, devtools_client) = (command.spawn()?, None::<devtools::Client>);
         let pid = child.id();
+        managed.devtools =
+            devtools_client.or_else(|| devtools_failure.map(devtools::Client::failed));
 
         tracing::info!(
             app = %managed.config.id,
@@ -1032,6 +1107,9 @@ fn schedule_restart_or_halt(managed: &mut ManagedApp, exit_code: Option<i32>, de
 
 /// Stop an app: SIGTERM to its process group, then SIGKILL if it lingers.
 async fn stop(managed: &mut ManagedApp) {
+    // Before SIGTERM: dropping the session closes Chromium's fd 3, which
+    // would end the browser by itself, and nothing may keep it past here.
+    managed.devtools = None;
     let Some(mut child) = managed.child.take() else {
         return;
     };
@@ -1098,6 +1176,7 @@ mod tests {
             profiles_root: root.join("profiles"),
             log_root: root.join("logs"),
             api_base: "http://127.0.0.1:9088/api/v1".into(),
+            browser_devtools: true,
         }
     }
 
@@ -1288,6 +1367,68 @@ mod tests {
             workspace,
             blocked: None,
         }
+    }
+
+    /// The spawn wiring end to end: a "browser" that reads the first byte
+    /// of a request from fd 3 and answers request 1 (`Browser.getVersion`)
+    /// on fd 4 shows up in `devtools_internals`, and stopping it drops the
+    /// session.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chromium_app_gets_a_devtools_session_on_fds_3_and_4() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let browser = dir.path().join("fake-chrome");
+        std::fs::write(
+            &browser,
+            "#!/bin/sh\n\
+             head -c 1 <&3 >/dev/null || exit 1\n\
+             printf '%s\\000' '{\"id\":1,\"result\":{\"product\":\"Fake/1\",\"protocolVersion\":\"1.3\"}}' >&4\n\
+             exec sleep 30\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (supervisor, _) = supervisor(dir.path());
+        let mut app = sleeper("browser");
+        app.launcher = Launcher::ChromiumKiosk {
+            uri: "http://127.0.0.1/".into(),
+            show_fps_counter: false,
+            extra_args: Vec::new(),
+            program: Some(browser.display().to_string()),
+            grant_capture: false,
+        };
+        // An exec app beside it never gets a session.
+        supervisor
+            .reconcile(
+                &[app, sleeper("other")],
+                &[target("browser", None), target("other", None)],
+            )
+            .await;
+        let pid = supervisor.status("browser").await.unwrap().pid.unwrap();
+
+        let mut found = None;
+        for _ in 0..500 {
+            let internals = supervisor.devtools_internals().await;
+            if internals
+                .first()
+                .is_some_and(|(_, _, i)| i.version.is_some())
+            {
+                found = Some(internals);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let internals = found.expect("the fake browser's answer arrives over fd 4");
+        assert_eq!(internals.len(), 1, "only the chromium app");
+        let (id, seen_pid, internals) = &internals[0];
+        assert_eq!(id, "browser");
+        assert_eq!(*seen_pid, pid);
+        assert_eq!(internals.version.as_ref().unwrap().product, "Fake/1");
+        assert_eq!(internals.status.state, devtools::DevtoolsState::Connected);
+
+        supervisor.shutdown().await;
+        assert!(supervisor.devtools_internals().await.is_empty());
     }
 
     #[tokio::test]
