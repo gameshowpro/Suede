@@ -219,7 +219,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         write_proc(p, 100, 1, "chrome", 0, 256, "/opt/chrome\0--kiosk\0");
-        write_proc(p, 101, 100, "chrome", 0, 512, "/opt/chrome\0--type=gpu-process\0");
+        write_proc(
+            p,
+            101,
+            100,
+            "chrome",
+            0,
+            512,
+            "/opt/chrome\0--type=gpu-process\0",
+        );
         write_proc(
             p,
             102,

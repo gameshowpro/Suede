@@ -29,6 +29,10 @@ pub enum ServerEvent {
     /// a running slicer has simply reported nothing yet, rather than
     /// reading that as "not running" — see `ProjectionReport`.
     ProjectionStatsChanged(Box<ProjectionReport>),
+    /// Same shape as `GET /system/gpu`.
+    GpuChanged(Box<crate::nvidia_smi::GpuTelemetry>),
+    /// Same shape as `GET /system/browsers`.
+    BrowsersChanged(Vec<crate::telemetry::BrowserReport>),
 }
 
 impl ServerEvent {
@@ -43,6 +47,8 @@ impl ServerEvent {
             Self::StatusChanged(_) => "status_changed",
             Self::ChecksChanged(_) => "checks_changed",
             Self::ProjectionStatsChanged(_) => "projection_stats_changed",
+            Self::GpuChanged(_) => "gpu_changed",
+            Self::BrowsersChanged(_) => "browsers_changed",
         }
     }
 
@@ -57,6 +63,8 @@ impl ServerEvent {
             Self::StatusChanged(status) => serde_json::to_value(status),
             Self::ChecksChanged(checks) => serde_json::to_value(checks),
             Self::ProjectionStatsChanged(report) => serde_json::to_value(report),
+            Self::GpuChanged(gpu) => serde_json::to_value(gpu),
+            Self::BrowsersChanged(browsers) => serde_json::to_value(browsers),
         }
         .unwrap_or(serde_json::Value::Null)
     }

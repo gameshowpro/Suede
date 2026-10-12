@@ -43,6 +43,19 @@ pub struct GpuTelemetry {
     pub processes: Vec<GpuProcessSample>,
 }
 
+impl Default for GpuTelemetry {
+    /// Nothing sampled yet: unavailable, with no reason.
+    fn default() -> Self {
+        Self {
+            available: false,
+            reason: None,
+            sampled_at: None,
+            gpus: Vec::new(),
+            processes: Vec::new(),
+        }
+    }
+}
+
 impl GpuTelemetry {
     /// A result for when sampling was not possible.
     fn unavailable(reason: String) -> Self {

@@ -127,6 +127,37 @@ pub async fn get_projection_stats(State(state): State<ApiState>) -> Json<Project
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/system/gpu", tag = "observed",
+    responses((
+        status = 200,
+        description = "What nvidia-smi last reported, with each GPU process \
+                       attributed to the app that owns it. Always 200: a \
+                       machine without an NVIDIA GPU answers \
+                       `available: false` and says why.",
+        body = crate::nvidia_smi::GpuTelemetry,
+    ))
+)]
+pub async fn get_gpu(State(state): State<ApiState>) -> Json<crate::nvidia_smi::GpuTelemetry> {
+    Json(state.snapshot.gpu())
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/system/browsers", tag = "observed",
+    responses((
+        status = 200,
+        description = "One report per running chromium-kiosk app: its \
+                       process table, GPU watchdog verdict, and what its \
+                       DevTools session learned (GPU view, media players)",
+        body = Vec<crate::telemetry::BrowserReport>,
+    ))
+)]
+pub async fn list_browsers(
+    State(state): State<ApiState>,
+) -> Json<Vec<crate::telemetry::BrowserReport>> {
+    Json(state.snapshot.browsers())
+}
+
+#[utoipa::path(
     get, path = "/api/v1/system", tag = "observed",
     responses((status = 200, description = "Daemon and environment information", body = SystemInfo))
 )]
@@ -690,6 +721,23 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"running": true}));
+    }
+
+    #[tokio::test]
+    async fn gpu_telemetry_is_unavailable_before_the_first_sample() {
+        let (status, body) = get_json("/api/v1/system/gpu").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["available"], false);
+        assert!(body["reason"].is_null());
+        assert_eq!(body["gpus"], serde_json::json!([]));
+        assert_eq!(body["processes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn browser_reports_are_empty_before_the_first_sample() {
+        let (status, body) = get_json("/api/v1/system/browsers").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
     }
 
     #[tokio::test]

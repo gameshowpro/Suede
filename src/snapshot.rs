@@ -41,6 +41,12 @@ pub struct Snapshot {
     /// Each report names the process it was judged for, so a reader can
     /// tell a stale one (an app restarted since) from the current one.
     browser_gpu: RwLock<Vec<crate::browser_gpu::AppGpuReport>>,
+    /// What `nvidia-smi` last reported, with each process attributed to its
+    /// app, as [`crate::telemetry`] last published it.
+    gpu: RwLock<crate::nvidia_smi::GpuTelemetry>,
+    /// One report per running `chromium-kiosk` app, as
+    /// [`crate::telemetry`] last published it.
+    browsers: RwLock<Vec<crate::telemetry::BrowserReport>>,
 }
 
 impl Snapshot {
@@ -80,6 +86,36 @@ impl Snapshot {
             return false;
         }
         *guard = reports;
+        true
+    }
+
+    /// What `nvidia-smi` last reported.
+    pub fn gpu(&self) -> crate::nvidia_smi::GpuTelemetry {
+        self.gpu.read().unwrap().clone()
+    }
+
+    /// Record the GPU telemetry. Returns whether it changed.
+    pub fn set_gpu(&self, gpu: crate::nvidia_smi::GpuTelemetry) -> bool {
+        let mut guard = self.gpu.write().unwrap();
+        if *guard == gpu {
+            return false;
+        }
+        *guard = gpu;
+        true
+    }
+
+    /// The Chromium apps' reports.
+    pub fn browsers(&self) -> Vec<crate::telemetry::BrowserReport> {
+        self.browsers.read().unwrap().clone()
+    }
+
+    /// Record the Chromium reports. Returns whether they changed.
+    pub fn set_browsers(&self, browsers: Vec<crate::telemetry::BrowserReport>) -> bool {
+        let mut guard = self.browsers.write().unwrap();
+        if *guard == browsers {
+            return false;
+        }
+        *guard = browsers;
         true
     }
 

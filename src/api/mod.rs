@@ -490,6 +490,8 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/projection/arrangement", get(projection::get_arrangement))
         .route("/system", get(observed::get_system))
+        .route("/system/gpu", get(observed::get_gpu))
+        .route("/system/browsers", get(observed::list_browsers))
         .route("/system/checks", get(observed::list_checks))
         .route("/system/checks/{id}/fix", post(observed::fix_check))
         .route("/system/power", post(observed::power))

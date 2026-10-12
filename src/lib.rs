@@ -31,6 +31,7 @@ pub mod snapshot;
 pub mod state;
 pub mod supervisor;
 pub mod sway;
+pub mod telemetry;
 pub mod util;
 pub mod wallpapers;
 pub mod watchdog;

@@ -461,6 +461,15 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         )
         .run(shutdown_rx.clone()),
     );
+    tokio::spawn(
+        suede::telemetry::Telemetry::new(
+            supervisor.clone(),
+            snapshot.clone(),
+            events.clone(),
+            bootstrap.browser_devtools,
+        )
+        .run(shutdown_rx.clone()),
+    );
     tokio::spawn(run_checks(
         checks.clone(),
         events.clone(),

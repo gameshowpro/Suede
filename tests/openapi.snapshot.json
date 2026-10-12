@@ -812,6 +812,270 @@
           }
         ]
       },
+      "BrowserGpuDevice": {
+        "description": "One GPU as Chromium sees it (`SystemInfo.getInfo` `gpu.devices[]`).",
+        "properties": {
+          "device": {
+            "description": "`deviceString`",
+            "type": "string"
+          },
+          "driverVendor": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "driverVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "vendor": {
+            "description": "`vendorString`",
+            "type": "string"
+          }
+        },
+        "required": [
+          "vendor",
+          "device"
+        ],
+        "type": "object"
+      },
+      "BrowserGpuInfo": {
+        "description": "Chromium's own view of its GPU, from `SystemInfo.getInfo`.",
+        "properties": {
+          "commandLine": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "devices": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserGpuDevice"
+            },
+            "type": "array"
+          },
+          "driverBugWorkarounds": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "featureStatus": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "`featureStatus`, sorted by key, e.g. `video_decode: enabled`.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "fetchedAt": {
+            "description": "Unix seconds this was last fetched.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "videoDecoding": {
+            "items": {
+              "$ref": "#/components/schemas/VideoProfile"
+            },
+            "type": "array"
+          },
+          "videoEncoding": {
+            "items": {
+              "$ref": "#/components/schemas/VideoProfile"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "devices",
+          "featureStatus",
+          "videoDecoding",
+          "videoEncoding",
+          "driverBugWorkarounds",
+          "fetchedAt"
+        ],
+        "type": "object"
+      },
+      "BrowserProcess": {
+        "description": "One process in an app's tree.",
+        "properties": {
+          "cpuPercent": {
+            "description": "CPU percent of one core over the last poll interval (utime+stime\ndelta / wall delta), null on the first sample of a pid.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pid": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "description": "\"browser\" for the root pid; otherwise the `--type=` value\n(\"gpu-process\", \"renderer\", \"utility\", \"zygote\", \"broker\", ...);\n\"unknown\" when there is none.",
+            "type": "string"
+          },
+          "rssMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "subtype": {
+            "description": "`--utility-sub-type=` value, when present (e.g.\n\"network.mojom.NetworkService\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "pid",
+          "role",
+          "rssMib"
+        ],
+        "type": "object"
+      },
+      "BrowserRendering": {
+        "description": "Whether Chromium's GPU process renders on the GPU.",
+        "enum": [
+          "hardware",
+          "software"
+        ],
+        "type": "string"
+      },
+      "BrowserReport": {
+        "description": "Everything known about one running `chromium-kiosk` app's browser.",
+        "properties": {
+          "app": {
+            "description": "The app's id.",
+            "type": "string"
+          },
+          "devtools": {
+            "$ref": "#/components/schemas/DevtoolsStatus",
+            "description": "State of the DevTools session the next fields come from."
+          },
+          "gpu": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BrowserGpuInfo",
+                "description": "The browser's own view of the GPU."
+              }
+            ]
+          },
+          "gpuProcessCrashes": {
+            "description": "GPU process crashes since launch.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mediaPlayers": {
+            "description": "Media players the browser reported.",
+            "items": {
+              "$ref": "#/components/schemas/MediaPlayer"
+            },
+            "type": "array"
+          },
+          "pid": {
+            "description": "The process Suede launched.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "processes": {
+            "description": "The browser's process tree.",
+            "items": {
+              "$ref": "#/components/schemas/BrowserProcess"
+            },
+            "type": "array"
+          },
+          "rendering": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BrowserRendering",
+                "description": "Whether the GPU process renders in hardware, once the GPU watchdog\nhas judged it."
+              }
+            ]
+          },
+          "sampledAt": {
+            "description": "Unix seconds of this sample.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "startedAt": {
+            "description": "Unix seconds the process was spawned.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "version": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BrowserVersion",
+                "description": "What `Browser.getVersion` answered."
+              }
+            ]
+          }
+        },
+        "required": [
+          "app",
+          "pid",
+          "sampledAt",
+          "gpuProcessCrashes",
+          "processes",
+          "devtools",
+          "mediaPlayers"
+        ],
+        "type": "object"
+      },
+      "BrowserVersion": {
+        "description": "What `Browser.getVersion` answered.",
+        "properties": {
+          "jsVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "product": {
+            "description": "e.g. \"Chrome/151.0.7922.71\"",
+            "type": "string"
+          },
+          "protocolVersion": {
+            "type": "string"
+          },
+          "userAgent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "product",
+          "protocolVersion"
+        ],
+        "type": "object"
+      },
       "CanvasConfig": {
         "additionalProperties": false,
         "description": "Canvas aspect and the operator-selected render width.",
@@ -1228,6 +1492,36 @@
         },
         "type": "object"
       },
+      "DevtoolsState": {
+        "description": "Where the DevTools session with one browser stands.",
+        "enum": [
+          "disabled",
+          "connecting",
+          "connected",
+          "failed",
+          "closed"
+        ],
+        "type": "string"
+      },
+      "DevtoolsStatus": {
+        "description": "[`DevtoolsState`] with the reason behind it.",
+        "properties": {
+          "detail": {
+            "description": "Human-readable detail: why disabled/failed/closed, or null.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/DevtoolsState"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
       "DisplayIdentity": {
         "additionalProperties": false,
         "description": "Enough of a display's EDID to tell \"the same display\" from \"a different\none on the same connector\".",
@@ -1357,6 +1651,309 @@
         "required": [
           "requested",
           "effective"
+        ],
+        "type": "object"
+      },
+      "GpuProcessKind": {
+        "description": "What a process does on the GPU, from `pmon`'s `type` column.",
+        "enum": [
+          "graphics",
+          "compute",
+          "both"
+        ],
+        "type": "string"
+      },
+      "GpuProcessSample": {
+        "description": "One process's use of one GPU.",
+        "properties": {
+          "app": {
+            "description": "The Suede app whose process tree this PID is in, if any. Filled by the\ntelemetry task, never by the parser.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "command": {
+            "description": "The `command` column, or \"\" when absent.",
+            "type": "string"
+          },
+          "decoderPercent": {
+            "description": "Decoder utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "encoderPercent": {
+            "description": "Encoder utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "framebufferMib": {
+            "description": "Framebuffer memory held.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "gpuIndex": {
+            "description": "Which GPU, as in [`GpuSample::index`].",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/GpuProcessKind",
+            "description": "Graphics, compute or both."
+          },
+          "memoryPercent": {
+            "description": "Memory utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pid": {
+            "description": "Process id.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "description": "Chromium role when the app is a `chromium-kiosk` app and the PID is one\nof its processes (\"browser\", \"gpu-process\", \"renderer\", ...). Filled by\nthe telemetry task, never by the parser.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "smPercent": {
+            "description": "Streaming multiprocessor utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "gpuIndex",
+          "pid",
+          "kind",
+          "command"
+        ],
+        "type": "object"
+      },
+      "GpuSample": {
+        "description": "One GPU's current readings.",
+        "properties": {
+          "clockMemoryMhz": {
+            "description": "Memory clock.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "clockSmMhz": {
+            "description": "Shader clock.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "driverVersion": {
+            "description": "Driver version string.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fanPercent": {
+            "description": "Fan speed.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "index": {
+            "description": "Position in `nvidia-smi`'s output.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memoryTotalMib": {
+            "description": "Total framebuffer memory.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memoryUsedMib": {
+            "description": "Framebuffer memory in use.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Product name.",
+            "type": "string"
+          },
+          "pcieGeneration": {
+            "description": "Current PCIe generation.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcieWidth": {
+            "description": "Current PCIe lane count.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "performanceState": {
+            "description": "Performance state, e.g. \"P2\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "powerDrawW": {
+            "description": "Current power draw.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "powerLimitW": {
+            "description": "Enforced power limit.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "temperatureC": {
+            "description": "Core temperature.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationDecoderPercent": {
+            "description": "Video decoder utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationEncoderPercent": {
+            "description": "Video encoder utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationGpuPercent": {
+            "description": "Graphics engine utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationMemoryPercent": {
+            "description": "Memory controller utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "name"
+        ],
+        "type": "object"
+      },
+      "GpuTelemetry": {
+        "description": "What `nvidia-smi` reported on the last poll.",
+        "properties": {
+          "available": {
+            "description": "`nvidia-smi` was found and answered on the last poll.",
+            "type": "boolean"
+          },
+          "gpus": {
+            "description": "One entry per GPU.",
+            "items": {
+              "$ref": "#/components/schemas/GpuSample"
+            },
+            "type": "array"
+          },
+          "processes": {
+            "description": "One entry per process using a GPU.",
+            "items": {
+              "$ref": "#/components/schemas/GpuProcessSample"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why not, when `available` is false (\"nvidia-smi is not installed\",\n\"nvidia-smi exited with status 9: ...\", \"nvidia-smi timed out\"). Also\ncarries the process-table failure when only that part failed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sampledAt": {
+            "description": "Unix seconds of the last successful sample.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "available",
+          "gpus",
+          "processes"
         ],
         "type": "object"
       },
@@ -1626,6 +2223,201 @@
             "type": "object"
           }
         ]
+      },
+      "MediaMessage": {
+        "description": "A warning or error a media player logged.",
+        "properties": {
+          "level": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "level",
+          "message"
+        ],
+        "type": "object"
+      },
+      "MediaPlayer": {
+        "description": "One media player, assembled from the Media domain's events.",
+        "properties": {
+          "audioCodec": {
+            "description": "`codec` of the first `kAudioTracks` entry.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audioDecoder": {
+            "description": "`kAudioDecoderName`",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audioDecoderPlatform": {
+            "description": "`kIsPlatformAudioDecoder`",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "bitrate": {
+            "description": "`kBitrate`",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "bufferingState": {
+            "description": "The last `pipeline_buffering_state.state`, e.g. \"BUFFERING_HAVE_ENOUGH\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "createdAt": {
+            "description": "Unix seconds the player was first seen by Suede.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "destroyed": {
+            "description": "Set by `kWebMediaPlayerDestroyed`, or when the page the player\nbelonged to went away.",
+            "type": "boolean"
+          },
+          "durationSeconds": {
+            "description": "`kMaxDuration`, else the last `kDurationChanged` duration.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ended": {
+            "description": "Set by `kEnded`, cleared by a later `kPlay`.",
+            "type": "boolean"
+          },
+          "errors": {
+            "description": "Last 5 raised errors, serialized JSON.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "frameUrl": {
+            "description": "`kFrameUrl`",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "`playerId`",
+            "type": "string"
+          },
+          "lastActivityAt": {
+            "description": "Unix seconds of the last event/property/message for this player.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "messages": {
+            "description": "Last 10 messages at level \"warning\" or \"error\".",
+            "items": {
+              "$ref": "#/components/schemas/MediaMessage"
+            },
+            "type": "array"
+          },
+          "pipelineState": {
+            "description": "The last `kPipelineStateChange`, without the leading `k` (\"Playing\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "playing": {
+            "description": "true after `kPlay`, false after `kPause`/`kEnded`; null before either.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "properties": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Every property as last reported, sorted by name (raw internals).",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "renderer": {
+            "description": "`kRendererName`",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resolution": {
+            "description": "`kResolution`, else the last `kVideoSizeChanged` dimensions.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceUrl": {
+            "description": "The `url` of the last `kLoad` event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "streaming": {
+            "description": "`kIsStreaming`",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "videoCodec": {
+            "description": "From the first `kVideoTracks` entry: its `profile` (e.g. \"h264\nhigh\") when present, else its `codec` (e.g. \"h264\").",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "videoDecoder": {
+            "description": "`kVideoDecoderName`, e.g. \"VaapiVideoDecoder\" or \"FFmpegVideoDecoder\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "videoDecoderPlatform": {
+            "description": "`kIsPlatformVideoDecoder`: true when the decoder is the platform's\n(hardware) one.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "createdAt",
+          "ended",
+          "destroyed",
+          "lastActivityAt",
+          "messages",
+          "errors",
+          "properties"
+        ],
+        "type": "object"
       },
       "Mode": {
         "description": "A display mode. Refresh is in Hz (Sway reports mHz on the wire).",
@@ -3685,6 +4477,43 @@
         "required": [
           "x",
           "y"
+        ],
+        "type": "object"
+      },
+      "VideoProfile": {
+        "description": "A video decode or encode profile Chromium reports as accelerated.",
+        "properties": {
+          "maxHeight": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxWidth": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minHeight": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minWidth": {
+            "description": "0 when Chromium reports no minimum (encode profiles never do).",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "profile": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile",
+          "maxWidth",
+          "maxHeight",
+          "minWidth",
+          "minHeight"
         ],
         "type": "object"
       },
@@ -5894,6 +6723,29 @@
         ]
       }
     },
+    "/api/v1/system/browsers": {
+      "get": {
+        "operationId": "list_browsers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/BrowserReport"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "One report per running chromium-kiosk app: its process table, GPU watchdog verdict, and what its DevTools session learned (GPU view, media players)"
+          }
+        },
+        "tags": [
+          "observed"
+        ]
+      }
+    },
     "/api/v1/system/checks": {
       "get": {
         "operationId": "list_checks",
@@ -5944,6 +6796,26 @@
           },
           "404": {
             "description": "No automated fix exists for this check"
+          }
+        },
+        "tags": [
+          "observed"
+        ]
+      }
+    },
+    "/api/v1/system/gpu": {
+      "get": {
+        "operationId": "get_gpu",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GpuTelemetry"
+                }
+              }
+            },
+            "description": "What nvidia-smi last reported, with each GPU process attributed to the app that owns it. Always 200: a machine without an NVIDIA GPU answers `available: false` and says why."
           }
         },
         "tags": [
