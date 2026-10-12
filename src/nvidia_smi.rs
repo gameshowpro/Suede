@@ -265,40 +265,107 @@ pub fn parse_query_gpu(output: &str) -> Vec<GpuSample> {
 
 /// Parse the output of `nvidia-smi pmon -c 1 -s um`.
 ///
-/// Columns: gpu, pid, type, sm, mem, enc, dec, jpg, ofa, fb, ccpm, then an
-/// optional command (which may contain spaces). Comment lines start with `#`.
-/// `app` and `role` are left `None`.
+/// The column set depends on the driver release: 615 prints `gpu, pid,
+/// type, sm, mem, enc, dec, jpg, ofa, fb, ccpm, command`, older releases
+/// have no `jpg`/`ofa` (or `ccpm`) columns at all. So the first `# gpu ...`
+/// header line decides where each value sits, and a column the header does
+/// not name is simply `None`. Rows before any header are skipped. `command`
+/// is everything after the last named numeric column, joined with spaces,
+/// or empty. `app` and `role` are left `None`.
 pub fn parse_pmon(output: &str) -> Vec<GpuProcessSample> {
-    output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() < 11 {
-                return None;
+    let mut columns: Option<PmonColumns> = None;
+    let mut samples = Vec::new();
+    for line in output.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('#') {
+            let names: Vec<&str> = header.split_whitespace().collect();
+            // The first header line names the columns; the second holds
+            // units (`Idx`, `#`, `C/G`, `%`, ...), which must not replace it.
+            if names.first() == Some(&"gpu") {
+                columns = PmonColumns::from_names(&names);
             }
-            let kind = match fields[2] {
-                "G" => GpuProcessKind::Graphics,
-                "C" => GpuProcessKind::Compute,
-                "C+G" | "G+C" => GpuProcessKind::Both,
-                _ => return None,
-            };
-            Some(GpuProcessSample {
-                gpu_index: fields[0].parse().ok()?,
-                pid: fields[1].parse().ok()?,
-                kind,
-                command: fields[11..].join(" "),
-                sm_percent: number(fields[3]),
-                memory_percent: number(fields[4]),
-                encoder_percent: number(fields[5]),
-                decoder_percent: number(fields[6]),
-                framebuffer_mib: number(fields[9]),
-                app: None,
-                role: None,
-            })
+            continue;
+        }
+        let Some(columns) = &columns else {
+            continue;
+        };
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() <= columns.last_numeric {
+            continue;
+        }
+        let at = |index: Option<usize>| index.and_then(|i| fields.get(i).copied());
+        let kind = match at(columns.kind) {
+            Some("G") => GpuProcessKind::Graphics,
+            Some("C") => GpuProcessKind::Compute,
+            Some("C+G") | Some("G+C") => GpuProcessKind::Both,
+            _ => continue,
+        };
+        let (Some(gpu_index), Some(pid)) = (
+            at(columns.gpu).and_then(|f| f.parse().ok()),
+            at(columns.pid).and_then(|f| f.parse().ok()),
+        ) else {
+            continue;
+        };
+        samples.push(GpuProcessSample {
+            gpu_index,
+            pid,
+            kind,
+            command: fields[columns.last_numeric + 1..].join(" "),
+            sm_percent: at(columns.sm).and_then(number),
+            memory_percent: at(columns.mem).and_then(number),
+            encoder_percent: at(columns.enc).and_then(number),
+            decoder_percent: at(columns.dec).and_then(number),
+            framebuffer_mib: at(columns.fb).and_then(number),
+            app: None,
+            role: None,
+        });
+    }
+    samples
+}
+
+/// Where each `pmon` value sits on a row, from the `# gpu pid type ...`
+/// header line.
+#[derive(Debug, Clone, Copy)]
+struct PmonColumns {
+    gpu: Option<usize>,
+    pid: Option<usize>,
+    kind: Option<usize>,
+    sm: Option<usize>,
+    mem: Option<usize>,
+    enc: Option<usize>,
+    dec: Option<usize>,
+    fb: Option<usize>,
+    /// Index of the last column that is not `command`, so the command (which
+    /// may contain spaces) is everything after it.
+    last_numeric: usize,
+}
+
+impl PmonColumns {
+    fn from_names(names: &[&str]) -> Option<Self> {
+        let find = |name: &str| names.iter().position(|n| *n == name);
+        let (gpu, pid, kind) = (find("gpu"), find("pid"), find("type"));
+        if gpu.is_none() || pid.is_none() || kind.is_none() {
+            return None;
+        }
+        let last_numeric = match find("command") {
+            Some(index) if index > 0 => index - 1,
+            // No command column: every column is a value.
+            _ => names.len() - 1,
+        };
+        Some(Self {
+            gpu,
+            pid,
+            kind,
+            sm: find("sm"),
+            mem: find("mem"),
+            enc: find("enc"),
+            dec: find("dec"),
+            fb: find("fb"),
+            last_numeric,
         })
-        .collect()
+    }
 }
 
 #[cfg(test)]
@@ -378,7 +445,11 @@ mod tests {
 
     #[test]
     fn pmon_percentages_and_both_kind() {
-        let output = "    1    42   C+G     12     3     4     5      -      -    100      0    chrome --type=gpu\n";
+        let output = "\
+# gpu         pid   type     sm    mem    enc    dec    jpg    ofa     fb   ccpm    command
+# Idx           #    C/G      %      %      %      %      %      %     MB     MB    name
+    1    42   C+G     12     3     4     5      -      -    100      0    chrome --type=gpu
+";
         let processes = parse_pmon(output);
         assert_eq!(processes.len(), 1);
         let process = &processes[0];
@@ -393,9 +464,40 @@ mod tests {
     }
 
     #[test]
+    fn pmon_older_driver_without_jpg_ofa_columns() {
+        // Pre-535 releases print neither `jpg`/`ofa` nor `ccpm`; the header
+        // decides where `dec` and `fb` sit.
+        let output = "\
+# gpu        pid  type    sm   mem   enc   dec    fb   command
+# Idx          #   C/G     %     %     %     %    MB   name
+    0      12345     G     7     1     -    12   184   chrome --type=gpu-process
+";
+        let processes = parse_pmon(output);
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].pid, 12345);
+        assert_eq!(processes[0].sm_percent, Some(7));
+        assert_eq!(processes[0].decoder_percent, Some(12));
+        assert_eq!(processes[0].framebuffer_mib, Some(184));
+        assert_eq!(processes[0].command, "chrome --type=gpu-process");
+    }
+
+    #[test]
+    fn pmon_rows_before_a_header_are_skipped() {
+        assert!(parse_pmon(
+            "    0      12345     G     7     1     -    12   184   chrome
+"
+        )
+        .is_empty());
+    }
+
+    #[test]
     fn pmon_without_command_column() {
+        // A release whose header names no `command` column: every column
+        // is a value and the command is empty.
         let processes = parse_pmon(
-            "    0    7     G      -      -      -      -      -      -      3      0\n",
+            "# gpu  pid  type  sm  mem  enc  dec  jpg  ofa  fb  ccpm\n\
+             # Idx    #   C/G   %    %    %    %    %    %  MB    MB\n\
+                 0    7     G   -    -    -    -    -    -   3     0\n",
         );
         assert_eq!(processes.len(), 1);
         assert_eq!(processes[0].command, "");
