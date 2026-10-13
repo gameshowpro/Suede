@@ -4477,7 +4477,8 @@ function progressCell(ph, ctx = {}) {
   const title = [fill, pipeline && pipeline !== "playing" ? `pipeline ${pipeline}` : ""].filter(Boolean).join(", ");
   const dropped = ph.droppedFrames > 0
     ? `<span class="pill bad">${escape(ph.droppedFrames)} dropped</span>` : "";
-  return `<div class="progress-cell"><div class="pbar ${mods}" title="${escape(title)}"><i style="width:${(fraction * 100).toFixed(1)}%"></i></div>
+  const tween = ctx.key ? ` data-playhead="${escape(ctx.key)}"` : "";
+  return `<div class="progress-cell"${tween}><div class="pbar ${mods}" title="${escape(title)}"><i style="width:${(fraction * 100).toFixed(1)}%"></i></div>
     <span class="ptime">${escape(time)}</span>${dropped}</div>`;
 }
 const isBoolText = (v) => v === true || v === false || v === "true" || v === "false";
@@ -4569,7 +4570,7 @@ function renderPlayer(p, app, sampledAt) {
   const state = playerState(p);
   const ph = p.playhead;
   const progress = p.destroyed || !ph ? dash
-    : progressCell(ph, { pipeline: p.pipelineState, error: (p.errors?.length ?? 0) > 0 });
+    : progressCell(ph, { pipeline: p.pipelineState, error: (p.errors?.length ?? 0) > 0, key: `${app}:${p.id}` });
   const key = `${app}:${p.id}`;
   const selected = selectedPlayers.has(key);
   const row = `<tr class="player-row${selected ? " selected" : ""}${p.destroyed ? " hint" : ""}" role="button" tabindex="0"
@@ -4580,15 +4581,15 @@ function renderPlayer(p, app, sampledAt) {
   return selected
     ? row + `<tr class="player-detail"><td colspan="7">${playerDetail(p, ph, sampledAt)}</td></tr>` : row;
 }
-function unmatchedTable(list) {
+function unmatchedTable(list, app) {
   if (!list?.length) return "";
   return `<h3>Unmatched media elements</h3><table><thead><tr><th>Element</th><th>Current src</th>
-    <th>Progress</th><th>State</th></tr></thead><tbody>${list.map((ph) => {
+    <th>Progress</th><th>State</th></tr></thead><tbody>${list.map((ph, i) => {
       const word = ph.ended ? "ended" : ph.paused ? "paused" : "playing";
       const tone = ph.ended ? "muted" : ph.paused ? "warn" : "ok";
       return `<tr><td>${escape(ph.element)}</td>
         <td class="mono" style="overflow-wrap:anywhere">${ph.currentSrc ? escape(ph.currentSrc) : dash}</td>
-        <td>${progressCell(ph)}</td><td><span class="pill ${tone}">${word}</span></td></tr>`;
+        <td>${progressCell(ph, { key: unmatchedKey(app, i) })}</td><td><span class="pill ${tone}">${word}</span></td></tr>`;
     }).join("")}</tbody></table>`;
 }
 
@@ -4666,7 +4667,7 @@ function renderBrowser(r) {
       players.map((p) => renderPlayer(p, r.app, r.sampledAt)).join("")}</tbody></table></div>`
     : `<p class="hint">${dt.state === "connected" ? "No media players reported yet."
         : `DevTools not connected${dt.detail ? `: ${escape(dt.detail)}` : "."}`}</p>`)
-    + unmatchedTable(r.unmatchedElements);
+    + unmatchedTable(r.unmatchedElements, r.app);
 
   return `<div style="margin-bottom:22px">${head}${gpuBlock}${procBlock}${playerBlock}</div>`;
 }
@@ -4676,7 +4677,75 @@ function renderBrowsers() {
   $("browsers-panel").hidden = list.length === 0;
   if (!list.length) return;
   $("browsers").innerHTML = list.map(renderBrowser).join("");
+  tweenPlayheads();
+  ensureTween();
 }
+
+// Playhead tweening. Samples arrive every few seconds; between them the bars
+// and times advance in the browser from an anchor taken at receipt, updated
+// in place through data-playhead (the panel is never re-rendered for it).
+// A 200 ms setInterval rather than requestAnimationFrame: the text changes
+// once a second, so 60 Hz frames would only burn CPU on an appliance.
+const playheadAnchors = new Map();
+let tweenTimer = null;
+// Unmatched elements have no id; "unmatched:" keeps their keys apart from player ids.
+const unmatchedKey = (app, i) => `unmatched:${app}:${i}`;
+function recordPlayheadAnchors(reports) {
+  const at = performance.now();
+  playheadAnchors.clear();
+  const add = (key, ph, advancing) => {
+    if (!ph) return;
+    const age = Math.max(0, (Number(ph.sampledAt) || 0) - (Number(ph.readAt) || 0));
+    const dur = Number(ph.durationSeconds);
+    const rate = Number(ph.playbackRate);
+    playheadAnchors.set(key, {
+      at, position: (Number(ph.currentTimeSeconds) || 0) + (ph.readAt != null && ph.sampledAt != null ? age : 0),
+      duration: ph.durationSeconds != null && Number.isFinite(dur) ? dur : null,
+      rate: Number.isFinite(rate) ? rate : 1,
+      advancing: advancing && ph.paused === false && ph.ended === false && rate > 0,
+    });
+  };
+  for (const r of Array.isArray(reports) ? reports : []) {
+    for (const p of r.mediaPlayers || []) {
+      add(`${r.app}:${p.id}`, p.playhead && { ...p.playhead, sampledAt: r.sampledAt },
+        !p.destroyed && playerState(p).word === "playing");
+    }
+    (r.unmatchedElements || []).forEach((ph, i) =>
+      add(unmatchedKey(r.app, i), { ...ph, sampledAt: r.sampledAt }, true));
+  }
+}
+function setBrowserReports(reports) {
+  browserReports = reports;
+  recordPlayheadAnchors(reports);
+}
+function tweenActive() {
+  return !document.hidden && !$("tab-system").classList.contains("hidden")
+    && [...playheadAnchors.values()].some((a) => a.advancing);
+}
+function tweenPlayheads() {
+  const now = performance.now();
+  for (const cell of document.querySelectorAll("#browsers [data-playhead]")) {
+    const a = playheadAnchors.get(cell.dataset.playhead);
+    if (!a?.advancing) continue;
+    let pos = a.position + ((now - a.at) / 1000) * a.rate;
+    const live = a.duration == null;
+    if (!live) pos = Math.min(pos, a.duration);
+    const fill = cell.querySelector(".pbar i");
+    if (fill && !live && a.duration > 0) fill.style.width = `${(Math.max(0, pos / a.duration) * 100).toFixed(1)}%`;
+    const text = cell.querySelector(".ptime");
+    if (text) text.textContent = live ? `${clockTime(pos)} · live` : `${clockTime(pos)} / ${clockTime(a.duration)}`;
+  }
+}
+function ensureTween() {
+  if (tweenTimer != null || !tweenActive()) return;
+  tweenTimer = setInterval(() => {
+    if (!tweenActive()) { clearInterval(tweenTimer); tweenTimer = null; return; }
+    tweenPlayheads();
+  }, 200);
+}
+document.addEventListener("visibilitychange", () => { tweenPlayheads(); ensureTween(); });
+document.querySelectorAll("nav button[data-tab]").forEach((b) =>
+  b.addEventListener("click", () => { tweenPlayheads(); ensureTween(); }));
 
 // Slicer pipeline chart: captured and presented fps as nested step areas on
 // the same 5 minute axis as the GPU chart (100 % = the output's refresh
@@ -4968,7 +5037,7 @@ async function loadAll() {
   const cpuVersion = cpuEventVersion;
   const latestCpu = await api("/system/cpu").catch(() => null);
   if (cpuVersion === cpuEventVersion) cpuTelemetry = latestCpu;
-  browserReports = await api("/system/browsers").catch(() => []);
+  setBrowserReports(await api("/system/browsers").catch(() => []));
   await loadConfig();
   renderAv(); renderOutputChoices();
   renderSystem(await api("/system"));
@@ -5162,7 +5231,7 @@ function connect() {
   });
   source.addEventListener("browsers_changed", (e) => {
     if (stream !== source) return;
-    browserReports = JSON.parse(e.data);
+    setBrowserReports(JSON.parse(e.data));
     renderGpuAndBrowsers();
   });
 }
