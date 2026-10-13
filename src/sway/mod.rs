@@ -110,6 +110,12 @@ pub trait SwayClient: Send + Sync + 'static {
 
     /// Whether the event connection is currently established.
     fn is_connected(&self) -> bool;
+
+    /// The compositor's process id, when it can be told (the real client
+    /// reads it from the socket name). Used only to attribute CPU use.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Locate the Sway IPC socket, in the order sway itself documents.
@@ -160,6 +166,16 @@ fn scan_for_socket(dir: &std::path::Path) -> Option<PathBuf> {
     matches.into_iter().next()
 }
 
+/// The pid in a `sway-ipc.<uid>.<pid>.sock` file name, if it has that shape.
+pub fn socket_pid(path: &std::path::Path) -> Option<u32> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("sway-ipc."))
+        .and_then(|rest| rest.strip_suffix(".sock"))
+        .and_then(|rest| rest.split('.').nth(1))
+        .and_then(|pid| pid.parse::<u32>().ok())
+}
+
 /// Whether the sway that created `path` is still running, as far as can be
 /// told: sway names its socket `sway-ipc.<uid>.<pid>.sock`, and a sway that
 /// was killed rather than asked to exit leaves the file behind. Connecting
@@ -172,14 +188,7 @@ fn scan_for_socket(dir: &std::path::Path) -> Option<PathBuf> {
 /// fallback), where the daemon restarts while the old compositor's socket is
 /// gone and the new one's is not yet in systemd's environment.
 pub fn socket_owner_alive(path: &std::path::Path) -> bool {
-    let Some(pid) = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix("sway-ipc."))
-        .and_then(|rest| rest.strip_suffix(".sock"))
-        .and_then(|rest| rest.split('.').nth(1))
-        .and_then(|pid| pid.parse::<u32>().ok())
-    else {
+    let Some(pid) = socket_pid(path) else {
         return true;
     };
     let proc = std::path::Path::new("/proc");
@@ -238,6 +247,16 @@ pub async fn connect_with_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_socket_name_carries_the_compositor_pid() {
+        use std::path::Path;
+        assert_eq!(
+            socket_pid(Path::new("/run/user/1000/sway-ipc.1000.4321.sock")),
+            Some(4321)
+        );
+        assert_eq!(socket_pid(Path::new("/run/user/1000/other.sock")), None);
+    }
 
     #[test]
     fn tearing_support_is_gated_on_1_10() {

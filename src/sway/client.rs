@@ -307,6 +307,10 @@ impl SwayClient for IpcClient {
     fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
     }
+
+    fn pid(&self) -> Option<u32> {
+        super::socket_pid(&self.socket)
+    }
 }
 
 #[cfg(test)]

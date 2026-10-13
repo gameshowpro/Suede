@@ -160,9 +160,9 @@ way to notice on its own unless told to.
 
 Suede detects and corrects this itself now, three ways: the slicer notices
 its own outputs disappearing from the Wayland registry and exits so the
-daemon respawns it; failing that, the slicer notices two consecutive
-ten-second intervals of presentation feedback answering "discarded" for
-everything and exits anyway; and the reconciler forces a slicer restart on
+daemon respawns it; failing that, the slicer notices 20 seconds of
+consecutive statistics intervals of presentation feedback answering
+"discarded" for everything and exits anyway; and the reconciler forces a slicer restart on
 any pass that actually changed which outputs are enabled, whether or not the
 compositor removes the global. A `systemctl --user restart suede` remains a
 manual fix for the same condition, and a fast way to confirm the diagnosis,
@@ -442,8 +442,8 @@ grep -c 'GPU process exited unexpectedly' ~/.local/state/suede/logs/<app>.log
 
 What Suede does about it: with
 [`restart_on_gpu_fallback = true`](configuration.md#restart-on-gpu-fallback)
-(the default), it restarts the app itself once two looks five seconds apart
-both find the GPU process in software, with restart reason `gpuFallback`. It
+(the default), it restarts the app itself once two looks one diagnostics
+interval apart both find the GPU process in software, with restart reason `gpuFallback`. It
 does that at most three times per app in any hour, so a GPU that keeps
 failing cannot blank the displays in a loop; once those are used, the check
 fails saying so, and its fix restarts the app on request (that does not use
@@ -457,6 +457,9 @@ driver instead.
 Set `restart_on_gpu_fallback = false` (or `SUEDE_RESTART_ON_GPU_FALLBACK=false`)
 to leave the restart to an operator; the check still fails and still offers
 its fix.
+
+The System tab shows the same GPU process verdict beside the browser's own
+view; see [Reading the GPU and Chromium panels](#gpu-and-chromium-panels).
 
 A known cause on NVIDIA: `nvidia-vaapi-driver` older than 0.0.14 (Debian 13
 ships 0.0.13) exports decoded frames that NVIDIA's GBM cannot import, so each
@@ -478,6 +481,113 @@ wins), for example
 `--enable-features=VaapiVideoDecoder,CanvasOopRasterization`. Video then
 decodes on the processor, which is slower but no longer takes the GPU process
 down. See [Environment and hardware acceleration](configuration.md#environment-and-hardware-acceleration).
+
+## Reading the GPU and Chromium panels {: #gpu-and-chromium-panels }
+
+The System tab has four panels between **System** and **Health checks**.
+Every figure on them is sampled once per diagnostics interval, which
+`GET /system` reports as `diagnosticsIntervalSeconds`; the web UI reads it
+from there. They answer "is this video decoded on the GPU?", "is the wall keeping up?"
+and "what is the browser doing?" without a terminal.
+
+**GPU.** Shown only on a machine with an NVIDIA driver and `nvidia-smi`; it
+is hidden otherwise. Once per diagnostics interval Suede runs `nvidia-smi` (about 80 ms
+of wall time, negligible processor use) and shows, per GPU, utilization for
+graphics, memory, decoder and encoder, memory used, temperature, power, clocks
+and the PCIe link. The two bus figures are the megabytes per second the GPU
+receives from the host ("to GPU") and sends back ("from GPU"), each also shown
+as a percent of the link as currently trained, not of the most the card or slot
+could train to. NVIDIA retrains the link down to a slower generation at idle,
+so the percent can move when the traffic does not. A field the driver does not
+support shows as empty. The
+process table lists each process using the GPU with its share of graphics
+(SM), memory, encoder and decoder, and its framebuffer in MiB. Each process
+is attributed to the Suede app whose process tree it belongs to, and for a
+`chromium-kiosk` app to its role (browser, GPU process, renderer, ...), so
+you can see which app is using the decoder.
+
+**Slicer pipeline.** Shown between the GPU and Chromium panels while a slicer
+runs. It charts the same five minutes as the GPU chart. The outer area is
+captured frames per second and the inner area is presented frames per second,
+both as a percent of the output refresh rate (100 % is the caption's rate);
+the band between them is frames dropped or superseded. The offset line is the
+largest spread between outputs showing the same frame, with one frame period
+as 100 %. A marker flags every interval that had straddles, frames shown on
+different refreshes by different outputs. The slicer reports once per diagnostics interval, so the chart moves in steps and the values are averages over each
+interval. A static source makes the slicer report nothing, and the chart then
+shows a gap rather than a flat line.
+
+**CPU.** Always shown. Once per diagnostics interval Suede reads `/proc/stat`,
+`/proc/loadavg` and `/proc/meminfo`, and a temperature from `/sys`; it starts
+no program and polls nothing else, so the panel costs about a millisecond. The
+chart shows the whole machine, the compositor (Sway), the Suede daemon, the
+slicer, each app's whole process tree and memory in use, all as a percent of
+the machine: every core fully busy is 100 %. The same share is also given as a
+percent of one core, the figure `top` shows, so a process that keeps one core
+of twenty busy reads 5 % of the machine and 100 % of a core. The strip of small
+bars under the chart is one bar per core, so a single saturated core stands out
+even when the total is low. The three Suede processes are counted alone and an
+app's share is its own tree, so nothing is counted twice. The temperature is
+the package sensor of the first `coretemp`, `k10temp`, `cpu_thermal` or
+`cpu-thermal` device under `/sys/class/hwmon`; a machine without one shows no
+temperature. The first sample after a start has no percentages, because a
+percentage needs two readings.
+
+**Chromium.** One block per running `chromium-kiosk` app (not Firefox or
+`exec` apps):
+
+- the rendering verdict and GPU process crash count, from the same watch as
+  the **Browser GPU acceleration** check
+  (see [above](#browser-software-rendering));
+- the process table from `/proc`: role, process ID, processor use (percent of
+  one core) and resident memory;
+- the browser's own GPU view: version, GPU device and driver, feature status
+  such as `video_decode`, and the decode profiles it offers;
+- the media players Chromium reports: decoder, codec, resolution, duration,
+  pipeline state, playback progress, and any warnings or errors.
+
+The GPU view and media players need the DevTools pipe. If the block says
+DevTools is disabled, see
+[Browser DevTools pipe](configuration.md#browser-devtools).
+
+**Hardware or software video decoding.** Read the player's video decoder:
+
+| Decoder | Platform decoder | Decoding is |
+| --- | --- | --- |
+| `VaapiVideoDecoder` | true | hardware, on the GPU |
+| `FFmpegVideoDecoder`, `Dav1dVideoDecoder`, `VpxVideoDecoder` | false | software, on the processor |
+
+A feature status of `video_decode: disabled_software` says the same thing
+for the whole browser. The decode profile list is not a signal: on Linux,
+Chromium leaves it empty even while VA-API decoding works (measured on
+System A with a 1080p H.264 stream on `VaapiVideoDecoder`), so read the
+player's decoder, not the list. Software decoding is not a fault by itself,
+but a 4K or several simultaneous streams may not keep up. If the **Hardware video decode** health check warns about
+`nvidia-vaapi-driver`, see [above](#browser-software-rendering).
+
+**Cross-checking with the GPU decoder percent.** While a player claims
+hardware decoding, the GPU panel's decoder utilization, and the decoder
+percent on that app's browser or GPU process, should be above zero. If a
+player says `VaapiVideoDecoder` but the decoder stays at zero, suspect the
+player has stopped or paused. If it says `FFmpegVideoDecoder` and the decoder
+is busy, something else is using it. The cross-check cannot tell you more when
+there is no `nvidia-smi` (no decoder number at all) or when several players
+or apps share the GPU: the utilization is per GPU, and the process table
+attributes it per process, not per player.
+
+**Playback progress.** Each interval Suede reads the playhead from the page
+itself with one script evaluation per page, bounded by a 2 s timeout and never
+started while the previous one is still running. It is the only thing Suede
+asks the page itself; everything else is what Chromium pushes. The script
+reports each media element's position, duration, play state, ready state and
+dropped frames, and Suede pairs each element with a player by source address,
+then resolution, then order. Elements no player claims are listed on their own.
+A page too busy to answer simply shows no progress that interval.
+
+**What is deliberately not collected.** Per-frame timing and the page's own
+tooling stay out: Suede reads progress and dropped frame counts, once per
+interval, and nothing finer. Use the page's own tooling if you need
+frame-level numbers.
 
 ## Suede itself stops answering, but the process is still there
 

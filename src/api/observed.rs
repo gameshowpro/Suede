@@ -127,6 +127,72 @@ pub async fn get_projection_stats(State(state): State<ApiState>) -> Json<Project
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/system/gpu", tag = "observed",
+    responses((
+        status = 200,
+        description = "What nvidia-smi last reported, with each GPU process \
+                       attributed to the app that owns it. Always 200: a \
+                       machine without an NVIDIA GPU answers \
+                       `available: false` and says why.",
+        body = crate::nvidia_smi::GpuTelemetry,
+    ))
+)]
+pub async fn get_gpu(State(state): State<ApiState>) -> Json<crate::nvidia_smi::GpuTelemetry> {
+    Json(state.snapshot.gpu())
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/system/pipeline", tag = "observed",
+    responses((
+        status = 200,
+        description = "The slicer's captured and presented frame rates, \
+                       presentation offset and straddle counts, one point \
+                       per diagnostics interval for the last five minutes while a \
+                       slicer ran. Always 200: with no slicer, `running` is \
+                       false and `history` is empty.",
+        body = crate::telemetry::PipelineTelemetry,
+    ))
+)]
+pub async fn get_pipeline(
+    State(state): State<ApiState>,
+) -> Json<crate::telemetry::PipelineTelemetry> {
+    Json(state.snapshot.pipeline())
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/system/cpu", tag = "observed",
+    responses((
+        status = 200,
+        description = "Whole-machine and per-core CPU use, load, memory, \
+                       package temperature, the daemon, compositor and \
+                       slicer processes, and each app's process tree, with \
+                       one history point per diagnostics interval for the \
+                       last five minutes. Always 200: before the first \
+                       sample the figures are empty.",
+        body = crate::cpu::CpuTelemetry,
+    ))
+)]
+pub async fn get_cpu(State(state): State<ApiState>) -> Json<crate::cpu::CpuTelemetry> {
+    Json(state.snapshot.cpu())
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/system/browsers", tag = "observed",
+    responses((
+        status = 200,
+        description = "One report per running chromium-kiosk app: its \
+                       process table, GPU watchdog verdict, and what its \
+                       DevTools session learned (GPU view, media players)",
+        body = Vec<crate::telemetry::BrowserReport>,
+    ))
+)]
+pub async fn list_browsers(
+    State(state): State<ApiState>,
+) -> Json<Vec<crate::telemetry::BrowserReport>> {
+    Json(state.snapshot.browsers())
+}
+
+#[utoipa::path(
     get, path = "/api/v1/system", tag = "observed",
     responses((status = 200, description = "Daemon and environment information", body = SystemInfo))
 )]
@@ -172,6 +238,7 @@ pub async fn get_system(State(state): State<ApiState>) -> Json<SystemInfo> {
             enabled: state.bootstrap.align_outputs,
             ..state.snapshot.output_alignment()
         },
+        diagnostics_interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
     })
 }
 
@@ -691,6 +758,43 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"running": true}));
+    }
+
+    #[tokio::test]
+    async fn gpu_telemetry_is_unavailable_before_the_first_sample() {
+        let (status, body) = get_json("/api/v1/system/gpu").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["available"], false);
+        assert!(body["reason"].is_null());
+        assert_eq!(body["gpus"], serde_json::json!([]));
+        assert_eq!(body["processes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn pipeline_telemetry_is_empty_before_the_first_tick() {
+        let (status, body) = get_json("/api/v1/system/pipeline").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"running": false, "history": []}));
+    }
+
+    #[tokio::test]
+    async fn cpu_telemetry_is_empty_before_the_first_tick() {
+        let (status, body) = get_json("/api/v1/system/cpu").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cores"], 0);
+        assert_eq!(body["totalPercent"], serde_json::Value::Null);
+        assert_eq!(body["corePercent"], serde_json::json!([]));
+        assert_eq!(body["processes"], serde_json::json!([]));
+        assert_eq!(body["apps"], serde_json::json!([]));
+        assert_eq!(body["history"], serde_json::json!([]));
+        assert_eq!(body["load1"], 0.0);
+    }
+
+    #[tokio::test]
+    async fn browser_reports_are_empty_before_the_first_sample() {
+        let (status, body) = get_json("/api/v1/system/browsers").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!([]));
     }
 
     #[tokio::test]

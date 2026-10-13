@@ -98,3 +98,15 @@ docs_base_url = "https://suede.gameshow.pro/"
 # the restart to an operator through the browser-gpu health check's fix.
 # See configuration.md#restart-on-gpu-fallback.
 # restart_on_gpu_fallback = true
+
+# Whether chromium-kiosk apps are launched with a private DevTools pipe, so
+# the web UI's Chromium panel can show the browser's own GPU view and its
+# media players (decoder, codec, pipeline state).
+# Env: SUEDE_BROWSER_DEVTOOLS
+#
+# On by default. The pipe is a pair of inherited file descriptors between
+# Suede and the browser: no port, no socket, nothing another process can
+# connect to, and Chromium only pushes player state changes over it. Set
+# false to launch without it; the panel then keeps the process table only.
+# Applies to browsers launched afterwards. See configuration.md#browser-devtools.
+# browser_devtools = true

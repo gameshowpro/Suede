@@ -23,7 +23,10 @@ pub struct Snapshot {
     /// to read, instead of each guessing it from whether stats have arrived
     /// (see `ProjectionReport` for why that guess was wrong on 2026-09-15).
     slicer_running: RwLock<bool>,
-    /// Live-control progress is distinct from ten-second frame statistics so
+    /// The running slicer's process id, for the CPU panel. Set wherever the
+    /// slicer is published as running and cleared with it.
+    slicer_pid: RwLock<Option<u32>>,
+    /// Live-control progress is distinct from interval frame statistics so
     /// a static source can still show whether a requested edit was installed.
     projection_control: RwLock<ProjectionControlStatus>,
     projection_geometry: RwLock<crate::model::observed::ProjectionGeometryStatus>,
@@ -41,6 +44,16 @@ pub struct Snapshot {
     /// Each report names the process it was judged for, so a reader can
     /// tell a stale one (an app restarted since) from the current one.
     browser_gpu: RwLock<Vec<crate::browser_gpu::AppGpuReport>>,
+    /// What `nvidia-smi` last reported, with each process attributed to its
+    /// app, as [`crate::telemetry`] last published it.
+    gpu: RwLock<crate::nvidia_smi::GpuTelemetry>,
+    /// The slicer pipeline history, as [`crate::telemetry`] last published it.
+    pipeline: RwLock<crate::telemetry::PipelineTelemetry>,
+    /// The CPU panel, as [`crate::telemetry`] last published it.
+    cpu: RwLock<crate::cpu::CpuTelemetry>,
+    /// One report per running `chromium-kiosk` app, as
+    /// [`crate::telemetry`] last published it.
+    browsers: RwLock<Vec<crate::telemetry::BrowserReport>>,
 }
 
 impl Snapshot {
@@ -80,6 +93,66 @@ impl Snapshot {
             return false;
         }
         *guard = reports;
+        true
+    }
+
+    /// What `nvidia-smi` last reported.
+    pub fn gpu(&self) -> crate::nvidia_smi::GpuTelemetry {
+        self.gpu.read().unwrap().clone()
+    }
+
+    /// Record the GPU telemetry. Returns whether it changed.
+    pub fn set_gpu(&self, gpu: crate::nvidia_smi::GpuTelemetry) -> bool {
+        let mut guard = self.gpu.write().unwrap();
+        if *guard == gpu {
+            return false;
+        }
+        *guard = gpu;
+        true
+    }
+
+    /// The CPU panel.
+    pub fn cpu(&self) -> crate::cpu::CpuTelemetry {
+        self.cpu.read().unwrap().clone()
+    }
+
+    /// Record the CPU panel. Returns whether it changed.
+    pub fn set_cpu(&self, cpu: crate::cpu::CpuTelemetry) -> bool {
+        let mut guard = self.cpu.write().unwrap();
+        if *guard == cpu {
+            return false;
+        }
+        *guard = cpu;
+        true
+    }
+
+    /// The slicer pipeline history.
+    pub fn pipeline(&self) -> crate::telemetry::PipelineTelemetry {
+        self.pipeline.read().unwrap().clone()
+    }
+
+    /// Record the slicer pipeline history. Returns whether it changed.
+    pub fn set_pipeline(&self, pipeline: crate::telemetry::PipelineTelemetry) -> bool {
+        let mut guard = self.pipeline.write().unwrap();
+        if *guard == pipeline {
+            return false;
+        }
+        *guard = pipeline;
+        true
+    }
+
+    /// The Chromium apps' reports.
+    pub fn browsers(&self) -> Vec<crate::telemetry::BrowserReport> {
+        self.browsers.read().unwrap().clone()
+    }
+
+    /// Record the Chromium reports. Returns whether they changed.
+    pub fn set_browsers(&self, browsers: Vec<crate::telemetry::BrowserReport>) -> bool {
+        let mut guard = self.browsers.write().unwrap();
+        if *guard == browsers {
+            return false;
+        }
+        *guard = browsers;
         true
     }
 
@@ -152,8 +225,22 @@ impl Snapshot {
         *self.slicer_running.read().unwrap()
     }
 
+    /// The running slicer's process id, if one is known.
+    pub fn slicer_pid(&self) -> Option<u32> {
+        *self.slicer_pid.read().unwrap()
+    }
+
+    /// Record the running slicer's process id. A slicer that is not running
+    /// has none, so `set_slicer_running(false)` clears it too.
+    pub fn set_slicer_pid(&self, pid: Option<u32>) {
+        *self.slicer_pid.write().unwrap() = pid;
+    }
+
     /// Replace the slicer's liveness, reporting whether it actually changed.
     pub fn set_slicer_running(&self, running: bool) -> bool {
+        if !running {
+            self.set_slicer_pid(None);
+        }
         let mut guard = self.slicer_running.write().unwrap();
         if *guard == running {
             return false;
@@ -316,7 +403,7 @@ mod tests {
 
         let stats = ProjectionStats {
             measured_at: 1,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 60.0,
             presented_fps: 60.0,
@@ -372,6 +459,17 @@ mod tests {
     }
 
     #[test]
+    fn the_slicer_pid_is_cleared_with_its_liveness() {
+        let snapshot = Snapshot::new();
+        assert_eq!(snapshot.slicer_pid(), None);
+        snapshot.set_slicer_running(true);
+        snapshot.set_slicer_pid(Some(4242));
+        assert_eq!(snapshot.slicer_pid(), Some(4242));
+        snapshot.set_slicer_running(false);
+        assert_eq!(snapshot.slicer_pid(), None);
+    }
+
+    #[test]
     fn projection_report_combines_liveness_and_the_last_interval() {
         use crate::model::{CaptureIntervals, FrameCost, ProjectionStats};
 
@@ -390,7 +488,7 @@ mod tests {
 
         let stats = ProjectionStats {
             measured_at: 1,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 60.0,
             presented_fps: 60.0,

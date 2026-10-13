@@ -1104,6 +1104,7 @@ impl Reconciler {
         // which stays "no" for as long as a static page produces no frames
         // to report (see `ProjectionReport`).
         self.publish_slicer_running(manager.slicer_running());
+        self.snapshot.set_slicer_pid(manager.slicer_pid());
         (canvas, divergences)
     }
 
@@ -1977,6 +1978,7 @@ mod tests {
                 profiles_root: dir.path().join("profiles"),
                 log_root: dir.path().join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
+                browser_devtools: true,
             },
             // Unrestricted: these tests exercise reconciliation, not the
             // allowlist, and launch stand-ins like "sleep" that a real

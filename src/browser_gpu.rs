@@ -39,7 +39,7 @@ use crate::snapshot::Snapshot;
 use crate::supervisor::Supervisor;
 
 /// How often [`Watchdog::run`] looks.
-pub const POLL: Duration = Duration::from_secs(5);
+pub const POLL: Duration = crate::diagnostics::SAMPLE_INTERVAL;
 
 /// Polls in a row that must see software rendering, for the same process,
 /// before a restart. Two, so the decision always rests on two separate
@@ -118,7 +118,7 @@ fn is_software(args: &[&str]) -> bool {
 }
 
 /// Every process's children, from each `/proc/<pid>/stat`.
-fn children_by_parent(proc_root: &Path) -> HashMap<u32, Vec<u32>> {
+pub(crate) fn children_by_parent(proc_root: &Path) -> HashMap<u32, Vec<u32>> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     let Ok(entries) = std::fs::read_dir(proc_root) else {
         return children;
@@ -144,7 +144,7 @@ fn children_by_parent(proc_root: &Path) -> HashMap<u32, Vec<u32>> {
 /// The parent pid from a `/proc/<pid>/stat` line: the second field after
 /// the command name. The name is parenthesized and may itself contain
 /// spaces and parentheses, so the fields are counted from the last `)`.
-fn parent_pid(stat: &str) -> Option<u32> {
+pub(crate) fn parent_pid(stat: &str) -> Option<u32> {
     let rest = &stat[stat.rfind(')')? + 1..];
     let mut fields = rest.split_whitespace();
     fields.next()?; // state
@@ -152,7 +152,7 @@ fn parent_pid(stat: &str) -> Option<u32> {
 }
 
 /// Every descendant of `root`, breadth first, each once.
-fn descendants(children: &HashMap<u32, Vec<u32>>, root: u32) -> Vec<u32> {
+pub(crate) fn descendants(children: &HashMap<u32, Vec<u32>>, root: u32) -> Vec<u32> {
     let mut seen = HashSet::from([root]);
     let mut queue = VecDeque::from([root]);
     let mut found = Vec::new();
@@ -1316,6 +1316,7 @@ mod tests {
                 profiles_root: dir.join("profiles"),
                 log_root: dir.join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
+                browser_devtools: true,
             },
             vec!["*".to_string()],
         ));

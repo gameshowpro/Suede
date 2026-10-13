@@ -328,6 +328,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         presentation = bootstrap.presentation.as_str(),
         align_outputs = bootstrap.align_outputs,
         restart_on_gpu_fallback = bootstrap.restart_on_gpu_fallback,
+        browser_devtools = bootstrap.browser_devtools,
         mock = args.mock,
         "starting suede"
     );
@@ -410,6 +411,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
             log_root: bootstrap.state_dir.join("logs"),
             // Loopback: the browsers posting heartbeats run on this machine.
             api_base: format!("http://127.0.0.1:{}/api/v1", bootstrap.bind.port()),
+            browser_devtools: bootstrap.browser_devtools,
         },
         bootstrap.allowed_programs.clone(),
     ));
@@ -476,6 +478,16 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
             supervisor.clone(),
             checks.clone(),
             snapshot.clone(),
+        )
+        .run(shutdown_rx.clone()),
+    );
+    tokio::spawn(
+        suede::telemetry::Telemetry::new(
+            supervisor.clone(),
+            snapshot.clone(),
+            events.clone(),
+            sway.clone(),
+            bootstrap.browser_devtools,
         )
         .run(shutdown_rx.clone()),
     );

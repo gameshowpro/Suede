@@ -199,7 +199,13 @@ pub async fn measure(
         )));
     };
     let key = MeasurementKey::new(app, &chosen);
-    let spec = launcher::build(&check_app, context, Some(&chosen));
+    // Without the DevTools pipe: this spawn does not put anything on fds 3
+    // and 4, and Chromium given the flag without them exits at once.
+    let spec_context = launcher::LaunchContext {
+        browser_devtools: false,
+        ..context.clone()
+    };
+    let spec = launcher::build(&check_app, &spec_context, Some(&chosen));
 
     // Its own profile, started clean every time — including for Firefox,
     // which the preset leaves profileless and which would otherwise hand the
@@ -1050,6 +1056,7 @@ mod tests {
             profiles_root: "/tmp/profiles".into(),
             log_root: "/tmp/logs".into(),
             api_base: "http://127.0.0.1:9088/api/v1".into(),
+            browser_devtools: true,
         };
         let app: AppConfig = serde_json::from_value(serde_json::json!({
             "id": "renderer",
@@ -1082,6 +1089,7 @@ mod tests {
             profiles_root: "/tmp/profiles".into(),
             log_root: "/tmp/logs".into(),
             api_base: "http://127.0.0.1:9088/api/v1".into(),
+            browser_devtools: true,
         };
         let app: AppConfig = serde_json::from_value(serde_json::json!({
             "id": "renderer",

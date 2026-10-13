@@ -490,6 +490,10 @@ pub fn router(state: ApiState) -> Router {
         )
         .route("/projection/arrangement", get(projection::get_arrangement))
         .route("/system", get(observed::get_system))
+        .route("/system/gpu", get(observed::get_gpu))
+        .route("/system/pipeline", get(observed::get_pipeline))
+        .route("/system/cpu", get(observed::get_cpu))
+        .route("/system/browsers", get(observed::list_browsers))
         .route("/system/checks", get(observed::list_checks))
         .route("/system/checks/{id}/fix", post(observed::fix_check))
         .route("/system/power", post(observed::power))
@@ -745,6 +749,7 @@ pub mod test_support {
                 profiles_root: dir.path().join("profiles"),
                 log_root: dir.path().join("logs"),
                 api_base: "http://127.0.0.1:9088/api/v1".into(),
+                browser_devtools: true,
             },
             // Unrestricted: API-level tests exercise the app lifecycle
             // endpoints, not the allowlist, and launch stand-in commands a

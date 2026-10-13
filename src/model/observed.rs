@@ -566,6 +566,10 @@ pub struct SystemInfo {
     /// [`OutputAlignmentStatus`] and
     /// [`crate::config::BootstrapConfig::align_outputs`].
     pub output_alignment: OutputAlignmentStatus,
+    /// Seconds between samples of every diagnostic: the slicer's statistics
+    /// interval and the GPU, process and pipeline telemetry tick. The web UI
+    /// reads it instead of assuming one.
+    pub diagnostics_interval_seconds: f64,
 }
 
 /// What `GET /system` reports about automatic output phase alignment: the
@@ -991,7 +995,7 @@ pub struct ProjectionReport {
     pub last_interval: Option<ProjectionStats>,
     /// Lifecycle of the most recent live slicer update.  This is independent
     /// of frame-interval statistics: a static canvas can apply a revision
-    /// before it has any ten-second interval to report.
+    /// before it has any statistics interval to report.
     #[serde(default, skip_serializing_if = "ProjectionControlStatus::is_empty")]
     pub control: ProjectionControlStatus,
 }

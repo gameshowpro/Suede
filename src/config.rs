@@ -53,6 +53,7 @@ struct FileConfig {
     gl_yield: Option<String>,
     align_outputs: Option<bool>,
     restart_on_gpu_fallback: Option<bool>,
+    browser_devtools: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -171,6 +172,19 @@ pub struct BootstrapConfig {
     /// fix. Daemon behavior like [`Self::align_outputs`], so
     /// `SUEDE_RESTART_ON_GPU_FALLBACK` overrides it.
     pub restart_on_gpu_fallback: bool,
+    /// Whether `chromium-kiosk` apps are launched with
+    /// `--remote-debugging-pipe`, so Suede can read the browser's own view of
+    /// its GPU and the media players it creates — see [`crate::devtools`].
+    ///
+    /// Defaults to `true`: the pipe opens no port and no socket, Chromium
+    /// parks one reader thread on it, and nothing is polled through it
+    /// beyond a few requests at launch, a `SystemInfo.getInfo` every 30
+    /// seconds, and the push-only media player events. `false` launches
+    /// Chromium without the flag and runs no client; the rest of the
+    /// browser telemetry still works. Daemon behavior like
+    /// [`Self::restart_on_gpu_fallback`], so `SUEDE_BROWSER_DEVTOOLS`
+    /// overrides it.
+    pub browser_devtools: bool,
 }
 
 impl Default for BootstrapConfig {
@@ -190,6 +204,7 @@ impl Default for BootstrapConfig {
             gl_yield: GlYieldMode::Usleep,
             align_outputs: true,
             restart_on_gpu_fallback: true,
+            browser_devtools: true,
         }
     }
 }
@@ -283,6 +298,9 @@ pub enum ConfigError {
     /// Same reasoning as [`ConfigError::AlignOutputs`].
     #[error("invalid SUEDE_RESTART_ON_GPU_FALLBACK {value:?}; accepted values are true, false")]
     RestartOnGpuFallback { value: String },
+    /// Same reasoning as [`ConfigError::AlignOutputs`].
+    #[error("invalid SUEDE_BROWSER_DEVTOOLS {value:?}; accepted values are true, false")]
+    BrowserDevtools { value: String },
 }
 
 impl BootstrapConfig {
@@ -376,6 +394,17 @@ impl BootstrapConfig {
                 _ => return Err(ConfigError::RestartOnGpuFallback { value }),
             },
             None => file.restart_on_gpu_fallback.unwrap_or(true),
+        };
+        config.browser_devtools = match std::env::var("SUEDE_BROWSER_DEVTOOLS")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            Some(value) => match value.as_str() {
+                "true" => true,
+                "false" => false,
+                _ => return Err(ConfigError::BrowserDevtools { value }),
+            },
+            None => file.browser_devtools.unwrap_or(true),
         };
 
         Ok(config)
@@ -892,6 +921,38 @@ mod tests {
         assert!(error.contains("true, false"), "{error}");
 
         unsafe { std::env::remove_var("SUEDE_RESTART_ON_GPU_FALLBACK") };
+    }
+
+    /// One test, like the GPU fallback test, because
+    /// `SUEDE_BROWSER_DEVTOOLS` is process-wide state.
+    #[test]
+    fn browser_devtools_defaults_to_on_and_is_read_from_file_and_env() {
+        let _guard = env_lock();
+        // Safety: the whole test holds `env_lock`.
+        unsafe { std::env::remove_var("SUEDE_BROWSER_DEVTOOLS") };
+
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(config.browser_devtools, "absent means on");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+        std::fs::write(&path, "browser_devtools = false\n").unwrap();
+        assert!(!BootstrapConfig::load(Some(&path)).unwrap().browser_devtools);
+        std::fs::write(&path, "browser_devtools = true\n").unwrap();
+        assert!(BootstrapConfig::load(Some(&path)).unwrap().browser_devtools);
+
+        // The environment wins over the file, like every other override.
+        unsafe { std::env::set_var("SUEDE_BROWSER_DEVTOOLS", "false") };
+        assert!(!BootstrapConfig::load(Some(&path)).unwrap().browser_devtools);
+
+        // A typo fails loudly rather than silently picking a side.
+        unsafe { std::env::set_var("SUEDE_BROWSER_DEVTOOLS", "yes") };
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("yes"), "{error}");
+        assert!(error.contains("SUEDE_BROWSER_DEVTOOLS"), "{error}");
+        assert!(error.contains("true, false"), "{error}");
+
+        unsafe { std::env::remove_var("SUEDE_BROWSER_DEVTOOLS") };
     }
 
     #[test]
