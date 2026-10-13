@@ -4496,7 +4496,47 @@ function flattenJson(v) {
   }
   return String(v);
 }
-function trackValue(raw) {
+// Human-readable form of a raw Chromium media-log value, chosen by field
+// name. Hexadecimal literals become decimal first; then bitrate, sample
+// rate, duration/time (seconds) and byte-count names get units. Anything
+// that matches no rule or fails to parse comes back unchanged. Pure.
+function formatMediaValue(name, raw) {
+  if (typeof raw !== "string") return raw;
+  let text = raw.trim();
+  let hexed = false;
+  if (/^0x/i.test(text)) {
+    if (!/^0x[0-9a-f]+$/i.test(text)) return raw;
+    text = BigInt(text).toString();
+    hexed = true;
+  }
+  if (!/^\d+(\.\d+)?$/.test(text)) return raw;
+  const n = Number(text);
+  if (!Number.isFinite(n)) return raw;
+  const key = String(name);
+  // The number under 1000 in the largest fitting unit: integers plain,
+  // two decimals below 10, one decimal otherwise.
+  const scaled = (value, units) => {
+    const fmt = (x) => Number.isInteger(x) ? String(x) : x < 10 ? x.toFixed(2) : x.toFixed(1);
+    let i = 0, v = value;
+    while (i < units.length - 1 && (v >= 1000 || Number(fmt(v)) >= 1000)) { v /= 1000; i++; }
+    return `${fmt(v)} ${units[i]}`;
+  };
+  if (/bitrate$/i.test(key)) return scaled(n, ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"]);
+  if (/bytes$/i.test(key)) return scaled(n, ["B", "kB", "MB", "GB"]);
+  if (key === "samples per second") return scaled(n, ["Hz", "kHz"]);
+  if (/(duration|time)$/i.test(key)) {
+    const cs = Math.round(n * 100);
+    const two = (x) => String(x).padStart(2, "0");
+    return `${two(Math.floor(cs / 360000))}:${two(Math.floor(cs / 6000) % 60)}:${two(Math.floor(cs / 100) % 60)}.${two(cs % 100)}`;
+  }
+  return hexed ? BigInt(text).toLocaleString("en-US") : raw;
+}
+// Escaped cell text for a plain value.
+const mediaValueHtml = (name, raw) => escape(formatMediaValue(name, raw));
+// A ` title="raw"` attribute for the cell when formatting changed the value.
+const mediaTitleAttr = (name, raw) =>
+  formatMediaValue(name, raw) === raw ? "" : ` title="${escape(raw)}"`;
+function trackValue(name, raw) {
   if (raw == null) return dash;
   if (isBoolText(raw)) return boolChip(raw);
   const text = String(raw).trim();
@@ -4509,14 +4549,14 @@ function trackValue(raw) {
       }
     } catch { /* not JSON: show verbatim */ }
   }
-  return escape(raw);
+  return mediaValueHtml(name, raw);
 }
 // One heading plus a field/value table per track item.
 function trackTables(tracks, label) {
   if (!tracks?.length) return `<p class="hint">none</p>`;
   return tracks.map((t, i) => {
     const rows = Object.entries(t.fields || {}).map(([k, v]) =>
-      `<tr><td class="mono">${escape(k)}</td><td class="mono">${trackValue(v)}</td></tr>`).join("");
+      `<tr><td class="mono">${escape(k)}</td><td class="mono"${mediaTitleAttr(k, v)}>${trackValue(k, v)}</td></tr>`).join("");
     return `<h5>${escape(label)} ${i + 1}</h5>` + (rows
       ? `<table class="track"><tbody>${rows}</tbody></table>` : `<p class="hint">no fields</p>`);
   }).join("");
@@ -4528,7 +4568,7 @@ function playerDetail(p, ph, sampledAt) {
     ...Object.entries(p.properties || {}).filter(([k]) => k !== "kVideoTracks" && k !== "kAudioTracks"),
   ];
   const propRows = props.map(([k, v]) =>
-    `<tr><td class="mono">${escape(k)}</td><td class="mono">${isBoolText(v) ? boolChip(v) : escape(v)}</td></tr>`).join("");
+    `<tr><td class="mono">${escape(k)}</td><td class="mono"${mediaTitleAttr(k, v)}>${isBoolText(v) ? boolChip(v) : mediaValueHtml(k, v)}</td></tr>`).join("");
   const messages = (p.messages || []).slice(-10);
   const errors = (p.errors || []).slice(-5);
   const messageList = messages.length
