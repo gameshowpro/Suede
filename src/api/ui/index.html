@@ -187,7 +187,8 @@ tr.player-detail > td { background: var(--sunken); padding: 12px 14px; }
 .player-detail-grid h5 { margin: 10px 0 4px; font-size: 13px; }
 .player-detail-grid h4 + h5 { margin-top: 0; }
 .player-detail-grid table.track { width: 100%; }
-.player-detail-grid table.track td:first-child { white-space: nowrap; width: 1%; color: var(--muted); }
+.player-detail-grid td.pkey { font-family: inherit; overflow-wrap: break-word; width: 11em; }
+.player-detail-grid table.track td:first-child { color: var(--muted); }
 .player-detail-grid ul { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
 .progress-cell { display: flex; align-items: center; gap: 8px; min-width: 150px; }
 .pbar { position: relative; flex: 1 1 60px; min-width: 60px; max-width: 120px; height: 8px; border-radius: 4px;
@@ -4551,12 +4552,27 @@ function trackValue(name, raw) {
   }
   return mediaValueHtml(name, raw);
 }
+// A readable key for a media-log property: "kIsPlatformVideoDecoder" becomes
+// "Is platform video decoder". A leading k is dropped only before a capital,
+// CamelCase is split (capital runs stay together as acronyms), and the result
+// is sentence case with acronyms of two or more capitals kept. Names that
+// already contain spaces only get their first letter capitalized.
+function propertyLabel(name) {
+  const raw = String(name ?? "");
+  if (raw.includes(" ")) return raw.charAt(0).toUpperCase() + raw.slice(1);
+  const words = raw.replace(/^k(?=[A-Z])/, "")
+    .replace(/([a-z])(?=[A-Z])/g, "$1 ").replace(/([A-Z])(?=[A-Z][a-z])/g, "$1 ")
+    .replace(/([A-Za-z])(?=\d)/g, "$1 ").split(" ").filter(Boolean);
+  return words.map((w, i) => /^[A-Z]{2,}$/.test(w) ? w
+    : i === 0 ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w.toLowerCase()).join(" ");
+}
+const propertyKeyCell = (k) => `<td class="pkey" title="${escape(k)}">${escape(propertyLabel(k))}</td>`;
 // One heading plus a field/value table per track item.
 function trackTables(tracks, label) {
   if (!tracks?.length) return `<p class="hint">none</p>`;
   return tracks.map((t, i) => {
     const rows = Object.entries(t.fields || {}).map(([k, v]) =>
-      `<tr><td class="mono">${escape(k)}</td><td class="mono"${mediaTitleAttr(k, v)}>${trackValue(k, v)}</td></tr>`).join("");
+      `<tr>${propertyKeyCell(k)}<td class="mono"${mediaTitleAttr(k, v)}>${trackValue(k, v)}</td></tr>`).join("");
     return `<h5>${escape(label)} ${i + 1}</h5>` + (rows
       ? `<table class="track"><tbody>${rows}</tbody></table>` : `<p class="hint">no fields</p>`);
   }).join("");
@@ -4568,7 +4584,7 @@ function playerDetail(p, ph, sampledAt) {
     ...Object.entries(p.properties || {}).filter(([k]) => k !== "kVideoTracks" && k !== "kAudioTracks"),
   ];
   const propRows = props.map(([k, v]) =>
-    `<tr><td class="mono">${escape(k)}</td><td class="mono"${mediaTitleAttr(k, v)}>${isBoolText(v) ? boolChip(v) : mediaValueHtml(k, v)}</td></tr>`).join("");
+    `<tr>${propertyKeyCell(k)}<td class="mono"${mediaTitleAttr(k, v)}>${isBoolText(v) ? boolChip(v) : mediaValueHtml(k, v)}</td></tr>`).join("");
   const messages = (p.messages || []).slice(-10);
   const errors = (p.errors || []).slice(-5);
   const messageList = messages.length
