@@ -118,6 +118,15 @@ a { color: var(--accent); }
 .gpu-legend .key { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .gpu-legend .swatch { width: 14px; height: 0; border-top: 3px solid; border-radius: 2px; }
 .gpu-legend .swatch.bus { border-top-style: dashed; }
+.gpu-legend .swatch.c1 { border-color: var(--c1); background: color-mix(in srgb, var(--c1) 30%, transparent); }
+.gpu-legend .swatch.c3 { border-color: var(--c3); background: color-mix(in srgb, var(--c3) 45%, transparent); }
+.gpu-legend .swatch.c2 { border-color: var(--c2); }
+.gpu-chart .area { stroke: none; fill-opacity: .28; }
+.gpu-chart .area.inner { fill-opacity: .45; }
+.gpu-chart .edge { fill: none; stroke-width: 2; stroke-linejoin: round; }
+.gpu-chart .marker-label { fill: var(--muted); font-size: 9px; }
+.gpu-legend .swatch.fill { height: 10px; width: 14px; border: 2px solid; border-radius: 2px; }
+.gpu-legend .swatch.tri { width: 0; height: 0; border: 5px solid transparent; border-top: 8px solid var(--ink); border-radius: 0; }
 .gpu-caption { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
 .kv th { width: 11em; white-space: nowrap; }
 .feature-grid { display: grid; grid-template-columns: 1fr; gap: 0 28px; }
@@ -851,6 +860,13 @@ window.addEventListener("error", (event) => {
       <h3>Processes on the GPU</h3>
       <table id="gpu-processes"></table>
     </div>
+    <div class="panel" id="pipeline-panel" hidden>
+      <h2>Slicer pipeline</h2>
+      <p class="hint" id="pipeline-silent" hidden>The slicer is running.
+        No frames have been reported yet — the loop only runs while the
+        content is drawing.</p>
+      <div id="pipeline"></div>
+    </div>
     <div class="panel" id="browsers-panel" hidden>
       <h2>Chromium</h2>
       <div id="browsers"></div>
@@ -932,6 +948,8 @@ let outputs = [], config = null, apps = [], sinks = [], checks = [], status = nu
     // GpuTelemetry from nvidia-smi, and one BrowserReport per running
     // chromium-kiosk app. Both advisory; null/[] hides their panels.
     gpuTelemetry = null,
+    // PipelineTelemetry from /system/pipeline; advisory, null hides the panel.
+    pipelineTelemetry = null,
     browserReports = [];
 
 // Every display's background comes from here, so the lookup is shared.
@@ -3030,7 +3048,7 @@ const warpOutput = () => configEntry(selected);
 const warpAvailable = () => projectionStats?.geometry?.warpAvailable === true && config?.projection?.renderer !== "cpu";
 const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy;
 let warpDrag = null, rejectedHandle = null;
-let projectionEventVersion = 0;
+let projectionEventVersion = 0, pipelineEventVersion = 0;
 
 // Solve the projective map from a unit square to the pins. Center endpoints
 // are recovered with its inverse, never a distance ratio on a perspective edge.
@@ -4457,7 +4475,131 @@ function renderBrowsers() {
   if (!list.length) return;
   $("browsers").innerHTML = list.map(renderBrowser).join("");
 }
-function renderGpuAndBrowsers() { renderGpu(); renderBrowsers(); }
+
+// Slicer pipeline chart: captured and presented fps as nested step areas on
+// the same 5 minute axis as the GPU chart (100 % = the output's refresh
+// rate), the display offset as a line (100 % = one frame period) and a
+// triangle on every interval that had straddles. Values are ten-second
+// interval averages, so they are drawn as steps; null (stale) points break
+// every shape rather than drawing a flat line.
+function pipelineChart(p) {
+  const W = 720, H = 160, L = 34, R = 10, T = 8, B = 22;
+  const pw = W - L - R, ph = H - T - B;
+  const points = (Array.isArray(p.history) ? p.history : [])
+    .filter((point) => Number.isFinite(Number(point.at))).map((point) => ({ ...point, at: Number(point.at) }));
+  const y = (v) => T + ph * (1 - Math.min(100, Math.max(0, v)) / 100);
+  const ok = (v) => v != null && Number.isFinite(Number(v));
+  const hz = (point) => ok(point.outputHz) && point.outputHz > 0 ? point.outputHz : null;
+  const captured = (point) => hz(point) && ok(point.canvasFps) ? 100 * point.canvasFps / hz(point) : null;
+  const presented = (point) => hz(point) && ok(point.presentedFps) ? 100 * point.presentedFps / hz(point) : null;
+  const offset = (point) => hz(point) && ok(point.offsetMaxMs) ? 100 * point.offsetMaxMs * hz(point) / 1000 : null;
+  let svg = "";
+  for (const tick of [0, 25, 50, 75, 100]) {
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(tick)}" y2="${y(tick)}"/>` +
+      `<text class="axis-label" x="${L - 5}" y="${y(tick) + 4}" text-anchor="end">${tick}</text>`;
+  }
+  svg += `<text class="axis-label" x="${L}" y="${H - 6}">5 min ago</text>` +
+    `<text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">now</text>` +
+    `<text class="axis-label" x="${L + 4}" y="${T + 18}">of output rate</text>`;
+  const latest = points[points.length - 1];
+  if (points.length < 2) {
+    svg += `<text class="axis-label" x="${L + pw / 2}" y="${T + ph / 2}" text-anchor="middle">collecting…</text>`;
+  } else {
+    const now = latest.at;
+    const x = (at) => L + pw * (1 - (now - at) / HISTORY_SECONDS);
+    const visible = points.filter((point) => now - point.at <= HISTORY_SECONDS);
+    // Runs of connected non-null points as [{at, v}] arrays.
+    const runs = (value) => {
+      const out = []; let run = null, previous = null;
+      for (const point of visible) {
+        const v = value(point);
+        if (v == null) { run = null; previous = null; continue; }
+        if (run == null || point.at - previous > HISTORY_GAP_SECONDS) { run = []; out.push(run); }
+        run.push({ at: point.at, v }); previous = point.at;
+      }
+      return out;
+    };
+    // Step-before: an interval's value covers the time leading up to it.
+    const edge = (run) => run.map((q, i) => i === 0
+      ? `M${x(q.at).toFixed(1)},${y(q.v).toFixed(1)}`
+      : `L${x(run[i - 1].at).toFixed(1)},${y(q.v).toFixed(1)}L${x(q.at).toFixed(1)},${y(q.v).toFixed(1)}`).join("");
+    const fills = (value, color, cls) => {
+      let out = "";
+      for (const run of runs(value)) {
+        const d = edge(run);
+        if (run.length < 2) {
+          out += `<circle class="dot" cx="${x(run[0].at).toFixed(1)}" cy="${y(run[0].v).toFixed(1)}" r="3" fill="${color}"/>`;
+          continue;
+        }
+        out += `<path class="area ${cls}" fill="${color}" d="${d}L${x(run[run.length - 1].at).toFixed(1)},${y(0)}L${x(run[0].at).toFixed(1)},${y(0)}Z"/>` +
+          `<path class="edge" stroke="${color}" d="${d}"/>`;
+      }
+      return out;
+    };
+    svg += fills(captured, "var(--c1)", "outer") + fills(presented, "var(--c3)", "inner");
+    for (const run of runs(offset)) {
+      svg += run.length < 2
+        ? `<circle class="dot" cx="${x(run[0].at).toFixed(1)}" cy="${y(run[0].v).toFixed(1)}" r="3" fill="var(--c2)"/>`
+        : `<path class="edge" stroke="var(--c2)" d="${edge(run)}"/>`;
+    }
+    let lastLabelX = -Infinity;
+    for (const point of visible) {
+      if (!point.fresh || !(point.straddles > 0)) continue;
+      const cx = x(point.at);
+      svg += `<path d="M${(cx - 4).toFixed(1)},${T - 1}h8l-4,7z" fill="var(--ink)"><title>${escape(point.straddles)} straddle${point.straddles === 1 ? "" : "s"} in the ten-second interval</title></path>`;
+      if (cx - lastLabelX >= 16) {
+        svg += `<text class="marker-label" x="${(cx + 6).toFixed(1)}" y="${T + 5}">${escape(point.straddles)}</text>`;
+        lastLabelX = cx;
+      }
+    }
+    visible.forEach((point, i) => {
+      const x0 = i === 0 ? L : (x(visible[i - 1].at) + x(point.at)) / 2;
+      const x1 = i === visible.length - 1 ? W - R : (x(point.at) + x(visible[i + 1].at)) / 2;
+      const when = new Date(point.at * 1000).toLocaleTimeString();
+      const lines = ok(point.outputHz)
+        ? `Captured ${fmt(point.canvasFps, 1, " fps")}\nPresented ${fmt(point.presentedFps, 1, " fps")}\nOffset max ${fmt(point.offsetMaxMs, 1, " ms")}` +
+          (point.fresh && point.straddles > 0 ? `\nStraddles ${point.straddles}` : "")
+        : "No recent slicer interval";
+      svg += `<rect class="hit" x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}"><title>${escape(when)}\n${escape(lines)}</title></rect>`;
+    });
+  }
+  // Current values come from the same lastInterval the Frame timing card
+  // shows, so the two never disagree; the history only feeds the chart.
+  const s = p.lastInterval;
+  const outputHz = Math.max(0, ...(s.outputs || []).map((o) => Number(o.refreshHz) || 0)) ||
+    [...points].reverse().map(hz).find((v) => v != null) || null;
+  const ofRate = (fps) => outputHz && ok(fps) ? pct(100 * fps / outputHz) : dash;
+  const frameMs = outputHz ? 1000 / outputHz : null;
+  const w = latest ? points.filter((point) => latest.at - point.at <= HISTORY_SECONDS) : [];
+  const straddles = w.reduce((sum, point) => sum + (point.straddles || 0), 0);
+  const flagged = (n) => n > 0 ? `<span class="pill bad">${n}</span>` : String(n);
+  const key = (swatch, name, text) => `<span class="key"><span class="swatch ${swatch}"></span>${name} <b>${text}</b></span>`;
+  const legend =
+    key("fill c1", "Captured", `${num(s.canvasFps)} fps · ${ofRate(s.canvasFps)}`) +
+    key("fill c3", "Presented", `${num(s.presentedFps)} fps · ${ofRate(s.presentedFps)}`) +
+    key("c2", "Offset max", s.offsetMs
+      ? `${num(s.offsetMs.max)} ms${frameMs ? ` · ${pct(100 * s.offsetMs.max / frameMs)} of a frame` : ""}` : "not measured") +
+    key("tri", "Straddles", `${flagged(straddles)} in 5 min`);
+  const caption = `<p class="gpu-caption">${outputHz ? `100 % = ${escape(num(outputHz, 2))} Hz · ` : ""}${s.freeRun ? "free-run" : "locked"}. ` +
+    `The band between captured and presented is dropped frames. Values are ten-second averages.</p>`;
+  return `<div class="gpu-chart">
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Slicer pipeline over the last five minutes">${svg}</svg>
+    <div class="gpu-legend">${legend}</div>${caption}</div>`;
+}
+// The same three states as the Frame timing card, from the same
+// projectionStats: hidden when no slicer is running, one line while it has
+// reported nothing, the chart once there is an interval.
+function renderPipeline() {
+  const running = !!projectionStats?.running;
+  $("pipeline-panel").hidden = !running;
+  if (!running) return;
+  const has = !!projectionStats.lastInterval;
+  $("pipeline-silent").hidden = has;
+  $("pipeline").innerHTML = has
+    ? pipelineChart({ ...(pipelineTelemetry || { history: [] }), lastInterval: projectionStats.lastInterval })
+    : "";
+}
+function renderGpuAndBrowsers() { renderGpu(); renderPipeline(); renderBrowsers(); }
 
 async function loadAll() {
   lastLoadAt = Date.now();
@@ -4477,6 +4619,9 @@ async function loadAll() {
   const latestStats = await api("/projection/stats").catch(() => null);
   if (statsVersion === projectionEventVersion) projectionStats = latestStats;
   gpuTelemetry = await api("/system/gpu").catch(() => null);
+  const pipelineVersion = pipelineEventVersion;
+  const latestPipeline = await api("/system/pipeline").catch(() => null);
+  if (pipelineVersion === pipelineEventVersion) pipelineTelemetry = latestPipeline;
   browserReports = await api("/system/browsers").catch(() => []);
   await loadConfig();
   renderAv(); renderOutputChoices();
@@ -4650,11 +4795,17 @@ function connect() {
     // decides warp-controls'/output-warp's hidden state), not just
     // renderWarpStatus — otherwise recovered capability leaves the editor
     // hidden until something unrelated happens to redraw it.
-    renderProjectionTiming(); renderWarpEditor();
+    renderProjectionTiming(); renderWarpEditor(); renderPipeline();
   });
   source.addEventListener("gpu_changed", (e) => {
     if (stream !== source) return;
     gpuTelemetry = JSON.parse(e.data);
+    renderGpuAndBrowsers();
+  });
+  source.addEventListener("pipeline_changed", (e) => {
+    if (stream !== source) return;
+    pipelineEventVersion++;
+    pipelineTelemetry = JSON.parse(e.data);
     renderGpuAndBrowsers();
   });
   source.addEventListener("browsers_changed", (e) => {
