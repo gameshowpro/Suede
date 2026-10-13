@@ -103,19 +103,22 @@ a { color: var(--accent); }
 
 /* --- GPU history chart and Chromium block ---------------------------- */
 .gpu-block { margin-bottom: 18px; }
-.gpu-chart { --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; }
+.gpu-chart { --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; --c6: #008300; --c7: #6250d6; }
 @media (prefers-color-scheme: dark) {
-  .gpu-chart { --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; }
+  .gpu-chart { --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; --c6: #008300; --c7: #9085e9; }
 }
 .gpu-chart svg { display: block; width: 100%; height: auto; }
 .gpu-chart .grid { stroke: var(--line); stroke-width: 1; }
 .gpu-chart .axis-label { fill: var(--muted); font-size: 9px; }
 .gpu-chart .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.gpu-chart .series.bus { stroke-dasharray: 6 3; }
 .gpu-chart .dot { stroke: var(--panel); stroke-width: 2; }
 .gpu-chart .hit { fill: transparent; }
 .gpu-legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 6px 0 0; font-size: 13px; }
 .gpu-legend .key { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 .gpu-legend .swatch { width: 14px; height: 0; border-top: 3px solid; border-radius: 2px; }
+.gpu-legend .swatch.bus { border-top-style: dashed; }
+.gpu-caption { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
 .kv th { width: 11em; white-space: nowrap; }
 .feature-grid { display: grid; grid-template-columns: 1fr; gap: 0 28px; }
 @media (min-width: 900px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
@@ -4157,7 +4160,34 @@ const GPU_SERIES = [
   { name: "Encoder", color: "var(--c4)", value: (h) => h.utilizationEncoderPercent },
   { name: "Memory used", color: "var(--c5)", value: (h) =>
     h.memoryUsedMib == null || !h.memoryTotalMib ? null : 100 * h.memoryUsedMib / h.memoryTotalMib },
+  // PCIe bus traffic as a percent of the link as currently trained; dashed so
+  // the two bus series stay apart from the green/aqua pair under color-vision
+  // differences. Absent from the legend when the payload predates the fields.
+  { name: "To GPU", color: "var(--c6)", bus: true, mb: (h) => h.pcieRxMbS,
+    value: (h) => h.pcieRxPercent },
+  { name: "From GPU", color: "var(--c7)", bus: true, mb: (h) => h.pcieTxMbS,
+    value: (h) => h.pcieTxPercent },
 ];
+// The latest history sample that names a link; it says which link the newest
+// bus figures were measured against. Falls back to the live sample.
+function pcieLink(g, gpu) {
+  const pts = Array.isArray(g.history) ? g.history : [];
+  for (let i = pts.length - 1; i >= 0; i--) {
+    const h = (pts[i].gpus || []).find((x) => x.index === gpu.index);
+    if (h && (h.pcieGeneration != null || h.pcieWidth != null)) return h;
+  }
+  return gpu;
+}
+function pcieLinkText(h) {
+  return h.pcieGeneration == null && h.pcieWidth == null
+    ? dash : `Gen ${fmt(h.pcieGeneration)} ×${fmt(h.pcieWidth)}`;
+}
+function seriesPresent(g, gpu, series) {
+  if (!series.bus) return true;
+  if (series.value(gpu) !== undefined || series.mb(gpu) !== undefined) return true;
+  return (Array.isArray(g.history) ? g.history : []).some((pt) =>
+    (pt.gpus || []).some((x) => x.index === gpu.index && series.value(x) != null));
+}
 function gpuChart(g, gpu) {
   const W = 720, H = 160, L = 34, R = 10, T = 8, B = 22;
   const pw = W - L - R, ph = H - T - B;
@@ -4165,6 +4195,7 @@ function gpuChart(g, gpu) {
     at: Number(point.at),
     sample: (point.gpus || []).find((x) => x.index === gpu.index) ?? null,
   })).filter((point) => point.sample && Number.isFinite(point.at));
+  const shown = GPU_SERIES.filter((series) => seriesPresent(g, gpu, series));
   const y = (v) => T + ph * (1 - Math.min(100, Math.max(0, v)) / 100);
   let svg = "";
   for (const tick of [0, 25, 50, 75, 100]) {
@@ -4179,7 +4210,7 @@ function gpuChart(g, gpu) {
     const now = points[points.length - 1].at;
     const x = (at) => L + pw * (1 - (now - at) / HISTORY_SECONDS);
     const visible = points.filter((point) => now - point.at <= HISTORY_SECONDS);
-    for (const series of GPU_SERIES) {
+    for (const series of shown) {
       let path = "", dots = "", previous = null;
       visible.forEach((point, i) => {
         const v = series.value(point.sample);
@@ -4195,28 +4226,45 @@ function gpuChart(g, gpu) {
           dots += `<circle class="dot" cx="${x(point.at).toFixed(1)}" cy="${y(v).toFixed(1)}" r="3" fill="${series.color}"/>`;
         }
       });
-      svg += `<path class="series" stroke="${series.color}" d="${path}"/>${dots}`;
+      svg += `<path class="series${series.bus ? " bus" : ""}" stroke="${series.color}" d="${path}"/>${dots}`;
     }
     // Hover targets: one column per sample with the values in a native tooltip.
     visible.forEach((point, i) => {
       const x0 = i === 0 ? L : (x(visible[i - 1].at) + x(point.at)) / 2;
       const x1 = i === visible.length - 1 ? W - R : (x(point.at) + x(visible[i + 1].at)) / 2;
       const when = new Date(point.at * 1000).toLocaleTimeString();
-      const lines = GPU_SERIES.map((series) => {
+      const lines = shown.map((series) => {
         const v = series.value(point.sample);
+        if (series.bus) return `${series.name} ${busText(v, series.mb(point.sample))}`;
         return `${series.name} ${v == null ? dash : Math.round(v) + " %"}`;
       }).join("\n");
       svg += `<rect class="hit" x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}"><title>${escape(when)}\n${escape(lines)}</title></rect>`;
     });
   }
-  const legend = GPU_SERIES.map((series) => {
+  const legend = shown.map((series) => {
     const v = series.value(gpu);
-    return `<span class="key"><span class="swatch" style="border-color:${series.color}"></span>${series.name}
-      <b>${v == null ? dash : fmt(v, 0, " %")}</b></span>`;
+    const text = series.bus ? busText(v, series.mb(gpu)) : v == null ? dash : fmt(v, 0, " %");
+    return `<span class="key"><span class="swatch${series.bus ? " bus" : ""}" style="border-color:${series.color}"></span>${series.name}
+      <b>${text}</b></span>`;
   }).join("");
+  const caption = shown.some((series) => series.bus)
+    ? `<p class="gpu-caption">Bus traffic is a percent of the ${escape(pcieLinkText(pcieLink(g, gpu)))} link as currently trained.</p>` : "";
   return `<div class="gpu-chart" data-gpu="${escape(gpu.index)}">
     <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="GPU ${escape(gpu.index)} utilization over the last five minutes">${svg}</svg>
-    <div class="gpu-legend">${legend}</div></div>`;
+    <div class="gpu-legend">${legend}</div>${caption}</div>`;
+}
+// "2.2 % · 344 MB/s" with "—" for whichever half is missing.
+function busText(percent, mbS) {
+  return `${percent == null ? dash : fmt(percent, 1, " %")} · ${mbS == null ? dash : fmt(mbS, 0, " MB/s")}`;
+}
+// Facts row: "Gen 3 ×16 · to GPU 344 MB/s (2.2 %) · from GPU 28 MB/s (0.2 %)".
+function pcieFacts(s) {
+  const link = pcieLinkText(s);
+  if (s.pcieRxMbS === undefined && s.pcieTxMbS === undefined
+    && s.pcieRxPercent === undefined && s.pcieTxPercent === undefined) return link;
+  const part = (label, mbS, percent) =>
+    `${label} ${mbS == null ? dash : fmt(mbS, 0, " MB/s")} (${percent == null ? dash : fmt(percent, 1, " %")})`;
+  return `${link} · ${part("to GPU", s.pcieRxMbS, s.pcieRxPercent)} · ${part("from GPU", s.pcieTxMbS, s.pcieTxPercent)}`;
 }
 
 function renderGpu() {
@@ -4227,8 +4275,7 @@ function renderGpu() {
   $("gpu").innerHTML = gpus.map((s) => {
     const memory = s.memoryUsedMib == null && s.memoryTotalMib == null
       ? dash : `${fmt(s.memoryUsedMib)} / ${fmt(s.memoryTotalMib)} MiB`;
-    const pcie = s.pcieGeneration == null && s.pcieWidth == null
-      ? dash : `Gen ${fmt(s.pcieGeneration)} ×${fmt(s.pcieWidth)}`;
+    const pcie = pcieFacts(s);
     const fan = s.fanPercent == null ? "" : ` · fan ${fmt(s.fanPercent, 0, " %")}`;
     return `<div class="gpu-block"><table><tbody><tr><td colspan="2"><b>${escape(s.name)}</b>
         <span class="hint">GPU ${escape(s.index)} · driver ${escape(s.driverVersion ?? dash)} ·
