@@ -101,6 +101,28 @@ dialog .dialog-foot { display: flex; gap: 8px; align-items: center; flex-wrap: w
   border-radius: 0 0 12px 12px; }
 a { color: var(--accent); }
 
+/* --- GPU history chart and Chromium block ---------------------------- */
+.gpu-block { margin-bottom: 18px; }
+.gpu-chart { --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; }
+@media (prefers-color-scheme: dark) {
+  .gpu-chart { --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; }
+}
+.gpu-chart svg { display: block; width: 100%; height: auto; }
+.gpu-chart .grid { stroke: var(--line); stroke-width: 1; }
+.gpu-chart .axis-label { fill: var(--muted); font-size: 9px; }
+.gpu-chart .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.gpu-chart .dot { stroke: var(--panel); stroke-width: 2; }
+.gpu-chart .hit { fill: transparent; }
+.gpu-legend { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 6px 0 0; font-size: 13px; }
+.gpu-legend .key { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.gpu-legend .swatch { width: 14px; height: 0; border-top: 3px solid; border-radius: 2px; }
+.kv th { width: 11em; white-space: nowrap; }
+.feature-grid { display: grid; grid-template-columns: 1fr; gap: 0 28px; }
+@media (min-width: 900px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
+.feature-grid table { table-layout: fixed; }
+.feature-grid td.chip { width: 15em; white-space: nowrap; }
+.feature-grid td.name { overflow-wrap: anywhere; }
+
 /* --- alerts: the operator's first stop ------------------------------- */
 .alert { border: 1px solid var(--line); border-left: 4px solid var(--muted);
   border-radius: 0 9px 9px 0; padding: 12px 14px; margin-bottom: 10px; background: var(--panel); }
@@ -821,7 +843,7 @@ window.addEventListener("error", (event) => {
     </div>
     <div class="panel" id="gpu-panel" hidden>
       <h2>GPU</h2>
-      <table id="gpu"></table>
+      <div id="gpu"></div>
       <p class="hint" id="gpu-note" hidden></p>
       <h3>Processes on the GPU</h3>
       <table id="gpu-processes"></table>
@@ -4107,7 +4129,95 @@ const clockTime = (seconds) => {
   const total = Math.round(Number(seconds));
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
 };
+// Keys of <details> the operator opened in the GPU and Chromium panels. The
+// panels are rebuilt from strings on every event, which would close them.
+// `toggle` does not bubble, so listen in the capture phase on the panels.
+const openDetails = new Set();
+for (const id of ["gpu-panel", "browsers-panel"]) {
+  $(id).addEventListener("toggle", (e) => {
+    const key = e.target?.dataset?.key;
+    if (key == null) return;
+    if (e.target.open) openDetails.add(key); else openDetails.delete(key);
+  }, true);
+}
 const GPU_KIND = { graphics: "G", compute: "C", both: "C+G" };
+
+// Five-minute utilization chart, one per GPU. Plain SVG regenerated on every
+// gpu_changed (60 points is cheap). Series colors are the dataviz palette's
+// first five categorical slots, stepped for the panel surface in each theme
+// (CSS variables --c1..--c5 on .gpu-chart). Text stays in ink/muted tokens;
+// the legend carries the current values, which is the relief the lighter
+// light-mode slots need.
+const HISTORY_SECONDS = 300;
+const HISTORY_GAP_SECONDS = 7;
+const GPU_SERIES = [
+  { name: "Graphics", color: "var(--c1)", value: (h) => h.utilizationGpuPercent },
+  { name: "Memory", color: "var(--c2)", value: (h) => h.utilizationMemoryPercent },
+  { name: "Decoder", color: "var(--c3)", value: (h) => h.utilizationDecoderPercent },
+  { name: "Encoder", color: "var(--c4)", value: (h) => h.utilizationEncoderPercent },
+  { name: "Memory used", color: "var(--c5)", value: (h) =>
+    h.memoryUsedMib == null || !h.memoryTotalMib ? null : 100 * h.memoryUsedMib / h.memoryTotalMib },
+];
+function gpuChart(g, gpu) {
+  const W = 720, H = 160, L = 34, R = 10, T = 8, B = 22;
+  const pw = W - L - R, ph = H - T - B;
+  const points = (Array.isArray(g.history) ? g.history : []).map((point) => ({
+    at: Number(point.at),
+    sample: (point.gpus || []).find((x) => x.index === gpu.index) ?? null,
+  })).filter((point) => point.sample && Number.isFinite(point.at));
+  const y = (v) => T + ph * (1 - Math.min(100, Math.max(0, v)) / 100);
+  let svg = "";
+  for (const tick of [0, 25, 50, 75, 100]) {
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(tick)}" y2="${y(tick)}"/>` +
+      `<text class="axis-label" x="${L - 5}" y="${y(tick) + 4}" text-anchor="end">${tick}</text>`;
+  }
+  svg += `<text class="axis-label" x="${L}" y="${H - 6}">5 min ago</text>` +
+    `<text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">now</text>`;
+  if (points.length < 2) {
+    svg += `<text class="axis-label" x="${L + pw / 2}" y="${T + ph / 2}" text-anchor="middle">collecting…</text>`;
+  } else {
+    const now = points[points.length - 1].at;
+    const x = (at) => L + pw * (1 - (now - at) / HISTORY_SECONDS);
+    const visible = points.filter((point) => now - point.at <= HISTORY_SECONDS);
+    for (const series of GPU_SERIES) {
+      let path = "", dots = "", previous = null;
+      visible.forEach((point, i) => {
+        const v = series.value(point.sample);
+        if (v == null || !Number.isFinite(Number(v))) { previous = null; return; }
+        const connected = previous != null && point.at - previous <= HISTORY_GAP_SECONDS;
+        path += `${connected ? "L" : "M"}${x(point.at).toFixed(1)},${y(v).toFixed(1)}`;
+        previous = point.at;
+        // A lone sample between gaps has no line to show it, so mark it.
+        const next = visible[i + 1];
+        const nextConnected = next && next.at - point.at <= HISTORY_GAP_SECONDS
+          && series.value(next.sample) != null;
+        if (!connected && !nextConnected) {
+          dots += `<circle class="dot" cx="${x(point.at).toFixed(1)}" cy="${y(v).toFixed(1)}" r="3" fill="${series.color}"/>`;
+        }
+      });
+      svg += `<path class="series" stroke="${series.color}" d="${path}"/>${dots}`;
+    }
+    // Hover targets: one column per sample with the values in a native tooltip.
+    visible.forEach((point, i) => {
+      const x0 = i === 0 ? L : (x(visible[i - 1].at) + x(point.at)) / 2;
+      const x1 = i === visible.length - 1 ? W - R : (x(point.at) + x(visible[i + 1].at)) / 2;
+      const when = new Date(point.at * 1000).toLocaleTimeString();
+      const lines = GPU_SERIES.map((series) => {
+        const v = series.value(point.sample);
+        return `${series.name} ${v == null ? dash : Math.round(v) + " %"}`;
+      }).join("\n");
+      svg += `<rect class="hit" x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}"><title>${escape(when)}\n${escape(lines)}</title></rect>`;
+    });
+  }
+  const legend = GPU_SERIES.map((series) => {
+    const v = series.value(gpu);
+    return `<span class="key"><span class="swatch" style="border-color:${series.color}"></span>${series.name}
+      <b>${v == null ? dash : fmt(v, 0, " %")}</b></span>`;
+  }).join("");
+  return `<div class="gpu-chart" data-gpu="${escape(gpu.index)}">
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="GPU ${escape(gpu.index)} utilization over the last five minutes">${svg}</svg>
+    <div class="gpu-legend">${legend}</div></div>`;
+}
 
 function renderGpu() {
   const g = gpuTelemetry;
@@ -4120,7 +4230,7 @@ function renderGpu() {
     const pcie = s.pcieGeneration == null && s.pcieWidth == null
       ? dash : `Gen ${fmt(s.pcieGeneration)} ×${fmt(s.pcieWidth)}`;
     const fan = s.fanPercent == null ? "" : ` · fan ${fmt(s.fanPercent, 0, " %")}`;
-    return `<tbody><tr><td colspan="2"><b>${escape(s.name)}</b>
+    return `<div class="gpu-block"><table><tbody><tr><td colspan="2"><b>${escape(s.name)}</b>
         <span class="hint">GPU ${escape(s.index)} · driver ${escape(s.driverVersion ?? dash)} ·
         state ${escape(s.performanceState ?? dash)}</span></td></tr>
       <tr><th>Utilization</th><td>graphics ${pct(s.utilizationGpuPercent)} ·
@@ -4132,8 +4242,9 @@ function renderGpu() {
         ${fmt(s.powerDrawW, 1, " W")} of ${fmt(s.powerLimitW, 1, " W")}${fan}</td></tr>
       <tr><th>Clocks</th><td>SM ${fmt(s.clockSmMhz, 0, " MHz")} ·
         memory ${fmt(s.clockMemoryMhz, 0, " MHz")}</td></tr>
-      <tr><th>PCIe</th><td>${pcie}</td></tr></tbody>`;
-  }).join("") || `<tbody><tr><td class="hint">No GPUs reported.</td></tr></tbody>`;
+      <tr><th>PCIe</th><td>${pcie}</td></tr></tbody></table>
+      ${gpuChart(g, s)}</div>`;
+  }).join("") || `<p class="hint">No GPUs reported.</p>`;
 
   // Attributed rows first (by app, then PID); the rest keep PID order.
   const procs = [...(g.processes || [])].sort((a, b) =>
@@ -4168,16 +4279,21 @@ function baseName(url) {
   const clean = String(url).split(/[?#]/)[0].replace(/\/+$/, "");
   return clean.slice(clean.lastIndexOf("/") + 1) || String(url);
 }
+// One word per player. Precedence: destroyed, error, ended, then the play
+// flag and pipeline state. Returns the word and the pill tone.
 function playerState(p) {
-  if (p.destroyed) return "destroyed";
-  const parts = [];
-  if (p.pipelineState) parts.push(p.pipelineState);
-  if (p.ended) parts.push("ended");
-  else if (p.playing === true) parts.push("playing");
-  else if (p.playing === false) parts.push("paused");
-  return parts.join(" · ") || dash;
+  const pipeline = p.pipelineState ? String(p.pipelineState).toLowerCase() : null;
+  if (p.destroyed) return { word: "destroyed", tone: "muted" };
+  if (pipeline === "error" || (p.errors?.length ?? 0) > 0) return { word: "error", tone: "bad" };
+  if (p.ended) return { word: "ended", tone: "muted" };
+  if (p.playing === true) {
+    if (pipeline == null || pipeline === "playing") return { word: "playing", tone: "ok" };
+    return { word: pipeline, tone: "warn" };
+  }
+  if (p.playing === false) return { word: "paused", tone: "warn" };
+  return pipeline ? { word: pipeline, tone: "muted" } : { word: dash, tone: "muted" };
 }
-function renderPlayer(p) {
+function renderPlayer(p, app) {
   const src = p.sourceUrl ?? p.frameUrl;
   const source = src
     ? `<span title="${escape(src)}">${escape(baseName(src))}</span>` : dash;
@@ -4193,14 +4309,20 @@ function renderPlayer(p) {
     : lastMessage
       ? `<span class="pill ${lastMessage.level === "error" ? "bad" : "warn"}">${escape(lastMessage.level)}</span> ${escape(lastMessage.message)}`
       : "";
-  const props = Object.entries(p.properties || {});
-  const raw = props.length
-    ? `<details><summary>${props.length} properties</summary><table>${
-        props.map(([k, v]) => `<tr><td class="mono">${escape(k)}</td><td class="mono">${escape(v)}</td></tr>`).join("")
-      }</table></details>` : "";
+  const props = [
+    ["pipeline state", p.pipelineState ?? dash], ["playing", p.playing ?? dash],
+    ["ended", p.ended ?? dash], ["buffering state", p.bufferingState ?? dash],
+    ...Object.entries(p.properties || {}),
+  ];
+  const propsKey = `props:${app}:${p.id}`;
+  const raw = `<details data-key="${escape(propsKey)}"${openDetails.has(propsKey) ? " open" : ""}>
+    <summary>${props.length} properties</summary><table>${
+      props.map(([k, v]) => `<tr><td class="mono">${escape(k)}</td><td class="mono">${escape(v)}</td></tr>`).join("")
+    }</table></details>`;
+  const state = playerState(p);
   return `<tr${p.destroyed ? ' class="hint"' : ""}><td>${source}</td><td>${decoder}</td>
     <td>${codec}</td><td>${escape(p.resolution ?? dash)}</td>
-    <td>${clockTime(p.durationSeconds)}</td><td>${escape(playerState(p))}</td>
+    <td>${clockTime(p.durationSeconds)}</td><td><span class="pill ${state.tone}">${escape(state.word)}</span></td>
     <td>${latest || dash}${raw}</td></tr>`;
 }
 
@@ -4226,20 +4348,33 @@ function renderBrowser(r) {
     : `DevTools not connected${dt.detail ? `: ${escape(dt.detail)}` : "."}`}</p>`;
   const g = r.gpu;
   if (g) {
-    const devices = (g.devices || []).map((d) =>
-      `${escape(d.device)} <span class="hint">(${escape(d.vendor)}${d.driverVendor || d.driverVersion
-        ? `, driver ${escape([d.driverVendor, d.driverVersion].filter(Boolean).join(" "))}` : ""})</span>`).join("<br>") || dash;
-    const features = Object.entries(g.featureStatus || {}).map(([k, v]) =>
-      `<span style="white-space:nowrap"><span class="mono">${escape(k)}</span>: ${featurePill(v)}</span>`).join(" ");
+    const deviceList = g.devices || [];
+    const deviceRows = deviceList.map((d, i) =>
+      (deviceList.length > 1 ? `<tr><th colspan="2">GPU ${i}</th></tr>` : "") +
+      `<tr><th>Device</th><td>${escape(d.device || dash)}</td></tr>
+       <tr><th>Vendor</th><td>${escape(d.vendor || dash)}</td></tr>
+       <tr><th>Driver vendor</th><td>${escape(d.driverVendor || dash)}</td></tr>
+       <tr><th>Driver version</th><td>${escape(d.driverVersion || dash)}</td></tr>`).join("")
+      || `<tr><th>Device</th><td>${dash}</td></tr>`;
+    const featureEntries = Object.entries(g.featureStatus || {})
+      .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    const featureTable = (rows) => `<table><tbody>${rows.map(([k, v]) =>
+      `<tr><td class="name mono">${escape(k)}</td><td class="chip">${featurePill(v)}</td></tr>`).join("")}</tbody></table>`;
+    const half = Math.ceil(featureEntries.length / 2);
+    const features = featureEntries.length
+      ? `<div class="feature-grid">${featureTable(featureEntries.slice(0, half))}${
+          half < featureEntries.length ? featureTable(featureEntries.slice(half)) : ""}</div>`
+      : `<p class="hint">${dash}</p>`;
     const profiles = (list) => (list || []).map((v) =>
       `${escape(v.profile)} (max ${escape(v.maxWidth)}×${escape(v.maxHeight)})`).join(", ") || dash;
     const workarounds = g.driverBugWorkarounds || [];
-    gpuBlock = `<h3>GPU in Chromium</h3><table>
-      <tr><th>Device</th><td>${devices}</td></tr>
-      <tr><th>Features</th><td>${features || dash}</td></tr>
+    const cmdKey = `cmdline:${r.app}`;
+    gpuBlock = `<h3>GPU in Chromium</h3><table class="kv">${deviceRows}</table>
+      <h3>Features</h3>${features}
+      <table class="kv">
       <tr><th>Video decoding</th><td>${profiles(g.videoDecoding)}</td></tr>
       <tr><th>Video encoding</th><td>${profiles(g.videoEncoding)}</td></tr></table>
-      <details><summary>Command line and driver bug workarounds</summary>
+      <details data-key="${escape(cmdKey)}"${openDetails.has(cmdKey) ? " open" : ""}><summary>Command line and driver bug workarounds</summary>
         <p class="mono" style="word-break:break-all">${g.commandLine ? escape(g.commandLine) : dash}</p>
         <p class="hint">Driver bug workarounds: ${workarounds.length ? escape(workarounds.join(", ")) : "none"}</p>
       </details>`;
@@ -4262,7 +4397,7 @@ function renderBrowser(r) {
   const playerBlock = `<h3>Media players</h3>` + (players.length
     ? `<table><thead><tr><th>Source</th><th>Video decoder</th><th>Codec</th><th>Resolution</th>
         <th>Duration</th><th>State</th><th>Latest warning or error</th></tr></thead><tbody>${
-      players.map(renderPlayer).join("")}</tbody></table>`
+      players.map((p) => renderPlayer(p, r.app)).join("")}</tbody></table>`
     : `<p class="hint">${dt.state === "connected" ? "No media players reported yet."
         : `DevTools not connected${dt.detail ? `: ${escape(dt.detail)}` : "."}`}</p>`);
 
