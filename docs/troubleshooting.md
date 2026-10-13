@@ -544,7 +544,7 @@ percentage needs two readings.
 - the browser's own GPU view: version, GPU device and driver, feature status
   such as `video_decode`, and the decode profiles it offers;
 - the media players Chromium reports: decoder, codec, resolution, duration,
-  pipeline state, and any warnings or errors.
+  pipeline state, playback progress, and any warnings or errors.
 
 The GPU view and media players need the DevTools pipe. If the block says
 DevTools is disabled, see
@@ -575,10 +575,19 @@ there is no `nvidia-smi` (no decoder number at all) or when several players
 or apps share the GPU: the utilization is per GPU, and the process table
 attributes it per process, not per player.
 
-**What is deliberately not collected.** Playback progress and dropped frames
-live in the page, and reading them would mean polling the page every
-interval, which costs the page's own thread time. Suede only reads what
-Chromium pushes. Use the page's own tooling if you need those numbers.
+**Playback progress.** Each interval Suede reads the playhead from the page
+itself with one script evaluation per page, bounded by a 2 s timeout and never
+started while the previous one is still running. It is the only thing Suede
+asks the page itself; everything else is what Chromium pushes. The script
+reports each media element's position, duration, play state, ready state and
+dropped frames, and Suede pairs each element with a player by source address,
+then resolution, then order. Elements no player claims are listed on their own.
+A page too busy to answer simply shows no progress that interval.
+
+**What is deliberately not collected.** Per-frame timing and the page's own
+tooling stay out: Suede reads progress and dropped frame counts, once per
+interval, and nothing finer. Use the page's own tooling if you need
+frame-level numbers.
 
 ## Suede itself stops answering, but the process is still there
 

@@ -185,6 +185,8 @@ impl Modify for SecurityAddon {
         crate::devtools::BrowserGpuInfo,
         crate::devtools::MediaMessage,
         crate::devtools::MediaPlayer,
+        crate::devtools::MediaTrack,
+        crate::devtools::Playhead,
         crate::telemetry::PipelineTelemetry,
         crate::telemetry::PipelinePoint,
         crate::cpu::CpuTelemetry,

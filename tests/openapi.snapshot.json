@@ -1024,6 +1024,13 @@
               "null"
             ]
           },
+          "unmatchedElements": {
+            "description": "Media elements in the page that no player in `media_players` matched.",
+            "items": {
+              "$ref": "#/components/schemas/Playhead"
+            },
+            "type": "array"
+          },
           "version": {
             "oneOf": [
               {
@@ -1043,7 +1050,8 @@
           "gpuProcessCrashes",
           "processes",
           "devtools",
-          "mediaPlayers"
+          "mediaPlayers",
+          "unmatchedElements"
         ],
         "type": "object"
       },
@@ -2763,6 +2771,13 @@
               "null"
             ]
           },
+          "audioTracks": {
+            "description": "Parsed from `kAudioTracks`.",
+            "items": {
+              "$ref": "#/components/schemas/MediaTrack"
+            },
+            "type": "array"
+          },
           "bitrate": {
             "description": "`kBitrate`",
             "format": "int64",
@@ -2839,6 +2854,17 @@
               "null"
             ]
           },
+          "playhead": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Playhead",
+                "description": "The page's media element matched to this player, if any and fresh."
+              }
+            ]
+          },
           "playing": {
             "description": "true after `kPlay`, false after `kPause`/`kEnded`; null before either.",
             "type": [
@@ -2904,6 +2930,13 @@
               "boolean",
               "null"
             ]
+          },
+          "videoTracks": {
+            "description": "Parsed from `kVideoTracks`.",
+            "items": {
+              "$ref": "#/components/schemas/MediaTrack"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -2914,7 +2947,28 @@
           "lastActivityAt",
           "messages",
           "errors",
-          "properties"
+          "properties",
+          "videoTracks",
+          "audioTracks"
+        ],
+        "type": "object"
+      },
+      "MediaTrack": {
+        "description": "One entry of `kVideoTracks` or `kAudioTracks`.",
+        "properties": {
+          "fields": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Every key of the track object, sorted; nested objects serialized as\ncompact JSON strings.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "fields"
         ],
         "type": "object"
       },
@@ -3535,6 +3589,108 @@
         "required": [
           "running",
           "history"
+        ],
+        "type": "object"
+      },
+      "Playhead": {
+        "description": "What the page's own media element says, read with `Runtime.evaluate`.",
+        "properties": {
+          "currentSrc": {
+            "type": "string"
+          },
+          "currentTimeSeconds": {
+            "format": "double",
+            "type": "number"
+          },
+          "droppedFrames": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "durationSeconds": {
+            "description": "null when the element reports Infinity or NaN (live streams).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "element": {
+            "description": "\"video\" | \"audio\"",
+            "type": "string"
+          },
+          "ended": {
+            "type": "boolean"
+          },
+          "muted": {
+            "type": "boolean"
+          },
+          "networkState": {
+            "description": "`HTMLMediaElement.networkState`, 0 to 3.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "playbackRate": {
+            "format": "double",
+            "type": "number"
+          },
+          "readAt": {
+            "description": "Unix seconds the page answered.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "readyState": {
+            "description": "`HTMLMediaElement.readyState`, 0 to 4.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "totalFrames": {
+            "description": "From `getVideoPlaybackQuality`, null for audio elements.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "videoHeight": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "videoWidth": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "volume": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "element",
+          "currentSrc",
+          "currentTimeSeconds",
+          "paused",
+          "ended",
+          "readyState",
+          "networkState",
+          "playbackRate",
+          "muted",
+          "volume",
+          "videoWidth",
+          "videoHeight",
+          "readAt"
         ],
         "type": "object"
       },

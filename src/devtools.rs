@@ -33,15 +33,20 @@
 //! and an attach plus `Media.enable` per page), refreshes
 //! `SystemInfo.getInfo` every [`REFRESH_INTERVAL`] (feature status changes
 //! after a GPU process crash and fallback), and otherwise only listens: the
-//! Media domain pushes events on player state changes, never per frame.
-//! Nothing is evaluated in the page and nothing is polled.
+//! domain pushes events on player state changes, never per frame. The one
+//! thing Suede asks a page itself is the playhead: once per
+//! [`crate::diagnostics::SAMPLE_INTERVAL`] a single `Runtime.evaluate`
+//! ([`PLAYHEAD_EXPRESSION`]) reads each media element's position, bounded
+//! by [`EVALUATE_TIMEOUT_MS`] and never issued while the previous one for
+//! that page is still outstanding.
 
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -157,6 +162,43 @@ pub struct BrowserGpuInfo {
     pub fetched_at: u64,
 }
 
+/// What the page's own media element says, read with `Runtime.evaluate`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Playhead {
+    /// "video" | "audio"
+    pub element: String,
+    pub current_src: String,
+    pub current_time_seconds: f64,
+    /// null when the element reports Infinity or NaN (live streams).
+    pub duration_seconds: Option<f64>,
+    pub paused: bool,
+    pub ended: bool,
+    /// `HTMLMediaElement.readyState`, 0 to 4.
+    pub ready_state: u8,
+    /// `HTMLMediaElement.networkState`, 0 to 3.
+    pub network_state: u8,
+    pub playback_rate: f64,
+    pub muted: bool,
+    pub volume: f64,
+    pub video_width: u32,
+    pub video_height: u32,
+    /// From `getVideoPlaybackQuality`, null for audio elements.
+    pub total_frames: Option<u64>,
+    pub dropped_frames: Option<u64>,
+    /// Unix seconds the page answered.
+    pub read_at: u64,
+}
+
+/// One entry of `kVideoTracks` or `kAudioTracks`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaTrack {
+    /// Every key of the track object, sorted; nested objects serialized as
+    /// compact JSON strings.
+    pub fields: BTreeMap<String, String>,
+}
+
 /// A warning or error a media player logged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +262,12 @@ pub struct MediaPlayer {
     pub errors: Vec<String>,
     /// Every property as last reported, sorted by name (raw internals).
     pub properties: BTreeMap<String, String>,
+    /// Parsed from `kVideoTracks`.
+    pub video_tracks: Vec<MediaTrack>,
+    /// Parsed from `kAudioTracks`.
+    pub audio_tracks: Vec<MediaTrack>,
+    /// The page's media element matched to this player, if any and fresh.
+    pub playhead: Option<Playhead>,
 }
 
 impl MediaPlayer {
@@ -249,6 +297,9 @@ impl MediaPlayer {
             messages: Vec::new(),
             errors: Vec::new(),
             properties: BTreeMap::new(),
+            video_tracks: Vec::new(),
+            audio_tracks: Vec::new(),
+            playhead: None,
         }
     }
 }
@@ -261,6 +312,8 @@ pub struct Internals {
     pub gpu: Option<BrowserGpuInfo>,
     /// Oldest first.
     pub players: Vec<MediaPlayer>,
+    /// Media elements no player matched, in page then document order.
+    pub unmatched_elements: Vec<Playhead>,
 }
 
 /// State shared between the [`Client`] handle and its task.
@@ -285,6 +338,7 @@ fn lock(shared: &Mutex<Shared>) -> MutexGuard<'_, Shared> {
 pub(crate) struct Timing {
     pub request_timeout: Duration,
     pub refresh_interval: Duration,
+    pub playhead_interval: Duration,
 }
 
 impl Default for Timing {
@@ -292,6 +346,7 @@ impl Default for Timing {
         Self {
             request_timeout: REQUEST_TIMEOUT,
             refresh_interval: REFRESH_INTERVAL,
+            playhead_interval: crate::diagnostics::SAMPLE_INTERVAL,
         }
     }
 }
@@ -348,12 +403,13 @@ impl Client {
     /// their retention are dropped on the way.
     pub fn internals(&self) -> Internals {
         let mut shared = lock(&self.shared);
-        let players = shared.media.players(crate::util::unix_now());
+        let (players, unmatched_elements) = shared.media.snapshot(crate::util::unix_now());
         Internals {
             status: shared.status.clone(),
             version: shared.version.clone(),
             gpu: shared.gpu.clone(),
             players,
+            unmatched_elements,
         }
     }
 
@@ -628,7 +684,7 @@ async fn run<R, W>(
     timing: Timing,
 ) where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + Send,
 {
     let connection = Connection {
         writer,
@@ -643,7 +699,7 @@ async fn run<R, W>(
             let mut shared = lock(&shared);
             shared.status = DevtoolsStatus::new(DevtoolsState::Closed, Some(why));
         }
-        _ = control(&app_id, &connection, &shared, targets_rx, timing.refresh_interval) => {}
+        _ = control(&app_id, &connection, &shared, targets_rx, timing) => {}
     }
 }
 
@@ -733,15 +789,21 @@ fn handle_frame<W: AsyncWrite + Unpin>(
     }
 }
 
+/// One playhead read in flight: its session and the raw answer.
+type PlayheadRead<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = (String, Result<Value, String>)> + Send + 'a>,
+>;
+
 /// The handshake, then attaching to new pages and the periodic refresh.
 /// Never returns on its own; ends when [`run`] drops it.
-async fn control<W: AsyncWrite + Unpin>(
+async fn control<W: AsyncWrite + Unpin + Send>(
     app_id: &str,
     connection: &Connection<W>,
     shared: &Mutex<Shared>,
     mut targets: mpsc::UnboundedReceiver<TargetEvent>,
-    refresh: Duration,
+    timing: Timing,
 ) {
+    let refresh = timing.refresh_interval;
     let mut failures: Vec<String> = Vec::new();
     let mut answered = 0;
 
@@ -806,8 +868,40 @@ async fn control<W: AsyncWrite + Unpin>(
 
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + refresh, refresh);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let poll_every = timing.playhead_interval;
+    let mut playhead_tick =
+        tokio::time::interval_at(tokio::time::Instant::now() + poll_every, poll_every);
+    playhead_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Sessions with a playhead evaluate outstanding, and the evaluates.
+    let mut in_flight: HashSet<String> = HashSet::new();
+    let mut polls: FuturesUnordered<PlayheadRead<'_>> = FuturesUnordered::new();
     loop {
         tokio::select! {
+            Some((session, outcome)) = polls.next(), if !polls.is_empty() => {
+                in_flight.remove(&session);
+                if !sessions.values().any(|known| *known == session) {
+                    continue;
+                }
+                match outcome.and_then(|result| parse_playheads(&result, crate::util::unix_now())) {
+                    Ok(playheads) => lock(shared).media.set_playheads(&session, playheads),
+                    Err(error) => {
+                        tracing::debug!(app = %app_id, %error, "playhead read failed");
+                    }
+                }
+            }
+            _ = playhead_tick.tick() => {
+                for session in sessions.values() {
+                    if in_flight.insert(session.clone()) {
+                        let session = session.clone();
+                        polls.push(Box::pin(async move {
+                            let outcome = connection
+                                .call("Runtime.evaluate", playhead_params(), Some(&session))
+                                .await;
+                            (session, outcome)
+                        }));
+                    }
+                }
+            }
             event = targets.recv() => {
                 let Some(event) = event else {
                     // The reader has ended, and `run` is about to drop this.
@@ -1010,6 +1104,212 @@ fn value_text(value: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The playhead
+
+/// How long the page may spend on [`PLAYHEAD_EXPRESSION`] before Chromium
+/// abandons it (`Runtime.evaluate`'s experimental `timeout`).
+pub const EVALUATE_TIMEOUT_MS: u64 = 2000;
+
+/// Walks every `video` and `audio` element, including those in open shadow
+/// roots, and returns plain JSON shaped like [`Playhead`] (without
+/// `readAt`, which Suede stamps on arrival).
+pub const PLAYHEAD_EXPRESSION: &str = r#"(() => {
+  const out = [];
+  const walk = (root) => {
+    for (const el of root.querySelectorAll("video, audio")) {
+      const isVideo = el.tagName === "VIDEO";
+      let quality = null;
+      if (isVideo && typeof el.getVideoPlaybackQuality === "function") {
+        quality = el.getVideoPlaybackQuality();
+      }
+      out.push({
+        element: isVideo ? "video" : "audio",
+        currentSrc: el.currentSrc || "",
+        currentTimeSeconds: Number.isFinite(el.currentTime) ? el.currentTime : 0,
+        durationSeconds: Number.isFinite(el.duration) ? el.duration : null,
+        paused: !!el.paused,
+        ended: !!el.ended,
+        readyState: el.readyState,
+        networkState: el.networkState,
+        playbackRate: el.playbackRate,
+        muted: !!el.muted,
+        volume: el.volume,
+        videoWidth: el.videoWidth || 0,
+        videoHeight: el.videoHeight || 0,
+        totalFrames: quality ? quality.totalVideoFrames : null,
+        droppedFrames: quality ? quality.droppedVideoFrames : null,
+      });
+    }
+    for (const host of root.querySelectorAll("*")) {
+      if (host.shadowRoot) walk(host.shadowRoot);
+    }
+  };
+  walk(document);
+  return out;
+})()"#;
+
+/// The `Runtime.evaluate` parameters for one playhead read.
+fn playhead_params() -> Value {
+    json!({
+        "expression": PLAYHEAD_EXPRESSION,
+        "returnByValue": true,
+        "awaitPromise": false,
+        "timeout": EVALUATE_TIMEOUT_MS,
+    })
+}
+
+/// `Runtime.evaluate`'s result for [`PLAYHEAD_EXPRESSION`], stamped `now`.
+pub(crate) fn parse_playheads(result: &Value, now: u64) -> Result<Vec<Playhead>, String> {
+    if let Some(details) = result.get("exceptionDetails") {
+        let text = details
+            .get("exception")
+            .and_then(|exception| exception.get("description"))
+            .and_then(Value::as_str)
+            .or_else(|| details.get("text").and_then(Value::as_str))
+            .unwrap_or("the script threw");
+        return Err(format!("the playhead script failed: {text}"));
+    }
+    let Some(Value::Array(elements)) = result.get("result").and_then(|r| r.get("value")) else {
+        return Err("the playhead script returned no array".to_string());
+    };
+    Ok(elements
+        .iter()
+        .filter(|entry| entry.is_object())
+        .map(|entry| {
+            let number = |key: &str| entry.get(key).and_then(Value::as_f64);
+            let flag = |key: &str| entry.get(key).and_then(Value::as_bool).unwrap_or(false);
+            let count = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(Value::as_f64)
+                    .filter(|n| n.is_finite() && *n >= 0.0)
+                    .map(|n| n as u64)
+            };
+            Playhead {
+                element: string_at(entry, "element").unwrap_or_else(|| "video".to_string()),
+                current_src: string_at(entry, "currentSrc").unwrap_or_default(),
+                current_time_seconds: number("currentTimeSeconds")
+                    .filter(|n| n.is_finite())
+                    .unwrap_or(0.0),
+                duration_seconds: number("durationSeconds").filter(|n| n.is_finite()),
+                paused: flag("paused"),
+                ended: flag("ended"),
+                ready_state: count("readyState").unwrap_or(0).min(255) as u8,
+                network_state: count("networkState").unwrap_or(0).min(255) as u8,
+                playback_rate: number("playbackRate")
+                    .filter(|n| n.is_finite())
+                    .unwrap_or(1.0),
+                muted: flag("muted"),
+                volume: number("volume").filter(|n| n.is_finite()).unwrap_or(1.0),
+                video_width: count("videoWidth").unwrap_or(0).min(u32::MAX as u64) as u32,
+                video_height: count("videoHeight").unwrap_or(0).min(u32::MAX as u64) as u32,
+                total_frames: count("totalFrames"),
+                dropped_frames: count("droppedFrames"),
+                read_at: now,
+            }
+        })
+        .collect())
+}
+
+/// `url` without its query and fragment.
+fn without_query(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
+/// Pair a page's media elements (document order) with its players
+/// (`created_at` order): by source URL, then by the URL's path alone, then
+/// among several candidates by resolution, then by order. Each element
+/// matches at most one player. Returns the elements nobody matched.
+pub(crate) fn match_playheads(
+    players: &mut [&mut MediaPlayer],
+    elements: Vec<Playhead>,
+) -> Vec<Playhead> {
+    let mut slots: Vec<Option<Playhead>> = elements.into_iter().map(Some).collect();
+    let mut order: Vec<usize> = (0..players.len()).collect();
+    order.sort_by_key(|&index| players[index].created_at);
+    for index in order {
+        let player = &mut *players[index];
+        let Some(url) = player.source_url.clone() else {
+            continue;
+        };
+        let candidates = |same: &dyn Fn(&str) -> bool| -> Vec<usize> {
+            slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| slot.as_ref().is_some_and(|head| same(&head.current_src)))
+                .map(|(position, _)| position)
+                .collect()
+        };
+        let mut found = candidates(&|src| src == url);
+        if found.is_empty() {
+            let path = without_query(&url);
+            found = candidates(&|src| without_query(src) == path);
+        }
+        if found.len() > 1 {
+            if let Some(resolution) = player.resolution.as_deref() {
+                let narrowed: Vec<usize> = found
+                    .iter()
+                    .copied()
+                    .filter(|&position| {
+                        slots[position].as_ref().is_some_and(|head| {
+                            format!("{}x{}", head.video_width, head.video_height) == resolution
+                        })
+                    })
+                    .collect();
+                if !narrowed.is_empty() {
+                    found = narrowed;
+                }
+            }
+        }
+        if let Some(&position) = found.first() {
+            player.playhead = slots[position].take();
+        }
+    }
+    slots.into_iter().flatten().collect()
+}
+
+/// A `kVideoTracks`/`kAudioTracks` value (a JSON array of objects encoded
+/// as a string) as one [`MediaTrack`] per entry. `None` when it is not one.
+fn parse_tracks(value: &str) -> Option<Vec<MediaTrack>> {
+    let entries = match serde_json::from_str::<Value>(value).ok()? {
+        Value::Array(entries) => entries,
+        object @ Value::Object(_) => vec![object],
+        _ => return None,
+    };
+    Some(
+        entries
+            .iter()
+            .filter_map(Value::as_object)
+            .map(|object| MediaTrack {
+                fields: object
+                    .iter()
+                    .map(|(key, value)| {
+                        let text = match value {
+                            Value::String(text) => text.clone(),
+                            other => sorted(other).to_string(),
+                        };
+                        (key.clone(), text)
+                    })
+                    .collect(),
+            })
+            .collect(),
+    )
+}
+
+/// `value` with every object's keys in sorted order, at any depth.
+fn sorted(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let ordered: BTreeMap<&String, Value> =
+                object.iter().map(|(key, v)| (key, sorted(v))).collect();
+            Value::Object(ordered.into_iter().map(|(k, v)| (k.clone(), v)).collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(sorted).collect()),
+        other => other.clone(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Media players
 
 /// Every media player one browser has reported, keyed by the DevTools
@@ -1018,6 +1318,8 @@ fn value_text(value: &Value) -> String {
 pub(crate) struct MediaTracker {
     /// In order of first sight.
     players: Vec<Tracked>,
+    /// The last successful playhead read per session.
+    playheads: HashMap<String, Vec<Playhead>>,
 }
 
 #[derive(Debug)]
@@ -1114,6 +1416,7 @@ impl MediaTracker {
     /// Mark every player of a page that has gone as destroyed, so it ages
     /// out like one whose destroy event arrived.
     pub(crate) fn forget_session(&mut self, session: &str, now: u64) {
+        self.playheads.remove(session);
         for tracked in self.players.iter_mut().filter(|t| t.session == session) {
             if !tracked.player.destroyed {
                 tracked.player.destroyed = true;
@@ -1124,9 +1427,41 @@ impl MediaTracker {
 
     /// The players as of `now`, oldest first, after dropping destroyed ones
     /// past their retention.
+    #[cfg(test)]
     pub(crate) fn players(&mut self, now: u64) -> Vec<MediaPlayer> {
+        self.snapshot(now).0
+    }
+
+    /// Replace a session's playheads with a fresh read.
+    pub(crate) fn set_playheads(&mut self, session: &str, playheads: Vec<Playhead>) {
+        self.playheads.insert(session.to_string(), playheads);
+    }
+
+    /// The players as in [`Self::players`], each with its matched playhead
+    /// (those older than [`crate::diagnostics::stale_after`] are dropped),
+    /// and the elements no player matched.
+    pub(crate) fn snapshot(&mut self, now: u64) -> (Vec<MediaPlayer>, Vec<Playhead>) {
         self.prune(now);
-        self.players.iter().map(|t| t.player.clone()).collect()
+        let stale = crate::diagnostics::stale_after().as_secs_f64();
+        let mut players: Vec<MediaPlayer> = self.players.iter().map(|t| t.player.clone()).collect();
+        let mut sessions: Vec<&String> = self.playheads.keys().collect();
+        sessions.sort();
+        let mut unmatched = Vec::new();
+        for session in sessions {
+            let fresh: Vec<Playhead> = self.playheads[session]
+                .iter()
+                .filter(|head| now.saturating_sub(head.read_at) as f64 <= stale)
+                .cloned()
+                .collect();
+            let mut mine: Vec<&mut MediaPlayer> = players
+                .iter_mut()
+                .zip(&self.players)
+                .filter(|(player, tracked)| tracked.session == *session && !player.destroyed)
+                .map(|(player, _)| player)
+                .collect();
+            unmatched.extend(match_playheads(&mut mine, fresh));
+        }
+        (players, unmatched)
     }
 
     /// The player, created if new, with its activity time bumped.
@@ -1238,11 +1573,17 @@ fn set_property(player: &mut MediaPlayer, name: &str, value: String) {
         "kAudioDecoderName" => player.audio_decoder = non_empty(&value),
         "kIsPlatformAudioDecoder" => player.audio_decoder_platform = parse_bool(&value),
         "kVideoTracks" => {
+            if let Some(tracks) = parse_tracks(&value) {
+                player.video_tracks = tracks;
+            }
             if let Some(codec) = first_track(&value).as_ref().and_then(video_codec) {
                 player.video_codec = Some(codec);
             }
         }
         "kAudioTracks" => {
+            if let Some(tracks) = parse_tracks(&value) {
+                player.audio_tracks = tracks;
+            }
             if let Some(codec) = first_track(&value)
                 .and_then(|track| string_at(&track, "codec"))
                 .filter(|codec| !codec.is_empty())
@@ -2151,6 +2492,7 @@ mod tests {
         let timing = Timing {
             request_timeout: Duration::from_millis(50),
             refresh_interval: Duration::from_secs(3600),
+            ..Timing::default()
         };
         let (client, _fake) = connect(timing);
         let internals = eventually(&client, "failed", |i| {
@@ -2165,6 +2507,7 @@ mod tests {
         let timing = Timing {
             request_timeout: Duration::from_secs(5),
             refresh_interval: Duration::from_millis(50),
+            ..Timing::default()
         };
         let (client, mut fake) = connect(timing);
         for method in [
@@ -2206,6 +2549,314 @@ mod tests {
             internals.status.detail.as_deref(),
             Some("cannot create the DevTools pipes: EMFILE")
         );
+    }
+
+    // --- the playhead ---
+
+    fn head(src: &str, width: u32, height: u32) -> Playhead {
+        Playhead {
+            element: "video".into(),
+            current_src: src.into(),
+            current_time_seconds: 1.5,
+            duration_seconds: Some(20.0),
+            paused: false,
+            ended: false,
+            ready_state: 4,
+            network_state: 1,
+            playback_rate: 1.0,
+            muted: false,
+            volume: 1.0,
+            video_width: width,
+            video_height: height,
+            total_frames: Some(10),
+            dropped_frames: Some(0),
+            read_at: 100,
+        }
+    }
+
+    fn player(id: &str, created_at: u64, url: &str, resolution: Option<&str>) -> MediaPlayer {
+        let mut player = MediaPlayer::new(id, created_at);
+        player.source_url = Some(url.to_string());
+        player.resolution = resolution.map(str::to_string);
+        player
+    }
+
+    fn matched(
+        players: &mut [MediaPlayer],
+        elements: Vec<Playhead>,
+    ) -> (Vec<Option<String>>, Vec<Playhead>) {
+        let mut refs: Vec<&mut MediaPlayer> = players.iter_mut().collect();
+        let unmatched = match_playheads(&mut refs, elements);
+        let srcs = players
+            .iter()
+            .map(|p| p.playhead.as_ref().map(|h| h.current_src.clone()))
+            .collect();
+        (srcs, unmatched)
+    }
+
+    #[test]
+    fn playheads_parse_with_null_duration_audio_and_shadow_elements() {
+        let result = json!({"result": {"type": "object", "value": [
+            {"element": "video", "currentSrc": "file:///a.mp4", "currentTimeSeconds": 12.25,
+             "durationSeconds": 20.0, "paused": false, "ended": false, "readyState": 4,
+             "networkState": 2, "playbackRate": 1.0, "muted": true, "volume": 0.5,
+             "videoWidth": 1920, "videoHeight": 1080, "totalFrames": 300, "droppedFrames": 3},
+            {"element": "video", "currentSrc": "http://x/live.m3u8", "currentTimeSeconds": 5.0,
+             "durationSeconds": null, "paused": true, "ended": false, "readyState": 3,
+             "networkState": 2, "playbackRate": 1.0, "muted": false, "volume": 1.0,
+             "videoWidth": 640, "videoHeight": 360, "totalFrames": 10, "droppedFrames": 0},
+            {"element": "audio", "currentSrc": "file:///b.mp3", "currentTimeSeconds": 0.0,
+             "durationSeconds": 3.5, "paused": true, "ended": true, "readyState": 4,
+             "networkState": 1, "playbackRate": 1.0, "muted": false, "volume": 1.0,
+             "videoWidth": 0, "videoHeight": 0, "totalFrames": null, "droppedFrames": null},
+        ]}});
+        let heads = parse_playheads(&result, 777).unwrap();
+        assert_eq!(heads.len(), 3);
+        assert_eq!(heads[0].current_time_seconds, 12.25);
+        assert_eq!(heads[0].duration_seconds, Some(20.0));
+        assert!(heads[0].muted);
+        assert_eq!(heads[0].dropped_frames, Some(3));
+        assert_eq!((heads[0].video_width, heads[0].video_height), (1920, 1080));
+        assert_eq!(heads[0].read_at, 777);
+        assert_eq!(heads[1].duration_seconds, None, "a live stream");
+        assert!(heads[1].paused);
+        assert_eq!(heads[2].element, "audio");
+        assert!(heads[2].ended);
+        assert_eq!(heads[2].total_frames, None);
+        assert_eq!(heads[2].dropped_frames, None);
+
+        let thrown =
+            json!({"result": {"type": "object"}, "exceptionDetails": {"text": "Uncaught"}});
+        assert!(parse_playheads(&thrown, 1)
+            .unwrap_err()
+            .contains("Uncaught"));
+        assert!(parse_playheads(&json!({"result": {"value": 3}}), 1).is_err());
+    }
+
+    #[test]
+    fn the_expression_reaches_shadow_roots_and_both_element_kinds() {
+        assert!(PLAYHEAD_EXPRESSION.contains(r#"querySelectorAll("video, audio")"#));
+        assert!(PLAYHEAD_EXPRESSION.contains("shadowRoot"));
+        assert!(PLAYHEAD_EXPRESSION.contains("Number.isFinite(el.duration)"));
+    }
+
+    #[test]
+    fn playheads_match_by_url_then_path_then_resolution_then_order() {
+        // By URL: order of the elements does not matter.
+        let mut players = vec![
+            player("A", 1, "file:///a.mp4", None),
+            player("B", 2, "file:///b.mp4", None),
+        ];
+        let (srcs, unmatched) = matched(
+            &mut players,
+            vec![
+                head("file:///b.mp4", 0, 0),
+                head("file:///a.mp4", 0, 0),
+                head("file:///c.mp4", 0, 0),
+            ],
+        );
+        assert_eq!(
+            srcs,
+            vec![Some("file:///a.mp4".into()), Some("file:///b.mp4".into())]
+        );
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0].current_src, "file:///c.mp4");
+
+        // By path when the query differs.
+        let mut players = vec![player("A", 1, "http://h/a.mp4?token=1", None)];
+        let (srcs, unmatched) = matched(&mut players, vec![head("http://h/a.mp4?token=2", 0, 0)]);
+        assert_eq!(srcs, vec![Some("http://h/a.mp4?token=2".into())]);
+        assert!(unmatched.is_empty());
+
+        // By resolution among identical URLs.
+        let mut players = vec![player("A", 1, "file:///a.mp4", Some("1920x1080"))];
+        let (_, unmatched) = matched(
+            &mut players,
+            vec![
+                head("file:///a.mp4", 640, 360),
+                head("file:///a.mp4", 1920, 1080),
+            ],
+        );
+        assert_eq!(players[0].playhead.as_ref().unwrap().video_width, 1920);
+        assert_eq!(unmatched.len(), 1);
+        assert_eq!(unmatched[0].video_width, 640);
+
+        // By order when nothing else separates them: players in
+        // created_at order take elements in document order.
+        let mut first = head("file:///a.mp4", 100, 100);
+        first.current_time_seconds = 1.0;
+        let mut second = head("file:///a.mp4", 100, 100);
+        second.current_time_seconds = 2.0;
+        let mut players = vec![
+            player("late", 9, "file:///a.mp4", None),
+            player("early", 3, "file:///a.mp4", None),
+        ];
+        let (_, unmatched) = matched(&mut players, vec![first, second]);
+        assert!(unmatched.is_empty());
+        assert_eq!(
+            players[1].playhead.as_ref().unwrap().current_time_seconds,
+            1.0
+        );
+        assert_eq!(
+            players[0].playhead.as_ref().unwrap().current_time_seconds,
+            2.0
+        );
+
+        // An element is never shared between players.
+        let mut players = vec![
+            player("A", 1, "file:///a.mp4", None),
+            player("B", 2, "file:///a.mp4", None),
+        ];
+        let (srcs, unmatched) = matched(&mut players, vec![head("file:///a.mp4", 0, 0)]);
+        assert_eq!(srcs, vec![Some("file:///a.mp4".into()), None]);
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn stale_playheads_are_dropped_and_destroyed_players_get_none() {
+        let mut media = MediaTracker::default();
+        media.apply(
+            Some("S1"),
+            "Media.playerEventsAdded",
+            &events("P1", &[r#"{"event":"kLoad","url":"file:///a.mp4"}"#]),
+            100,
+        );
+        let mut fresh = head("file:///a.mp4", 0, 0);
+        fresh.read_at = 100;
+        media.set_playheads("S1", vec![fresh]);
+        let (players, unmatched) = media.snapshot(101);
+        assert!(players[0].playhead.is_some());
+        assert!(unmatched.is_empty());
+
+        let stale_secs = crate::diagnostics::stale_after().as_secs() + 1;
+        let (players, unmatched) = media.snapshot(100 + stale_secs);
+        assert!(players[0].playhead.is_none(), "too old");
+        assert!(unmatched.is_empty(), "dropped, not unmatched");
+
+        media.forget_session("S1", 102);
+        let (players, unmatched) = media.snapshot(102);
+        assert!(players[0].destroyed);
+        assert!(players[0].playhead.is_none());
+        assert!(unmatched.is_empty(), "the page's reads went with the page");
+    }
+
+    #[test]
+    fn tracks_parse_with_nested_objects_serialized_and_sorted() {
+        let mut media = MediaTracker::default();
+        media.apply(
+            Some("S1"),
+            "Media.playerPropertiesChanged",
+            &props(
+                "P1",
+                &[
+                    (
+                        "kVideoTracks",
+                        r#"[{"codec":"h264","profile":"h264 high","coded size":"1920x1080","color space":{"transfer":"BT709","primaries":"BT709","range":"LIMITED"},"hdr metadata":{}},{"codec":"vp9","bitrate":1000}]"#,
+                    ),
+                    ("kAudioTracks", r#"[{"codec":"aac","channels":2}]"#),
+                ],
+            ),
+            100,
+        );
+        let p = &media.players(100)[0];
+        assert_eq!(p.video_tracks.len(), 2);
+        let first = &p.video_tracks[0].fields;
+        assert_eq!(first["codec"], "h264");
+        assert_eq!(
+            first["color space"],
+            r#"{"primaries":"BT709","range":"LIMITED","transfer":"BT709"}"#
+        );
+        assert_eq!(first["hdr metadata"], "{}");
+        let keys: Vec<&String> = first.keys().collect();
+        let mut sorted_keys = keys.clone();
+        sorted_keys.sort();
+        assert_eq!(keys, sorted_keys);
+        assert_eq!(p.video_tracks[1].fields["bitrate"], "1000");
+        assert_eq!(p.audio_tracks.len(), 1);
+        assert_eq!(p.audio_tracks[0].fields["channels"], "2");
+        assert_eq!(
+            p.video_codec.as_deref(),
+            Some("h264 high"),
+            "first track still wins"
+        );
+
+        // Garbage leaves the last good list in place.
+        media.apply(
+            Some("S1"),
+            "Media.playerPropertiesChanged",
+            &props("P1", &[("kAudioTracks", "not json")]),
+            101,
+        );
+        assert_eq!(media.players(101)[0].audio_tracks.len(), 1);
+        // An empty list empties it.
+        media.apply(
+            Some("S1"),
+            "Media.playerPropertiesChanged",
+            &props("P1", &[("kAudioTracks", "[]")]),
+            102,
+        );
+        assert!(media.players(102)[0].audio_tracks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_playhead_is_read_once_at_a_time_per_page() {
+        let timing = Timing {
+            request_timeout: Duration::from_secs(5),
+            refresh_interval: Duration::from_secs(3600),
+            playhead_interval: Duration::from_millis(40),
+        };
+        let (client, mut fake) = connect(timing);
+        for method in [
+            "Browser.getVersion",
+            "SystemInfo.getInfo",
+            "Target.setDiscoverTargets",
+        ] {
+            let request = fake.expect(method).await;
+            fake.answer(&request, json!({})).await;
+        }
+        let request = fake.expect("Target.getTargets").await;
+        fake.answer(
+            &request,
+            json!({"targetInfos": [{"targetId": "T1", "type": "page"}]}),
+        )
+        .await;
+        let request = fake.expect("Target.attachToTarget").await;
+        fake.answer(&request, json!({"sessionId": "S1"})).await;
+        let request = fake.expect("Media.enable").await;
+        fake.answer(&request, json!({})).await;
+
+        let first = fake.expect("Runtime.evaluate").await;
+        assert_eq!(first["sessionId"], "S1");
+        assert_eq!(first["params"]["expression"], PLAYHEAD_EXPRESSION);
+        assert_eq!(first["params"]["returnByValue"], true);
+        assert_eq!(first["params"]["awaitPromise"], false);
+        assert_eq!(first["params"]["timeout"], 2000);
+
+        // Unanswered: several ticks pass and nothing else is sent.
+        let another = tokio::time::timeout(Duration::from_millis(250), fake.next_request()).await;
+        assert!(
+            another.is_err(),
+            "a second evaluate while one is outstanding"
+        );
+
+        fake.answer(
+            &first,
+            json!({"result": {"type": "object", "value": [
+                {"element": "video", "currentSrc": "file:///a.mp4", "currentTimeSeconds": 2.0,
+                 "durationSeconds": null, "paused": false, "ended": false, "readyState": 4,
+                 "networkState": 2, "playbackRate": 1.0, "muted": false, "volume": 1.0,
+                 "videoWidth": 10, "videoHeight": 10, "totalFrames": 5, "droppedFrames": 0}]}}),
+        )
+        .await;
+        let internals = eventually(&client, "the unmatched element", |i| {
+            !i.unmatched_elements.is_empty()
+        })
+        .await;
+        assert_eq!(internals.unmatched_elements[0].current_src, "file:///a.mp4");
+        assert_eq!(internals.unmatched_elements[0].duration_seconds, None);
+
+        // With the answer in, the next tick asks again.
+        fake.expect("Runtime.evaluate").await;
     }
 
     // --- fd wiring ---

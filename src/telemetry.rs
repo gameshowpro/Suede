@@ -43,7 +43,7 @@ use utoipa::ToSchema;
 use crate::browser_gpu::{AppGpuReport, Rendering};
 use crate::cpu::{CpuSampler, SOLO_PREFIX};
 use crate::devtools::{
-    BrowserGpuInfo, BrowserVersion, DevtoolsState, DevtoolsStatus, Internals, MediaPlayer,
+    BrowserGpuInfo, BrowserVersion, DevtoolsState, DevtoolsStatus, Internals, MediaPlayer, Playhead,
 };
 use crate::diagnostics::{history_capacity, stale_after, HISTORY_WINDOW};
 use crate::events::{EventHub, ServerEvent};
@@ -112,6 +112,8 @@ pub struct BrowserReport {
     pub gpu: Option<BrowserGpuInfo>,
     /// Media players the browser reported.
     pub media_players: Vec<MediaPlayer>,
+    /// Media elements in the page that no player in `media_players` matched.
+    pub unmatched_elements: Vec<Playhead>,
 }
 
 /// Everything one poll needs besides the clock.
@@ -401,6 +403,7 @@ pub fn assemble(inputs: &Inputs<'_>, now: u64) -> Vec<BrowserReport> {
             version: internals.version,
             gpu: internals.gpu,
             media_players: internals.players,
+            unmatched_elements: internals.unmatched_elements,
         });
     }
     reports
@@ -617,6 +620,7 @@ mod tests {
             }),
             gpu: None,
             players: Vec::new(),
+            unmatched_elements: Vec::new(),
         }
     }
 
