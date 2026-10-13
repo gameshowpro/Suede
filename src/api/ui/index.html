@@ -184,6 +184,10 @@ tr.player-detail > td { background: var(--sunken); padding: 12px 14px; }
 .player-detail-grid h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .player-detail-grid table td, .player-detail-grid table th { padding: 4px 8px; font-size: 13px; vertical-align: top; }
 .player-detail-grid td.mono { overflow-wrap: anywhere; }
+.player-detail-grid h5 { margin: 10px 0 4px; font-size: 13px; }
+.player-detail-grid h4 + h5 { margin-top: 0; }
+.player-detail-grid table.track { width: 100%; }
+.player-detail-grid table.track td:first-child { white-space: nowrap; width: 1%; color: var(--muted); }
 .player-detail-grid ul { margin: 6px 0 0; padding-left: 18px; font-size: 13px; }
 .progress-cell { display: flex; align-items: center; gap: 8px; min-width: 150px; }
 .pbar { position: relative; flex: 1 1 60px; min-width: 60px; max-width: 120px; height: 8px; border-radius: 4px;
@@ -4479,17 +4483,42 @@ function progressCell(ph, ctx = {}) {
 const isBoolText = (v) => v === true || v === false || v === "true" || v === "false";
 const boolChip = (v) => (v === true || v === "true")
   ? `<span class="pill ok">true</span>` : `<span class="pill bad">false</span>`;
-// One table per track list; columns are the union of field names.
-function trackTable(tracks) {
+// A track field value as readable text. JSON objects become "key value"
+// pairs joined with " · " (empty object: dash), arrays their items joined
+// with ", "; anything else stays verbatim. Returns plain text, unescaped.
+function flattenJson(v) {
+  if (v === null) return "null";
+  if (Array.isArray(v)) return v.map(flattenJson).join(", ");
+  if (typeof v === "object") {
+    const pairs = Object.entries(v);
+    return pairs.length ? pairs.map(([k, x]) => `${k} ${flattenJson(x)}`).join(" · ") : dash;
+  }
+  return String(v);
+}
+function trackValue(raw) {
+  if (raw == null) return dash;
+  if (isBoolText(raw)) return boolChip(raw);
+  const text = String(raw).trim();
+  if (text.startsWith("{") || text.startsWith("[")) {
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed !== null && typeof parsed === "object") {
+        const flat = flattenJson(parsed);
+        return flat === "" ? dash : escape(flat);
+      }
+    } catch { /* not JSON: show verbatim */ }
+  }
+  return escape(raw);
+}
+// One heading plus a field/value table per track item.
+function trackTables(tracks, label) {
   if (!tracks?.length) return `<p class="hint">none</p>`;
-  const cols = [];
-  for (const t of tracks) for (const k of Object.keys(t.fields || {})) if (!cols.includes(k)) cols.push(k);
-  if (!cols.length) return `<p class="hint">none</p>`;
-  return `<table><thead><tr>${cols.map((c) => `<th>${escape(c)}</th>`).join("")}</tr></thead><tbody>${
-    tracks.map((t) => `<tr>${cols.map((c) => {
-      const v = (t.fields || {})[c];
-      return `<td class="mono">${v == null ? dash : escape(v)}</td>`;
-    }).join("")}</tr>`).join("")}</tbody></table>`;
+  return tracks.map((t, i) => {
+    const rows = Object.entries(t.fields || {}).map(([k, v]) =>
+      `<tr><td class="mono">${escape(k)}</td><td class="mono">${trackValue(v)}</td></tr>`).join("");
+    return `<h5>${escape(label)} ${i + 1}</h5>` + (rows
+      ? `<table class="track"><tbody>${rows}</tbody></table>` : `<p class="hint">no fields</p>`);
+  }).join("");
 }
 function playerDetail(p, ph, sampledAt) {
   const props = [
@@ -4524,7 +4553,7 @@ function playerDetail(p, ph, sampledAt) {
   }
   return `<div class="player-detail-grid">
     <section><h4>Properties</h4><table><tbody>${propRows}</tbody></table>${messageList}${errorList}</section>
-    <section><h4>Video tracks</h4>${trackTable(p.videoTracks)}<h4 style="margin-top:12px">Audio tracks</h4>${trackTable(p.audioTracks)}</section>
+    <section><h4>Video tracks</h4>${trackTables(p.videoTracks, "Video track")}<h4 style="margin-top:12px">Audio tracks</h4>${trackTables(p.audioTracks, "Audio track")}</section>
     <section><h4>Playhead</h4>${playhead}</section></div>`;
 }
 function renderPlayer(p, app, sampledAt) {
