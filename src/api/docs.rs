@@ -170,6 +170,8 @@ impl Modify for SecurityAddon {
         crate::model::GspFirmware,
         crate::nvidia_smi::GpuTelemetry,
         crate::nvidia_smi::GpuSample,
+        crate::nvidia_smi::GpuHistoryPoint,
+        crate::nvidia_smi::GpuHistorySample,
         crate::nvidia_smi::GpuProcessKind,
         crate::nvidia_smi::GpuProcessSample,
         crate::procs::BrowserProcess,

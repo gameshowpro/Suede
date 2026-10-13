@@ -19,6 +19,13 @@ use utoipa::ToSchema;
 /// How long each `nvidia-smi` invocation may run before it is abandoned.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How far back [`GpuTelemetry::history`] reaches, in seconds.
+pub const HISTORY_SECONDS: u64 = 300;
+
+/// The most points [`GpuTelemetry::history`] holds: five minutes at the
+/// telemetry task's 5 s poll.
+pub const HISTORY_CAPACITY: usize = 60;
+
 /// The `--query-gpu` fields, in the order [`parse_query_gpu`] expects them.
 const QUERY_FIELDS: &str = "name,driver_version,pstate,utilization.gpu,utilization.memory,\
 utilization.decoder,utilization.encoder,memory.used,memory.total,temperature.gpu,\
@@ -41,6 +48,11 @@ pub struct GpuTelemetry {
     pub gpus: Vec<GpuSample>,
     /// One entry per process using a GPU.
     pub processes: Vec<GpuProcessSample>,
+    /// Samples from the last [`HISTORY_SECONDS`], oldest first, at most
+    /// [`HISTORY_CAPACITY`] points: one per successful `nvidia-smi` poll. Kept
+    /// when a later poll fails, so the graph survives a blip. Empty from the
+    /// parser; filled by the telemetry task.
+    pub history: Vec<GpuHistoryPoint>,
 }
 
 impl Default for GpuTelemetry {
@@ -52,6 +64,7 @@ impl Default for GpuTelemetry {
             sampled_at: None,
             gpus: Vec::new(),
             processes: Vec::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -65,8 +78,45 @@ impl GpuTelemetry {
             sampled_at: None,
             gpus: Vec::new(),
             processes: Vec::new(),
+            history: Vec::new(),
         }
     }
+}
+
+/// Every GPU's readings at one successful poll.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuHistoryPoint {
+    /// Unix seconds of the sample.
+    pub at: u64,
+    /// One entry per GPU.
+    pub gpus: Vec<GpuHistorySample>,
+}
+
+/// The readings worth graphing from one GPU at one poll.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GpuHistorySample {
+    /// Position in `nvidia-smi`'s output, as in [`GpuSample::index`].
+    pub index: u32,
+    /// Graphics engine utilization.
+    pub utilization_gpu_percent: Option<u32>,
+    /// Memory controller utilization.
+    pub utilization_memory_percent: Option<u32>,
+    /// Video decoder utilization.
+    pub utilization_decoder_percent: Option<u32>,
+    /// Video encoder utilization.
+    pub utilization_encoder_percent: Option<u32>,
+    /// Framebuffer memory in use.
+    pub memory_used_mib: Option<u64>,
+    /// Total framebuffer memory.
+    pub memory_total_mib: Option<u64>,
+    /// Core temperature.
+    pub temperature_c: Option<u32>,
+    /// Current power draw.
+    pub power_draw_w: Option<f64>,
+    /// Shader clock.
+    pub clock_sm_mhz: Option<u32>,
 }
 
 /// One GPU's current readings.
@@ -186,6 +236,7 @@ pub async fn sample() -> GpuTelemetry {
         sampled_at,
         gpus,
         processes,
+        history: Vec::new(),
     }
 }
 

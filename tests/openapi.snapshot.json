@@ -1654,6 +1654,124 @@
         ],
         "type": "object"
       },
+      "GpuHistoryPoint": {
+        "description": "Every GPU's readings at one successful poll.",
+        "properties": {
+          "at": {
+            "description": "Unix seconds of the sample.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "gpus": {
+            "description": "One entry per GPU.",
+            "items": {
+              "$ref": "#/components/schemas/GpuHistorySample"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "at",
+          "gpus"
+        ],
+        "type": "object"
+      },
+      "GpuHistorySample": {
+        "description": "The readings worth graphing from one GPU at one poll.",
+        "properties": {
+          "clockSmMhz": {
+            "description": "Shader clock.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "index": {
+            "description": "Position in `nvidia-smi`'s output, as in [`GpuSample::index`].",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memoryTotalMib": {
+            "description": "Total framebuffer memory.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memoryUsedMib": {
+            "description": "Framebuffer memory in use.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "powerDrawW": {
+            "description": "Current power draw.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "temperatureC": {
+            "description": "Core temperature.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationDecoderPercent": {
+            "description": "Video decoder utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationEncoderPercent": {
+            "description": "Video encoder utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationGpuPercent": {
+            "description": "Graphics engine utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "utilizationMemoryPercent": {
+            "description": "Memory controller utilization.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "index"
+        ],
+        "type": "object"
+      },
       "GpuProcessKind": {
         "description": "What a process does on the GPU, from `pmon`'s `type` column.",
         "enum": [
@@ -1926,6 +2044,13 @@
             },
             "type": "array"
           },
+          "history": {
+            "description": "Samples from the last [`HISTORY_SECONDS`], oldest first, at most\n[`HISTORY_CAPACITY`] points: one per successful `nvidia-smi` poll. Kept\nwhen a later poll fails, so the graph survives a blip. Empty from the\nparser; filled by the telemetry task.",
+            "items": {
+              "$ref": "#/components/schemas/GpuHistoryPoint"
+            },
+            "type": "array"
+          },
           "processes": {
             "description": "One entry per process using a GPU.",
             "items": {
@@ -1953,7 +2078,8 @@
         "required": [
           "available",
           "gpus",
-          "processes"
+          "processes",
+          "history"
         ],
         "type": "object"
       },

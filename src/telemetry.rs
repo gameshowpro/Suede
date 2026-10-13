@@ -18,6 +18,7 @@
 //! binary is known to be missing, the task looks again only every
 //! [`REPROBE_MISSING`].
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,9 @@ use crate::devtools::{
 };
 use crate::events::{EventHub, ServerEvent};
 use crate::model::{AppState, AppStatus};
-use crate::nvidia_smi::{self, GpuTelemetry};
+use crate::nvidia_smi::{
+    self, GpuHistoryPoint, GpuHistorySample, GpuTelemetry, HISTORY_CAPACITY, HISTORY_SECONDS,
+};
 use crate::procs::{BrowserProcess, ProcessSampleSet, ProcessSampler};
 use crate::snapshot::Snapshot;
 use crate::supervisor::Supervisor;
@@ -120,6 +123,60 @@ pub fn annotate_gpu(gpu: &mut GpuTelemetry, processes: &ProcessSampleSet) {
     }
 }
 
+/// Append one point built from `sample.gpus` and drop what is too old or over
+/// capacity.
+///
+/// Trimming by age as well as count keeps the graph honest after a long gap
+/// (for example `nvidia-smi` missing, then back): stale points would otherwise
+/// sit beside fresh ones as if they were adjacent.
+pub fn push_history(buffer: &mut VecDeque<GpuHistoryPoint>, sample: &GpuTelemetry, now: u64) {
+    buffer.push_back(GpuHistoryPoint {
+        at: now,
+        gpus: sample
+            .gpus
+            .iter()
+            .map(|gpu| GpuHistorySample {
+                index: gpu.index,
+                utilization_gpu_percent: gpu.utilization_gpu_percent,
+                utilization_memory_percent: gpu.utilization_memory_percent,
+                utilization_decoder_percent: gpu.utilization_decoder_percent,
+                utilization_encoder_percent: gpu.utilization_encoder_percent,
+                memory_used_mib: gpu.memory_used_mib,
+                memory_total_mib: gpu.memory_total_mib,
+                temperature_c: gpu.temperature_c,
+                power_draw_w: gpu.power_draw_w,
+                clock_sm_mhz: gpu.clock_sm_mhz,
+            })
+            .collect(),
+    });
+    while buffer
+        .front()
+        .is_some_and(|point| now.saturating_sub(point.at) > HISTORY_SECONDS)
+    {
+        buffer.pop_front();
+    }
+    while buffer.len() > HISTORY_CAPACITY {
+        buffer.pop_front();
+    }
+}
+
+/// Record a fresh poll in `buffer` and publish the buffer on `gpu`.
+///
+/// Only a poll that actually ran (`probed`) and was answered adds a point; a
+/// reused value or a failed poll adds nothing, but the history still goes out
+/// on `gpu` so it survives the failure.
+fn apply_history(
+    buffer: &mut VecDeque<GpuHistoryPoint>,
+    gpu: &mut GpuTelemetry,
+    probed: bool,
+    now: u64,
+) {
+    if probed && gpu.available {
+        push_history(buffer, gpu, now);
+    }
+    gpu.history = buffer.iter().cloned().collect();
+}
+
 /// One report per running `chromium-kiosk` app with a process.
 pub fn assemble(inputs: &Inputs<'_>, now: u64) -> Vec<BrowserReport> {
     let mut reports = Vec::new();
@@ -185,6 +242,8 @@ pub struct Telemetry {
     sampler: ProcessSampler,
     /// When `nvidia-smi` was last found missing, to rate-limit re-probing.
     missing_since: Option<Instant>,
+    /// Recent successful GPU polls, published as [`GpuTelemetry::history`].
+    history: VecDeque<GpuHistoryPoint>,
 }
 
 impl Telemetry {
@@ -202,6 +261,7 @@ impl Telemetry {
             browser_devtools,
             sampler: ProcessSampler::new(),
             missing_since: None,
+            history: VecDeque::new(),
         }
     }
 
@@ -228,6 +288,7 @@ impl Telemetry {
             self.snapshot.gpu()
         };
         annotate_gpu(&mut gpu, &processes);
+        apply_history(&mut self.history, &mut gpu, probe, crate::util::unix_now());
 
         let gpu_reports = self.snapshot.browser_gpu();
         let internals = self.supervisor.devtools_internals().await;
@@ -354,6 +415,7 @@ mod tests {
             sampled_at: Some(5),
             gpus: Vec::new(),
             processes: vec![gpu_process(101), gpu_process(999)],
+            history: Vec::new(),
         };
         annotate_gpu(&mut gpu, &sample_set());
         assert_eq!(gpu.processes[0].app.as_deref(), Some("wall"));
@@ -445,5 +507,93 @@ mod tests {
             "the process table still appears"
         );
         assert!(reports[0].media_players.is_empty());
+    }
+
+    fn polled(index: u32, util: u32) -> GpuTelemetry {
+        GpuTelemetry {
+            available: true,
+            reason: None,
+            sampled_at: Some(1),
+            gpus: vec![crate::nvidia_smi::GpuSample {
+                index,
+                name: "Quadro".into(),
+                driver_version: None,
+                performance_state: None,
+                utilization_gpu_percent: Some(util),
+                utilization_memory_percent: None,
+                utilization_decoder_percent: None,
+                utilization_encoder_percent: None,
+                memory_used_mib: Some(100),
+                memory_total_mib: Some(1000),
+                temperature_c: None,
+                power_draw_w: None,
+                power_limit_w: None,
+                clock_sm_mhz: None,
+                clock_memory_mhz: None,
+                pcie_generation: None,
+                pcie_width: None,
+                fan_percent: None,
+            }],
+            processes: Vec::new(),
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_pushed_point_carries_the_graphed_readings() {
+        let mut buffer = VecDeque::new();
+        push_history(&mut buffer, &polled(1, 42), 1000);
+        let point = &buffer[0];
+        assert_eq!(point.at, 1000);
+        assert_eq!(point.gpus[0].index, 1);
+        assert_eq!(point.gpus[0].utilization_gpu_percent, Some(42));
+        assert_eq!(point.gpus[0].memory_total_mib, Some(1000));
+    }
+
+    #[test]
+    fn history_is_capped_at_capacity() {
+        let mut buffer = VecDeque::new();
+        for i in 0..=HISTORY_CAPACITY as u64 {
+            push_history(&mut buffer, &polled(0, 1), 1000 + i);
+        }
+        assert_eq!(buffer.len(), HISTORY_CAPACITY);
+        assert_eq!(buffer.front().map(|p| p.at), Some(1001), "oldest dropped");
+    }
+
+    #[test]
+    fn history_drops_points_older_than_the_window_even_under_capacity() {
+        let mut buffer = VecDeque::new();
+        push_history(&mut buffer, &polled(0, 1), 1000);
+        push_history(&mut buffer, &polled(0, 1), 1000 + HISTORY_SECONDS);
+        assert_eq!(buffer.len(), 2, "exactly at the window edge is kept");
+        push_history(&mut buffer, &polled(0, 1), 1001 + HISTORY_SECONDS);
+        assert_eq!(buffer.len(), 2, "the point 301 s old is gone");
+        assert_eq!(buffer.front().map(|p| p.at), Some(1000 + HISTORY_SECONDS));
+    }
+
+    #[test]
+    fn a_reused_value_adds_no_point() {
+        let mut buffer = VecDeque::new();
+        let mut gpu = polled(0, 1);
+        apply_history(&mut buffer, &mut gpu, false, 1000);
+        assert!(buffer.is_empty());
+        assert!(gpu.history.is_empty());
+    }
+
+    #[test]
+    fn history_survives_a_failed_poll() {
+        let mut buffer = VecDeque::new();
+        let mut gpu = polled(0, 1);
+        apply_history(&mut buffer, &mut gpu, true, 1000);
+        assert_eq!(gpu.history.len(), 1);
+
+        let mut failed = GpuTelemetry {
+            reason: Some("nvidia-smi timed out".into()),
+            ..GpuTelemetry::default()
+        };
+        apply_history(&mut buffer, &mut failed, true, 1005);
+        assert!(!failed.available);
+        assert_eq!(failed.history.len(), 1, "no new point, old one kept");
+        assert_eq!(failed.history[0].at, 1000);
     }
 }
