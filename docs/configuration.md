@@ -297,7 +297,7 @@ With `align_outputs = true` (the default) Suede runs that fix itself:
 
 - only while presentation is effectively `wayland`, with at least two
   active physical displays and a slicer reporting `phaseMs`;
-- once two of the slicer's ten-second intervals in a row are out of
+- once 20 seconds of the slicer's intervals in a row are out of
   tolerance by the `output-phase` check's own rule (any display more than
   1.0 ms from the first), never on a single disturbed interval;
 - at most three times per compositor session; the budget resets when sway
@@ -332,8 +332,8 @@ for the whole story.
 With `restart_on_gpu_fallback = true` (the default) Suede restarts the app
 itself:
 
-- only for a running `chromium-kiosk` app, once two looks five seconds apart
-  at the same browser process both find its GPU process in software;
+- only for a running `chromium-kiosk` app, once two looks one diagnostics
+  interval apart at the same browser process both find its GPU process in software;
 - only if the app's log shows its GPU process crashed since launch, since a
   browser that started in software would start the same way again;
 - at most three times per app in any rolling hour; after that the

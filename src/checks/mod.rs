@@ -2061,8 +2061,9 @@ impl CheckRunner {
         let names: Vec<&str> = active.iter().map(|output| output.name.as_str()).collect();
         let mut outcome = format!(
             "disabled and re-enabled {} together, in one sway command each; \
-             the check reflects the result on the next slicer interval (10 s)",
-            names.join(", ")
+             the check reflects the result on the next slicer interval ({} s)",
+            names.join(", "),
+            crate::diagnostics::SAMPLE_INTERVAL.as_secs()
         );
         if !failures.is_empty() {
             outcome.push_str(&format!(
@@ -3994,7 +3995,13 @@ mod tests {
         let detail = runner.fix(ids::OUTPUT_PHASE).await.unwrap();
         assert!(detail.contains("HDMI-A-1"), "{detail}");
         assert!(detail.contains("HDMI-A-2"), "{detail}");
-        assert!(detail.contains("10 s"), "{detail}");
+        assert!(
+            detail.contains(&format!(
+                "({} s)",
+                crate::diagnostics::SAMPLE_INTERVAL.as_secs()
+            )),
+            "{detail}"
+        );
 
         let commands = sway.commands();
         assert!(
@@ -4279,7 +4286,7 @@ mod tests {
     fn stats_with(presentation_feedback: bool, outputs: Vec<OutputTiming>) -> ProjectionStats {
         ProjectionStats {
             measured_at: 1,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 60.0,
             presented_fps: 60.0,

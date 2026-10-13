@@ -23,7 +23,7 @@ pub struct Snapshot {
     /// to read, instead of each guessing it from whether stats have arrived
     /// (see `ProjectionReport` for why that guess was wrong on 2026-09-15).
     slicer_running: RwLock<bool>,
-    /// Live-control progress is distinct from ten-second frame statistics so
+    /// Live-control progress is distinct from interval frame statistics so
     /// a static source can still show whether a requested edit was installed.
     projection_control: RwLock<ProjectionControlStatus>,
     projection_geometry: RwLock<crate::model::observed::ProjectionGeometryStatus>,
@@ -369,7 +369,7 @@ mod tests {
 
         let stats = ProjectionStats {
             measured_at: 1,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 60.0,
             presented_fps: 60.0,
@@ -443,7 +443,7 @@ mod tests {
 
         let stats = ProjectionStats {
             measured_at: 1,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 60.0,
             presented_fps: 60.0,

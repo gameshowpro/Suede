@@ -578,7 +578,7 @@ window.addEventListener("error", (event) => {
           <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th><th>Request to present</th><th>GPU span</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
         <p class="hint" id="pj-timing-hint">Measured by the slicer over each
-          10 s interval using validated protocol display timestamps. Request to
+          <span id="pj-timing-interval">interval</span> using validated protocol display timestamps. Request to
           present starts immediately before the Wayland feedback request or
           direct submission; it is not capture-to-glass or photon latency.
           Offset is how far apart the displays showed the same frame; a
@@ -3414,6 +3414,8 @@ function renderProjectionTiming() {
   $("pj-timing-outputs-table").hidden = !s;
   $("pj-timing-hint").hidden = !s;
   if (!s) return;
+  const interval = diagnosticsIntervalSeconds(s.intervalSeconds);
+  $("pj-timing-interval").textContent = interval ? `${interval} s interval` : "interval";
   // A value worth a second look is styled like a failing check, not buried
   // in a sentence — the operator scans for color, not text.
   const flagged = (n) => n > 0 ? `<span class="pill bad">${n}</span>` : String(n);
@@ -4170,7 +4172,18 @@ const GPU_KIND = { graphics: "G", compute: "C", both: "C+G" };
 // the legend carries the current values, which is the relief the lighter
 // light-mode slots need.
 const HISTORY_SECONDS = 300;
-const HISTORY_GAP_SECONDS = 7;
+// Seconds between samples of every diagnostic, as the daemon reports it; the
+// fallback is a slicer interval's own length. Null when neither is known.
+function diagnosticsIntervalSeconds(fallback) {
+  const seconds = Number(systemInfo?.diagnosticsIntervalSeconds ?? fallback);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+// A gap longer than one and a half intervals breaks a line; with no interval
+// known nothing is broken.
+function historyGapSeconds(fallback) {
+  const seconds = diagnosticsIntervalSeconds(fallback);
+  return seconds == null ? Infinity : 1.5 * seconds;
+}
 const GPU_SERIES = [
   { name: "Graphics", color: "var(--c1)", value: (h) => h.utilizationGpuPercent },
   { name: "Memory", color: "var(--c2)", value: (h) => h.utilizationMemoryPercent },
@@ -4228,17 +4241,18 @@ function gpuChart(g, gpu) {
     const now = points[points.length - 1].at;
     const x = (at) => L + pw * (1 - (now - at) / HISTORY_SECONDS);
     const visible = points.filter((point) => now - point.at <= HISTORY_SECONDS);
+    const gap = historyGapSeconds();
     for (const series of shown) {
       let path = "", dots = "", previous = null;
       visible.forEach((point, i) => {
         const v = series.value(point.sample);
         if (v == null || !Number.isFinite(Number(v))) { previous = null; return; }
-        const connected = previous != null && point.at - previous <= HISTORY_GAP_SECONDS;
+        const connected = previous != null && point.at - previous <= gap;
         path += `${connected ? "L" : "M"}${x(point.at).toFixed(1)},${y(v).toFixed(1)}`;
         previous = point.at;
         // A lone sample between gaps has no line to show it, so mark it.
         const next = visible[i + 1];
-        const nextConnected = next && next.at - point.at <= HISTORY_GAP_SECONDS
+        const nextConnected = next && next.at - point.at <= gap
           && series.value(next.sample) != null;
         if (!connected && !nextConnected) {
           dots += `<circle class="dot" cx="${x(point.at).toFixed(1)}" cy="${y(v).toFixed(1)}" r="3" fill="${series.color}"/>`;
@@ -4479,8 +4493,8 @@ function renderBrowsers() {
 // Slicer pipeline chart: captured and presented fps as nested step areas on
 // the same 5 minute axis as the GPU chart (100 % = the output's refresh
 // rate), the display offset as a line (100 % = one frame period) and a
-// triangle on every interval that had straddles. Values are ten-second
-// interval averages, so they are drawn as steps; null (stale) points break
+// triangle on every interval that had straddles. Values are averages over
+// one diagnostics interval, so they are drawn as steps; null (stale) points break
 // every shape rather than drawing a flat line.
 function pipelineChart(p) {
   const W = 720, H = 160, L = 34, R = 10, T = 8, B = 22;
@@ -4508,13 +4522,14 @@ function pipelineChart(p) {
     const now = latest.at;
     const x = (at) => L + pw * (1 - (now - at) / HISTORY_SECONDS);
     const visible = points.filter((point) => now - point.at <= HISTORY_SECONDS);
+    const gap = historyGapSeconds(latest.intervalSeconds);
     // Runs of connected non-null points as [{at, v}] arrays.
     const runs = (value) => {
       const out = []; let run = null, previous = null;
       for (const point of visible) {
         const v = value(point);
         if (v == null) { run = null; previous = null; continue; }
-        if (run == null || point.at - previous > HISTORY_GAP_SECONDS) { run = []; out.push(run); }
+        if (run == null || point.at - previous > gap) { run = []; out.push(run); }
         run.push({ at: point.at, v }); previous = point.at;
       }
       return out;
@@ -4546,7 +4561,7 @@ function pipelineChart(p) {
     for (const point of visible) {
       if (!point.fresh || !(point.straddles > 0)) continue;
       const cx = x(point.at);
-      svg += `<path d="M${(cx - 4).toFixed(1)},${T - 1}h8l-4,7z" fill="var(--ink)"><title>${escape(point.straddles)} straddle${point.straddles === 1 ? "" : "s"} in the ten-second interval</title></path>`;
+      svg += `<path d="M${(cx - 4).toFixed(1)},${T - 1}h8l-4,7z" fill="var(--ink)"><title>${escape(point.straddles)} straddle${point.straddles === 1 ? "" : "s"} in the interval</title></path>`;
       if (cx - lastLabelX >= 16) {
         svg += `<text class="marker-label" x="${(cx + 6).toFixed(1)}" y="${T + 5}">${escape(point.straddles)}</text>`;
         lastLabelX = cx;
@@ -4580,8 +4595,9 @@ function pipelineChart(p) {
     key("c2", "Offset max", s.offsetMs
       ? `${num(s.offsetMs.max)} ms${frameMs ? ` · ${pct(100 * s.offsetMs.max / frameMs)} of a frame` : ""}` : "not measured") +
     key("tri", "Straddles", `${flagged(straddles)} in 5 min`);
+  const intervalSeconds = diagnosticsIntervalSeconds(latest?.intervalSeconds);
   const caption = `<p class="gpu-caption">${outputHz ? `100 % = ${escape(num(outputHz, 2))} Hz · ` : ""}${s.freeRun ? "free-run" : "locked"}. ` +
-    `The band between captured and presented is dropped frames. Values are ten-second averages.</p>`;
+    `The band between captured and presented is dropped frames. Values are ${intervalSeconds ? `${escape(String(intervalSeconds))}-second` : "per-interval"} averages.</p>`;
   return `<div class="gpu-chart">
     <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Slicer pipeline over the last five minutes">${svg}</svg>
     <div class="gpu-legend">${legend}</div>${caption}</div>`;

@@ -7,8 +7,8 @@
 //! example the GPU process table) can attribute a pid to the app it belongs to.
 //!
 //! Cost: one `/proc` directory walk plus two small file reads per sampled
-//! process, every 5 s. The GPU watchdog already performs the same walk at
-//! that cadence, so this adds no new kind of load.
+//! process, every diagnostics interval. The GPU watchdog already performs the
+//! same walk at that cadence, so this adds no new kind of load.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

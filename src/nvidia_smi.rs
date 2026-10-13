@@ -19,13 +19,6 @@ use utoipa::ToSchema;
 /// How long each `nvidia-smi` invocation may run before it is abandoned.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How far back [`GpuTelemetry::history`] reaches, in seconds.
-pub const HISTORY_SECONDS: u64 = 300;
-
-/// The most points [`GpuTelemetry::history`] holds: five minutes at the
-/// telemetry task's 5 s poll.
-pub const HISTORY_CAPACITY: usize = 60;
-
 /// The `--query-gpu` fields, in the order [`parse_query_gpu`] expects them.
 const QUERY_FIELDS: &str = "name,driver_version,pstate,utilization.gpu,utilization.memory,\
 utilization.decoder,utilization.encoder,memory.used,memory.total,temperature.gpu,\
@@ -48,8 +41,8 @@ pub struct GpuTelemetry {
     pub gpus: Vec<GpuSample>,
     /// One entry per process using a GPU.
     pub processes: Vec<GpuProcessSample>,
-    /// Samples from the last [`HISTORY_SECONDS`], oldest first, at most
-    /// [`HISTORY_CAPACITY`] points: one per successful `nvidia-smi` poll. Kept
+    /// Samples from the last [`crate::diagnostics::HISTORY_WINDOW`], oldest
+    /// first, at most [`crate::diagnostics::history_capacity`] points: one per successful `nvidia-smi` poll. Kept
     /// when a later poll fails, so the graph survives a blip. Empty from the
     /// parser; filled by the telemetry task.
     pub history: Vec<GpuHistoryPoint>,

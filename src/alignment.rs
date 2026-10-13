@@ -34,13 +34,17 @@ use crate::snapshot::Snapshot;
 /// the hardware measured; the rest cover a head that was still settling.
 pub const MAX_ATTEMPTS: u32 = 3;
 
-/// Fresh out-of-tolerance intervals in a row before an alignment runs, so a
-/// single disturbed interval (a mode-set, a hotplug) never blanks the wall.
-pub const OUT_OF_PHASE_INTERVALS: u32 = 2;
+/// How long the displays must stay out of tolerance, as consecutive slicer
+/// intervals, before an alignment runs, so a single disturbed interval (a
+/// mode-set, a hotplug) never blanks the wall.
+pub const OUT_OF_PHASE_FOR: Duration = Duration::from_secs(20);
+
+/// [`OUT_OF_PHASE_FOR`] expressed in slicer intervals.
+pub const OUT_OF_PHASE_INTERVALS: u32 = crate::diagnostics::samples_in(OUT_OF_PHASE_FOR);
 
 /// How long a running slicer may go without reporting an interval before
-/// alignment says, once per session, that it cannot judge the phase. Three
-/// of the slicer's ten-second intervals.
+/// alignment says, once per session, that it cannot judge the phase. Thirty
+/// seconds of wall clock whatever the interval is.
 pub const NO_STATS_GRACE: Duration = Duration::from_secs(30);
 
 /// How often [`Aligner::run`] evaluates.
@@ -435,7 +439,7 @@ impl Aligner {
     /// subscription to `projection_stats_changed`: that event also carries
     /// every live-control acknowledgment, which can arrive many times a
     /// second while someone drags a corner, and a second's latency is
-    /// nothing against the slicer's ten-second interval.
+    /// nothing against the slicer's statistics interval.
     pub async fn run(mut self, mut shutdown: watch::Receiver<bool>) {
         self.snapshot
             .set_output_alignment(self.policy.status().clone());
@@ -473,7 +477,7 @@ mod tests {
     fn stats(measured_at: u64, phases: &[f64]) -> ProjectionStats {
         ProjectionStats {
             measured_at,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 60.0,
             presented_fps: 60.0,
@@ -553,21 +557,43 @@ mod tests {
         }
     }
 
+    /// One slicer interval, in seconds.
+    const STEP: u64 = crate::diagnostics::SAMPLE_INTERVAL.as_secs();
+    /// Out-of-phase intervals in a row that start an alignment.
+    const N: u64 = OUT_OF_PHASE_INTERVALS as u64;
+
+    /// Interval number `k` (1-based, ending `k` steps after the start)
+    /// reported with these phases.
+    fn feed(policy: &mut Policy, clock: &Clock, k: u64, phases: &[f64]) -> Decision {
+        policy.evaluate(&clock.at(k * STEP, Some(&stats(1000 + k * STEP, phases))))
+    }
+
+    /// Out-of-phase intervals `from..=to`; the decision on the last one.
+    fn feed_out(policy: &mut Policy, clock: &Clock, from: u64, to: u64) -> Decision {
+        let mut decision = Decision::Wait;
+        for k in from..=to {
+            decision = feed(policy, clock, k, OUT);
+        }
+        decision
+    }
+
     #[test]
-    fn two_consecutive_out_of_phase_intervals_start_one_alignment() {
+    fn enough_consecutive_out_of_phase_intervals_start_one_alignment() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        let first = stats(1010, OUT);
-        assert_eq!(policy.evaluate(&clock.at(10, Some(&first))), Decision::Wait);
+        assert_eq!(feed_out(&mut policy, &clock, 1, N - 1), Decision::Wait);
         assert_eq!(
             policy.status().last_result,
             Some(OutputAlignmentResult::OutOfPhase)
         );
-        // The same report again is not a second interval.
-        assert_eq!(policy.evaluate(&clock.at(11, Some(&first))), Decision::Wait);
-        let second = stats(1020, OUT);
+        // The same report again is not another interval.
+        let last = stats(1000 + (N - 1) * STEP, OUT);
         assert_eq!(
-            policy.evaluate(&clock.at(20, Some(&second))),
+            policy.evaluate(&clock.at((N - 1) * STEP + 1, Some(&last))),
+            Decision::Wait
+        );
+        assert_eq!(
+            feed(&mut policy, &clock, N, OUT),
             Decision::Align {
                 attempt: 1,
                 phase_ms: 6.3
@@ -577,23 +603,30 @@ mod tests {
         assert_eq!(policy.status().last_phase_ms, Some(6.3));
     }
 
+    /// Deliberate: a change of the diagnostics interval must be a visible
+    /// edit here, because the wall-clock rule is 20 s of out-of-phase
+    /// intervals and the interval count is derived from it.
+    #[test]
+    fn the_interval_count_is_twenty_seconds_at_five_second_intervals() {
+        assert_eq!(OUT_OF_PHASE_FOR, Duration::from_secs(20));
+        assert_eq!(OUT_OF_PHASE_INTERVALS, 4);
+        assert_eq!(N * STEP, OUT_OF_PHASE_FOR.as_secs());
+    }
+
     #[test]
     fn an_in_phase_interval_resets_the_count() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        policy.evaluate(&clock.at(10, Some(&stats(1010, OUT))));
-        assert_eq!(
-            policy.evaluate(&clock.at(20, Some(&stats(1020, IN)))),
-            Decision::Wait
-        );
+        feed_out(&mut policy, &clock, 1, N - 1);
+        assert_eq!(feed(&mut policy, &clock, N, IN), Decision::Wait);
         assert_eq!(
             policy.status().last_result,
             Some(OutputAlignmentResult::InPhase)
         );
         assert_eq!(
-            policy.evaluate(&clock.at(30, Some(&stats(1030, OUT)))),
+            feed(&mut policy, &clock, N + 1, OUT),
             Decision::Wait,
-            "one out-of-phase interval after an in-phase one is not two in a row"
+            "one out-of-phase interval after an in-phase one is not a run"
         );
     }
 
@@ -602,8 +635,9 @@ mod tests {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
         let edge = [0.0, PHASE_TOLERANCE_MS, -PHASE_TOLERANCE_MS];
-        policy.evaluate(&clock.at(10, Some(&stats(1010, &edge))));
-        policy.evaluate(&clock.at(20, Some(&stats(1020, &edge))));
+        for k in 1..=N {
+            feed(&mut policy, &clock, k, &edge);
+        }
         assert_eq!(
             policy.status().last_result,
             Some(OutputAlignmentResult::InPhase)
@@ -615,20 +649,19 @@ mod tests {
     fn the_result_is_judged_only_on_an_interval_that_started_after_the_alignment() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        policy.evaluate(&clock.at(10, Some(&stats(1010, OUT))));
-        policy.evaluate(&clock.at(20, Some(&stats(1020, OUT))));
-        policy.alignment_finished(clock.start + Duration::from_secs(23), 1023, true);
+        feed_out(&mut policy, &clock, 1, N);
+        let end = N * STEP;
+        policy.alignment_finished(
+            clock.start + Duration::from_secs(end + 1),
+            1000 + end + 1,
+            true,
+        );
 
         // Ends after the alignment but started before it: half of it is the
         // alignment's own disturbance.
-        let straddling = stats(1030, OUT);
+        assert_eq!(feed(&mut policy, &clock, N + 1, OUT), Decision::Wait);
         assert_eq!(
-            policy.evaluate(&clock.at(30, Some(&straddling))),
-            Decision::Wait
-        );
-        let after = stats(1040, IN);
-        assert_eq!(
-            policy.evaluate(&clock.at(40, Some(&after))),
+            feed(&mut policy, &clock, N + 2, IN),
             Decision::Judged {
                 attempt: 1,
                 phase_ms: 0.1,
@@ -641,10 +674,7 @@ mod tests {
         );
         // Later in-phase intervals keep saying aligned, not in phase: this
         // session needed an alignment.
-        assert_eq!(
-            policy.evaluate(&clock.at(50, Some(&stats(1050, IN)))),
-            Decision::Wait
-        );
+        assert_eq!(feed(&mut policy, &clock, N + 3, IN), Decision::Wait);
         assert_eq!(
             policy.status().last_result,
             Some(OutputAlignmentResult::Aligned)
@@ -655,16 +685,16 @@ mod tests {
     fn at_most_three_attempts_per_session_then_one_give_up() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        let mut t = 10;
+        let mut t = STEP;
         let mut next = |policy: &mut Policy| {
             let report = stats(1000 + t, OUT);
             let decision = policy.evaluate(&clock.at(t, Some(&report)));
-            t += 10;
+            t += STEP;
             decision
         };
         let mut aligns = 0;
         let mut gave_up = 0;
-        for _ in 0..20 {
+        for _ in 0..(MAX_ATTEMPTS as u64 + 2) * N {
             match next(&mut policy) {
                 Decision::Align { .. } => {
                     aligns += 1;
@@ -692,18 +722,22 @@ mod tests {
     fn a_failed_alignment_still_counts_and_is_reported() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        policy.evaluate(&clock.at(10, Some(&stats(1010, OUT))));
-        policy.evaluate(&clock.at(20, Some(&stats(1020, OUT))));
-        policy.alignment_finished(clock.start + Duration::from_secs(21), 1021, false);
+        feed_out(&mut policy, &clock, 1, N);
+        let end = N * STEP;
+        policy.alignment_finished(
+            clock.start + Duration::from_secs(end + 1),
+            1000 + end + 1,
+            false,
+        );
         assert_eq!(
             policy.status().last_result,
             Some(OutputAlignmentResult::Failed)
         );
         assert_eq!(policy.status().attempts, 1);
-        // Not awaiting a result: the next two out-of-phase intervals try again.
-        policy.evaluate(&clock.at(30, Some(&stats(1030, OUT))));
+        // Not awaiting a result: the next run of out-of-phase intervals
+        // tries again.
         assert_eq!(
-            policy.evaluate(&clock.at(40, Some(&stats(1040, OUT)))),
+            feed_out(&mut policy, &clock, N + 1, 2 * N),
             Decision::Align {
                 attempt: 2,
                 phase_ms: 6.3
@@ -715,16 +749,21 @@ mod tests {
     fn a_new_socket_or_output_set_resets_the_budget() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        policy.evaluate(&clock.at(10, Some(&stats(1010, OUT))));
-        policy.evaluate(&clock.at(20, Some(&stats(1020, OUT))));
-        policy.alignment_finished(clock.start + Duration::from_secs(21), 1021, true);
-        policy.evaluate(&clock.at(40, Some(&stats(1040, IN))));
+        feed_out(&mut policy, &clock, 1, N);
+        let end = N * STEP;
+        policy.alignment_finished(
+            clock.start + Duration::from_secs(end + 1),
+            1000 + end + 1,
+            true,
+        );
+        feed(&mut policy, &clock, N + 2, IN);
         assert_eq!(policy.status().attempts, 1);
 
         // A projector unplugged: a new session, and the interval measured on
         // the old set is not judged against the new one.
-        let replugged = stats(1045, OUT);
-        let mut observation = clock.at(45, Some(&replugged));
+        let base = (N + 3) * STEP;
+        let replugged = stats(1000 + base, OUT);
+        let mut observation = clock.at(base, Some(&replugged));
         observation.session = session(&["DP-1", "DP-2", "DP-3"]);
         assert_eq!(policy.evaluate(&observation), Decision::Wait);
         assert_eq!(policy.status().attempts, 0);
@@ -732,14 +771,14 @@ mod tests {
 
         // A compositor restart on the same outputs is a new session too.
         let three = session(&["DP-1", "DP-2", "DP-3"]);
-        for t in [60, 70] {
+        for t in (N + 4..=2 * N + 3).map(|k| k * STEP) {
             let report = stats(1000 + t, OUT);
             let mut observation = clock.at(t, Some(&report));
             observation.session = three.clone();
             policy.evaluate(&observation);
         }
         assert_eq!(policy.status().attempts, 1);
-        let mut observation = clock.at(75, None);
+        let mut observation = clock.at((2 * N + 3) * STEP + 1, None);
         observation.session = SessionKey {
             socket: Some(PathBuf::from("/run/user/1000/sway-ipc.1000.2.sock")),
             ..three
@@ -752,18 +791,22 @@ mod tests {
     fn transient_output_sets_during_an_alignment_do_not_reset_the_budget() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        policy.evaluate(&clock.at(10, Some(&stats(1010, OUT))));
-        policy.evaluate(&clock.at(20, Some(&stats(1020, OUT))));
-        policy.alignment_finished(clock.start + Duration::from_secs(21), 1021, true);
+        feed_out(&mut policy, &clock, 1, N);
+        let end = N * STEP;
+        policy.alignment_finished(
+            clock.start + Duration::from_secs(end + 1),
+            1000 + end + 1,
+            true,
+        );
 
         // Every head disabled, then two of four back: neither is a session.
         for outputs in [&[][..], &["DP-1", "DP-2"][..]] {
-            let mut observation = clock.at(22, None);
+            let mut observation = clock.at(end + 2, None);
             observation.session = session(outputs);
             assert_eq!(policy.evaluate(&observation), Decision::Wait);
         }
         assert_eq!(policy.status().attempts, 1);
-        policy.evaluate(&clock.at(40, Some(&stats(1040, IN))));
+        feed(&mut policy, &clock, N + 2, IN);
         assert_eq!(policy.status().attempts, 1);
         assert_eq!(
             policy.status().last_result,
@@ -774,37 +817,36 @@ mod tests {
     #[test]
     fn never_in_a_direct_session_during_a_pending_reconcile_or_when_disabled() {
         let clock = Clock::new();
-        let out_a = stats(1010, OUT);
-        let out_b = stats(1020, OUT);
+        let reports: Vec<ProjectionStats> = (1..=N).map(|k| stats(1000 + k * STEP, OUT)).collect();
+        let observe = |k: u64| clock.at(k * STEP, Some(&reports[k as usize - 1]));
 
         let mut direct = Policy::new(true);
-        for (t, report) in [(10, &out_a), (20, &out_b)] {
-            let mut observation = clock.at(t, Some(report));
+        for k in 1..=N {
+            let mut observation = observe(k);
             observation.direct = true;
             assert_eq!(direct.evaluate(&observation), Decision::Wait);
         }
         assert_eq!(direct.status().last_result, None);
 
         let mut disabled = Policy::new(false);
-        assert_eq!(
-            disabled.evaluate(&clock.at(10, Some(&out_a))),
-            Decision::Wait
-        );
-        assert_eq!(
-            disabled.evaluate(&clock.at(20, Some(&out_b))),
-            Decision::Wait
-        );
+        for k in 1..=N {
+            assert_eq!(disabled.evaluate(&observe(k)), Decision::Wait);
+        }
         assert!(!disabled.status().enabled);
 
         // A pending reconcile holds the decision rather than dropping it:
         // the same interval is judged once the pass is done.
         let mut pending = Policy::new(true);
-        pending.evaluate(&clock.at(10, Some(&out_a)));
-        let mut observation = clock.at(20, Some(&out_b));
+        for k in 1..N {
+            pending.evaluate(&observe(k));
+        }
+        let mut observation = observe(N);
         observation.reconcile_pending = true;
         assert_eq!(pending.evaluate(&observation), Decision::Wait);
+        let mut later = observe(N);
+        later.now += Duration::from_secs(1);
         assert!(matches!(
-            pending.evaluate(&clock.at(21, Some(&out_b))),
+            pending.evaluate(&later),
             Decision::Align { attempt: 1, .. }
         ));
     }
@@ -813,7 +855,7 @@ mod tests {
     fn fewer_than_two_heads_is_never_judged() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        for t in [10, 20, 30] {
+        for t in (1..=N + 1).map(|k| k * STEP) {
             let report = stats(1000 + t, OUT);
             let mut observation = clock.at(t, Some(&report));
             observation.session = session(&["DP-1"]);
@@ -826,9 +868,10 @@ mod tests {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
         assert_eq!(policy.evaluate(&clock.at(0, None)), Decision::Wait);
-        assert_eq!(policy.evaluate(&clock.at(29, None)), Decision::Wait);
-        assert_eq!(policy.evaluate(&clock.at(30, None)), Decision::NotJudged);
-        for t in 31..200 {
+        let grace = NO_STATS_GRACE.as_secs();
+        assert_eq!(policy.evaluate(&clock.at(grace - 1, None)), Decision::Wait);
+        assert_eq!(policy.evaluate(&clock.at(grace, None)), Decision::NotJudged);
+        for t in grace + 1..200 {
             assert_eq!(policy.evaluate(&clock.at(t, None)), Decision::Wait);
         }
         assert_eq!(policy.status().attempts, 0);
@@ -840,9 +883,9 @@ mod tests {
         // A stale report from before the content went still is the same as
         // none: it was already judged.
         let mut policy = Policy::new(true);
-        let old = stats(1010, OUT);
-        policy.evaluate(&clock.at(10, Some(&old)));
-        for t in 11..100 {
+        let old = stats(1000 + STEP, OUT);
+        policy.evaluate(&clock.at(STEP, Some(&old)));
+        for t in STEP + 1..100 {
             assert_ne!(
                 policy.evaluate(&clock.at(t, Some(&old))),
                 Decision::Align {
@@ -865,15 +908,14 @@ mod tests {
     fn an_interval_with_nothing_to_compare_is_neither() {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
-        let mut no_timing = stats(1010, OUT);
-        no_timing.presentation_feedback = false;
-        policy.evaluate(&clock.at(10, Some(&no_timing)));
-        let mut no_timing = stats(1020, OUT);
-        no_timing.presentation_feedback = false;
-        assert_eq!(
-            policy.evaluate(&clock.at(20, Some(&no_timing))),
-            Decision::Wait
-        );
+        for k in 1..=N {
+            let mut no_timing = stats(1000 + k * STEP, OUT);
+            no_timing.presentation_feedback = false;
+            assert_eq!(
+                policy.evaluate(&clock.at(k * STEP, Some(&no_timing))),
+                Decision::Wait
+            );
+        }
         assert_eq!(policy.status().last_result, None);
         assert_eq!(policy.status().attempts, 0);
     }
@@ -964,9 +1006,11 @@ mod tests {
             report
         };
         let now = unix_now();
-        snapshot.set_projection_stats(Some(misaligned(now - 10)));
-        assert_eq!(aligner.step().await, Decision::Wait);
-        assert!(sway.commands().is_empty(), "one interval is not enough");
+        for back in (1..N).rev() {
+            snapshot.set_projection_stats(Some(misaligned(now - back * STEP)));
+            assert_eq!(aligner.step().await, Decision::Wait);
+        }
+        assert!(sway.commands().is_empty(), "too few intervals");
 
         snapshot.set_projection_stats(Some(misaligned(now)));
         assert_eq!(

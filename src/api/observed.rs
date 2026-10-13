@@ -147,7 +147,7 @@ pub async fn get_gpu(State(state): State<ApiState>) -> Json<crate::nvidia_smi::G
         status = 200,
         description = "The slicer's captured and presented frame rates, \
                        presentation offset and straddle counts, one point \
-                       per five seconds for the last five minutes while a \
+                       per diagnostics interval for the last five minutes while a \
                        slicer ran. Always 200: with no slicer, `running` is \
                        false and `history` is empty.",
         body = crate::telemetry::PipelineTelemetry,
@@ -221,6 +221,7 @@ pub async fn get_system(State(state): State<ApiState>) -> Json<SystemInfo> {
             enabled: state.bootstrap.align_outputs,
             ..state.snapshot.output_alignment()
         },
+        diagnostics_interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
     })
 }
 

@@ -161,7 +161,7 @@ way to notice on its own unless told to.
 Suede detects and corrects this itself now, three ways: the slicer notices
 its own outputs disappearing from the Wayland registry and exits so the
 daemon respawns it; failing that, the slicer notices two consecutive
-ten-second intervals of presentation feedback answering "discarded" for
+statistics intervals of presentation feedback answering "discarded" for
 everything and exits anyway; and the reconciler forces a slicer restart on
 any pass that actually changed which outputs are enabled, whether or not the
 compositor removes the global. A `systemctl --user restart suede` remains a
@@ -442,8 +442,8 @@ grep -c 'GPU process exited unexpectedly' ~/.local/state/suede/logs/<app>.log
 
 What Suede does about it: with
 [`restart_on_gpu_fallback = true`](configuration.md#restart-on-gpu-fallback)
-(the default), it restarts the app itself once two looks five seconds apart
-both find the GPU process in software, with restart reason `gpuFallback`. It
+(the default), it restarts the app itself once two looks one diagnostics
+interval apart both find the GPU process in software, with restart reason `gpuFallback`. It
 does that at most three times per app in any hour, so a GPU that keeps
 failing cannot blank the displays in a loop; once those are used, the check
 fails saying so, and its fix restarts the app on request (that does not use
@@ -485,11 +485,13 @@ down. See [Environment and hardware acceleration](configuration.md#environment-a
 ## Reading the GPU and Chromium panels {: #gpu-and-chromium-panels }
 
 The System tab has three panels between **System** and **Health checks**.
-They answer "is this video decoded on the GPU?", "is the wall keeping up?"
+Every figure on them is sampled once per diagnostics interval, which
+`GET /system` reports as `diagnosticsIntervalSeconds`; the web UI reads it
+from there. They answer "is this video decoded on the GPU?", "is the wall keeping up?"
 and "what is the browser doing?" without a terminal.
 
 **GPU.** Shown only on a machine with an NVIDIA driver and `nvidia-smi`; it
-is hidden otherwise. Every five seconds Suede runs `nvidia-smi` (about 80 ms
+is hidden otherwise. Once per diagnostics interval Suede runs `nvidia-smi` (about 80 ms
 of wall time, negligible processor use) and shows, per GPU, utilization for
 graphics, memory, decoder and encoder, memory used, temperature, power, clocks
 and the PCIe link. The two bus figures are the megabytes per second the GPU
@@ -511,8 +513,7 @@ both as a percent of the output refresh rate (100 % is the caption's rate);
 the band between them is frames dropped or superseded. The offset line is the
 largest spread between outputs showing the same frame, with one frame period
 as 100 %. A marker flags every interval that had straddles, frames shown on
-different refreshes by different outputs. The slicer reports once every ten
-seconds, so the chart moves in steps and the values are averages over each
+different refreshes by different outputs. The slicer reports once per diagnostics interval, so the chart moves in steps and the values are averages over each
 interval. A static source makes the slicer report nothing, and the chart then
 shows a gap rather than a flat line.
 

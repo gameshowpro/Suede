@@ -2131,7 +2131,7 @@
             "type": "array"
           },
           "history": {
-            "description": "Samples from the last [`HISTORY_SECONDS`], oldest first, at most\n[`HISTORY_CAPACITY`] points: one per successful `nvidia-smi` poll. Kept\nwhen a later poll fails, so the graph survives a blip. Empty from the\nparser; filled by the telemetry task.",
+            "description": "Samples from the last [`crate::diagnostics::HISTORY_WINDOW`], oldest\nfirst, at most [`crate::diagnostics::history_capacity`] points: one per successful `nvidia-smi` poll. Kept\nwhen a later poll fails, so the graph survives a blip. Empty from the\nparser; filled by the telemetry task.",
             "items": {
               "$ref": "#/components/schemas/GpuHistoryPoint"
             },
@@ -3127,7 +3127,7 @@
         "type": "object"
       },
       "PipelinePoint": {
-        "description": "One telemetry tick of the slicer pipeline.\n\nSlicer intervals are 10 s and ticks are 5 s, so most intervals appear on\ntwo points. Counters are therefore reported on the fresh point only, so a\nsum over the window is right.",
+        "description": "One telemetry tick of the slicer pipeline.\n\nSlicer intervals and ticks share one length ([`crate::diagnostics`]), but\nthey are not phase-locked, so a tick can see a new interval, the same one\nagain, or (rarely) skip one. Counters are therefore reported on the fresh\npoint only, so a sum over the window is right.",
         "properties": {
           "at": {
             "description": "Unix seconds of the tick.",
@@ -4101,7 +4101,7 @@
         "properties": {
           "control": {
             "$ref": "#/components/schemas/ProjectionControlStatus",
-            "description": "Lifecycle of the most recent live slicer update.  This is independent\nof frame-interval statistics: a static canvas can apply a revision\nbefore it has any ten-second interval to report."
+            "description": "Lifecycle of the most recent live slicer update.  This is independent\nof frame-interval statistics: a static canvas can apply a revision\nbefore it has any statistics interval to report."
           },
           "geometry": {
             "$ref": "#/components/schemas/ProjectionGeometryStatus",
@@ -4651,6 +4651,11 @@
             "description": "Which build is running: `git describe` output, e.g.\n`v0.1.0-12-g81226ee`. `suedeVersion` names the release this is meant\nto be; this names the commit it was actually built from, which is the\nquestion when a fix appears not to have landed.",
             "type": "string"
           },
+          "diagnosticsIntervalSeconds": {
+            "description": "Seconds between samples of every diagnostic: the slicer's statistics\ninterval and the GPU, process and pipeline telemetry tick. The web UI\nreads it instead of assuming one.",
+            "format": "double",
+            "type": "number"
+          },
           "glYield": {
             "$ref": "#/components/schemas/GlYieldStatus",
             "description": "NVIDIA's `__GL_YIELD` toggle, requested and live — experimental; see\n[`GlYieldStatus`]."
@@ -4727,7 +4732,8 @@
           "powerVerbs",
           "presentation",
           "glYield",
-          "outputAlignment"
+          "outputAlignment",
+          "diagnosticsIntervalSeconds"
         ],
         "type": "object"
       },
@@ -7172,7 +7178,7 @@
                 }
               }
             },
-            "description": "The slicer's captured and presented frame rates, presentation offset and straddle counts, one point per five seconds for the last five minutes while a slicer ran. Always 200: with no slicer, `running` is false and `history` is empty."
+            "description": "The slicer's captured and presented frame rates, presentation offset and straddle counts, one point per diagnostics interval for the last five minutes while a slicer ran. Always 200: with no slicer, `running` is false and `history` is empty."
           }
         },
         "tags": [

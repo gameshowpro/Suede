@@ -39,7 +39,7 @@ use crate::snapshot::Snapshot;
 use crate::supervisor::Supervisor;
 
 /// How often [`Watchdog::run`] looks.
-pub const POLL: Duration = Duration::from_secs(5);
+pub const POLL: Duration = crate::diagnostics::SAMPLE_INTERVAL;
 
 /// Polls in a row that must see software rendering, for the same process,
 /// before a restart. Two, so the decision always rests on two separate

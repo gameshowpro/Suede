@@ -30,17 +30,16 @@ use crate::browser_gpu::{AppGpuReport, Rendering};
 use crate::devtools::{
     BrowserGpuInfo, BrowserVersion, DevtoolsState, DevtoolsStatus, Internals, MediaPlayer,
 };
+use crate::diagnostics::{history_capacity, stale_after, HISTORY_WINDOW};
 use crate::events::{EventHub, ServerEvent};
 use crate::model::{AppState, AppStatus, Output, ProjectionStats};
-use crate::nvidia_smi::{
-    self, GpuHistoryPoint, GpuHistorySample, GpuTelemetry, HISTORY_CAPACITY, HISTORY_SECONDS,
-};
+use crate::nvidia_smi::{self, GpuHistoryPoint, GpuHistorySample, GpuTelemetry};
 use crate::procs::{BrowserProcess, ProcessSampleSet, ProcessSampler};
 use crate::snapshot::Snapshot;
 use crate::supervisor::Supervisor;
 
 /// How often [`Telemetry::run`] samples.
-pub const POLL: Duration = Duration::from_secs(5);
+pub const POLL: Duration = crate::diagnostics::SAMPLE_INTERVAL;
 
 /// How often to look for `nvidia-smi` again once it was found missing.
 pub const REPROBE_MISSING: Duration = Duration::from_secs(60);
@@ -158,17 +157,17 @@ pub fn push_history(buffer: &mut VecDeque<GpuHistoryPoint>, sample: &GpuTelemetr
     trim_history(buffer, now, |point| point.at);
 }
 
-/// Drop points older than [`HISTORY_SECONDS`], then the oldest over
-/// [`HISTORY_CAPACITY`]. Shared by the GPU and pipeline histories so the two
+/// Drop points older than [`HISTORY_WINDOW`], then the oldest over
+/// [`history_capacity`]. Shared by the GPU and pipeline histories so the two
 /// charts always cover the same window.
 fn trim_history<T>(buffer: &mut VecDeque<T>, now: u64, at: impl Fn(&T) -> u64) {
     while buffer
         .front()
-        .is_some_and(|point| now.saturating_sub(at(point)) > HISTORY_SECONDS)
+        .is_some_and(|point| now.saturating_sub(at(point)) > HISTORY_WINDOW.as_secs())
     {
         buffer.pop_front();
     }
-    while buffer.len() > HISTORY_CAPACITY {
+    while buffer.len() > history_capacity() {
         buffer.pop_front();
     }
 }
@@ -190,12 +189,6 @@ fn apply_history(
     gpu.history = buffer.iter().cloned().collect();
 }
 
-/// How old a slicer interval may get before the pipeline chart treats it as
-/// no data. The slicer reports every 10 s, so 25 s tolerates two late
-/// reports. A static source produces no intervals at all, and a flat line of
-/// the last values would read as a healthy pipeline.
-pub const STALE_SECONDS: u64 = 25;
-
 /// The slicer pipeline's history for the System tab's pipeline chart.
 ///
 /// Built from the interval the slicer already reports into the snapshot, so
@@ -212,9 +205,10 @@ pub struct PipelineTelemetry {
 
 /// One telemetry tick of the slicer pipeline.
 ///
-/// Slicer intervals are 10 s and ticks are 5 s, so most intervals appear on
-/// two points. Counters are therefore reported on the fresh point only, so a
-/// sum over the window is right.
+/// Slicer intervals and ticks share one length ([`crate::diagnostics`]), but
+/// they are not phase-locked, so a tick can see a new interval, the same one
+/// again, or (rarely) skip one. Counters are therefore reported on the fresh
+/// point only, so a sum over the window is right.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PipelinePoint {
@@ -264,7 +258,10 @@ fn output_rate(stats: &ProjectionStats, outputs: &[Output]) -> Option<f64> {
 ///
 /// `previous_measured_at` is the interval the previous tick saw. A missing or
 /// stale interval yields a point with no values rather than a repeat of old
-/// ones, so a quiet slicer reads as no data.
+/// ones, so a quiet slicer reads as no data. An interval older than
+/// [`stale_after`] (which tolerates two late reports) is no data: a static
+/// source produces no intervals at all, and a flat line of the last values
+/// would read as a healthy pipeline.
 pub fn pipeline_point(
     last: Option<&ProjectionStats>,
     previous_measured_at: Option<u64>,
@@ -288,7 +285,7 @@ pub fn pipeline_point(
         frames_superseded: 0,
     };
     let Some(stats) = last else { return empty };
-    if now.saturating_sub(stats.measured_at) > STALE_SECONDS {
+    if Duration::from_secs(now.saturating_sub(stats.measured_at)) > stale_after() {
         return empty;
     }
     let fresh = previous_measured_at != Some(stats.measured_at);
@@ -738,10 +735,10 @@ mod tests {
     #[test]
     fn history_is_capped_at_capacity() {
         let mut buffer = VecDeque::new();
-        for i in 0..=HISTORY_CAPACITY as u64 {
+        for i in 0..=history_capacity() as u64 {
             push_history(&mut buffer, &polled(0, 1), 1000 + i);
         }
-        assert_eq!(buffer.len(), HISTORY_CAPACITY);
+        assert_eq!(buffer.len(), history_capacity());
         assert_eq!(buffer.front().map(|p| p.at), Some(1001), "oldest dropped");
     }
 
@@ -749,11 +746,18 @@ mod tests {
     fn history_drops_points_older_than_the_window_even_under_capacity() {
         let mut buffer = VecDeque::new();
         push_history(&mut buffer, &polled(0, 1), 1000);
-        push_history(&mut buffer, &polled(0, 1), 1000 + HISTORY_SECONDS);
+        push_history(&mut buffer, &polled(0, 1), 1000 + HISTORY_WINDOW.as_secs());
         assert_eq!(buffer.len(), 2, "exactly at the window edge is kept");
-        push_history(&mut buffer, &polled(0, 1), 1001 + HISTORY_SECONDS);
-        assert_eq!(buffer.len(), 2, "the point 301 s old is gone");
-        assert_eq!(buffer.front().map(|p| p.at), Some(1000 + HISTORY_SECONDS));
+        push_history(&mut buffer, &polled(0, 1), 1001 + HISTORY_WINDOW.as_secs());
+        assert_eq!(
+            buffer.len(),
+            2,
+            "the point one second past the window is gone"
+        );
+        assert_eq!(
+            buffer.front().map(|p| p.at),
+            Some(1000 + HISTORY_WINDOW.as_secs())
+        );
     }
 
     #[test]
@@ -785,7 +789,7 @@ mod tests {
     fn stats(measured_at: u64) -> ProjectionStats {
         ProjectionStats {
             measured_at,
-            interval_seconds: 10.0,
+            interval_seconds: crate::diagnostics::SAMPLE_INTERVAL.as_secs_f64(),
             free_run: false,
             canvas_fps: 59.9,
             presented_fps: 30.0,
@@ -870,13 +874,23 @@ mod tests {
 
     #[test]
     fn a_stale_interval_is_no_data() {
-        let at_limit = pipeline_point(Some(&stats(1000)), Some(1000), &[], 1000 + STALE_SECONDS);
+        let at_limit = pipeline_point(
+            Some(&stats(1000)),
+            Some(1000),
+            &[],
+            1000 + stale_after().as_secs(),
+        );
         assert_eq!(
             at_limit.canvas_fps,
             Some(59.9),
-            "exactly 25 s is still data"
+            "exactly at the stale limit is still data"
         );
-        let stale = pipeline_point(Some(&stats(1000)), Some(990), &[], 1001 + STALE_SECONDS);
+        let stale = pipeline_point(
+            Some(&stats(1000)),
+            Some(990),
+            &[],
+            1001 + stale_after().as_secs(),
+        );
         assert!(!stale.fresh);
         assert_eq!(stale.measured_at, None);
         assert_eq!(stale.canvas_fps, None);
@@ -965,18 +979,24 @@ mod tests {
     #[test]
     fn pipeline_history_is_trimmed_by_age_and_capacity() {
         let mut buffer = VecDeque::new();
-        let newest = 1000 + HISTORY_CAPACITY as u64;
+        let newest = 1000 + history_capacity() as u64;
         for at in 1000..=newest {
             buffer.push_back(pipeline_point(None, None, &[], at));
         }
         trim_history(&mut buffer, newest, |point| point.at);
-        assert_eq!(buffer.len(), HISTORY_CAPACITY);
+        assert_eq!(buffer.len(), history_capacity());
         assert_eq!(buffer.front().map(|p| p.at), Some(1001), "oldest dropped");
 
-        trim_history(&mut buffer, newest + HISTORY_SECONDS, |point| point.at);
+        trim_history(&mut buffer, newest + HISTORY_WINDOW.as_secs(), |point| {
+            point.at
+        });
         assert_eq!(buffer.len(), 1, "only the newest is within the window");
         assert_eq!(buffer.front().map(|p| p.at), Some(newest));
-        trim_history(&mut buffer, newest + HISTORY_SECONDS + 1, |point| point.at);
+        trim_history(
+            &mut buffer,
+            newest + HISTORY_WINDOW.as_secs() + 1,
+            |point| point.at,
+        );
         assert!(buffer.is_empty(), "301 s old is gone");
     }
 }

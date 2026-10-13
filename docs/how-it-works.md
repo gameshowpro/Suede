@@ -540,7 +540,7 @@ together in that same single IPC message. The wall goes dark for the
 duration — there is no way to move every output to a new phase without
 letting each one restart its raster, and that means going through
 "nothing showing" — so run it between shows, not during one. The check
-itself only re-measures on the slicer's own ten-second interval, so the
+itself only re-measures once per slicer statistics interval, so the
 result shows up on the next report after the fix, not immediately.
 
 By default Suede does not wait for an operator: with

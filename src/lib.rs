@@ -12,6 +12,7 @@ pub mod capabilities;
 pub mod checks;
 pub mod config;
 pub mod devtools;
+pub mod diagnostics;
 pub mod drm_inventory;
 pub mod error;
 pub mod events;

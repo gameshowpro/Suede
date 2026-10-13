@@ -651,8 +651,9 @@ struct FrameStats {
 }
 
 impl FrameStats {
-    /// Long enough that the line is rare, short enough to watch a change land.
-    const INTERVAL: Duration = Duration::from_secs(10);
+    /// One diagnostics interval, so the telemetry tick and the slicer report
+    /// on the same beat.
+    const INTERVAL: Duration = crate::diagnostics::SAMPLE_INTERVAL;
 
     fn new() -> Self {
         Self {
@@ -1052,7 +1053,7 @@ impl Timing {
             if waiting {
                 if let Some(delta) = at_ns.and_then(|at| at.checked_sub(request_ns)) {
                     let samples = &mut self.latency_ms[index];
-                    // Covers a ten-second interval at high refresh rates without
+                    // Covers one statistics interval at high refresh rates without
                     // unbounded growth if feedback arrives faster than reporting.
                     if samples.len() < 4096 {
                         samples.push(delta as f64 / 1_000_000.0);
@@ -5446,7 +5447,7 @@ fn animated(pattern: TestPattern) -> bool {
 /// Everything that decides *when* a frame reaches an output is deliberately
 /// unchanged — the all-outputs gate, `free_run`, the buffer rotation,
 /// `wl_surface.frame`, `wp_presentation_feedback`, `snapshot_id`, the
-/// ten-second report and `GET /projection/stats` — because that machinery is
+/// periodic report and `GET /projection/stats` — because that machinery is
 /// exactly what this pattern exists to photograph. What is gone is the
 /// canvas: there is nothing to capture, so nothing stands in for the
 /// screencopy `Ready` that would otherwise mark a new frame's arrival.
