@@ -103,6 +103,7 @@ use ash::vk;
 
 pub mod display;
 mod meter;
+pub mod shared;
 
 const VERT_SPV: &[u8] = include_bytes!("shaders/blend.vert.spv");
 const FRAG_SPV: &[u8] = include_bytes!("shaders/blend.frag.spv");
@@ -169,6 +170,9 @@ impl DmabufImage {
 
 impl Drop for DmabufImage {
     fn drop(&mut self) {
+        if self.device.direct_failed.load(Ordering::Relaxed) {
+            return;
+        }
         // Safety: `view`, `image`, and `memory` were all created together in
         // `Gpu::create_image` and are exclusively owned by this struct —
         // nothing else ever stores a copy of these handles. `device` (an
@@ -191,6 +195,7 @@ impl Drop for DmabufImage {
 pub struct StaticCanvas {
     width: u32,
     height: u32,
+    format: vk::Format,
     image: vk::Image,
     memory: vk::DeviceMemory,
     view: vk::ImageView,
@@ -199,6 +204,9 @@ pub struct StaticCanvas {
 
 impl Drop for StaticCanvas {
     fn drop(&mut self) {
+        if self.device.direct_failed.load(Ordering::Relaxed) {
+            return;
+        }
         // Safety: these handles are exclusively owned by this canvas. Its
         // DeviceState Arc keeps the Vulkan device alive through teardown.
         unsafe {
@@ -261,6 +269,7 @@ enum Source<'a> {
 enum CanvasImage<'a> {
     Dmabuf(&'a DmabufImage),
     Static(&'a StaticCanvas),
+    Shared(&'a shared::SharedImage),
 }
 
 impl CanvasImage<'_> {
@@ -268,6 +277,7 @@ impl CanvasImage<'_> {
         match self {
             Self::Dmabuf(image) => image.image,
             Self::Static(image) => image.image,
+            Self::Shared(image) => image.image,
         }
     }
 
@@ -275,6 +285,7 @@ impl CanvasImage<'_> {
         match self {
             Self::Dmabuf(image) => image.view,
             Self::Static(image) => image.view,
+            Self::Shared(image) => image.view,
         }
     }
 
@@ -282,6 +293,7 @@ impl CanvasImage<'_> {
         match self {
             Self::Dmabuf(image) => image.height,
             Self::Static(image) => image.height,
+            Self::Shared(image) => image.description.height,
         }
     }
 
@@ -295,7 +307,7 @@ impl CanvasImage<'_> {
             // Static canvases are locally allocated optimal RGBA images;
             // upload_static_canvas_rgba verifies linear filtering before
             // creating one.
-            Self::Static(_) => true,
+            Self::Static(_) | Self::Shared(_) => true,
         }
     }
 
@@ -476,6 +488,7 @@ struct DeviceState {
     queue: vk::Queue,
     queue_family: u32,
     external_memory_fd: ash::khr::external_memory_fd::Device,
+    external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     calibrated_timestamps: bool,
     /// Prefer coherent CPU-mappable device-local storage and CPU table shadows.
     prefer_local_tables: bool,
@@ -1033,16 +1046,22 @@ impl Gpu {
             .iter()
             .map(|name| name.as_ptr())
             .collect();
-        // Optional timestamps must not make the ordinary compositor path
-        // dependent on the calibration extension's availability.
+        // Optional transport and timestamp extensions must not make the
+        // ordinary compositor path dependent on their availability.
         let extensions =
             unsafe { instance.enumerate_device_extension_properties(physical_device) }?;
-        let calibrated_timestamps = extensions.iter().any(|extension| unsafe {
-            CStr::from_ptr(extension.extension_name.as_ptr())
-                == ash::khr::calibrated_timestamps::NAME
-        });
+        let supports = |name: &CStr| {
+            extensions.iter().any(|extension| unsafe {
+                CStr::from_ptr(extension.extension_name.as_ptr()) == name
+            })
+        };
+        let semaphore_fd_supported = supports(ash::khr::external_semaphore_fd::NAME);
+        let calibrated_timestamps = supports(ash::khr::calibrated_timestamps::NAME);
         if calibrated_timestamps && direct_primary.is_none() {
             device_extensions.push(ash::khr::calibrated_timestamps::NAME.as_ptr());
+        }
+        if semaphore_fd_supported {
+            device_extensions.push(ash::khr::external_semaphore_fd::NAME.as_ptr());
         }
         if direct_primary.is_some() {
             device_extensions.extend(display::DEVICE_EXTENSIONS.iter().map(|name| name.as_ptr()));
@@ -1129,6 +1148,8 @@ impl Gpu {
         // a queue at index 0 (every queue family reports `queue_count >= 1`).
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let external_memory_fd = ash::khr::external_memory_fd::Device::new(instance, &device);
+        let external_semaphore_fd = semaphore_fd_supported
+            .then(|| ash::khr::external_semaphore_fd::Device::new(instance, &device));
         let drm_format_modifier =
             ash::ext::image_drm_format_modifier::Device::new(instance, &device);
 
@@ -1140,6 +1161,7 @@ impl Gpu {
             queue,
             queue_family,
             external_memory_fd,
+            external_semaphore_fd,
             calibrated_timestamps,
             prefer_local_tables: gpu_table_memory_from_env() == GpuTableMemory::Auto,
             drm_format_modifier,
@@ -1951,6 +1973,7 @@ impl Gpu {
         Ok(StaticCanvas {
             width,
             height,
+            format: vk::Format::R8G8B8A8_UNORM,
             image,
             memory,
             view,
@@ -3720,6 +3743,9 @@ impl Gpu {
     }
 
     fn wait_for_pending_work(&mut self) -> anyhow::Result<()> {
+        if self.device.direct_failed.load(Ordering::Relaxed) {
+            bail!("Vulkan completion unverified; device resources are quarantined");
+        }
         if !self.fence_in_flight {
             return Ok(());
         }
@@ -3765,6 +3791,13 @@ impl Gpu {
         wait_semaphores: &[vk::Semaphore],
         signal_semaphores: &[vk::Semaphore],
     ) -> anyhow::Result<Duration> {
+        let retained_shared_source = matches!(
+            &source,
+            Source::Canvas {
+                image: CanvasImage::Shared(_),
+                ..
+            }
+        );
         if jobs.is_empty() {
             return Ok(Duration::ZERO);
         }
@@ -4116,18 +4149,23 @@ impl Gpu {
         // no implicit fencing — see the module doc's measurements. Waiting
         // here is what makes it safe for the caller to commit right after
         // `blend()` returns.
-        unsafe {
+        let completed = unsafe {
             device.wait_for_fences(
                 &[self.fence],
                 true,
-                if self.device.direct_mode {
+                if self.device.direct_mode || retained_shared_source {
                     2_000_000_000
                 } else {
                     u64::MAX
                 },
             )
+        };
+        if completed.is_err() {
+            // Imported source and output images may outlive this call but
+            // drop before Gpu on an error path. Quarantine them immediately.
+            self.device.direct_failed.store(true, Ordering::Relaxed);
         }
-        .context("vkWaitForFences")?;
+        completed.context("vkWaitForFences")?;
         let wait_duration = wait_from.elapsed();
         self.fence_in_flight = false;
         if let Some(sample) = sample {
@@ -4145,7 +4183,7 @@ impl Drop for Gpu {
                 std::mem::forget(direct);
             }
             std::mem::forget(self.device.clone());
-            eprintln!("direct Vulkan completion unverified; retaining Vulkan and DRM resources");
+            eprintln!("Vulkan completion unverified; retaining Vulkan and DRM resources");
             return;
         }
         if let Some(mut direct) = self.direct.take() {

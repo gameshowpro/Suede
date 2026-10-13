@@ -1569,6 +1569,15 @@ struct State {
     requires_linear_sampling: bool,
     /// Immutable diagnostic sources; each output retains its connector labels.
     static_canvases: Vec<gpu::StaticCanvas>,
+    /// Set before warp initialization; imported formats must prove linear
+    /// sampling support before the shared loop can accept a frame.
+    shared_source: bool,
+    shared_pending_gpu: bool,
+    shared_pacing: bool,
+    shared_completed: Vec<Option<u64>>,
+    /// Owned cache of the experimental external Vulkan source.
+    shared_canvas: Option<gpu::StaticCanvas>,
+    shared_poll_fd: Option<std::os::fd::RawFd>,
     /// A failed draw keeps the retained source dirty and retries on a bounded timer.
     gpu_retry_after: Option<Instant>,
     adaptive: Option<LiftRuntime>,
@@ -2405,6 +2414,39 @@ pub fn run_with_presentation_until(
     direct: Option<&gpu::display::DirectDisplayConfig>,
     deadline: Option<Instant>,
 ) -> anyhow::Result<()> {
+    run_with_source_until(spec, direct, deadline, None)
+}
+
+/// Experimental source override. Presentation, transfer tables, warping, and
+/// projection statistics remain on the same Wayland GPU path.
+pub fn run_with_source_until(
+    spec: &SlicerSpec,
+    direct: Option<&gpu::display::DirectDisplayConfig>,
+    deadline: Option<Instant>,
+    shared_socket: Option<&std::path::Path>,
+) -> anyhow::Result<()> {
+    let explicit = shared_socket.map(|socket| super::shared_texture::SharedInputOptions {
+        socket: socket.to_owned(),
+        mode: super::shared_texture::SharedInputMode::Copy,
+        pacing: false,
+    });
+    run_with_shared_input_until(
+        spec,
+        direct,
+        deadline,
+        explicit.as_ref().or(spec.shared_input.as_ref()),
+    )
+}
+
+/// Shared Vulkan input can feed either existing output presenter. Explicit
+/// options override the managed specification; the owned-copy mode remains
+/// the default and retains the original shared-source behavior.
+pub fn run_with_shared_input_until(
+    spec: &SlicerSpec,
+    direct: Option<&gpu::display::DirectDisplayConfig>,
+    deadline: Option<Instant>,
+    shared_input: Option<&super::shared_texture::SharedInputOptions>,
+) -> anyhow::Result<()> {
     install_shutdown_signal_handler();
     let selection = std::env::var("SUEDE_TEST_OUTPUTS");
     let selected_spec = match selection {
@@ -2421,6 +2463,26 @@ pub fn run_with_presentation_until(
         Err(error) => return Err(anyhow::anyhow!("invalid SUEDE_TEST_OUTPUTS: {error}")),
     };
     let spec = selected_spec.as_ref().unwrap_or(spec);
+    let shared_input = shared_input.or(spec.shared_input.as_ref());
+    let shared_socket = shared_input.map(|input| input.socket.as_path());
+    if shared_socket.is_some() {
+        anyhow::ensure!(
+            spec.renderer != Renderer::Cpu,
+            "shared texture requires the GPU renderer"
+        );
+        anyhow::ensure!(
+            spec.pattern.is_none(),
+            "shared texture cannot be combined with a test pattern"
+        );
+        anyhow::ensure!(
+            spec.adaptive_lift.is_none(),
+            "shared texture does not yet support adaptive source measurement"
+        );
+        anyhow::ensure!(
+            spec.canvas_width > 0 && spec.canvas_height > 0,
+            "shared texture requires positive canvas dimensions"
+        );
+    }
     if direct.is_some() {
         anyhow::ensure!(
             spec.renderer != Renderer::Cpu,
@@ -2449,7 +2511,11 @@ pub fn run_with_presentation_until(
     let compositor: WlCompositor = globals.bind(&handle, 4..=4, ())?;
     let shm: WlShm = globals.bind(&handle, 1..=1, ())?;
     let layer_shell: ZwlrLayerShellV1 = globals.bind(&handle, 1..=4, ())?;
-    let screencopy: ZwlrScreencopyManagerV1 = globals.bind(&handle, 1..=3, ())?;
+    let screencopy: Option<ZwlrScreencopyManagerV1> = if shared_socket.is_some() {
+        None
+    } else {
+        Some(globals.bind(&handle, 1..=3, ())?)
+    };
     // Optional: without it, gating still works exactly the same way (it
     // never depended on presentation feedback), only `offset_ms` and the
     // per-output presented/discarded/refreshHz figures cannot be measured.
@@ -2494,6 +2560,12 @@ pub fn run_with_presentation_until(
         warp_available: false,
         requires_linear_sampling,
         static_canvases: Vec::new(),
+        shared_source: shared_socket.is_some(),
+        shared_pending_gpu: false,
+        shared_pacing: shared_input.is_some_and(|input| input.pacing),
+        shared_completed: vec![None; spec.slices.len()],
+        shared_canvas: None,
+        shared_poll_fd: None,
         gpu_retry_after: None,
         adaptive: None,
         capture_id: 0,
@@ -2523,12 +2595,16 @@ pub fn run_with_presentation_until(
             .find(|(_, n, ..)| n.as_deref() == Some(name))
             .map(|(o, ..)| o.clone())
     };
-    let source = find(&state, &spec.source)
-        .ok_or_else(|| anyhow::anyhow!("no output named {} to capture", spec.source))?;
+    let source = find(&state, &spec.source);
+    anyhow::ensure!(
+        shared_socket.is_some() || source.is_some(),
+        "no output named {} to capture",
+        spec.source
+    );
     if let Some(name) = state
         .outputs
         .iter()
-        .find(|(o, ..)| *o == source)
+        .find(|(o, ..)| shared_socket.is_none() && source.as_ref() == Some(o))
         .map(|(.., name)| *name)
     {
         state.used_outputs.push(name);
@@ -2541,7 +2617,7 @@ pub fn run_with_presentation_until(
     let canvas_refresh_mhz = state
         .outputs
         .iter()
-        .find(|(o, ..)| *o == source)
+        .find(|(o, ..)| source.as_ref() == Some(o))
         .and_then(|(_, _, refresh, _)| *refresh);
     state.canvas_period_ms = canvas_refresh_mhz
         .filter(|&mhz| mhz > 0)
@@ -2700,6 +2776,30 @@ pub fn run_with_presentation_until(
         presenter.transfer = transfer;
     }
 
+    if let Some(input) = shared_input {
+        anyhow::ensure!(
+            !input.pacing || state.direct || state.presentation.is_some(),
+            "shared pacing requires completed presentation feedback"
+        );
+        state.capture.backend = Some(Backend::Gpu);
+        anyhow::ensure!(
+            state.gpu.is_some(),
+            "shared texture requires Vulkan: {}",
+            state.gpu_error.as_deref().unwrap_or("GPU unavailable")
+        );
+        create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
+        initialize_warp_control(spec, &connection, &mut queue, &mut state)?;
+        return run_shared_source(
+            spec,
+            input,
+            &connection,
+            &mut queue,
+            &mut state,
+            &handle,
+            dmabuf.as_ref(),
+        );
+    }
+
     if let Some(pattern) = spec.pattern {
         state.capture.backend = Some(
             decide_sync_backend(&mut state, dmabuf.as_ref(), !animated(pattern)).inspect_err(
@@ -2783,6 +2883,8 @@ pub fn run_with_presentation_until(
     // wall that is only waiting on its own outputs — not on the canvas —
     // never waits for a capture that has not even been requested yet.
     let mut failures = 0u32;
+    let source = source.context("capture output disappeared")?;
+    let screencopy = screencopy.context("screencopy protocol unavailable")?;
 
     // Prime: one capture requested and handed a buffer to fill, and the
     // *next* one already requested so its buffer negotiation can run
@@ -3179,6 +3281,7 @@ fn initialize_warp_control(
             "selected CPU pipeline does not support geometric warp correction".into()
         }))
     } else if spec.pattern.is_none()
+        && !state.shared_source
         && state
             .capture
             .gpu_images
@@ -3449,6 +3552,10 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     let upload = Instant::now();
     let result = if !validated {
         Err(anyhow::anyhow!("output topology changed; restart required"))
+    } else if state.shared_source && prepared.spec.adaptive_lift.is_some() {
+        Err(anyhow::anyhow!(
+            "shared texture does not yet support adaptive source measurement"
+        ))
     } else if filtering_restart {
         Err(anyhow::anyhow!(
             "capture format/modifier does not support linear filtering required by the slice crop; restarting with CPU"
@@ -3569,6 +3676,317 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     );
     configure_adaptive(state, &prepared.spec, prepared.generation);
     Ok(())
+}
+
+/// Drive the external producer through the existing Wayland presenter.
+/// A local GPU cache is the only image sampled after a release packet.
+fn connect_shared_source(
+    path: &std::path::Path,
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+) -> anyhow::Result<Option<super::shared_texture::Receiver>> {
+    let until = Instant::now() + Duration::from_secs(60);
+    let mut announced = false;
+    loop {
+        if state.should_stop() {
+            return Ok(None);
+        }
+        match super::shared_texture::Receiver::connect(path) {
+            Ok(receiver) => return Ok(Some(receiver)),
+            Err(error) => {
+                let retry = error
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .and_then(std::io::Error::raw_os_error)
+                    .is_some_and(|errno| {
+                        matches!(errno, libc::ENOENT | libc::ECONNREFUSED | libc::EAGAIN)
+                    });
+                if !retry || Instant::now() >= until {
+                    return Err(error).context(
+                        "connecting shared producer (startup wait is bounded to 60 seconds)",
+                    );
+                }
+                if !announced {
+                    eprintln!(
+                        "slicer: waiting up to 60 seconds for shared producer {}",
+                        path.display()
+                    );
+                    announced = true;
+                }
+            }
+        }
+        apply_warp_updates(state)?;
+        dispatch_until(
+            connection,
+            queue,
+            state,
+            (Instant::now() + Duration::from_millis(100)).min(until),
+        )?;
+    }
+}
+
+/// Completion credit follows the same output policy as presentation: all
+/// active outputs in locked mode, the first active output in free-run mode.
+/// Discarded commits never earn a credit; timed-out outputs leave the gate.
+fn shared_frame_completed(state: &State, snapshot_id: u64) -> bool {
+    let mut active = 0;
+    let mut complete = 0;
+    for (index, presenter) in state.presenters.iter().enumerate() {
+        let expired = presenter.feedback_pending_for.is_some()
+            && presenter
+                .feedback_since
+                .is_some_and(|since| since.elapsed() >= STALL_TIMEOUT);
+        if presenter.stalled || expired {
+            continue;
+        }
+        active += 1;
+        if state
+            .shared_completed
+            .get(index)
+            .is_some_and(|value| value.is_some_and(|completed| completed >= snapshot_id))
+        {
+            complete += 1;
+        }
+    }
+    active > 0
+        && if state.free_run {
+            complete > 0
+        } else {
+            complete == active
+        }
+}
+
+fn run_shared_source(
+    spec: &SlicerSpec,
+    input: &super::shared_texture::SharedInputOptions,
+    connection: &Connection,
+    queue: &mut wayland_client::EventQueue<State>,
+    state: &mut State,
+    handle: &QueueHandle<State>,
+    dmabuf: Option<&ZwpLinuxDmabufV1>,
+) -> anyhow::Result<()> {
+    use super::shared_texture::{Packet, SharedInputMode, SLOT_COUNT};
+    let Some(mut receiver) = connect_shared_source(&input.socket, connection, queue, state)? else {
+        return state.finish();
+    };
+    state.shared_poll_fd = Some(receiver.fd());
+    let mut slots: [Option<gpu::shared::SharedImage>; SLOT_COUNT] = std::array::from_fn(|_| None);
+    // This token is dropped before slots on every error path, retiring any
+    // outstanding acquire/copy/release before image or semaphore teardown.
+    let mut source_flight: Option<gpu::shared::SharedCopy> = None;
+    let mut pending_frame: Option<(usize, u64)> = None;
+    let mut retained_frame: Option<(usize, u64)> = None;
+    let mut pacing_snapshot = None;
+    let mut initial_credit = false;
+    let mut outstanding_credit = false;
+    let mut source_format = None;
+    let mut since = Instant::now();
+    let mut frames = 0u64;
+    let mut sync_time = Duration::ZERO;
+    let mut transport_time = Duration::ZERO;
+    eprintln!("slicer: shared texture input {}, mode {:?}, pacing {}, presentation {} (no CPU pixel readback)",
+        input.socket.display(), input.mode, input.pacing, if state.direct { "direct Vulkan" } else { "Wayland" });
+    loop {
+        dispatch_until(connection, queue, state, Instant::now())?;
+        if state.should_stop() {
+            if let Some(mut flight) = source_flight.take() {
+                state
+                    .gpu
+                    .as_mut()
+                    .context("shared GPU unavailable")?
+                    .finish_shared_copy(&mut flight)?;
+                if input.mode == SharedInputMode::Retain {
+                    retained_frame = pending_frame.take();
+                }
+            }
+            if let Some((slot, sequence)) = retained_frame.take() {
+                let image = slots[slot]
+                    .as_ref()
+                    .context("retained shared slot unavailable")?;
+                source_flight = Some(
+                    state
+                        .gpu
+                        .as_mut()
+                        .context("shared GPU unavailable")?
+                        .submit_shared_switch(Some(image), None)?,
+                );
+                receiver.release(slot, sequence)?;
+                state
+                    .gpu
+                    .as_mut()
+                    .unwrap()
+                    .finish_shared_copy(source_flight.as_mut().unwrap())?;
+                source_flight.take();
+            }
+            state.shared_pending_gpu = false;
+            state.shared_poll_fd = None;
+            return state.finish();
+        }
+        receiver.check_connection()?;
+        if let Some(flight) = source_flight.as_mut() {
+            if let Some(elapsed) = state
+                .gpu
+                .as_mut()
+                .context("shared GPU unavailable")?
+                .poll_shared_copy(flight)?
+            {
+                source_flight.take();
+                state.shared_pending_gpu = false;
+                sync_time += elapsed;
+                let frame = pending_frame
+                    .take()
+                    .context("completed shared submission has no frame")?;
+                if input.mode == SharedInputMode::Retain {
+                    retained_frame = Some(frame);
+                }
+                state.capture.first_copy_done = true;
+                record_capture_interval(state);
+                state.stats.captured += 1;
+                state.capture_id += 1;
+                state.new_snapshot();
+                if input.pacing {
+                    pacing_snapshot = Some(state.timing.snapshot_id);
+                }
+                frames += 1;
+            }
+        }
+        if let Some(snapshot) =
+            pacing_snapshot.filter(|&snapshot| shared_frame_completed(state, snapshot))
+        {
+            receiver.grant_credit()?;
+            outstanding_credit = true;
+            pacing_snapshot = None;
+            let _ = snapshot;
+        }
+        if source_flight.is_none() {
+            apply_warp_updates(state)?;
+            if !state.direct {
+                let dmabuf = dmabuf.context("shared texture: dmabuf unavailable")?;
+                for index in 0..state.presenters.len() {
+                    ensure_gpu_present_buffers(state, dmabuf, handle, index);
+                }
+            }
+            if state.capture.first_copy_done && state.can_present() {
+                let started = Instant::now();
+                let before = state.stats.presented;
+                let retained = retained_frame.and_then(|(slot, _)| slots[slot].as_ref());
+                if state.direct {
+                    present_frame_direct_source(state, None, retained)?;
+                } else if let Some(image) = retained {
+                    present_retained_gpu(state, handle, image);
+                } else {
+                    present_frame_gpu(state, handle);
+                }
+                state.stats.blending += started.elapsed();
+                if state.stats.presented > before {
+                    state.note_commit_cycle(false);
+                }
+            } else if state.capture.first_copy_done && state.presenters.iter().any(|p| p.stale) {
+                state.note_gate_blocked();
+            }
+            // Drain descriptors, but accept at most one frame per event pass.
+            for _ in 0..SLOT_COUNT {
+                let receive_started = Instant::now();
+                let packet = receiver.receive()?;
+                transport_time += receive_started.elapsed();
+                let Some(packet) = packet else {
+                    break;
+                };
+                match packet {
+                    Packet::Slot(description, fds) => {
+                        anyhow::ensure!(
+                            description.width == spec.canvas_width as u32
+                                && description.height == spec.canvas_height as u32,
+                            "shared texture: producer dimensions {}x{} do not match canvas {}x{}",
+                            description.width,
+                            description.height,
+                            spec.canvas_width,
+                            spec.canvas_height
+                        );
+                        anyhow::ensure!(
+                            source_format.is_none_or(|format| format == description.format),
+                            "shared texture: pool slots have different formats"
+                        );
+                        source_format = Some(description.format);
+                        let index = description.slot;
+                        let started = Instant::now();
+                        slots[index] = Some(
+                            state
+                                .gpu
+                                .as_ref()
+                                .context("shared GPU unavailable")?
+                                .import_shared_image(description, fds)?,
+                        );
+                        eprintln!(
+                            "slicer: shared slot {index} imported in {:.3} ms",
+                            started.elapsed().as_secs_f64() * 1000.0
+                        );
+                        if input.pacing && !initial_credit && slots.iter().all(Option::is_some) {
+                            receiver.grant_credit()?;
+                            initial_credit = true;
+                            outstanding_credit = true;
+                        }
+                    }
+                    Packet::Frame { slot, sequence } => {
+                        anyhow::ensure!(!input.pacing || outstanding_credit,
+                            "shared texture: producer sent a frame without a pacing credit; producer and consumer pacing must match");
+                        outstanding_credit = false;
+                        let source = slots[slot]
+                            .as_ref()
+                            .context("shared texture: unregistered frame slot")?;
+                        let gpu = state.gpu.as_mut().context("shared GPU unavailable")?;
+                        let started = Instant::now();
+                        pending_frame = Some((slot, sequence));
+                        if input.mode == SharedInputMode::Copy {
+                            if state.shared_canvas.is_none() {
+                                state.shared_canvas = Some(gpu.create_shared_cache(source)?);
+                            }
+                            source_flight = Some(gpu.submit_shared_frame(
+                                source,
+                                state.shared_canvas.as_ref().unwrap(),
+                                !state.capture.first_copy_done,
+                            )?);
+                            receiver.release(slot, sequence)?;
+                        } else {
+                            let previous =
+                                retained_frame.and_then(|(slot, _)| slots[slot].as_ref());
+                            source_flight = Some(gpu.submit_shared_switch(previous, Some(source))?);
+                            if let Some((old_slot, old_sequence)) = retained_frame {
+                                receiver.release(old_slot, old_sequence)?;
+                            }
+                        }
+                        state.stats.snapshot += started.elapsed();
+                        state.shared_pending_gpu = true;
+                        break;
+                    }
+                }
+            }
+        }
+        state.report_stats_if_due();
+        if since.elapsed() >= Duration::from_secs(10) && frames > 0 {
+            eprintln!("slicer: shared texture {:.1} fps received, mode {:?}, asynchronous source+sync latency {:.3} ms/frame, socket {:.3} ms/frame, pacing {}",
+                frames as f64 / since.elapsed().as_secs_f64(), input.mode,
+                sync_time.as_secs_f64() * 1000.0 / frames as f64,
+                transport_time.as_secs_f64() * 1000.0 / frames as f64, input.pacing);
+            since = Instant::now();
+            frames = 0;
+            sync_time = Duration::ZERO;
+            transport_time = Duration::ZERO;
+        }
+        state.shared_pending_gpu = source_flight.is_some();
+        state.shared_poll_fd = source_flight.is_none().then_some(receiver.fd());
+        let wait = if source_flight.is_some() {
+            Duration::from_millis(2)
+        } else if pacing_snapshot.is_some() {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_secs(1)
+        };
+        let waiting_started = Instant::now();
+        dispatch_until(connection, queue, state, Instant::now() + wait)?;
+        state.stats.waiting += waiting_started.elapsed();
+    }
 }
 
 /// Ask the compositor for the canvas's next damaged frame.
@@ -4507,6 +4925,14 @@ fn present_frame(state: &mut State, handle: &QueueHandle<State>) {
 /// display swapchains. The same transfer tables and warp revisions used by
 /// the Wayland GPU path are installed on `Gpu`; only the final target differs.
 fn present_frame_direct(state: &mut State, capture_slot: Option<usize>) -> anyhow::Result<()> {
+    present_frame_direct_source(state, capture_slot, None)
+}
+
+fn present_frame_direct_source(
+    state: &mut State,
+    capture_slot: Option<usize>,
+    retained: Option<&gpu::shared::SharedImage>,
+) -> anyhow::Result<()> {
     let signal = state.gate_signal();
     let due: Vec<usize> = state
         .presenters
@@ -4536,7 +4962,27 @@ fn present_frame_direct(state: &mut State, capture_slot: Option<usize>) -> anyho
         gpu.set_dynamic_lift(runtime.controller.level(), runtime.maximum)?;
     }
     let snapshot_id = state.timing.snapshot_id;
-    if state.static_canvases.is_empty() {
+    if let Some(canvas) = retained {
+        let frame = gpu
+            .blend_shared_direct(canvas, &jobs)
+            .context("direct retained shared blend failed")?;
+        state.stats.gpu += frame.gpu_wait;
+        for &index in &due {
+            state.timing.request(snapshot_id, index);
+        }
+        gpu.present_direct(frame, snapshot_id)
+            .context("direct retained shared present failed")?;
+    } else if let Some(canvas) = state.shared_canvas.as_ref() {
+        let frame = gpu
+            .blend_static_direct(canvas, &jobs)
+            .context("direct shared-cache blend failed")?;
+        state.stats.gpu += frame.gpu_wait;
+        for &index in &due {
+            state.timing.request(snapshot_id, index);
+        }
+        gpu.present_direct(frame, snapshot_id)
+            .context("direct shared-cache present failed")?;
+    } else if state.static_canvases.is_empty() {
         let slot = capture_slot
             .or(state.capture.last_blended_slot)
             .context("direct presentation has no completed capture")?;
@@ -4658,6 +5104,9 @@ fn complete_direct_presentation(
         (1_000_000_000_000u64 / u64::from(refresh_millihz.max(1))) as u32,
         false,
     );
+    if let Some(completed) = state.shared_completed.get_mut(index) {
+        *completed = Some(completed.map_or(snapshot_id, |previous| previous.max(snapshot_id)));
+    }
     if let Some(revision) = p
         .direct_pending_warp
         .remove(&snapshot_id)
@@ -4692,7 +5141,9 @@ fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
         .pending_slot
         .take()
         .or(state.capture.last_blended_slot)
-        .or_else(|| (!state.static_canvases.is_empty()).then_some(0));
+        .or_else(|| {
+            (!state.static_canvases.is_empty() || state.shared_canvas.is_some()).then_some(0)
+        });
     let Some(slot) = slot else {
         // Nothing has been captured yet this run: clear `stale` the same way
         // `gpu_blend_due` would, so a presenter that somehow raced ahead of
@@ -4725,6 +5176,25 @@ fn present_frame_gpu(state: &mut State, handle: &QueueHandle<State>) {
 /// `can_present`), so a configured presenter that was not due simply had
 /// nothing new to show and is not owed a re-blend later.
 fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
+    gpu_blend_due_source(state, capture_slot, None)
+}
+
+fn present_retained_gpu(
+    state: &mut State,
+    handle: &QueueHandle<State>,
+    retained: &gpu::shared::SharedImage,
+) {
+    let due = gpu_blend_due_source(state, 0, Some(retained));
+    if !due.is_empty() {
+        gpu_present_due(state, handle, &due);
+    }
+}
+
+fn gpu_blend_due_source(
+    state: &mut State,
+    capture_slot: usize,
+    retained: Option<&gpu::shared::SharedImage>,
+) -> Vec<Due> {
     if let (Some(runtime), Some(gpu)) = (&state.adaptive, &mut state.gpu) {
         // Validated configured coverage and controller bounds make this
         // update infallible. One value is shared by every job in this draw.
@@ -4742,10 +5212,15 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
         gpu,
         gpu_retry_after,
         static_canvases,
+        shared_canvas,
         ..
     } = state;
     let canvas_image = capture.gpu_images.get(capture_slot).map(|(image, _)| image);
-    if canvas_image.is_none() && static_canvases.is_empty() {
+    if canvas_image.is_none()
+        && static_canvases.is_empty()
+        && shared_canvas.is_none()
+        && retained.is_none()
+    {
         for presenter in presenters.iter_mut() {
             presenter.stale = false;
         }
@@ -4801,7 +5276,11 @@ fn gpu_blend_due(state: &mut State, capture_slot: usize) -> Vec<Due> {
     let gpu = gpu
         .as_mut()
         .expect("Backend::Gpu implies state.gpu is Some");
-    let result = if static_canvases.is_empty() {
+    let result = if let Some(canvas) = retained {
+        gpu.blend_shared(canvas, &jobs)
+    } else if let Some(canvas) = shared_canvas.as_ref() {
+        gpu.blend_static(canvas, &jobs)
+    } else if static_canvases.is_empty() {
         gpu.blend(canvas_image.unwrap(), y_invert, &jobs)
     } else {
         jobs.iter().try_fold(Duration::ZERO, |total, job| {
@@ -5739,7 +6218,19 @@ fn dispatch_until_with_feedback(
             revents: 0,
         },
         libc::pollfd {
-            fd: state.warp_updates.as_ref().map_or(-1, |c| c.fd()),
+            // A completed control build cannot be installed while the shared
+            // copy owns the command buffer. Its notification stays queued
+            // until the copy completes, rather than waking every fence poll.
+            fd: if state.shared_pending_gpu {
+                -1
+            } else {
+                state.warp_updates.as_ref().map_or(-1, |c| c.fd())
+            },
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: state.shared_poll_fd.unwrap_or(-1),
             events: libc::POLLIN,
             revents: 0,
         },
@@ -6500,11 +6991,20 @@ impl Dispatch<WpPresentationFeedback, (usize, u64, u64)> for State {
                         }
                     }
                 }
+                if let Some(completed) = state.shared_completed.get_mut(index) {
+                    *completed =
+                        Some(completed.map_or(snapshot_id, |previous| previous.max(snapshot_id)));
+                }
                 state
                     .timing
                     .presented_optional(snapshot_id, index, at_ns, refresh, zero_copy);
             }
             wp_presentation_feedback::Event::Discarded => {
+                if state.shared_pacing && snapshot_id == state.timing.snapshot_id {
+                    if let Some(presenter) = state.presenters.get_mut(index) {
+                        presenter.stale = true;
+                    }
+                }
                 state.timing.discarded(snapshot_id, index);
             }
             // `sync_output`, sent only ahead of `Presented`, is not needed:
@@ -7395,6 +7895,12 @@ mod tests {
             warp_available: false,
             requires_linear_sampling: false,
             static_canvases: Vec::new(),
+            shared_source: false,
+            shared_pending_gpu: false,
+            shared_pacing: false,
+            shared_completed: Vec::new(),
+            shared_canvas: None,
+            shared_poll_fd: None,
             gpu_retry_after: None,
             adaptive: None,
             capture_id: 0,
@@ -8828,6 +9334,56 @@ mod tests {
     }
 
     #[test]
+    fn shared_pacing_requires_current_completed_outputs_and_respects_free_run_and_stalls() {
+        let (_connection, _server, mut state) = lifecycle_state();
+        state.direct = true;
+        state.shared_source = true;
+        state.shared_pacing = true;
+        state.shared_completed = vec![None; 2];
+        state.timing = Timing::new(2);
+        for index in 0..2 {
+            state.timing.request(3, index);
+            state.presenters[index].commit_sent(3, true);
+        }
+        assert!(
+            !shared_frame_completed(&state, 3),
+            "submission cannot earn a credit"
+        );
+        complete_direct_presentation(&mut state, 0, "OUT-0", 2, None, 60_000).unwrap();
+        assert!(
+            !shared_frame_completed(&state, 3),
+            "older completion cannot credit a new source"
+        );
+        complete_direct_presentation(&mut state, 0, "OUT-0", 3, None, 60_000).unwrap();
+        assert!(
+            !shared_frame_completed(&state, 3),
+            "locked mode waits for the second output"
+        );
+        state.free_run = true;
+        assert!(shared_frame_completed(&state, 3));
+        state.free_run = false;
+        complete_direct_presentation(&mut state, 1, "OUT-1", 3, None, 60_000).unwrap();
+        assert!(shared_frame_completed(&state, 3));
+        for index in 0..2 {
+            state.timing.request(4, index);
+            state.presenters[index].commit_sent(4, true);
+        }
+        assert!(!shared_frame_completed(&state, 4));
+        complete_direct_presentation(&mut state, 0, "OUT-0", 4, None, 60_000).unwrap();
+        state.presenters[1].feedback_since =
+            Some(Instant::now() - STALL_TIMEOUT - Duration::from_millis(1));
+        assert!(
+            shared_frame_completed(&state, 4),
+            "an expired output must not freeze producer pacing"
+        );
+        state.presenters[0].stalled = true;
+        assert!(
+            !shared_frame_completed(&state, 4),
+            "no active outputs cannot grant credits"
+        );
+    }
+
+    #[test]
     fn direct_completion_during_dispatch_wakes_the_waiting_canvas_frame() {
         let (connection, _server, mut state) = lifecycle_state();
         state.direct = true;
@@ -9154,6 +9710,7 @@ mod reconstruction {
             .expect("a shared canvas with identity corners and a valid layout plans");
         let projection = desired.projection.as_ref().unwrap();
         super::SlicerSpec {
+            shared_input: None,
             control_session: String::new(),
             source: "canvas".to_string(),
             canvas_width: plan.canvas_width,

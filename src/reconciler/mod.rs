@@ -283,6 +283,44 @@ impl Reconciler {
         self.blend.lock().await.shutdown();
     }
 
+    /// A shared producer accepts one receiver for its lifetime. An explicit
+    /// restart must replace both endpoints before the producer launches again.
+    pub async fn restart_app(&self, id: &str) -> bool {
+        {
+            let _guard = self.pass.lock().await;
+            let desired = self.store.effective();
+            let shared_active = desired.active_app.as_deref() == Some(id)
+                && desired
+                    .apps
+                    .iter()
+                    .any(|app| app.id == id && app.shared_input.is_some());
+            if !shared_active {
+                return self.supervisor.restart(id).await;
+            }
+            if self.supervisor.status(id).await.is_none() {
+                return false;
+            }
+            #[cfg(feature = "projection")]
+            let stop_notice = self.blend.lock().await.shared_slicer_stop_notice();
+            self.supervisor
+                .prepare_shared_receiver_because(
+                    id,
+                    crate::model::RestartReason::ApiRequest,
+                    || {
+                        #[cfg(feature = "projection")]
+                        if let Some(notice) = &stop_notice {
+                            notice.producer_stopping();
+                        }
+                    },
+                )
+                .await;
+            #[cfg(feature = "projection")]
+            self.blend.lock().await.restart_slicer();
+        }
+        self.reconcile().await;
+        true
+    }
+
     /// The running slicer's process id, for tests that need to tell whether
     /// a pass restarted it — see `BlendManager::slicer_pid`.
     #[cfg(all(test, feature = "projection"))]
@@ -366,9 +404,13 @@ impl Reconciler {
     /// Run one full reconciliation pass and return the resulting status.
     pub async fn reconcile(&self) -> Status {
         let _guard = self.pass.lock().await;
+        let mut shared_producer_retired = false;
         let mut topology_changed = false;
         loop {
-            if let Some(status) = self.reconcile_once(&mut topology_changed).await {
+            if let Some(status) = self
+                .reconcile_once(&mut shared_producer_retired, &mut topology_changed)
+                .await
+            {
                 return status;
             }
             tracing::debug!(
@@ -377,7 +419,11 @@ impl Reconciler {
         }
     }
 
-    async fn reconcile_once(&self, topology_changed: &mut bool) -> Option<Status> {
+    async fn reconcile_once(
+        &self,
+        shared_producer_retired: &mut bool,
+        topology_changed: &mut bool,
+    ) -> Option<Status> {
         // The effective document: a live preview when one is being tried out
         // in the UI, otherwise the persisted state.
         // Keep the document and working-copy identity from one StateStore
@@ -407,6 +453,23 @@ impl Reconciler {
             // best one available while `state` reads `reconciling`.
             active_app: previous.active_app,
         });
+
+        // Keep the image receiver alive until the old producer has flushed
+        // and exited. Projection and output changes below may close it.
+        #[cfg(feature = "projection")]
+        let stop_notice = self.blend.lock().await.shared_slicer_stop_notice();
+        *shared_producer_retired |= self
+            .supervisor
+            .retire_shared_producers_before(&Self::effective_apps(&desired, None), || {
+                #[cfg(feature = "projection")]
+                if let Some(notice) = &stop_notice {
+                    notice.producer_stopping();
+                }
+            })
+            .await;
+        if self.store.generation() != config_generation {
+            return None;
+        }
 
         self.refresh_outputs().await;
 
@@ -473,6 +536,22 @@ impl Reconciler {
             )
         };
         divergences.extend(output_plan.divergences.iter().cloned());
+
+        if output_plan.topology_changed {
+            if let Some(id) = desired.active_app.as_deref() {
+                #[cfg(feature = "projection")]
+                let stop_notice = self.blend.lock().await.shared_slicer_stop_notice();
+                *shared_producer_retired |= self
+                    .supervisor
+                    .prepare_shared_receiver_before(id, || {
+                        #[cfg(feature = "projection")]
+                        if let Some(notice) = &stop_notice {
+                            notice.producer_stopping();
+                        }
+                    })
+                    .await;
+            }
+        }
         if self.store.generation() != config_generation {
             return None;
         }
@@ -538,13 +617,20 @@ impl Reconciler {
             return None;
         }
         let (canvas_output, projection_divergences) = self
-            .sync_projection(&desired, config_generation, canvas_plan, *topology_changed)
+            .sync_projection(
+                &desired,
+                config_generation,
+                canvas_plan,
+                *topology_changed,
+                *shared_producer_retired,
+            )
             .await;
+        *shared_producer_retired = false;
         *topology_changed = false;
         divergences.extend(projection_divergences);
 
-        // Awaited compositor work may outlast an activation change.
-        // Never launch an app from the superseded snapshot in that case.
+        // Awaited output/receiver shutdown may outlast an activation change.
+        // Never relaunch an app from the superseded snapshot in that case.
         if self.store.generation() != config_generation {
             return None;
         }
@@ -714,6 +800,7 @@ impl Reconciler {
         config_generation: u64,
         plan: Option<crate::projection::CanvasPlan>,
         restart_slicer: bool,
+        shared_producer_retired: bool,
     ) -> (Option<String>, Vec<Divergence>) {
         use crate::checks::is_synthetic_output;
         use crate::projection::{overlay_specs, Participant, SlicerSpec};
@@ -852,6 +939,12 @@ impl Reconciler {
                     // they left.
                     if (anything_to_show || idle_direct) && !plan.slices.is_empty() {
                         slicer = Some(SlicerSpec {
+                            shared_input: desired
+                                .active_app
+                                .as_deref()
+                                .and_then(|id| desired.app(id))
+                                .and_then(|app| app.shared_input.clone())
+                                .filter(|_| projection.test_pattern.is_none()),
                             layout: plan.layout,
                             coverage_rects: plan.coverage_rects,
                             control_session: String::new(),
@@ -968,8 +1061,35 @@ impl Reconciler {
                 direct = None;
             }
         }
+        if shared_producer_retired {
+            manager.restart_slicer();
+        }
         divergences.extend(manager.sync(&overlay));
-        if restart_slicer {
+        if self.direct_session.is_none()
+            && slicer
+                .as_ref()
+                .is_some_and(|spec| spec.shared_input.is_some())
+        {
+            manager.reap_exited_slicer();
+        }
+        // Protocol v1 accepts one receiver per producer lifetime. A geometry
+        // topology or source-policy replacement must retire both endpoints;
+        // starting a receiver against the old listener races producer exit.
+        if let Some(spec) = slicer.as_ref().filter(|spec| spec.shared_input.is_some()) {
+            if restart_slicer || manager.needs_slicer_replacement(spec, direct.as_ref()) {
+                if let Some(id) = desired.active_app.as_deref() {
+                    let stop_notice = manager.shared_slicer_stop_notice();
+                    self.supervisor
+                        .prepare_shared_receiver_before(id, || {
+                            if let Some(notice) = &stop_notice {
+                                notice.producer_stopping();
+                            }
+                        })
+                        .await;
+                }
+                manager.restart_slicer();
+            }
+        } else if restart_slicer {
             manager.restart_slicer();
         }
         divergences.extend(manager.sync_slicer_presenting(
@@ -996,6 +1116,7 @@ impl Reconciler {
         _config_generation: u64,
         _plan: Option<()>,
         _restart_slicer: bool,
+        _shared_producer_retired: bool,
     ) -> (Option<String>, Vec<Divergence>) {
         // No slicer ever runs in this build, so there is exactly one
         // liveness fact to publish, once.
@@ -1244,6 +1365,12 @@ impl Reconciler {
             .map(|mut app| {
                 app.enabled = desired.active_app.as_deref() == Some(app.id.as_str());
                 app.fullscreen = true;
+                if app.shared_input.is_some() {
+                    app.output = None;
+                    app.fullscreen = false;
+                    app.span_outputs = false;
+                    return app;
+                }
                 match canvas_output {
                     // Canvas mode: fill the headless canvas; the slicer takes
                     // it to the projectors.
@@ -2341,6 +2468,7 @@ mod tests {
 
     fn app(id: &str, output: Option<&str>, audio: Option<AudioConfig>) -> AppConfig {
         AppConfig {
+            shared_input: None,
             id: id.into(),
             enabled: true,
             launcher: Launcher::Exec {
@@ -2357,6 +2485,24 @@ mod tests {
             restart: RestartPolicy::default(),
             persist_profile: false,
         }
+    }
+
+    #[test]
+    fn shared_app_has_no_window_target() {
+        let mut desired = crate::model::DesiredState::new();
+        let mut source = app("offscreen", None, None);
+        source.shared_input = Some(crate::model::SharedInputOptions {
+            socket: "/tmp/offscreen.sock".into(),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        desired.apps.push(source);
+        desired.active_app = Some("offscreen".into());
+        let effective = Reconciler::effective_apps(&desired, Some("HEADLESS-1"));
+        assert!(effective[0].enabled);
+        assert!(!effective[0].expects_window());
+        assert!(effective[0].output.is_none());
+        assert!(!effective[0].span_outputs);
     }
 
     /// Observe the first compositor read without changing production clients.
@@ -2407,6 +2553,99 @@ mod tests {
             docs_base_url: "https://suede.gameshow.pro/".into(),
             allow_overlaps: false,
         }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_deactivation_flushes_producer_before_touching_outputs() {
+        let mut harness = harness();
+        let ready = harness._dir.path().join("producer-ready");
+        let flushed = harness._dir.path().join("producer-flushed");
+        let mut source = app("shared", None, None);
+        source.shared_input = Some(crate::model::SharedInputOptions {
+            socket: harness._dir.path().join("source.sock"),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        source.launcher = Launcher::Exec {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "trap 'echo flushed > \"$FLUSHED\"; exit 0' TERM; echo ready > \"$READY\"; while :; do sleep 0.02; done".into(),
+            ],
+        };
+        source
+            .env
+            .insert("READY".into(), ready.display().to_string());
+        source
+            .env
+            .insert("FLUSHED".into(), flushed.display().to_string());
+        harness.supervisor.reconcile(&[source.clone()], &[]).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(source);
+                state.active_app = None;
+            })
+            .unwrap();
+        let observed = flushed.clone();
+        hook_outputs(&mut harness, move || {
+            assert!(
+                observed.exists(),
+                "producer must finish before output/projection changes"
+            );
+        });
+        harness.reconciler.reconcile().await;
+        harness.supervisor.tick(&[]).await;
+        assert!(harness
+            .supervisor
+            .status("shared")
+            .await
+            .unwrap()
+            .pid
+            .is_none());
+        assert_eq!(std::fs::read_to_string(flushed).unwrap().trim(), "flushed");
+        harness.supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shared_deactivation_during_a_pass_prevents_a_stale_launch() {
+        let mut harness = harness();
+        let mut source = app("shared", None, None);
+        source.shared_input = Some(crate::model::SharedInputOptions {
+            socket: harness._dir.path().join("source.sock"),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(source);
+                state.active_app = Some("shared".into());
+            })
+            .unwrap();
+        let store = harness.store.clone();
+        hook_outputs(&mut harness, move || {
+            store.update(|state| state.active_app = None).unwrap();
+        });
+        let status = harness.reconciler.reconcile().await;
+        assert!(status.active_app.is_none());
+        assert_eq!(status.revision, harness.store.revision());
+        assert!(harness
+            .supervisor
+            .status("shared")
+            .await
+            .unwrap()
+            .pid
+            .is_none());
+        harness.supervisor.shutdown().await;
     }
 
     #[tokio::test]
@@ -3139,6 +3378,48 @@ mod tests {
         assert!(harness.reconciler.slicer_pid().await.is_none());
         assert!(harness.reconciler.slicer_direct().await.is_none());
         harness.supervisor.shutdown().await;
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn restarting_an_active_shared_app_replaces_both_endpoints() {
+        let (harness, _) = direct_harness(crate::drm_inventory::test_support::wall(&["DP-1"]));
+        let mut source = app("shared", None, None);
+        source.shared_input = Some(crate::model::SharedInputOptions {
+            socket: harness._dir.path().join("source.sock"),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        harness
+            .store
+            .update(|state| {
+                state.outputs.push(direct_output("DP-1", 0, 60.0));
+                state.apps.push(source);
+                state.active_app = Some("shared".into());
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        let before_producer = harness
+            .supervisor
+            .status("shared")
+            .await
+            .unwrap()
+            .pid
+            .unwrap();
+        let before_receiver = harness.reconciler.slicer_pid().await.unwrap();
+        assert!(harness.reconciler.restart_app("shared").await);
+        let after = harness.supervisor.status("shared").await.unwrap();
+        assert_ne!(after.pid.unwrap(), before_producer);
+        assert_eq!(
+            after.last_restart_reason,
+            Some(crate::model::RestartReason::ApiRequest)
+        );
+        assert_ne!(
+            harness.reconciler.slicer_pid().await.unwrap(),
+            before_receiver
+        );
+        harness.supervisor.shutdown().await;
+        harness.reconciler.shutdown().await;
     }
 
     #[cfg(feature = "projection")]

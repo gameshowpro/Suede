@@ -79,6 +79,8 @@ pub mod manager;
 pub mod overlay;
 pub mod pattern;
 #[cfg(unix)]
+pub mod shared_texture;
+#[cfg(unix)]
 pub mod slicer;
 pub use crate::warp_math as warp;
 pub mod layout;

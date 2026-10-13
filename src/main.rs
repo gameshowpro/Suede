@@ -91,6 +91,18 @@ struct BlendArgs {
 #[cfg(all(feature = "projection", unix))]
 #[derive(Args)]
 struct SliceArgs {
+    /// Experimental external Vulkan image source (Unix SOCK_SEQPACKET).
+    #[arg(long, value_name = "PATH")]
+    shared_socket: Option<PathBuf>,
+
+    /// Copy imported images or retain and sample them directly.
+    #[arg(long, value_enum, default_value = "copy", requires = "shared_socket")]
+    shared_mode: suede::model::SharedInputMode,
+
+    /// Pace the producer using presentation feedback (requires producer opt-in).
+    #[arg(long, requires = "shared_socket")]
+    shared_pacing: bool,
+
     /// The overlay specification, as serialized by the daemon.
     #[arg(long, value_name = "JSON")]
     spec: String,
@@ -212,10 +224,18 @@ fn main() -> std::process::ExitCode {
             let deadline = args
                 .run_for_seconds
                 .map(|seconds| std::time::Instant::now() + std::time::Duration::from_secs(seconds));
-            let result = suede::projection::slicer::run_with_presentation_until(
+            let shared = args
+                .shared_socket
+                .map(|socket| suede::model::SharedInputOptions {
+                    socket,
+                    mode: args.shared_mode,
+                    pacing: args.shared_pacing,
+                });
+            let result = suede::projection::slicer::run_with_shared_input_until(
                 &spec,
                 presentation_config.as_ref(),
                 deadline,
+                shared.as_ref(),
             );
             match result {
                 Ok(()) => std::process::ExitCode::SUCCESS,

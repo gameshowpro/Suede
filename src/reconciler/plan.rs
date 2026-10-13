@@ -659,6 +659,7 @@ mod tests {
 
     fn app(id: &str, output: Option<&str>) -> AppConfig {
         AppConfig {
+            shared_input: None,
             id: id.into(),
             enabled: true,
             launcher: Launcher::Exec {

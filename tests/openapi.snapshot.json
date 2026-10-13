@@ -134,6 +134,17 @@
           },
           "restart": {
             "$ref": "#/components/schemas/RestartPolicy"
+          },
+          "sharedInput": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SharedInputOptions",
+                "description": "Experimental same-GPU Vulkan input. The app renders offscreen and\nsupplies the socket; Suede retains its configured output geometry."
+              }
+            ]
           }
         },
         "required": [
@@ -3422,6 +3433,33 @@
         "required": [
           "hideCursor",
           "outputPollIntervalSeconds"
+        ],
+        "type": "object"
+      },
+      "SharedInputMode": {
+        "enum": [
+          "copy",
+          "retain"
+        ],
+        "type": "string"
+      },
+      "SharedInputOptions": {
+        "additionalProperties": false,
+        "description": "Experimental external-image transport configuration. Color is encoded SDR.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/SharedInputMode"
+          },
+          "pacing": {
+            "description": "Grant producer frame credits from presentation feedback.",
+            "type": "boolean"
+          },
+          "socket": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "socket"
         ],
         "type": "object"
       },

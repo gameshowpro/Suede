@@ -547,6 +547,7 @@ mod tests {
             .store
             .update(|state| {
                 state.apps.push(crate::model::AppConfig {
+                    shared_input: None,
                     id: "renderer".into(),
                     enabled: true,
                     launcher: crate::model::Launcher::Exec {

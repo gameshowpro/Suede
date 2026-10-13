@@ -693,6 +693,23 @@ impl DesiredState {
                     }
                 }
             }
+            if let Some(input) = &app.shared_input {
+                if !matches!(app.launcher, Launcher::Exec { .. }) {
+                    errors.push(format!("{prefix}.sharedInput requires an exec launcher"));
+                }
+                let socket = input.socket.to_string_lossy();
+                if !input.socket.is_absolute() || socket.len() >= 108 || socket.contains('\0') {
+                    errors.push(format!("{prefix}.sharedInput.socket must be an absolute Unix socket path shorter than 108 bytes"));
+                }
+                if self.active_app.as_deref() == Some(app.id.as_str()) {
+                    match &self.projection {
+                        Some(projection) if projection.renderer != Renderer::Cpu
+                            && projection.black_lift.adaptive().is_none()
+                            && (projection.canvas.is_some() || projection.mode == ProjectionMode::Warp) => {}
+                        _ => errors.push(format!("{prefix}.sharedInput requires a GPU canvas without adaptive black lift")),
+                    }
+                }
+            }
             if app.restart.delay_ms > app.restart.max_delay_ms {
                 errors.push(format!(
                     "{prefix}.restart.delayMs must not exceed maxDelayMs"
@@ -1503,6 +1520,10 @@ pub struct AppConfig {
     /// Client-chosen, unique, stable identifier.
     pub id: String,
     pub launcher: Launcher,
+    /// Experimental same-GPU Vulkan input. The app renders offscreen and
+    /// supplies the socket; Suede retains its configured output geometry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_input: Option<SharedInputOptions>,
     /// Whether this app runs. Not part of the API: derived from
     /// [`DesiredState::active_app`] by the reconciler, kept as a field only
     /// because the supervisor consumes per-app configs.
@@ -1555,11 +1576,37 @@ impl AppConfig {
     /// it only counts when an output is pinned — placement is the thing that
     /// needs a window.
     pub fn expects_window(&self) -> bool {
+        if self.shared_input.is_some() {
+            return false;
+        }
         match self.launcher {
             Launcher::ChromiumKiosk { .. } | Launcher::FirefoxKiosk { .. } => true,
             Launcher::Exec { .. } => self.output.is_some(),
         }
     }
+}
+
+/// Experimental external-image transport configuration. Color is encoded SDR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedInputOptions {
+    #[schema(value_type = String)]
+    pub socket: std::path::PathBuf,
+    #[serde(default)]
+    pub mode: SharedInputMode,
+    /// Grant producer frame credits from presentation feedback.
+    #[serde(default)]
+    pub pacing: bool,
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SharedInputMode {
+    #[default]
+    Copy,
+    Retain,
 }
 
 /// Daemon-level settings that belong to desired state.
@@ -1784,8 +1831,46 @@ mod tests {
     }
 
     #[test]
+    fn shared_input_requires_an_absolute_socket_and_an_exec_launcher() {
+        let mut app: AppConfig = serde_json::from_value(serde_json::json!({
+            "id": "offscreen", "launcher": {"kind": "exec", "command": "renderer"},
+            "sharedInput": {"socket": "/tmp/renderer.sock", "mode": "retain", "pacing": true}
+        }))
+        .unwrap();
+        assert!(!app.expects_window());
+        let mut state = DesiredState::new();
+        state.apps.push(app.clone());
+        assert!(state.validate(true).is_ok());
+        app.shared_input.as_mut().unwrap().socket = "relative.sock".into();
+        state.apps[0] = app;
+        assert!(state
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("absolute Unix socket")));
+        state.apps[0].shared_input.as_mut().unwrap().socket = "/tmp/renderer.sock".into();
+        state.active_app = Some("offscreen".into());
+        assert!(state
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("GPU canvas")));
+        state.apps[0].launcher = Launcher::FirefoxKiosk {
+            uri: "https://example.com".into(),
+            extra_args: Vec::new(),
+            program: None,
+        };
+        assert!(state
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("exec launcher")));
+    }
+
+    #[test]
     fn validation_catches_duplicate_app_ids() {
         let app = AppConfig {
+            shared_input: None,
             id: "a".into(),
             enabled: true,
             launcher: Launcher::Exec {
@@ -2036,6 +2121,7 @@ mod tests {
     #[test]
     fn validation_rejects_bad_environment_names() {
         let mut app = AppConfig {
+            shared_input: None,
             id: "a".into(),
             enabled: true,
             launcher: Launcher::Exec {
@@ -2065,6 +2151,7 @@ mod tests {
     fn validation_rejects_unsafe_app_id() {
         let state = DesiredState {
             apps: vec![AppConfig {
+                shared_input: None,
                 id: "../escape".into(),
                 enabled: true,
                 launcher: Launcher::Exec {

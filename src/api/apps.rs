@@ -170,7 +170,7 @@ pub async fn restart_app(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> ApiResult<Json<AppStatus>> {
-    if !state.supervisor.restart(&id).await {
+    if !state.reconciler.restart_app(&id).await {
         return Err(ApiError::NotFound(format!("no app named {id}")));
     }
     tracing::info!(app = %id, "restarted on request");
@@ -277,6 +277,7 @@ mod tests {
 
     fn sleeper(id: &str) -> AppConfig {
         AppConfig {
+            shared_input: None,
             id: id.into(),
             enabled: true,
             launcher: Launcher::Exec {

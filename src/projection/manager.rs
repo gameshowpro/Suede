@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::io::{BufReader, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 
@@ -56,6 +56,21 @@ struct RunningSlicer {
     /// nothing a fallback reason would want, so its stderr still flows
     /// straight to the daemon's own journal (see [`spawn_internal`]).
     last_stderr: Arc<Mutex<Option<String>>>,
+    /// Shared producer shutdown may close the reader before reconciliation
+    /// finishes. This flag belongs to this child, not to a reconciliation task.
+    expected_exit: Arc<AtomicBool>,
+}
+
+/// Register planned producer shutdown before sending its termination signal.
+/// Dropping the caller or canceling its pass cannot erase the child-local flag.
+pub struct SlicerStopNotice {
+    expected_exit: Arc<AtomicBool>,
+}
+
+impl SlicerStopNotice {
+    pub fn producer_stopping(&self) {
+        self.expected_exit.store(true, Ordering::Release);
+    }
 }
 
 /// How a slicer ended on its own: its process status, and — for direct
@@ -250,6 +265,18 @@ impl BlendManager {
             .is_some_and(|running| !matches!(running.child.try_wait(), Ok(None)))
     }
 
+    /// A notice only for the current live shared receiver. An existing crash
+    /// remains unexpected, and an old notice cannot mark a replacement child.
+    pub fn shared_slicer_stop_notice(&mut self) -> Option<SlicerStopNotice> {
+        let running = self.slicer.as_mut()?;
+        if running.desired.shared_input.is_none() || !matches!(running.child.try_wait(), Ok(None)) {
+            return None;
+        }
+        Some(SlicerStopNotice {
+            expected_exit: running.expected_exit.clone(),
+        })
+    }
+
     /// Reap a slicer that exited on its own, returning how it ended; `None`
     /// when none is running or it is still alive. Stops done by this
     /// manager never show up here — only exits the daemon did not cause,
@@ -260,6 +287,11 @@ impl BlendManager {
             Ok(Some(status)) => status.to_string(),
             Err(error) => format!("could not check the slicer: {error}"),
         };
+        if self.slicer.as_ref()?.expected_exit.load(Ordering::Acquire) {
+            tracing::info!(%status, "shared receiver exited after planned producer shutdown");
+            self.stop_slicer("producer stopped");
+            return None;
+        }
         // Read before `stop_slicer` drops the `RunningSlicer`: the `Arc` is
         // shared with the (possibly still finishing) stderr reader thread,
         // so this is the last non-empty line seen by the time the child was
@@ -511,6 +543,24 @@ impl BlendManager {
     /// different connector, mode or card, or switching between direct and
     /// compositor presentation — replaces the child rather than updating it
     /// live, because the displays are acquired once at startup.
+    pub fn needs_slicer_replacement(
+        &self,
+        spec: &SlicerSpec,
+        direct: Option<&DirectDisplayConfig>,
+    ) -> bool {
+        let live = self
+            .slicer
+            .as_ref()
+            .filter(|running| running.desired.renderer == spec.renderer)
+            .map(|running| running.live_control)
+            .unwrap_or_else(|| slicer_requests_live_candidate(spec));
+        self.slicer.as_ref().map(|running| running.fingerprint)
+            != Some(with_direct_presentation(
+                slicer_fingerprint(spec, live),
+                direct,
+            ))
+    }
+
     pub fn sync_slicer_presenting(
         &mut self,
         spec: Option<&SlicerSpec>,
@@ -749,6 +799,7 @@ impl BlendManager {
                     config_generations,
                     protocol_mismatch,
                     last_stderr,
+                    expected_exit: Arc::new(AtomicBool::new(false)),
                 });
                 self.slicer_direct = direct.cloned();
                 // --spec is generation zero in this new session. Do not
@@ -1232,7 +1283,10 @@ fn stop_running_slicer(mut slicer: RunningSlicer, direct: bool) {
     if let Some(writer) = &mut slicer.writer {
         writer.close();
     }
-    stop_child(&mut slicer.child, direct.then_some(DIRECT_STOP_TIMEOUT));
+    // Imported image readers must finish and return their semaphore payloads
+    // even when the final outputs are ordinary Wayland surfaces.
+    let graceful = direct || slicer.desired.shared_input.is_some();
+    stop_child(&mut slicer.child, graceful.then_some(DIRECT_STOP_TIMEOUT));
     if let Some(writer) = &mut slicer.writer {
         writer.join();
     }
@@ -1353,6 +1407,9 @@ fn fingerprint_slicer_json(spec: &SlicerSpec) -> u64 {
 /// that value; lift and geometry remain live snapshots.
 fn slicer_topology_fingerprint(spec: &SlicerSpec) -> u64 {
     let mut hasher = DefaultHasher::new();
+    serde_json::to_string(&spec.shared_input)
+        .unwrap_or_default()
+        .hash(&mut hasher);
     spec.source.hash(&mut hasher);
     spec.canvas_width.hash(&mut hasher);
     spec.canvas_height.hash(&mut hasher);
@@ -1466,6 +1523,7 @@ mod tests {
 
     fn minimal_slicer_spec() -> SlicerSpec {
         SlicerSpec {
+            shared_input: None,
             adaptive_lift: None,
             layout: None,
             coverage_rects: Vec::new(),
@@ -1487,6 +1545,145 @@ mod tests {
         BlendManager::new(Arc::new(Snapshot::new()), EventHub::new())
     }
 
+    #[cfg(unix)]
+    fn install_live_shared_receiver(manager: &mut BlendManager) {
+        let mut spec = minimal_slicer_spec();
+        spec.shared_input = Some(crate::model::SharedInputOptions {
+            socket: "/tmp/receiver-test.sock".into(),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        manager.slicer = Some(RunningSlicer {
+            child: Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap(),
+            fingerprint: slicer_fingerprint(&spec, false),
+            session: String::new(),
+            desired: spec,
+            live_control: false,
+            writer: None,
+            config_generations: Arc::new(Mutex::new(BTreeMap::new())),
+            protocol_mismatch: Arc::new(AtomicBool::new(false)),
+            last_stderr: Arc::new(Mutex::new(None)),
+            expected_exit: Arc::new(AtomicBool::new(false)),
+        });
+        manager.slicer_direct = Some(direct_config(59_939));
+    }
+
+    #[cfg(unix)]
+    async fn finish_test_receiver(manager: &mut BlendManager) {
+        drop(manager.slicer.as_mut().unwrap().child.stdin.take());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !manager.slicer_has_exited() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planned_shared_exit_is_not_a_crash_during_canceled_producer_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let stopping = directory.path().join("stopping");
+        let supervisor = crate::supervisor::Supervisor::new(
+            Arc::new(crate::sway::mock::MockSway::empty()),
+            EventHub::new(),
+            crate::supervisor::LaunchContext {
+                profiles_root: directory.path().join("profiles"),
+                log_root: directory.path().join("logs"),
+                api_base: "http://127.0.0.1:9088/api/v1".into(),
+            },
+            vec!["*".into()],
+        );
+        let mut producer: crate::model::AppConfig = serde_json::from_value(serde_json::json!({
+            "id": "producer",
+            "launcher": {"kind": "exec", "command": "sh", "args": ["-c",
+                "trap 'echo stopping > \"$STOPPING\"; while :; do sleep 0.01; done' TERM; echo ready > \"$READY\"; while :; do sleep 0.01; done"]},
+            "sharedInput": {"socket": directory.path().join("source.sock")},
+            "env": {"READY": ready, "STOPPING": stopping}
+        })).unwrap();
+        producer.enabled = true;
+        supervisor.reconcile(&[producer], &[]).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut manager = manager_for_test();
+        install_live_shared_receiver(&mut manager);
+        let notice = manager.shared_slicer_stop_notice().unwrap();
+        let session = crate::presentation::DirectSession::new(None);
+        let stats = serde_json::from_value(serde_json::json!({
+            "measuredAt": 10, "intervalSeconds": 10.0, "freeRun": false,
+            "canvasFps": 60.0, "presentedFps": 60.0, "framesSuperseded": 0,
+            "stalls": 0, "perFrameMs": {"waiting": 0.0, "snapshot": 0.0,
+                "requesting": 0.0, "blending": 0.0, "gpu": 0.0},
+            "presentationFeedback": true, "offsetMs": null, "straddles": 0,
+            "gateHolds": 0, "renderer": "gpu", "presentationBackend": "vulkan-display",
+            "captureIntervals": {"one": 0, "two": 0, "three": 0, "more": 0}, "outputs": []
+        }))
+        .unwrap();
+        assert!(session.observe_stats(&stats));
+        session.slicer_exited("prior real crash", None);
+        session.slicer_exited("prior real crash", None);
+        let shutdown = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            supervisor.retire_shared_producers_before(&[], || notice.producer_stopping()),
+        );
+        let monitor = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while !stopping.exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            finish_test_receiver(&mut manager).await;
+            if let Some(exit) = manager.reap_exited_slicer() {
+                session.slicer_exited(&exit.status, exit.last_stderr_line.as_deref());
+            }
+            assert!(
+                !session.exit_requested(),
+                "planned EOF must not spend the third crash credit"
+            );
+        };
+        let (result, ()) = tokio::join!(shutdown, monitor);
+        assert!(
+            result.is_err(),
+            "producer shutdown was deliberately canceled"
+        );
+        assert!(!manager.slicer_running());
+        supervisor.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_stop_notice_does_not_hide_a_replacement_receiver_crash() {
+        let mut manager = manager_for_test();
+        install_live_shared_receiver(&mut manager);
+        let notice = manager.shared_slicer_stop_notice().unwrap();
+        manager.restart_slicer();
+        install_live_shared_receiver(&mut manager);
+        notice.producer_stopping();
+        drop(notice);
+        finish_test_receiver(&mut manager).await;
+        assert!(
+            manager.shared_slicer_stop_notice().is_none(),
+            "an existing crash cannot be marked planned"
+        );
+        assert!(
+            manager.reap_exited_slicer().is_some(),
+            "unmarked replacement exit remains a real crash"
+        );
+    }
+
     #[test]
     fn an_unforced_call_with_an_unchanged_spec_leaves_the_slicer_alone() {
         let mut manager = manager_for_test();
@@ -1501,6 +1698,24 @@ mod tests {
             Some(pid),
             "an unchanged spec must not be restarted"
         );
+    }
+
+    #[test]
+    fn shared_transport_changes_replace_the_slicer() {
+        let mut spec = minimal_slicer_spec();
+        let original = slicer_fingerprint(&spec, true);
+        spec.shared_input = Some(crate::model::SharedInputOptions {
+            socket: "/tmp/producer.sock".into(),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        let copied = slicer_fingerprint(&spec, true);
+        assert_ne!(original, copied);
+        spec.shared_input.as_mut().unwrap().mode = crate::model::SharedInputMode::Retain;
+        let retained = slicer_fingerprint(&spec, true);
+        assert_ne!(copied, retained);
+        spec.shared_input.as_mut().unwrap().pacing = true;
+        assert_ne!(retained, slicer_fingerprint(&spec, true));
     }
 
     #[test]
@@ -2210,6 +2425,7 @@ mod tests {
             config_generations: Arc::new(Mutex::new(BTreeMap::from([(0, 0)]))),
             protocol_mismatch: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_stderr: Arc::new(Mutex::new(None)),
+            expected_exit: Arc::new(AtomicBool::new(false)),
         });
         manager.snapshot.update_projection_control(|status| {
             status.session = Some(spec.control_session.clone());

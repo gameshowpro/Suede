@@ -67,6 +67,7 @@ struct ManagedApp {
     /// a stale reason.
     program_not_allowed: bool,
     /// A stopped process must wait for a current reconciliation before launch.
+    /// This also holds shared producers until their receiver is replaced.
     launch_pending: bool,
 }
 
@@ -423,6 +424,95 @@ impl Supervisor {
     pub async fn restart(&self, id: &str) -> bool {
         self.restart_because(id, RestartReason::ApiRequest, None)
             .await
+    }
+
+    /// Stop a single-connection image producer before replacing its receiver.
+    /// The next ordinary reconcile launches it after the new receiver exists.
+    pub async fn prepare_shared_receiver(&self, id: &str) -> bool {
+        self.prepare_shared_receiver_before(id, || {}).await
+    }
+
+    /// Register receiver retirement under the app lock before signaling the
+    /// producer. The callback must not wait or acquire the supervisor lock.
+    pub async fn prepare_shared_receiver_before(
+        &self,
+        id: &str,
+        before_stop: impl FnMut(),
+    ) -> bool {
+        self.prepare_shared_receiver_because(id, RestartReason::ConfigChanged, before_stop)
+            .await
+    }
+
+    pub async fn prepare_shared_receiver_because(
+        &self,
+        id: &str,
+        reason: RestartReason,
+        mut before_stop: impl FnMut(),
+    ) -> bool {
+        let mut apps = self.apps.lock().await;
+        let Some(managed) = apps.get_mut(id) else {
+            return false;
+        };
+        if managed.config.shared_input.is_none() {
+            return false;
+        }
+        managed.launch_pending = true;
+        let was_running = managed.is_running();
+        if was_running {
+            before_stop();
+        }
+        stop(managed).await;
+        if was_running {
+            managed.status.last_restart_reason = Some(reason);
+        }
+        managed.halted = false;
+        managed.attempts = 0;
+        managed.restart_at = Some(Instant::now());
+        unlatch_readiness(managed);
+        self.publish(managed);
+        was_running
+    }
+
+    /// Retire shared producers that the next app set no longer uses, while
+    /// their receivers are still alive. Disable restart before waiting for
+    /// SIGTERM so a supervisor tick cannot revive an intentionally stopped app.
+    pub async fn retire_shared_producers(&self, desired: &[AppConfig]) -> bool {
+        self.retire_shared_producers_before(desired, || {}).await
+    }
+
+    /// Register planned reader exit while both endpoints still exist, even if
+    /// the caller is canceled while awaiting the producer's graceful shutdown.
+    pub async fn retire_shared_producers_before(
+        &self,
+        desired: &[AppConfig],
+        mut before_stop: impl FnMut(),
+    ) -> bool {
+        let mut apps = self.apps.lock().await;
+        let mut retired = false;
+        for managed in apps.values_mut() {
+            if managed.config.shared_input.is_none()
+                || desired.iter().any(|app| {
+                    app.id == managed.config.id && app.enabled && app.shared_input.is_some()
+                })
+            {
+                continue;
+            }
+            if !managed.config.enabled && !managed.is_running() && !managed.launch_pending {
+                continue;
+            }
+            retired |= managed.is_running();
+            if managed.is_running() {
+                before_stop();
+            }
+            managed.config.enabled = false;
+            managed.launch_pending = false;
+            managed.restart_at = None;
+            stop(managed).await;
+            unlatch_readiness(managed);
+            set_state(&mut managed.status, AppState::Stopped, None);
+            self.publish(managed);
+        }
+        retired
     }
 
     /// Kill and relaunch an app, recording `reason` as why.
@@ -875,10 +965,25 @@ impl Supervisor {
         for (key, value) in &spec.env {
             command.env(key, value);
         }
+        if managed.config.shared_input.is_some() {
+            for key in [
+                "DISPLAY",
+                "WAYLAND_DISPLAY",
+                "SWAYSOCK",
+                "SDL_VIDEO_DRIVER",
+                "SDL_VIDEODRIVER",
+            ] {
+                command.env_remove(key);
+            }
+        }
         // Its own process group, so terminating the app takes its children with it.
         #[cfg(unix)]
         command.process_group(0);
 
+        #[cfg(target_os = "linux")]
+        if let Some(input) = &managed.config.shared_input {
+            prepare_shared_socket(&input.socket)?;
+        }
         // Profile and log preparation await filesystem work; activation may
         // have changed while those tasks ran. Check at the actual launch.
         if !is_current() {
@@ -923,6 +1028,53 @@ impl Supervisor {
             managed.status.clone(),
         )));
     }
+}
+
+/// Recover a filesystem socket left behind by a terminated producer. Never
+/// connect as a probe: accepting that connection would consume the producer's
+/// single receiver slot. A live bound socket is visible in this net namespace.
+#[cfg(target_os = "linux")]
+fn prepare_shared_socket(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let refuse = || {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "shared input socket {} is in use or is not a stale socket owned by this user",
+                path.display()
+            ),
+        )
+    };
+    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(refuse());
+    }
+    let sockets = std::fs::read_to_string("/proc/net/unix")?;
+    let name = path.to_string_lossy();
+    // The first seven fields have no spaces; the remaining suffix is the
+    // socket path and may itself contain spaces.
+    for line in sockets.lines().skip(1) {
+        let mut rest = line;
+        for _ in 0..7 {
+            rest = rest.trim_start();
+            rest = rest
+                .find(char::is_whitespace)
+                .map(|index| &rest[index..])
+                .unwrap_or("");
+        }
+        if rest.trim_start() == name {
+            return Err(refuse());
+        }
+    }
+    let current = std::fs::symlink_metadata(path)?;
+    if current.dev() != metadata.dev() || current.ino() != metadata.ino() {
+        return Err(refuse());
+    }
+    std::fs::remove_file(path)
 }
 
 /// Keep ticks from relaunching processes stopped by a stale reconciliation.
@@ -1101,6 +1253,124 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shared_socket_cleanup_preserves_live_sockets_and_other_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("renderer with spaces.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(prepare_shared_socket(&path).is_err());
+        assert!(path.exists());
+        drop(listener);
+        // Parallel app tests may fork while this listener exists. The child
+        // briefly retains it until exec closes the inherited descriptor, so
+        // cleanup correctly refuses it even after this thread drops its copy.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while let Err(error) = prepare_shared_socket(&path) {
+            assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+            assert!(Instant::now() < deadline, "socket stayed live: {error}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!path.exists());
+        std::fs::write(&path, "preserve").unwrap();
+        assert!(prepare_shared_socket(&path).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "preserve");
+    }
+
+    #[tokio::test]
+    async fn shared_receiver_replacement_stops_producer_until_reconcile() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(directory.path());
+        let mut app = sleeper("shared");
+        app.shared_input = Some(crate::model::SharedInputOptions {
+            socket: directory.path().join("source.sock"),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        supervisor.reconcile(&[app.clone()], &[]).await;
+        let before = supervisor.status("shared").await.unwrap().pid.unwrap();
+        supervisor.prepare_shared_receiver("shared").await;
+        assert!(supervisor.status("shared").await.unwrap().pid.is_none());
+        supervisor.tick(&[]).await;
+        assert!(
+            supervisor.status("shared").await.unwrap().pid.is_none(),
+            "ticks must wait for reconciliation to create the new receiver"
+        );
+        supervisor.reconcile(&[app], &[]).await;
+        assert_ne!(
+            supervisor.status("shared").await.unwrap().pid.unwrap(),
+            before
+        );
+        supervisor.reconcile(&[], &[]).await;
+    }
+
+    #[tokio::test]
+    async fn shared_deactivation_blocks_restart_without_stopping_ordinary_apps() {
+        let directory = tempfile::tempdir().unwrap();
+        let (supervisor, _) = supervisor(directory.path());
+        let mut shared = sleeper("shared");
+        shared.shared_input = Some(crate::model::SharedInputOptions {
+            socket: directory.path().join("source.sock"),
+            mode: crate::model::SharedInputMode::Copy,
+            pacing: false,
+        });
+        let ordinary = sleeper("ordinary");
+        supervisor
+            .reconcile(&[shared.clone(), ordinary.clone()], &[])
+            .await;
+        let ordinary_pid = supervisor.status("ordinary").await.unwrap().pid;
+        shared.enabled = false;
+        supervisor
+            .retire_shared_producers(&[shared.clone(), ordinary.clone()])
+            .await;
+        supervisor.tick(&[]).await;
+        let stopped = supervisor.status("shared").await.unwrap();
+        assert_eq!(stopped.state, AppState::Stopped);
+        assert!(stopped.pid.is_none());
+        assert_eq!(stopped.last_restart_reason, None);
+        assert_eq!(
+            supervisor.status("ordinary").await.unwrap().pid,
+            ordinary_pid
+        );
+        // An ordinary reconcile cannot revive the app after deactivation;
+        // a later explicit activation can.
+        supervisor
+            .reconcile(&[shared.clone(), ordinary.clone()], &[])
+            .await;
+        assert!(supervisor.status("shared").await.unwrap().pid.is_none());
+        shared.enabled = true;
+        supervisor.reconcile(&[shared, ordinary], &[]).await;
+        assert!(supervisor.status("shared").await.unwrap().pid.is_some());
+        supervisor.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removing_shared_app_or_switching_to_window_input_retires_producer() {
+        for remove in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (supervisor, _) = supervisor(directory.path());
+            let mut source = sleeper("shared");
+            source.shared_input = Some(crate::model::SharedInputOptions {
+                socket: directory.path().join("source.sock"),
+                mode: crate::model::SharedInputMode::Copy,
+                pacing: false,
+            });
+            supervisor.reconcile(&[source.clone()], &[]).await;
+            source.shared_input = None;
+            let next = if remove { vec![] } else { vec![source] };
+            assert!(supervisor.retire_shared_producers(&next).await);
+            supervisor.tick(&[]).await;
+            assert!(supervisor.status("shared").await.unwrap().pid.is_none());
+            supervisor.reconcile(&next, &[]).await;
+            if remove {
+                assert!(supervisor.status("shared").await.is_none());
+            } else {
+                assert!(supervisor.status("shared").await.unwrap().pid.is_some());
+            }
+            supervisor.shutdown().await;
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn deactivation_during_sigterm_prevents_stale_window_app_relaunch() {
@@ -1263,6 +1533,7 @@ mod tests {
     /// A long-lived process that ignores nothing and is available everywhere.
     fn sleeper(id: &str) -> AppConfig {
         AppConfig {
+            shared_input: None,
             id: id.into(),
             enabled: true,
             launcher: Launcher::Exec {

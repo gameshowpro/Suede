@@ -1140,6 +1140,7 @@ mod tests {
 
     fn spec(order: &[&str]) -> SlicerSpec {
         SlicerSpec {
+            shared_input: None,
             adaptive_lift: None,
             layout: None,
             coverage_rects: Vec::new(),

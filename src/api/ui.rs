@@ -142,6 +142,10 @@ mod tests {
             ("showFpsCounter", "a diagnostic, not a configuration choice"),
             ("persistProfile", "kiosk sessions are stateless by design"),
             (
+                "sharedInput",
+                "experimental Vulkan transport is configured outside the UI",
+            ),
+            (
                 "adopted",
                 "read-only: Suede's own pin of what settled, shown beside each field rather than edited",
             ),

@@ -1320,6 +1320,7 @@ mod tests {
             vec!["*".to_string()],
         ));
         let app = AppConfig {
+            shared_input: None,
             id: "arena-fx".into(),
             enabled: true,
             launcher: Launcher::ChromiumKiosk {

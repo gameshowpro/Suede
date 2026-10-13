@@ -379,6 +379,7 @@ mod tests {
     use crate::{model::Rect, projection::blend::SliceSpec};
     fn spec() -> SlicerSpec {
         SlicerSpec {
+            shared_input: None,
             layout: None,
             coverage_rects: Vec::new(),
             highlight_overlaps: false,

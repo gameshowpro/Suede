@@ -574,6 +574,7 @@ mod tests {
 
     fn app(id: &str, launcher: Launcher) -> AppConfig {
         AppConfig {
+            shared_input: None,
             id: id.into(),
             enabled: true,
             launcher,

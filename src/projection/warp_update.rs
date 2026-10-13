@@ -947,6 +947,7 @@ mod tests {
 
     fn fixture() -> SlicerSpec {
         SlicerSpec {
+            shared_input: None,
             layout: None,
             coverage_rects: Vec::new(),
             highlight_overlaps: false,
@@ -1917,6 +1918,7 @@ mod tests {
         assert!(!same_topology(
             &b,
             &SlicerSpec {
+                shared_input: None,
                 layout: None,
                 coverage_rects: Vec::new(),
                 gamma: 2.2,

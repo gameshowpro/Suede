@@ -28,8 +28,10 @@ actually is.
 - **OS / kernel:** Debian 13, kernel 6.12
 - **Graphics driver:** NVIDIA 615.71.09, open kernel module (GSP on)
 - **Compositor:** Sway 1.10.1
-- **Connected displays:** 3× 1920×1200 @ 59.95 Hz (a fourth projector
-  connector is currently disconnected)
+- **Connected displays:** 4× 1920×1200 @ 59.95 Hz (all four projector
+  connectors connected)
+- **PCIe:** The GPU sits on a riser, with the slot capped to PCIe Gen 3 in
+  the BIOS to avoid correctable link errors
 - **Notable settings:** `allow_overlaps = true`, committed as a 2×2
   overlapping projector grid
 

@@ -112,6 +112,9 @@ pub struct SliceSpec {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlicerSpec {
+    /// Optional offscreen application input, replacing compositor capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_input: Option<crate::model::SharedInputOptions>,
     /// Internal process session; never a persisted configuration revision.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub control_session: String,
@@ -1434,6 +1437,7 @@ mod tests {
     fn the_slicer_spec_serializes_stably() {
         // The spec crosses a process boundary as JSON; field names are ABI.
         let spec = SlicerSpec {
+            shared_input: None,
             // Round binary fractions, deliberately not derived from the
             // canvas dimensions below: serde_json's default (non-
             // `float_roundtrip`) float parser is not guaranteed exact to the
