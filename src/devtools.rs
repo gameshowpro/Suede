@@ -174,6 +174,8 @@ pub struct Playhead {
     pub duration_seconds: Option<f64>,
     pub paused: bool,
     pub ended: bool,
+    /// `HTMLMediaElement.loop`: the element wraps to the start at the end.
+    pub loop_enabled: bool,
     /// `HTMLMediaElement.readyState`, 0 to 4.
     pub ready_state: u8,
     /// `HTMLMediaElement.networkState`, 0 to 3.
@@ -1129,6 +1131,7 @@ pub const PLAYHEAD_EXPRESSION: &str = r#"(() => {
         durationSeconds: Number.isFinite(el.duration) ? el.duration : null,
         paused: !!el.paused,
         ended: !!el.ended,
+        loopEnabled: !!el.loop,
         readyState: el.readyState,
         networkState: el.networkState,
         playbackRate: el.playbackRate,
@@ -1194,6 +1197,7 @@ pub(crate) fn parse_playheads(result: &Value, now: u64) -> Result<Vec<Playhead>,
                 duration_seconds: number("durationSeconds").filter(|n| n.is_finite()),
                 paused: flag("paused"),
                 ended: flag("ended"),
+                loop_enabled: flag("loopEnabled"),
                 ready_state: count("readyState").unwrap_or(0).min(255) as u8,
                 network_state: count("networkState").unwrap_or(0).min(255) as u8,
                 playback_rate: number("playbackRate")
@@ -2561,6 +2565,7 @@ mod tests {
             duration_seconds: Some(20.0),
             paused: false,
             ended: false,
+            loop_enabled: false,
             ready_state: 4,
             network_state: 1,
             playback_rate: 1.0,
@@ -2598,7 +2603,7 @@ mod tests {
     fn playheads_parse_with_null_duration_audio_and_shadow_elements() {
         let result = json!({"result": {"type": "object", "value": [
             {"element": "video", "currentSrc": "file:///a.mp4", "currentTimeSeconds": 12.25,
-             "durationSeconds": 20.0, "paused": false, "ended": false, "readyState": 4,
+             "durationSeconds": 20.0, "paused": false, "ended": false, "loopEnabled": true, "readyState": 4,
              "networkState": 2, "playbackRate": 1.0, "muted": true, "volume": 0.5,
              "videoWidth": 1920, "videoHeight": 1080, "totalFrames": 300, "droppedFrames": 3},
             {"element": "video", "currentSrc": "http://x/live.m3u8", "currentTimeSeconds": 5.0,
@@ -2615,6 +2620,8 @@ mod tests {
         assert_eq!(heads[0].current_time_seconds, 12.25);
         assert_eq!(heads[0].duration_seconds, Some(20.0));
         assert!(heads[0].muted);
+        assert!(heads[0].loop_enabled);
+        assert!(!heads[1].loop_enabled, "absent means not looping");
         assert_eq!(heads[0].dropped_frames, Some(3));
         assert_eq!((heads[0].video_width, heads[0].video_height), (1920, 1080));
         assert_eq!(heads[0].read_at, 777);

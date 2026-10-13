@@ -3625,6 +3625,10 @@
           "ended": {
             "type": "boolean"
           },
+          "loopEnabled": {
+            "description": "`HTMLMediaElement.loop`: the element wraps to the start at the end.",
+            "type": "boolean"
+          },
           "muted": {
             "type": "boolean"
           },
@@ -3683,6 +3687,7 @@
           "currentTimeSeconds",
           "paused",
           "ended",
+          "loopEnabled",
           "readyState",
           "networkState",
           "playbackRate",

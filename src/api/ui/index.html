@@ -4702,6 +4702,7 @@ function recordPlayheadAnchors(reports) {
       at, position: (Number(ph.currentTimeSeconds) || 0) + (ph.readAt != null && ph.sampledAt != null ? age : 0),
       duration: ph.durationSeconds != null && Number.isFinite(dur) ? dur : null,
       rate: Number.isFinite(rate) ? rate : 1,
+      loop: ph.loopEnabled === true,
       advancing: advancing && ph.paused === false && ph.ended === false && rate > 0,
     });
   };
@@ -4729,7 +4730,7 @@ function tweenPlayheads() {
     if (!a?.advancing) continue;
     let pos = a.position + ((now - a.at) / 1000) * a.rate;
     const live = a.duration == null;
-    if (!live) pos = Math.min(pos, a.duration);
+    if (!live) pos = a.loop && a.duration > 0 ? pos % a.duration : Math.min(pos, a.duration);
     const fill = cell.querySelector(".pbar i");
     if (fill && !live && a.duration > 0) fill.style.width = `${(Math.max(0, pos / a.duration) * 100).toFixed(1)}%`;
     const text = cell.querySelector(".ptime");
