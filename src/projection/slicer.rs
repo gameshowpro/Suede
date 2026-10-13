@@ -360,12 +360,18 @@ const GATE_FLOOR_PERIODS: f64 = 1.0;
 /// right at startup or during a resize cannot look like the wall going dark.
 const MIN_FEEDBACK_ANSWERS_FOR_SELF_HEAL: u32 = 30;
 
-/// Consecutive dead intervals (see [`DeadIntervalTracker`]) required before
-/// the slicer gives up on itself and exits. Two, not one, so a single odd
-/// interval — a resize settling, a momentary compositor hiccup — cannot
-/// trigger a respawn on its own; the condition has to still be true ten
-/// seconds later.
-const CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL: u32 = 2;
+/// How long presentation feedback must stay dead before the slicer gives
+/// up on itself and exits. A wall-clock span, not an interval count, so the
+/// judgment does not change when the diagnostics interval does: more than
+/// one interval, so a single odd interval — a resize settling, a momentary
+/// compositor hiccup — cannot trigger a respawn on its own; the condition
+/// has to still be true twenty seconds on.
+const DEAD_FEEDBACK_FOR_SELF_HEAL: Duration = Duration::from_secs(20);
+
+/// Consecutive dead intervals (see [`DeadIntervalTracker`]) that cover
+/// [`DEAD_FEEDBACK_FOR_SELF_HEAL`].
+const CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL: u32 =
+    crate::diagnostics::samples_in(DEAD_FEEDBACK_FOR_SELF_HEAL);
 
 /// How to read one pixel of the captured canvas: bytes per pixel and where
 /// red, green, and blue live within them.
@@ -2230,13 +2236,14 @@ impl State {
             .record(presentation_feedback, interval_answers, interval_presented)
         {
             eprintln!(
-                "slicer: two consecutive {:.0}s intervals answered {interval_answers} \
+                "slicer: {} consecutive {:.0}s intervals answered {interval_answers} \
                  presentation-feedback requests and none were `Presented` — every frame is \
                  going nowhere, most likely because the outputs this slicer was built against \
                  were destroyed and recreated by the compositor (measured on a four-projector \
                  bench on 2026-09-15: `presented 0 discarded 605` on every output while this \
                  process kept reporting 60.4 fps). Exiting so the daemon's sync_slicer respawns \
                  it against whatever exists now.",
+                CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL,
                 elapsed.as_secs_f64(),
             );
             self.closed = true;
@@ -7185,15 +7192,26 @@ mod tests {
     // --- self-heal: the dead-interval predicate -------------------------
 
     #[test]
-    fn two_consecutive_dead_intervals_trip_the_tracker() {
-        let mut tracker = DeadIntervalTracker::default();
-        assert!(
-            !tracker.record(true, 40, 0),
-            "one bad interval is not enough"
+    fn dead_intervals_covering_the_self_heal_span_trip_the_tracker() {
+        // The count is derived from a 20 s span and the diagnostics
+        // interval, so the test counts up to it rather than assuming two.
+        let needed = CONSECUTIVE_DEAD_INTERVALS_FOR_SELF_HEAL;
+        assert!(needed >= 2, "one odd interval alone must never trip it");
+        assert_eq!(
+            needed as u64 * crate::diagnostics::SAMPLE_INTERVAL.as_secs(),
+            DEAD_FEEDBACK_FOR_SELF_HEAL.as_secs(),
+            "the count must cover the span exactly at this interval"
         );
+        let mut tracker = DeadIntervalTracker::default();
+        for n in 1..needed {
+            assert!(
+                !tracker.record(true, 40, 0),
+                "{n} bad interval(s) is not enough"
+            );
+        }
         assert!(
             tracker.record(true, 40, 0),
-            "a second consecutive bad interval must trip it"
+            "bad intervals covering the span must trip it"
         );
     }
 

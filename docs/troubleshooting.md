@@ -160,9 +160,9 @@ way to notice on its own unless told to.
 
 Suede detects and corrects this itself now, three ways: the slicer notices
 its own outputs disappearing from the Wayland registry and exits so the
-daemon respawns it; failing that, the slicer notices two consecutive
-statistics intervals of presentation feedback answering "discarded" for
-everything and exits anyway; and the reconciler forces a slicer restart on
+daemon respawns it; failing that, the slicer notices 20 seconds of
+consecutive statistics intervals of presentation feedback answering
+"discarded" for everything and exits anyway; and the reconciler forces a slicer restart on
 any pass that actually changed which outputs are enabled, whether or not the
 compositor removes the global. A `systemctl --user restart suede` remains a
 manual fix for the same condition, and a fast way to confirm the diagnosis,
