@@ -44,6 +44,8 @@ pub struct Snapshot {
     /// What `nvidia-smi` last reported, with each process attributed to its
     /// app, as [`crate::telemetry`] last published it.
     gpu: RwLock<crate::nvidia_smi::GpuTelemetry>,
+    /// The slicer pipeline history, as [`crate::telemetry`] last published it.
+    pipeline: RwLock<crate::telemetry::PipelineTelemetry>,
     /// One report per running `chromium-kiosk` app, as
     /// [`crate::telemetry`] last published it.
     browsers: RwLock<Vec<crate::telemetry::BrowserReport>>,
@@ -101,6 +103,21 @@ impl Snapshot {
             return false;
         }
         *guard = gpu;
+        true
+    }
+
+    /// The slicer pipeline history.
+    pub fn pipeline(&self) -> crate::telemetry::PipelineTelemetry {
+        self.pipeline.read().unwrap().clone()
+    }
+
+    /// Record the slicer pipeline history. Returns whether it changed.
+    pub fn set_pipeline(&self, pipeline: crate::telemetry::PipelineTelemetry) -> bool {
+        let mut guard = self.pipeline.write().unwrap();
+        if *guard == pipeline {
+            return false;
+        }
+        *guard = pipeline;
         true
     }
 

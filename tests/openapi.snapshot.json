@@ -3126,6 +3126,131 @@
         ],
         "type": "object"
       },
+      "PipelinePoint": {
+        "description": "One telemetry tick of the slicer pipeline.\n\nSlicer intervals are 10 s and ticks are 5 s, so most intervals appear on\ntwo points. Counters are therefore reported on the fresh point only, so a\nsum over the window is right.",
+        "properties": {
+          "at": {
+            "description": "Unix seconds of the tick.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "canvasFps": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "framesSuperseded": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "freeRun": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "fresh": {
+            "description": "This tick saw a new slicer interval (`measured_at` changed).",
+            "type": "boolean"
+          },
+          "gateHolds": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "intervalSeconds": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "measuredAt": {
+            "description": "The interval these values come from; null when stale.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "offsetMaxMs": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "offsetMeanMs": {
+            "description": "Null without presentation feedback or with fewer than two outputs.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "outputHz": {
+            "description": "The output refresh rate that is 100 % on the chart.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "presentedFps": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "stalls": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "straddles": {
+            "description": "Counters of the interval; 0 on a point that repeats it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "at",
+          "fresh",
+          "straddles",
+          "gateHolds",
+          "stalls",
+          "framesSuperseded"
+        ],
+        "type": "object"
+      },
+      "PipelineTelemetry": {
+        "description": "The slicer pipeline's history for the System tab's pipeline chart.\n\nBuilt from the interval the slicer already reports into the snapshot, so\nit adds nothing to the slicer, the capture path or presentation.",
+        "properties": {
+          "history": {
+            "description": "One point per telemetry tick while a slicer was running, oldest\nfirst; same `at` clock, capacity and age limit as the GPU history.",
+            "items": {
+              "$ref": "#/components/schemas/PipelinePoint"
+            },
+            "type": "array"
+          },
+          "running": {
+            "description": "Whether a slicer was running at the last tick.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "running",
+          "history"
+        ],
+        "type": "object"
+      },
       "Port": {
         "description": "A connector on the graphics hardware, attached or not.",
         "properties": {
@@ -7028,6 +7153,26 @@
               }
             },
             "description": "What nvidia-smi last reported, with each GPU process attributed to the app that owns it. Always 200: a machine without an NVIDIA GPU answers `available: false` and says why."
+          }
+        },
+        "tags": [
+          "observed"
+        ]
+      }
+    },
+    "/api/v1/system/pipeline": {
+      "get": {
+        "operationId": "get_pipeline",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PipelineTelemetry"
+                }
+              }
+            },
+            "description": "The slicer's captured and presented frame rates, presentation offset and straddle counts, one point per five seconds for the last five minutes while a slicer ran. Always 200: with no slicer, `running` is false and `history` is empty."
           }
         },
         "tags": [

@@ -142,6 +142,24 @@ pub async fn get_gpu(State(state): State<ApiState>) -> Json<crate::nvidia_smi::G
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/system/pipeline", tag = "observed",
+    responses((
+        status = 200,
+        description = "The slicer's captured and presented frame rates, \
+                       presentation offset and straddle counts, one point \
+                       per five seconds for the last five minutes while a \
+                       slicer ran. Always 200: with no slicer, `running` is \
+                       false and `history` is empty.",
+        body = crate::telemetry::PipelineTelemetry,
+    ))
+)]
+pub async fn get_pipeline(
+    State(state): State<ApiState>,
+) -> Json<crate::telemetry::PipelineTelemetry> {
+    Json(state.snapshot.pipeline())
+}
+
+#[utoipa::path(
     get, path = "/api/v1/system/browsers", tag = "observed",
     responses((
         status = 200,
@@ -731,6 +749,13 @@ mod tests {
         assert!(body["reason"].is_null());
         assert_eq!(body["gpus"], serde_json::json!([]));
         assert_eq!(body["processes"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn pipeline_telemetry_is_empty_before_the_first_tick() {
+        let (status, body) = get_json("/api/v1/system/pipeline").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, serde_json::json!({"running": false, "history": []}));
     }
 
     #[tokio::test]

@@ -504,6 +504,18 @@ is attributed to the Suede app whose process tree it belongs to, and for a
 `chromium-kiosk` app to its role (browser, GPU process, renderer, ...), so
 you can see which app is using the decoder.
 
+**Slicer pipeline.** Shown between the GPU and Chromium panels while a slicer
+runs. It charts the same five minutes as the GPU chart. The outer area is
+captured frames per second and the inner area is presented frames per second,
+both as a percent of the output refresh rate (100 % is the caption's rate);
+the band between them is frames dropped or superseded. The offset line is the
+largest spread between outputs showing the same frame, with one frame period
+as 100 %. A marker flags every interval that had straddles, frames shown on
+different refreshes by different outputs. The slicer reports once every ten
+seconds, so the chart moves in steps and the values are averages over each
+interval. A static source makes the slicer report nothing, and the chart then
+shows a gap rather than a flat line.
+
 **Chromium.** One block per running `chromium-kiosk` app (not Firefox or
 `exec` apps):
 

@@ -31,7 +31,7 @@ use crate::devtools::{
     BrowserGpuInfo, BrowserVersion, DevtoolsState, DevtoolsStatus, Internals, MediaPlayer,
 };
 use crate::events::{EventHub, ServerEvent};
-use crate::model::{AppState, AppStatus};
+use crate::model::{AppState, AppStatus, Output, ProjectionStats};
 use crate::nvidia_smi::{
     self, GpuHistoryPoint, GpuHistorySample, GpuTelemetry, HISTORY_CAPACITY, HISTORY_SECONDS,
 };
@@ -155,9 +155,16 @@ pub fn push_history(buffer: &mut VecDeque<GpuHistoryPoint>, sample: &GpuTelemetr
             })
             .collect(),
     });
+    trim_history(buffer, now, |point| point.at);
+}
+
+/// Drop points older than [`HISTORY_SECONDS`], then the oldest over
+/// [`HISTORY_CAPACITY`]. Shared by the GPU and pipeline histories so the two
+/// charts always cover the same window.
+fn trim_history<T>(buffer: &mut VecDeque<T>, now: u64, at: impl Fn(&T) -> u64) {
     while buffer
         .front()
-        .is_some_and(|point| now.saturating_sub(point.at) > HISTORY_SECONDS)
+        .is_some_and(|point| now.saturating_sub(at(point)) > HISTORY_SECONDS)
     {
         buffer.pop_front();
     }
@@ -181,6 +188,153 @@ fn apply_history(
         push_history(buffer, gpu, now);
     }
     gpu.history = buffer.iter().cloned().collect();
+}
+
+/// How old a slicer interval may get before the pipeline chart treats it as
+/// no data. The slicer reports every 10 s, so 25 s tolerates two late
+/// reports. A static source produces no intervals at all, and a flat line of
+/// the last values would read as a healthy pipeline.
+pub const STALE_SECONDS: u64 = 25;
+
+/// The slicer pipeline's history for the System tab's pipeline chart.
+///
+/// Built from the interval the slicer already reports into the snapshot, so
+/// it adds nothing to the slicer, the capture path or presentation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelineTelemetry {
+    /// Whether a slicer was running at the last tick.
+    pub running: bool,
+    /// One point per telemetry tick while a slicer was running, oldest
+    /// first; same `at` clock, capacity and age limit as the GPU history.
+    pub history: Vec<PipelinePoint>,
+}
+
+/// One telemetry tick of the slicer pipeline.
+///
+/// Slicer intervals are 10 s and ticks are 5 s, so most intervals appear on
+/// two points. Counters are therefore reported on the fresh point only, so a
+/// sum over the window is right.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PipelinePoint {
+    /// Unix seconds of the tick.
+    pub at: u64,
+    /// This tick saw a new slicer interval (`measured_at` changed).
+    pub fresh: bool,
+    /// The interval these values come from; null when stale.
+    pub measured_at: Option<u64>,
+    pub interval_seconds: Option<f64>,
+    /// The output refresh rate that is 100 % on the chart.
+    pub output_hz: Option<f64>,
+    pub canvas_fps: Option<f64>,
+    pub presented_fps: Option<f64>,
+    /// Null without presentation feedback or with fewer than two outputs.
+    pub offset_mean_ms: Option<f64>,
+    pub offset_max_ms: Option<f64>,
+    pub free_run: Option<bool>,
+    /// Counters of the interval; 0 on a point that repeats it.
+    pub straddles: u32,
+    pub gate_holds: u32,
+    pub stalls: u32,
+    pub frames_superseded: u32,
+}
+
+/// The output rate the chart calls 100 %: the fastest refresh rate the
+/// slicer measured, else the fastest current mode of an active output.
+fn output_rate(stats: &ProjectionStats, outputs: &[Output]) -> Option<f64> {
+    let fastest = |rates: Vec<f64>| {
+        rates
+            .into_iter()
+            .filter(|hz| hz.is_finite() && *hz > 0.0)
+            .reduce(f64::max)
+    };
+    fastest(stats.outputs.iter().filter_map(|o| o.refresh_hz).collect()).or_else(|| {
+        fastest(
+            outputs
+                .iter()
+                .filter(|o| o.active)
+                .filter_map(|o| o.current_mode.as_ref().map(|mode| mode.refresh_hz))
+                .collect(),
+        )
+    })
+}
+
+/// The pipeline point for one tick.
+///
+/// `previous_measured_at` is the interval the previous tick saw. A missing or
+/// stale interval yields a point with no values rather than a repeat of old
+/// ones, so a quiet slicer reads as no data.
+pub fn pipeline_point(
+    last: Option<&ProjectionStats>,
+    previous_measured_at: Option<u64>,
+    outputs: &[Output],
+    now: u64,
+) -> PipelinePoint {
+    let empty = PipelinePoint {
+        at: now,
+        fresh: false,
+        measured_at: None,
+        interval_seconds: None,
+        output_hz: None,
+        canvas_fps: None,
+        presented_fps: None,
+        offset_mean_ms: None,
+        offset_max_ms: None,
+        free_run: None,
+        straddles: 0,
+        gate_holds: 0,
+        stalls: 0,
+        frames_superseded: 0,
+    };
+    let Some(stats) = last else { return empty };
+    if now.saturating_sub(stats.measured_at) > STALE_SECONDS {
+        return empty;
+    }
+    let fresh = previous_measured_at != Some(stats.measured_at);
+    let counted = |value: u32| if fresh { value } else { 0 };
+    PipelinePoint {
+        fresh,
+        measured_at: Some(stats.measured_at),
+        interval_seconds: Some(stats.interval_seconds),
+        output_hz: output_rate(stats, outputs),
+        canvas_fps: Some(stats.canvas_fps),
+        presented_fps: Some(stats.presented_fps),
+        offset_mean_ms: stats.offset_ms.as_ref().map(|offset| offset.mean),
+        offset_max_ms: stats.offset_ms.as_ref().map(|offset| offset.max),
+        free_run: Some(stats.free_run),
+        straddles: counted(stats.straddles),
+        gate_holds: counted(stats.gate_holds),
+        stalls: counted(stats.stalls),
+        frames_superseded: counted(stats.frames_superseded),
+        ..empty
+    }
+}
+
+/// Add this tick's point while a slicer runs, trim, and return what to
+/// publish. Nothing is added when no slicer runs, so the chart shows a gap.
+fn apply_pipeline(
+    buffer: &mut VecDeque<PipelinePoint>,
+    previous_measured_at: &mut Option<u64>,
+    snapshot: &Snapshot,
+    now: u64,
+) -> PipelineTelemetry {
+    let running = snapshot.slicer_running();
+    if running {
+        let last = snapshot.projection_stats();
+        buffer.push_back(pipeline_point(
+            last.as_ref(),
+            *previous_measured_at,
+            &snapshot.outputs(),
+            now,
+        ));
+        *previous_measured_at = last.map(|stats| stats.measured_at);
+    }
+    trim_history(buffer, now, |point| point.at);
+    PipelineTelemetry {
+        running,
+        history: buffer.iter().cloned().collect(),
+    }
 }
 
 /// One report per running `chromium-kiosk` app with a process.
@@ -250,6 +404,10 @@ pub struct Telemetry {
     missing_since: Option<Instant>,
     /// Recent successful GPU polls, published as [`GpuTelemetry::history`].
     history: VecDeque<GpuHistoryPoint>,
+    /// Recent slicer intervals, published as [`PipelineTelemetry::history`].
+    pipeline: VecDeque<PipelinePoint>,
+    /// The slicer interval the previous tick saw, to tell a fresh one.
+    previous_measured_at: Option<u64>,
 }
 
 impl Telemetry {
@@ -268,6 +426,8 @@ impl Telemetry {
             sampler: ProcessSampler::new(),
             missing_since: None,
             history: VecDeque::new(),
+            pipeline: VecDeque::new(),
+            previous_measured_at: None,
         }
     }
 
@@ -311,6 +471,16 @@ impl Telemetry {
 
         if self.snapshot.set_gpu(gpu.clone()) {
             self.events.publish(ServerEvent::GpuChanged(Box::new(gpu)));
+        }
+        let pipeline = apply_pipeline(
+            &mut self.pipeline,
+            &mut self.previous_measured_at,
+            &self.snapshot,
+            crate::util::unix_now(),
+        );
+        if self.snapshot.set_pipeline(pipeline.clone()) {
+            self.events
+                .publish(ServerEvent::PipelineChanged(Box::new(pipeline)));
         }
         if self.snapshot.set_browsers(browsers.clone()) {
             self.events.publish(ServerEvent::BrowsersChanged(browsers));
@@ -610,5 +780,203 @@ mod tests {
         assert!(!failed.available);
         assert_eq!(failed.history.len(), 1, "no new point, old one kept");
         assert_eq!(failed.history[0].at, 1000);
+    }
+
+    fn stats(measured_at: u64) -> ProjectionStats {
+        ProjectionStats {
+            measured_at,
+            interval_seconds: 10.0,
+            free_run: false,
+            canvas_fps: 59.9,
+            presented_fps: 30.0,
+            frames_superseded: 4,
+            stalls: 1,
+            per_frame_ms: crate::model::FrameCost {
+                waiting: 1.0,
+                snapshot: 1.0,
+                requesting: 1.0,
+                blending: 1.0,
+                gpu: 0.0,
+            },
+            presentation_feedback: true,
+            offset_ms: None,
+            straddles: 3,
+            gate_holds: 2,
+            renderer: "cpu".to_string(),
+            presentation_backend: None,
+            timestamp_source: None,
+            capture_intervals: crate::model::CaptureIntervals::default(),
+            outputs: Vec::new(),
+            gpu_timing: None,
+        }
+    }
+
+    fn output(active: bool, hz: f64) -> Output {
+        Output {
+            name: "HDMI-A-1".into(),
+            active,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: Some(crate::model::Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: hz,
+            }),
+            modes: Vec::new(),
+            rect: crate::model::Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        }
+    }
+
+    fn counters(point: &PipelinePoint) -> (u32, u32, u32, u32) {
+        (
+            point.straddles,
+            point.gate_holds,
+            point.stalls,
+            point.frames_superseded,
+        )
+    }
+
+    #[test]
+    fn a_new_interval_is_fresh_and_carries_its_counters() {
+        let point = pipeline_point(Some(&stats(1000)), Some(990), &[output(true, 60.0)], 1003);
+        assert!(point.fresh);
+        assert_eq!(point.measured_at, Some(1000));
+        assert_eq!(point.canvas_fps, Some(59.9));
+        assert_eq!(point.output_hz, Some(60.0));
+        assert_eq!(counters(&point), (3, 2, 1, 4));
+    }
+
+    #[test]
+    fn a_repeated_interval_keeps_values_but_zeroes_counters() {
+        let point = pipeline_point(Some(&stats(1000)), Some(1000), &[], 1008);
+        assert!(!point.fresh);
+        assert_eq!(point.presented_fps, Some(30.0));
+        assert_eq!(counters(&point), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn the_first_interval_ever_seen_is_fresh() {
+        assert!(pipeline_point(Some(&stats(1000)), None, &[], 1001).fresh);
+    }
+
+    #[test]
+    fn a_stale_interval_is_no_data() {
+        let at_limit = pipeline_point(Some(&stats(1000)), Some(1000), &[], 1000 + STALE_SECONDS);
+        assert_eq!(
+            at_limit.canvas_fps,
+            Some(59.9),
+            "exactly 25 s is still data"
+        );
+        let stale = pipeline_point(Some(&stats(1000)), Some(990), &[], 1001 + STALE_SECONDS);
+        assert!(!stale.fresh);
+        assert_eq!(stale.measured_at, None);
+        assert_eq!(stale.canvas_fps, None);
+        assert_eq!(stale.output_hz, None);
+        assert_eq!(counters(&stale), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn no_interval_yet_is_no_data() {
+        let point = pipeline_point(None, None, &[], 1000);
+        assert!(!point.fresh);
+        assert_eq!(point.canvas_fps, None);
+    }
+
+    #[test]
+    fn the_output_rate_prefers_the_slicers_measurement() {
+        let mut measured = stats(1000);
+        measured.outputs = vec![timing(Some(50.0)), timing(Some(59.94)), timing(None)];
+        let point = pipeline_point(Some(&measured), None, &[output(true, 144.0)], 1001);
+        assert_eq!(point.output_hz, Some(59.94));
+    }
+
+    #[test]
+    fn the_output_rate_falls_back_to_active_output_modes() {
+        let outputs = [output(true, 50.0), output(true, 60.0), output(false, 144.0)];
+        let point = pipeline_point(Some(&stats(1000)), None, &outputs, 1001);
+        assert_eq!(point.output_hz, Some(60.0), "max of the active outputs");
+        let bare = pipeline_point(Some(&stats(1000)), None, &[], 1001);
+        assert_eq!(bare.output_hz, None);
+    }
+
+    #[test]
+    fn the_offset_is_copied_when_reported() {
+        let mut measured = stats(1000);
+        measured.offset_ms = Some(crate::model::PresentationOffset {
+            mean: 0.2,
+            max: 0.4,
+        });
+        let point = pipeline_point(Some(&measured), None, &[], 1001);
+        assert_eq!(
+            (point.offset_mean_ms, point.offset_max_ms),
+            (Some(0.2), Some(0.4))
+        );
+        let without = pipeline_point(Some(&stats(1000)), None, &[], 1001);
+        assert_eq!(without.offset_max_ms, None);
+    }
+
+    fn timing(refresh_hz: Option<f64>) -> crate::model::OutputTiming {
+        crate::model::OutputTiming {
+            name: "HDMI-A-1".into(),
+            presented: 0,
+            discarded: 0,
+            zero_copy_presented: 0,
+            refresh_hz,
+            phase_ms: None,
+            phase_spread_ms: None,
+            lag_frames: crate::model::LagFrames::default(),
+            commit_to_present_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_tick_adds_a_point_only_while_a_slicer_runs() {
+        let snapshot = Snapshot::new();
+        let mut buffer = VecDeque::new();
+        let mut previous = None;
+        let idle = apply_pipeline(&mut buffer, &mut previous, &snapshot, 1000);
+        assert!(!idle.running);
+        assert!(idle.history.is_empty());
+
+        snapshot.set_slicer_running(true);
+        snapshot.set_projection_stats(Some(stats(1000)));
+        let first = apply_pipeline(&mut buffer, &mut previous, &snapshot, 1001);
+        assert!(first.running);
+        assert!(first.history[0].fresh);
+        let second = apply_pipeline(&mut buffer, &mut previous, &snapshot, 1006);
+        assert_eq!(second.history.len(), 2);
+        assert!(!second.history[1].fresh, "same interval, a repeat");
+
+        snapshot.set_slicer_running(false);
+        let stopped = apply_pipeline(&mut buffer, &mut previous, &snapshot, 1011);
+        assert!(!stopped.running);
+        assert_eq!(stopped.history.len(), 2, "history kept, no new point");
+    }
+
+    #[test]
+    fn pipeline_history_is_trimmed_by_age_and_capacity() {
+        let mut buffer = VecDeque::new();
+        let newest = 1000 + HISTORY_CAPACITY as u64;
+        for at in 1000..=newest {
+            buffer.push_back(pipeline_point(None, None, &[], at));
+        }
+        trim_history(&mut buffer, newest, |point| point.at);
+        assert_eq!(buffer.len(), HISTORY_CAPACITY);
+        assert_eq!(buffer.front().map(|p| p.at), Some(1001), "oldest dropped");
+
+        trim_history(&mut buffer, newest + HISTORY_SECONDS, |point| point.at);
+        assert_eq!(buffer.len(), 1, "only the newest is within the window");
+        assert_eq!(buffer.front().map(|p| p.at), Some(newest));
+        trim_history(&mut buffer, newest + HISTORY_SECONDS + 1, |point| point.at);
+        assert!(buffer.is_empty(), "301 s old is gone");
     }
 }
