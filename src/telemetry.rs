@@ -1,11 +1,25 @@
-//! GPU and Chromium telemetry for the System tab's GPU and Chromium panels.
+//! GPU, CPU and Chromium telemetry for the System tab's panels.
 //!
 //! One background task, [`Telemetry`], every [`POLL`], gathers only sources
 //! that cost next to nothing: a `/proc` walk of every app's process tree
-//! ([`crate::procs`]), one `nvidia-smi` pair of invocations
-//! ([`crate::nvidia_smi`], measured at about 80 ms of wall time and
-//! negligible CPU), and the state the per-app DevTools sessions already
-//! hold in memory ([`crate::devtools`]). Nothing here talks to a browser.
+//! ([`crate::procs`]), the machine's own counters in `/proc` and `/sys`
+//! ([`crate::cpu`]), one `nvidia-smi` trio of invocations
+//! ([`crate::nvidia_smi`], about 70 ms of wall time and negligible CPU), and
+//! the state the per-app DevTools sessions already hold in memory
+//! ([`crate::devtools`]). Nothing here talks to a browser.
+//!
+//! # Loop shape
+//!
+//! A tick takes the clock once and stamps every sample with it, so the
+//! charts line up point for point. The `/proc` and `/sys` samplers are
+//! synchronous reads of a few small files (about a millisecond together), so
+//! they run inline: spawning a task per sampler would cost more in
+//! scheduling and channel traffic than it saves, and would add nothing to
+//! alignment. The one slow source is `nvidia-smi`, three child processes
+//! that mostly wait; [`nvidia_smi::sample`] runs those concurrently with
+//! `tokio::join!` (each command keeping its own timeout), so the tick waits
+//! for the slowest, about 70 ms, instead of the sum, about 150 ms, for three
+//! lines of code. Everything else is a snapshot or lock read.
 //!
 //! [`assemble`] is the pure join of those inputs, so the attribution rules
 //! (which Suede app and Chromium role own a GPU process, and what the
@@ -27,6 +41,7 @@ use tokio::sync::watch;
 use utoipa::ToSchema;
 
 use crate::browser_gpu::{AppGpuReport, Rendering};
+use crate::cpu::{CpuSampler, SOLO_PREFIX};
 use crate::devtools::{
     BrowserGpuInfo, BrowserVersion, DevtoolsState, DevtoolsStatus, Internals, MediaPlayer,
 };
@@ -37,6 +52,7 @@ use crate::nvidia_smi::{self, GpuHistoryPoint, GpuHistorySample, GpuTelemetry};
 use crate::procs::{BrowserProcess, ProcessSampleSet, ProcessSampler};
 use crate::snapshot::Snapshot;
 use crate::supervisor::Supervisor;
+use crate::sway::SwayClient;
 
 /// How often [`Telemetry::run`] samples.
 pub const POLL: Duration = crate::diagnostics::SAMPLE_INTERVAL;
@@ -160,7 +176,7 @@ pub fn push_history(buffer: &mut VecDeque<GpuHistoryPoint>, sample: &GpuTelemetr
 /// Drop points older than [`HISTORY_WINDOW`], then the oldest over
 /// [`history_capacity`]. Shared by the GPU and pipeline histories so the two
 /// charts always cover the same window.
-fn trim_history<T>(buffer: &mut VecDeque<T>, now: u64, at: impl Fn(&T) -> u64) {
+pub(crate) fn trim_history<T>(buffer: &mut VecDeque<T>, now: u64, at: impl Fn(&T) -> u64) {
     while buffer
         .front()
         .is_some_and(|point| now.saturating_sub(at(point)) > HISTORY_WINDOW.as_secs())
@@ -395,8 +411,10 @@ pub struct Telemetry {
     supervisor: Arc<Supervisor>,
     snapshot: Arc<Snapshot>,
     events: EventHub,
+    sway: Arc<dyn SwayClient>,
     browser_devtools: bool,
     sampler: ProcessSampler,
+    cpu: CpuSampler,
     /// When `nvidia-smi` was last found missing, to rate-limit re-probing.
     missing_since: Option<Instant>,
     /// Recent successful GPU polls, published as [`GpuTelemetry::history`].
@@ -413,14 +431,17 @@ impl Telemetry {
         supervisor: Arc<Supervisor>,
         snapshot: Arc<Snapshot>,
         events: EventHub,
+        sway: Arc<dyn SwayClient>,
         browser_devtools: bool,
     ) -> Self {
         Self {
             supervisor,
             snapshot,
             events,
+            sway,
             browser_devtools,
             sampler: ProcessSampler::new(),
+            cpu: CpuSampler::new(),
             missing_since: None,
             history: VecDeque::new(),
             pipeline: VecDeque::new(),
@@ -435,7 +456,23 @@ impl Telemetry {
             .iter()
             .filter_map(|(status, _)| status.pid.map(|pid| (status.id.clone(), pid)))
             .collect();
-        let processes = self.sampler.sample(&roots);
+        let now = crate::util::unix_now();
+        // The daemon, the compositor and the slicer are sampled alone: the
+        // daemon's tree would otherwise contain every app.
+        let mut solo = vec![(format!("{SOLO_PREFIX}suede"), std::process::id())];
+        solo.extend(
+            self.sway
+                .pid()
+                .map(|pid| (format!("{SOLO_PREFIX}sway"), pid)),
+        );
+        solo.extend(
+            self.snapshot
+                .slicer_pid()
+                .map(|pid| (format!("{SOLO_PREFIX}slicer"), pid)),
+        );
+        let mut processes = self.sampler.sample_with_solo(&roots, &solo);
+        let solo_processes = crate::cpu::take_solo(&mut processes);
+        let cpu = self.cpu.sample(&solo_processes, &processes, now);
 
         let probe = match self.missing_since {
             Some(since) => since.elapsed() >= REPROBE_MISSING,
@@ -451,7 +488,7 @@ impl Telemetry {
             self.snapshot.gpu()
         };
         annotate_gpu(&mut gpu, &processes);
-        apply_history(&mut self.history, &mut gpu, probe, crate::util::unix_now());
+        apply_history(&mut self.history, &mut gpu, probe, now);
 
         let gpu_reports = self.snapshot.browser_gpu();
         let internals = self.supervisor.devtools_internals().await;
@@ -463,9 +500,12 @@ impl Telemetry {
                 internals: &internals,
                 browser_devtools: self.browser_devtools,
             },
-            crate::util::unix_now(),
+            now,
         );
 
+        if self.snapshot.set_cpu(cpu.clone()) {
+            self.events.publish(ServerEvent::CpuChanged(Box::new(cpu)));
+        }
         if self.snapshot.set_gpu(gpu.clone()) {
             self.events.publish(ServerEvent::GpuChanged(Box::new(gpu)));
         }
@@ -473,7 +513,7 @@ impl Telemetry {
             &mut self.pipeline,
             &mut self.previous_measured_at,
             &self.snapshot,
-            crate::util::unix_now(),
+            now,
         );
         if self.snapshot.set_pipeline(pipeline.clone()) {
             self.events

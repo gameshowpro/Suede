@@ -984,6 +984,7 @@ impl Reconciler {
         // which stays "no" for as long as a static page produces no frames
         // to report (see `ProjectionReport`).
         self.publish_slicer_running(manager.slicer_running());
+        self.snapshot.set_slicer_pid(manager.slicer_pid());
         (canvas, divergences)
     }
 

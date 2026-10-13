@@ -160,6 +160,23 @@ pub async fn get_pipeline(
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/system/cpu", tag = "observed",
+    responses((
+        status = 200,
+        description = "Whole-machine and per-core CPU use, load, memory, \
+                       package temperature, the daemon, compositor and \
+                       slicer processes, and each app's process tree, with \
+                       one history point per diagnostics interval for the \
+                       last five minutes. Always 200: before the first \
+                       sample the figures are empty.",
+        body = crate::cpu::CpuTelemetry,
+    ))
+)]
+pub async fn get_cpu(State(state): State<ApiState>) -> Json<crate::cpu::CpuTelemetry> {
+    Json(state.snapshot.cpu())
+}
+
+#[utoipa::path(
     get, path = "/api/v1/system/browsers", tag = "observed",
     responses((
         status = 200,
@@ -757,6 +774,19 @@ mod tests {
         let (status, body) = get_json("/api/v1/system/pipeline").await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, serde_json::json!({"running": false, "history": []}));
+    }
+
+    #[tokio::test]
+    async fn cpu_telemetry_is_empty_before_the_first_tick() {
+        let (status, body) = get_json("/api/v1/system/cpu").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["cores"], 0);
+        assert_eq!(body["totalPercent"], serde_json::Value::Null);
+        assert_eq!(body["corePercent"], serde_json::json!([]));
+        assert_eq!(body["processes"], serde_json::json!([]));
+        assert_eq!(body["apps"], serde_json::json!([]));
+        assert_eq!(body["history"], serde_json::json!([]));
+        assert_eq!(body["load1"], 0.0);
     }
 
     #[tokio::test]

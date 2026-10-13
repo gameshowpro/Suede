@@ -80,6 +80,8 @@ const DIRECT_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 struct SlicerReaderState {
     current_epoch: Arc<Mutex<u64>>,
     epoch: u64,
+    /// The slicer's process id, published with its liveness.
+    pid: u32,
     session: String,
     config_generations: Arc<Mutex<BTreeMap<u64, u64>>>,
     protocol_mismatch: Arc<std::sync::atomic::AtomicBool>,
@@ -233,10 +235,9 @@ impl BlendManager {
         self.slicer.is_some()
     }
 
-    /// The running slicer's process id, if any — only ever needed to tell
-    /// "the same process" from "a fresh one" in a test, since no production
-    /// caller has a use for the number itself.
-    #[cfg(test)]
+    /// The running slicer's process id, if any: published for the CPU
+    /// panel, and used by tests to tell "the same process" from "a fresh
+    /// one".
     pub(crate) fn slicer_pid(&self) -> Option<u32> {
         self.slicer.as_ref().map(|running| running.child.id())
     }
@@ -729,6 +730,7 @@ impl BlendManager {
                         SlicerReaderState {
                             current_epoch: self.slicer_epoch.clone(),
                             epoch,
+                            pid: child.id(),
                             session: session.clone(),
                             config_generations: config_generations.clone(),
                             protocol_mismatch: protocol_mismatch.clone(),
@@ -1160,6 +1162,7 @@ fn spawn_slicer_stdout_reader(
                         }
                         snapshot.set_projection_stats(Some(stats));
                         snapshot.set_slicer_running(true);
+                        snapshot.set_slicer_pid(Some(state.pid));
                         events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
                             snapshot.projection_report(),
                         )));

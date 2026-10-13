@@ -466,6 +466,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
             supervisor.clone(),
             snapshot.clone(),
             events.clone(),
+            sway.clone(),
             bootstrap.browser_devtools,
         )
         .run(shutdown_rx.clone()),

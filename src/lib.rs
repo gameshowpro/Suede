@@ -11,6 +11,7 @@ pub mod browser_gpu;
 pub mod capabilities;
 pub mod checks;
 pub mod config;
+pub mod cpu;
 pub mod devtools;
 pub mod diagnostics;
 pub mod drm_inventory;

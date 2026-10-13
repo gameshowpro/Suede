@@ -95,13 +95,40 @@ impl ProcessSampler {
         self.sample_at(roots, Instant::now())
     }
 
+    /// Like [`sample`](Self::sample), plus `solo` roots that are sampled
+    /// alone, without their descendants, and claimed first. The daemon,
+    /// the compositor and the slicer are such roots: the daemon's tree would
+    /// otherwise swallow every app it started.
+    pub fn sample_with_solo(
+        &mut self,
+        roots: &[(String, u32)],
+        solo: &[(String, u32)],
+    ) -> ProcessSampleSet {
+        self.sample_roots(roots, solo, Instant::now())
+    }
+
     pub(crate) fn sample_at(&mut self, roots: &[(String, u32)], now: Instant) -> ProcessSampleSet {
+        self.sample_roots(roots, &[], now)
+    }
+
+    fn sample_roots(
+        &mut self,
+        roots: &[(String, u32)],
+        solo: &[(String, u32)],
+        now: Instant,
+    ) -> ProcessSampleSet {
         let children = children_by_parent(&self.proc_root);
         let mut set = ProcessSampleSet::default();
         let mut current: HashMap<u32, (u64, Instant)> = HashMap::new();
-        for (app, root) in roots {
-            let mut pids = vec![*root];
-            pids.extend(descendants(&children, *root));
+        let trees = solo
+            .iter()
+            .map(|(name, root)| (name, *root, vec![*root]))
+            .chain(roots.iter().map(|(app, root)| {
+                let mut pids = vec![*root];
+                pids.extend(descendants(&children, *root));
+                (app, *root, pids)
+            }));
+        for (app, root, pids) in trees {
             for pid in pids {
                 if set.owner.contains_key(&pid) {
                     continue;
@@ -114,7 +141,7 @@ impl ProcessSampler {
                     continue;
                 };
                 let cmdline = std::fs::read(dir.join("cmdline")).unwrap_or_default();
-                let (role, subtype) = classify(&cmdline, pid == *root);
+                let (role, subtype) = classify(&cmdline, pid == root);
                 let cpu_percent = self.previous.get(&pid).and_then(|(before, then)| {
                     let wall = now.checked_duration_since(*then)?.as_secs_f64();
                     if wall <= 0.0 {
@@ -261,6 +288,28 @@ mod tests {
             ("kiosk".to_string(), "gpu-process".to_string())
         );
         assert!(!set.owner.contains_key(&999));
+    }
+
+    #[test]
+    fn a_solo_root_is_sampled_alone_and_its_children_stay_with_their_app() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        write_proc(p, 10, 1, "suede", 0, 256, "suede\0serve\0");
+        write_proc(p, 100, 10, "chrome", 0, 0, "/opt/chrome\0");
+        write_proc(
+            p,
+            101,
+            100,
+            "chrome",
+            0,
+            0,
+            "/opt/chrome\0--type=renderer\0",
+        );
+        let mut sampler = ProcessSampler::with_proc_root(p.to_path_buf());
+        let set = sampler.sample_with_solo(&app(100), &[("@suede".to_string(), 10)]);
+        assert_eq!(set.by_app["@suede"].len(), 1, "no descendants");
+        assert_eq!(set.by_app["@suede"][0].rss_mib, 1);
+        assert_eq!(set.by_app["kiosk"].len(), 2, "the app keeps its tree");
     }
 
     #[test]

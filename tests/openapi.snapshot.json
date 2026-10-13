@@ -1412,6 +1412,293 @@
         ],
         "type": "object"
       },
+      "CpuApp": {
+        "description": "One Suede app's whole process tree.",
+        "properties": {
+          "app": {
+            "type": "string"
+          },
+          "corePercent": {
+            "description": "The same share as a percent of one core.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "percent": {
+            "description": "Percent of the whole machine, summed over the tree.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "processes": {
+            "description": "Processes in the tree.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rssMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "app",
+          "rssMib",
+          "processes"
+        ],
+        "type": "object"
+      },
+      "CpuAppShare": {
+        "description": "One app's share in a history point.",
+        "properties": {
+          "app": {
+            "type": "string"
+          },
+          "percent": {
+            "description": "Percent of the whole machine.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "app"
+        ],
+        "type": "object"
+      },
+      "CpuHistoryPoint": {
+        "description": "One diagnostics interval of the CPU panel.",
+        "properties": {
+          "apps": {
+            "description": "Each app's share of the machine.",
+            "items": {
+              "$ref": "#/components/schemas/CpuAppShare"
+            },
+            "type": "array"
+          },
+          "at": {
+            "description": "Unix seconds of the sample.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "maxCorePercent": {
+            "description": "The busiest core, so one saturated core shows against a low total.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "memoryUsedPercent": {
+            "description": "`(total - available) / total` of memory.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "slicerPercent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "suedePercent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "swayPercent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "temperatureC": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "totalPercent": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "at",
+          "apps"
+        ],
+        "type": "object"
+      },
+      "CpuProcess": {
+        "description": "One of the daemon, the compositor and the slicer.",
+        "properties": {
+          "corePercent": {
+            "description": "The same share as a percent of one core, the figure operators know\nfrom `top`.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "percent": {
+            "description": "Percent of the whole machine (all cores = 100); null on the first\nsample of the process.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pid": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "description": "\"suede\", \"sway\" or \"slicer\".",
+            "type": "string"
+          },
+          "rssMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "role",
+          "pid",
+          "rssMib"
+        ],
+        "type": "object"
+      },
+      "CpuTelemetry": {
+        "description": "What `GET /system/cpu` returns.",
+        "properties": {
+          "apps": {
+            "description": "Every Suede app's whole process tree.",
+            "items": {
+              "$ref": "#/components/schemas/CpuApp"
+            },
+            "type": "array"
+          },
+          "corePercent": {
+            "description": "Per core, 0 to 100, in `/proc/stat` order.",
+            "items": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "type": "array"
+          },
+          "cores": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "history": {
+            "items": {
+              "$ref": "#/components/schemas/CpuHistoryPoint"
+            },
+            "type": "array"
+          },
+          "load1": {
+            "format": "double",
+            "type": "number"
+          },
+          "load15": {
+            "format": "double",
+            "type": "number"
+          },
+          "load5": {
+            "format": "double",
+            "type": "number"
+          },
+          "memoryAvailableMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memoryTotalMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "processes": {
+            "description": "The daemon, the compositor and the slicer.",
+            "items": {
+              "$ref": "#/components/schemas/CpuProcess"
+            },
+            "type": "array"
+          },
+          "sampledAt": {
+            "description": "Unix seconds of this sample; 0 before the first.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "swapFreeMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "swapTotalMib": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "temperatureC": {
+            "description": "Package temperature from hwmon (`coretemp`, `k10temp`, `cpu_thermal`\nor `cpu-thermal`, first found), else null.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "totalPercent": {
+            "description": "All cores together, 0 to 100; null on the first sample.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sampledAt",
+          "cores",
+          "corePercent",
+          "load1",
+          "load5",
+          "load15",
+          "memoryTotalMib",
+          "memoryAvailableMib",
+          "swapTotalMib",
+          "swapFreeMib",
+          "processes",
+          "apps",
+          "history"
+        ],
+        "type": "object"
+      },
       "DesiredState": {
         "additionalProperties": false,
         "description": "The complete desired-state document.",
@@ -7139,6 +7426,26 @@
           },
           "404": {
             "description": "No automated fix exists for this check"
+          }
+        },
+        "tags": [
+          "observed"
+        ]
+      }
+    },
+    "/api/v1/system/cpu": {
+      "get": {
+        "operationId": "get_cpu",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CpuTelemetry"
+                }
+              }
+            },
+            "description": "Whole-machine and per-core CPU use, load, memory, package temperature, the daemon, compositor and slicer processes, and each app's process tree, with one history point per diagnostics interval for the last five minutes. Always 200: before the first sample the figures are empty."
           }
         },
         "tags": [

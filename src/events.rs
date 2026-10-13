@@ -33,6 +33,8 @@ pub enum ServerEvent {
     GpuChanged(Box<crate::nvidia_smi::GpuTelemetry>),
     /// Same shape as `GET /system/pipeline`.
     PipelineChanged(Box<crate::telemetry::PipelineTelemetry>),
+    /// Same shape as `GET /system/cpu`.
+    CpuChanged(Box<crate::cpu::CpuTelemetry>),
     /// Same shape as `GET /system/browsers`.
     BrowsersChanged(Vec<crate::telemetry::BrowserReport>),
 }
@@ -51,6 +53,7 @@ impl ServerEvent {
             Self::ProjectionStatsChanged(_) => "projection_stats_changed",
             Self::GpuChanged(_) => "gpu_changed",
             Self::PipelineChanged(_) => "pipeline_changed",
+            Self::CpuChanged(_) => "cpu_changed",
             Self::BrowsersChanged(_) => "browsers_changed",
         }
     }
@@ -68,6 +71,7 @@ impl ServerEvent {
             Self::ProjectionStatsChanged(report) => serde_json::to_value(report),
             Self::GpuChanged(gpu) => serde_json::to_value(gpu),
             Self::PipelineChanged(pipeline) => serde_json::to_value(pipeline),
+            Self::CpuChanged(cpu) => serde_json::to_value(cpu),
             Self::BrowsersChanged(browsers) => serde_json::to_value(browsers),
         }
         .unwrap_or(serde_json::Value::Null)

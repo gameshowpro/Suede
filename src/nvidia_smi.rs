@@ -230,26 +230,39 @@ pub struct GpuProcessSample {
 /// `reason` (both, joined with "; ", if both fail) and the affected fields
 /// empty.
 pub async fn sample() -> GpuTelemetry {
+    sample_with("nvidia-smi").await
+}
+
+/// [`sample`] against `program`, so a test can substitute a script.
+///
+/// The three commands are independent, so they run concurrently and the
+/// call waits for the slowest instead of the sum. Each keeps its own
+/// [`COMMAND_TIMEOUT`]. A failed query makes the whole sample unavailable,
+/// as before; the other two answers are then simply dropped.
+async fn sample_with(program: &str) -> GpuTelemetry {
     let query_args = [
         format!("--query-gpu={QUERY_FIELDS}"),
         "--format=csv,noheader,nounits".to_string(),
     ];
-    let gpu_text = match run(&query_args).await {
+    let pmon_args = ["pmon", "-c", "1", "-s", "um"].map(String::from);
+    // `dmon` reports throughput only; the percent needs the link generation
+    // and width from this same poll's query, so it is applied below.
+    let dmon_args = ["dmon", "-c", "1", "-s", "t"].map(String::from);
+    let (gpu_result, pmon_result, dmon_result) = tokio::join!(
+        run(program, &query_args),
+        run(program, &pmon_args),
+        run(program, &dmon_args),
+    );
+    let gpu_text = match gpu_result {
         Ok(text) => text,
         Err(reason) => return GpuTelemetry::unavailable(reason),
     };
     let mut gpus = parse_query_gpu(&gpu_text);
-
-    let pmon_args = ["pmon", "-c", "1", "-s", "um"].map(String::from);
-    let (processes, pmon_reason) = match run(&pmon_args).await {
+    let (processes, pmon_reason) = match pmon_result {
         Ok(text) => (parse_pmon(&text), None),
         Err(reason) => (Vec::new(), Some(reason)),
     };
-
-    // `dmon` reports throughput only; the percent needs the link generation
-    // and width from this same poll's query, so it is applied here.
-    let dmon_args = ["dmon", "-c", "1", "-s", "t"].map(String::from);
-    let dmon_reason = match run(&dmon_args).await {
+    let dmon_reason = match dmon_result {
         Ok(text) => {
             apply_pcie_throughput(&mut gpus, &parse_dmon_pcie(&text));
             None
@@ -323,8 +336,8 @@ pub fn pcie_percent(mb_s: u32, generation: Option<u32>, width: Option<u32>) -> O
 
 /// Run `nvidia-smi` with a timeout and return its stdout, or a reason it
 /// could not be used.
-async fn run(args: &[String]) -> Result<String, String> {
-    let mut command = tokio::process::Command::new("nvidia-smi");
+async fn run(program: &str, args: &[String]) -> Result<String, String> {
+    let mut command = tokio::process::Command::new(program);
     command.args(args).kill_on_drop(true);
     let output = match tokio::time::timeout(COMMAND_TIMEOUT, command.output()).await {
         Err(_) => return Err("nvidia-smi timed out".to_string()),
@@ -842,5 +855,23 @@ mod tests {
             assert!(telemetry.reason.is_some());
             assert!(telemetry.gpus.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn the_three_commands_run_concurrently() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("nvidia-smi");
+        std::fs::write(&script, "#!/bin/sh\nsleep 0.4\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let started = std::time::Instant::now();
+        let telemetry = sample_with(script.to_str().unwrap()).await;
+        let elapsed = started.elapsed();
+        assert!(telemetry.available, "{:?}", telemetry.reason);
+        // In sequence the three sleeps take at least 1.2 s.
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "three 0.4 s commands took {elapsed:?}"
+        );
     }
 }

@@ -484,7 +484,7 @@ down. See [Environment and hardware acceleration](configuration.md#environment-a
 
 ## Reading the GPU and Chromium panels {: #gpu-and-chromium-panels }
 
-The System tab has three panels between **System** and **Health checks**.
+The System tab has four panels between **System** and **Health checks**.
 Every figure on them is sampled once per diagnostics interval, which
 `GET /system` reports as `diagnosticsIntervalSeconds`; the web UI reads it
 from there. They answer "is this video decoded on the GPU?", "is the wall keeping up?"
@@ -516,6 +516,22 @@ as 100 %. A marker flags every interval that had straddles, frames shown on
 different refreshes by different outputs. The slicer reports once per diagnostics interval, so the chart moves in steps and the values are averages over each
 interval. A static source makes the slicer report nothing, and the chart then
 shows a gap rather than a flat line.
+
+**CPU.** Always shown. Once per diagnostics interval Suede reads `/proc/stat`,
+`/proc/loadavg` and `/proc/meminfo`, and a temperature from `/sys`; it starts
+no program and polls nothing else, so the panel costs about a millisecond. The
+chart shows the whole machine, the compositor (Sway), the Suede daemon, the
+slicer, each app's whole process tree and memory in use, all as a percent of
+the machine: every core fully busy is 100 %. The same share is also given as a
+percent of one core, the figure `top` shows, so a process that keeps one core
+of twenty busy reads 5 % of the machine and 100 % of a core. The strip of small
+bars under the chart is one bar per core, so a single saturated core stands out
+even when the total is low. The three Suede processes are counted alone and an
+app's share is its own tree, so nothing is counted twice. The temperature is
+the package sensor of the first `coretemp`, `k10temp`, `cpu_thermal` or
+`cpu-thermal` device under `/sys/class/hwmon`; a machine without one shows no
+temperature. The first sample after a start has no percentages, because a
+percentage needs two readings.
 
 **Chromium.** One block per running `chromium-kiosk` app (not Firefox or
 `exec` apps):
