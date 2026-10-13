@@ -484,9 +484,9 @@ down. See [Environment and hardware acceleration](configuration.md#environment-a
 
 ## Reading the GPU and Chromium panels {: #gpu-and-chromium-panels }
 
-The System tab has two panels between **System** and **Health checks**. They
-answer "is this video decoded on the GPU?" and "what is the browser doing?"
-without a terminal.
+The System tab has three panels between **System** and **Health checks**.
+They answer "is this video decoded on the GPU?", "is the wall keeping up?"
+and "what is the browser doing?" without a terminal.
 
 **GPU.** Shown only on a machine with an NVIDIA driver and `nvidia-smi`; it
 is hidden otherwise. Every five seconds Suede runs `nvidia-smi` (about 80 ms
