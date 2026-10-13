@@ -4499,8 +4499,10 @@ function flattenJson(v) {
 }
 // Human-readable form of a raw Chromium media-log value, chosen by field
 // name. Hexadecimal literals become decimal first; then bitrate, sample
-// rate, duration/time (seconds) and byte-count names get units. Anything
-// that matches no rule or fails to parse comes back unchanged. Pure.
+// rate, duration/time (seconds) and byte-count names get units. Times may
+// be negative (kStartTime carries the audio priming offset, e.g. -0.02322)
+// and keep their sign; the other units are unsigned. Anything that matches
+// no rule or fails to parse comes back unchanged. Pure.
 function formatMediaValue(name, raw) {
   if (typeof raw !== "string") return raw;
   let text = raw.trim();
@@ -4510,10 +4512,11 @@ function formatMediaValue(name, raw) {
     text = BigInt(text).toString();
     hexed = true;
   }
-  if (!/^\d+(\.\d+)?$/.test(text)) return raw;
+  const key = String(name);
+  const isTime = /(duration|time)$/i.test(key);
+  if (!(isTime ? /^-?\d+(\.\d+)?$/ : /^\d+(\.\d+)?$/).test(text)) return raw;
   const n = Number(text);
   if (!Number.isFinite(n)) return raw;
-  const key = String(name);
   // The number under 1000 in the largest fitting unit: integers plain,
   // two decimals below 10, one decimal otherwise.
   const scaled = (value, units) => {
@@ -4525,10 +4528,11 @@ function formatMediaValue(name, raw) {
   if (/bitrate$/i.test(key)) return scaled(n, ["bit/s", "kbit/s", "Mbit/s", "Gbit/s"]);
   if (/bytes$/i.test(key)) return scaled(n, ["B", "kB", "MB", "GB"]);
   if (key === "samples per second") return scaled(n, ["Hz", "kHz"]);
-  if (/(duration|time)$/i.test(key)) {
-    const cs = Math.round(n * 100);
+  if (isTime) {
+    const cs = Math.round(Math.abs(n) * 100);
     const two = (x) => String(x).padStart(2, "0");
-    return `${two(Math.floor(cs / 360000))}:${two(Math.floor(cs / 6000) % 60)}:${two(Math.floor(cs / 100) % 60)}.${two(cs % 100)}`;
+    const sign = n < 0 && cs > 0 ? "-" : "";
+    return `${sign}${two(Math.floor(cs / 360000))}:${two(Math.floor(cs / 6000) % 60)}:${two(Math.floor(cs / 100) % 60)}.${two(cs % 100)}`;
   }
   return hexed ? BigInt(text).toLocaleString("en-US") : raw;
 }
