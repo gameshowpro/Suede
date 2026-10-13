@@ -128,6 +128,22 @@ a { color: var(--accent); }
 .gpu-legend .swatch.fill { height: 10px; width: 14px; border: 2px solid; border-radius: 2px; }
 .gpu-legend .swatch.tri { width: 0; height: 0; border: 5px solid transparent; border-top: 8px solid var(--ink); border-radius: 0; }
 .gpu-caption { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+/* CPU card: eight categorical slots (Sway, Suede, Slicer, four apps, Memory
+   used), validated against the panel surface in both schemes. Total is ink
+   and "others" is muted dashed, so neither spends a hue. */
+.cpu-chart { --c1: #2a78d6; --c2: #eb6834; --c3: #1baf7a; --c4: #eda100; --c5: #e87ba4; --c6: #008300; --c7: #6250d6; --c8: #e34948; }
+@media (prefers-color-scheme: dark) {
+  .cpu-chart { --c1: #3987e5; --c2: #d95926; --c3: #199e70; --c4: #c98500; --c5: #d55181; --c6: #008300; --c7: #9085e9; --c8: #e66767; }
+}
+.gpu-chart .series.total { stroke-width: 2.5; }
+.gpu-chart .series.others { stroke-dasharray: 2 3; }
+.gpu-legend .swatch.others { border-top-style: dotted; }
+.core-strip { --core: #2a78d6; --hot: #eb6834; display: flex; align-items: flex-end; gap: 2px; height: 40px; margin: 10px 0 0; }
+@media (prefers-color-scheme: dark) { .core-strip { --core: #3987e5; --hot: #d95926; } }
+.core-strip .core { flex: 1; min-width: 4px; height: 100%; display: flex; align-items: flex-end;
+  background: var(--sunken); border-radius: 2px 2px 0 0; }
+.core-strip .core i { display: block; width: 100%; background: var(--core); border-radius: 2px 2px 0 0; min-height: 1px; }
+.core-strip .core.hot i { background: var(--hot); }
 .kv th { width: 11em; white-space: nowrap; }
 .feature-grid { display: grid; grid-template-columns: 1fr; gap: 0 28px; }
 @media (min-width: 900px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
@@ -867,6 +883,10 @@ window.addEventListener("error", (event) => {
         content is drawing.</p>
       <div id="pipeline"></div>
     </div>
+    <div class="panel" id="cpu-panel" hidden>
+      <h2>CPU</h2>
+      <div id="cpu"></div>
+    </div>
     <div class="panel" id="browsers-panel" hidden>
       <h2>Chromium</h2>
       <div id="browsers"></div>
@@ -950,6 +970,8 @@ let outputs = [], config = null, apps = [], sinks = [], checks = [], status = nu
     gpuTelemetry = null,
     // PipelineTelemetry from /system/pipeline; advisory, null hides the panel.
     pipelineTelemetry = null,
+    // CpuTelemetry from /system/cpu; advisory, null hides the panel.
+    cpuTelemetry = null,
     browserReports = [];
 
 // Every display's background comes from here, so the lookup is shared.
@@ -3049,6 +3071,7 @@ const warpAvailable = () => projectionStats?.geometry?.warpAvailable === true &&
 const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy;
 let warpDrag = null, rejectedHandle = null;
 let projectionEventVersion = 0, pipelineEventVersion = 0;
+let cpuEventVersion = 0;
 
 // Solve the projective map from a unit square to the pins. Center endpoints
 // are recovered with its inverse, never a distance ratio on a perspective edge.
@@ -4615,7 +4638,146 @@ function renderPipeline() {
     ? pipelineChart({ ...(pipelineTelemetry || { history: [] }), lastInterval: projectionStats.lastInterval })
     : "";
 }
-function renderGpuAndBrowsers() { renderGpu(); renderPipeline(); renderBrowsers(); }
+// CPU card: facts, a five-minute chart of the machine's share (0-100 % of all
+// cores), a per-core strip and a table of the Suede processes and apps.
+// Series colors follow the entity: Sway, Suede and the slicer keep their hue;
+// apps take the next four slots by name order, the rest fold into "others".
+const CPU_PROCESS_SERIES = [
+  { role: "sway", name: "Sway", color: "var(--c1)", value: (h) => h.swayPercent },
+  { role: "suede", name: "Suede", color: "var(--c2)", value: (h) => h.suedePercent },
+  { role: "slicer", name: "Slicer", color: "var(--c3)", value: (h) => h.slicerPercent },
+];
+const CPU_APP_COLORS = ["var(--c4)", "var(--c5)", "var(--c6)", "var(--c7)"];
+function cpuChart(c) {
+  const W = 720, H = 160, L = 34, R = 10, T = 8, B = 22;
+  const pw = W - L - R, ph = H - T - B;
+  const ok = (v) => v != null && Number.isFinite(Number(v));
+  // A gap is a sample missing for 1.5 intervals; the interval comes from
+  // GET /system, never a literal (5 only if an older daemon omits it).
+  const interval = Number(systemInfo?.diagnosticsIntervalSeconds) > 0
+    ? Number(systemInfo.diagnosticsIntervalSeconds) : 5;
+  const gap = 1.5 * interval;
+  const points = (Array.isArray(c.history) ? c.history : [])
+    .filter((point) => Number.isFinite(Number(point.at))).map((point) => ({ ...point, at: Number(point.at) }));
+  const appShare = (point, name) => (point.apps || []).find((a) => a.app === name)?.percent;
+  // At most four apps get a line: the busiest over the window, then colored
+  // in name order so a color does not move when the ranking does.
+  const totals = new Map();
+  for (const point of points) for (const a of point.apps || []) {
+    if (ok(a.percent)) totals.set(a.app, (totals.get(a.app) || 0) + Number(a.percent));
+  }
+  for (const a of c.apps || []) if (!totals.has(a.app)) totals.set(a.app, 0);
+  const ranked = [...totals.keys()].sort((a, b) => totals.get(b) - totals.get(a) || a.localeCompare(b));
+  const named = ranked.slice(0, 4).sort((a, b) => a.localeCompare(b));
+  const hasOthers = ranked.length > 4;
+  const sumOthers = (list) => {
+    const rest = list.filter((a) => !named.includes(a.app) && ok(a.percent));
+    return rest.length ? rest.reduce((sum, a) => sum + Number(a.percent), 0) : null;
+  };
+  const series = [
+    { name: "Total", cls: "total", color: "var(--ink)", value: (h) => h.totalPercent },
+    ...CPU_PROCESS_SERIES.map((s) => ({ ...s, process: true })),
+    ...named.map((app, i) => ({ name: app, app, color: CPU_APP_COLORS[i], mono: true,
+      value: (h) => appShare(h, app) })),
+    ...(hasOthers ? [{ name: "Others", cls: "others", color: "var(--muted)", value: (h) => sumOthers(h.apps || []) }] : []),
+    { name: "Memory used", color: "var(--c8)", value: (h) => h.memoryUsedPercent },
+  ];
+  const y = (v) => T + ph * (1 - Math.min(100, Math.max(0, v)) / 100);
+  let svg = "";
+  for (const tick of [0, 25, 50, 75, 100]) {
+    svg += `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(tick)}" y2="${y(tick)}"/>` +
+      `<text class="axis-label" x="${L - 5}" y="${y(tick) + 4}" text-anchor="end">${tick}</text>`;
+  }
+  svg += `<text class="axis-label" x="${L}" y="${H - 6}">5 min ago</text>` +
+    `<text class="axis-label" x="${W - R}" y="${H - 6}" text-anchor="end">now</text>` +
+    `<text class="axis-label" x="${L + 4}" y="${T + 18}">of the machine</text>`;
+  if (points.length < 2) {
+    svg += `<text class="axis-label" x="${L + pw / 2}" y="${T + ph / 2}" text-anchor="middle">collecting…</text>`;
+  } else {
+    const now = points[points.length - 1].at;
+    const x = (at) => L + pw * (1 - (now - at) / HISTORY_SECONDS);
+    const visible = points.filter((point) => now - point.at <= HISTORY_SECONDS);
+    for (const s of series) {
+      let path = "", dots = "", previous = null;
+      visible.forEach((point, i) => {
+        const v = s.value(point);
+        if (!ok(v)) { previous = null; return; }
+        const connected = previous != null && point.at - previous <= gap;
+        path += `${connected ? "L" : "M"}${x(point.at).toFixed(1)},${y(v).toFixed(1)}`;
+        previous = point.at;
+        const next = visible[i + 1];
+        const nextConnected = next && next.at - point.at <= gap && ok(s.value(next));
+        if (!connected && !nextConnected) {
+          dots += `<circle class="dot" cx="${x(point.at).toFixed(1)}" cy="${y(v).toFixed(1)}" r="3" fill="${s.color}"/>`;
+        }
+      });
+      svg += `<path class="series ${s.cls || ""}" stroke="${s.color}" d="${path}"/>${dots}`;
+    }
+    visible.forEach((point, i) => {
+      const x0 = i === 0 ? L : (x(visible[i - 1].at) + x(point.at)) / 2;
+      const x1 = i === visible.length - 1 ? W - R : (x(point.at) + x(visible[i + 1].at)) / 2;
+      const when = new Date(point.at * 1000).toLocaleTimeString();
+      const lines = series.map((s) => { const v = s.value(point); return `${s.name} ${ok(v) ? fmt(v, 1, " %") : dash}`; }).join("\n");
+      svg += `<rect class="hit" x="${x0.toFixed(1)}" y="${T}" width="${Math.max(1, x1 - x0).toFixed(1)}" height="${ph}"><title>${escape(when)}\n${escape(lines)}</title></rect>`;
+    });
+  }
+  // Legend: current figures from the live payload; process series carry both
+  // the share of the machine and the share of one core (the `top` figure).
+  const procByRole = new Map((c.processes || []).map((p) => [p.role, p]));
+  const appByName = new Map((c.apps || []).map((a) => [a.app, a]));
+  const both = (o) => o && o.percent != null
+    ? `${fmt(o.percent, 1, " %")} · ${fmt(o.corePercent, 0, " %")} of a core` : dash;
+  const legend = series.map((s) => {
+    let text;
+    if (s.process) text = both(procByRole.get(s.role));
+    else if (s.app) text = both(appByName.get(s.app));
+    else if (s.name === "Total") text = fmt(c.totalPercent, 1, " %");
+    else if (s.name === "Others") text = fmt(sumOthers(c.apps || []), 1, " %");
+    else text = c.memoryTotalMib ? fmt(100 * (c.memoryTotalMib - c.memoryAvailableMib) / c.memoryTotalMib, 0, " %") : dash;
+    return `<span class="key"><span class="swatch ${s.cls || ""}" style="border-color:${s.color}"></span>${s.mono ? `<span class="mono">${escape(s.name)}</span>` : escape(s.name)}
+      <b>${text}</b></span>`;
+  }).join("");
+  const caption = `<p class="gpu-caption">100 % = every core busy. Shares are averages over each ${escape(num(interval, 0))}-second sample.</p>`;
+  return `<div class="gpu-chart cpu-chart">
+    <svg viewBox="0 0 ${W} ${H}" role="img" aria-label="CPU use over the last five minutes">${svg}</svg>
+    <div class="gpu-legend">${legend}</div>${caption}</div>`;
+}
+function renderCpu() {
+  const c = cpuTelemetry;
+  const present = !!c && typeof c === "object";
+  $("cpu-panel").hidden = !present;
+  if (!present) return;
+  const cores = Array.isArray(c.corePercent) ? c.corePercent : [];
+  const mib = (v) => fmt(v, 0);
+  const used = c.memoryTotalMib != null && c.memoryAvailableMib != null ? c.memoryTotalMib - c.memoryAvailableMib : null;
+  const swapUsed = c.swapTotalMib != null && c.swapFreeMib != null ? c.swapTotalMib - c.swapFreeMib : null;
+  const load = [c.load1 ?? c.load_1, c.load5 ?? c.load_5, c.load15 ?? c.load_15]
+    .map((v) => fmt(v, 2)).join(" / ");
+  const facts = `<table class="kv"><tbody>
+    <tr><th>Cores and load</th><td>${fmt(c.cores)} cores · load ${load}</td></tr>
+    <tr><th>Memory</th><td>${mib(used)} / ${mib(c.memoryTotalMib)} MiB ·
+      swap ${mib(swapUsed)} / ${mib(c.swapTotalMib)} MiB</td></tr>
+    <tr><th>Temperature</th><td>${fmt(c.temperatureC, 0, " °C")}</td></tr></tbody></table>`;
+  const strip = cores.length ? `<div class="core-strip" role="img" aria-label="Use of each core">${
+    cores.map((v, i) => {
+      const h = v == null ? 0 : Math.min(100, Math.max(0, Number(v)));
+      return `<span class="core${h >= 90 ? " hot" : ""}" title="Core ${i}: ${escape(v == null ? dash : Math.round(v) + " %")}"><i style="height:${h}%"></i></span>`;
+    }).join("")}</div>
+    <p class="gpu-caption">Each bar is one core, in order; hover for its percent.</p>` : "";
+  const rows = [
+    ...(c.processes || []).map((p) => ({ ...p, name: p.role, mono: false, id: p.pid })),
+    ...(c.apps || []).map((a) => ({ ...a, name: a.app, mono: true, id: `${a.processes} process${a.processes === 1 ? "" : "es"}` })),
+  ];
+  const table = rows.length ? `<table><thead><tr><th>Process or app</th><th>PID or processes</th>
+      <th>Of the machine</th><th>Of a core</th><th>Memory</th></tr></thead><tbody>${
+    rows.map((r) => `<tr><td>${r.mono ? `<span class="mono">${escape(r.name)}</span>` : escape(r.name)}</td>
+      <td class="${typeof r.id === "number" ? "mono" : ""}">${escape(r.id ?? dash)}</td>
+      <td>${fmt(r.percent, 1, " %")}</td><td>${fmt(r.corePercent, 0, " %")}</td>
+      <td>${fmt(r.rssMib, 0, " MiB")}</td></tr>`).join("")}</tbody></table>`
+    : `<p class="hint">No processes found.</p>`;
+  $("cpu").innerHTML = facts + cpuChart(c) + strip + `<h3>Processes and apps</h3>` + table;
+}
+function renderGpuAndBrowsers() { renderGpu(); renderPipeline(); renderCpu(); renderBrowsers(); }
 
 async function loadAll() {
   lastLoadAt = Date.now();
@@ -4638,6 +4800,9 @@ async function loadAll() {
   const pipelineVersion = pipelineEventVersion;
   const latestPipeline = await api("/system/pipeline").catch(() => null);
   if (pipelineVersion === pipelineEventVersion) pipelineTelemetry = latestPipeline;
+  const cpuVersion = cpuEventVersion;
+  const latestCpu = await api("/system/cpu").catch(() => null);
+  if (cpuVersion === cpuEventVersion) cpuTelemetry = latestCpu;
   browserReports = await api("/system/browsers").catch(() => []);
   await loadConfig();
   renderAv(); renderOutputChoices();
@@ -4822,6 +4987,12 @@ function connect() {
     if (stream !== source) return;
     pipelineEventVersion++;
     pipelineTelemetry = JSON.parse(e.data);
+    renderGpuAndBrowsers();
+  });
+  source.addEventListener("cpu_changed", (e) => {
+    if (stream !== source) return;
+    cpuEventVersion++;
+    cpuTelemetry = JSON.parse(e.data);
     renderGpuAndBrowsers();
   });
   source.addEventListener("browsers_changed", (e) => {
