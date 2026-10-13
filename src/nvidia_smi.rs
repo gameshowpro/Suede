@@ -1,10 +1,10 @@
 //! GPU telemetry from `nvidia-smi`, for the System tab's GPU panel.
 //!
-//! Two invocations per sample: `--query-gpu` for per-GPU utilization, memory,
-//! temperature, power, clocks and PCIe link, and `pmon -c 1 -s um` for the
-//! per-process table. Measured on an appliance with a Quadro RTX 8000 they take
-//! about 23 ms and 54 ms of wall time and negligible CPU, so sampling every few
-//! seconds is cheap. Each call has its own short timeout so a wedged driver
+//! Three invocations per sample: `--query-gpu` for per-GPU utilization, memory,
+//! temperature, power, clocks and PCIe link, `pmon -c 1 -s um` for the
+//! per-process table, and `dmon -c 1 -s t` for PCIe throughput. Measured on an
+//! appliance with a Quadro RTX 8000 they take about 23 ms, 54 ms and 68 ms of
+//! wall time and negligible CPU, so sampling every few seconds is cheap. Each call has its own short timeout so a wedged driver
 //! cannot stall the telemetry task.
 //!
 //! Parsing is separated from process execution so it can be tested against
@@ -117,6 +117,20 @@ pub struct GpuHistorySample {
     pub power_draw_w: Option<f64>,
     /// Shader clock.
     pub clock_sm_mhz: Option<u32>,
+    /// PCIe generation in use when the sample was taken, so a point can be
+    /// read against the link it was measured on.
+    pub pcie_generation: Option<u32>,
+    /// PCIe lane count in use when the sample was taken.
+    pub pcie_width: Option<u32>,
+    /// MB/s received by the GPU (host to GPU), from `dmon -s t`.
+    pub pcie_rx_mb_s: Option<u32>,
+    /// MB/s sent by the GPU (GPU to host).
+    pub pcie_tx_mb_s: Option<u32>,
+    /// `pcie_rx_mb_s` as a percent of the link as currently trained
+    /// (`pcie_generation` x `pcie_width`), one decimal; null when any input is.
+    pub pcie_rx_percent: Option<f64>,
+    /// `pcie_tx_mb_s` as a percent of the link as currently trained.
+    pub pcie_tx_percent: Option<f64>,
 }
 
 /// One GPU's current readings.
@@ -157,6 +171,17 @@ pub struct GpuSample {
     pub pcie_generation: Option<u32>,
     /// Current PCIe lane count.
     pub pcie_width: Option<u32>,
+    /// MB/s received by the GPU (host to GPU), from `dmon -s t`.
+    pub pcie_rx_mb_s: Option<u32>,
+    /// MB/s sent by the GPU (GPU to host).
+    pub pcie_tx_mb_s: Option<u32>,
+    /// `pcie_rx_mb_s` as a percent of the link as currently trained
+    /// (`pcie_generation` x `pcie_width`), one decimal; null when any input is.
+    /// NVIDIA retrains the link down at idle, so this can move when traffic
+    /// does not.
+    pub pcie_rx_percent: Option<f64>,
+    /// `pcie_tx_mb_s` as a percent of the link as currently trained.
+    pub pcie_tx_percent: Option<f64>,
     /// Fan speed.
     pub fan_percent: Option<u32>,
 }
@@ -207,8 +232,10 @@ pub struct GpuProcessSample {
 /// Sample every GPU and the processes using them.
 ///
 /// Never fails: a missing binary, a non-zero exit or a timeout yields
-/// `available: false` with a reason. If only the process table fails, the GPU
-/// readings are still returned with the failure in `reason`.
+/// `available: false` with a reason. If only the process table or the PCIe
+/// throughput fails, the GPU readings are still returned with the failure in
+/// `reason` (both, joined with "; ", if both fail) and the affected fields
+/// empty.
 pub async fn sample() -> GpuTelemetry {
     let query_args = [
         format!("--query-gpu={QUERY_FIELDS}"),
@@ -218,12 +245,27 @@ pub async fn sample() -> GpuTelemetry {
         Ok(text) => text,
         Err(reason) => return GpuTelemetry::unavailable(reason),
     };
-    let gpus = parse_query_gpu(&gpu_text);
+    let mut gpus = parse_query_gpu(&gpu_text);
 
     let pmon_args = ["pmon", "-c", "1", "-s", "um"].map(String::from);
-    let (processes, reason) = match run(&pmon_args).await {
+    let (processes, pmon_reason) = match run(&pmon_args).await {
         Ok(text) => (parse_pmon(&text), None),
         Err(reason) => (Vec::new(), Some(reason)),
+    };
+
+    // `dmon` reports throughput only; the percent needs the link generation
+    // and width from this same poll's query, so it is applied here.
+    let dmon_args = ["dmon", "-c", "1", "-s", "t"].map(String::from);
+    let dmon_reason = match run(&dmon_args).await {
+        Ok(text) => {
+            apply_pcie_throughput(&mut gpus, &parse_dmon_pcie(&text));
+            None
+        }
+        Err(reason) => Some(reason),
+    };
+    let reason = match (pmon_reason, dmon_reason) {
+        (Some(pmon), Some(dmon)) => Some(format!("{pmon}; {dmon}")),
+        (one, other) => one.or(other),
     };
 
     let sampled_at = SystemTime::now()
@@ -238,6 +280,52 @@ pub async fn sample() -> GpuTelemetry {
         processes,
         history: Vec::new(),
     }
+}
+
+/// Fill each GPU's bus throughput and percent from `dmon` rows, matched on
+/// GPU index. A GPU with no row keeps its fields `None`.
+fn apply_pcie_throughput(gpus: &mut [GpuSample], rows: &[PcieThroughput]) {
+    for gpu in gpus {
+        let Some(row) = rows.iter().find(|row| row.gpu_index == gpu.index) else {
+            continue;
+        };
+        gpu.pcie_rx_mb_s = row.rx_mb_s;
+        gpu.pcie_tx_mb_s = row.tx_mb_s;
+        gpu.pcie_rx_percent = row
+            .rx_mb_s
+            .and_then(|mb_s| pcie_percent(mb_s, gpu.pcie_generation, gpu.pcie_width));
+        gpu.pcie_tx_percent = row
+            .tx_mb_s
+            .and_then(|mb_s| pcie_percent(mb_s, gpu.pcie_generation, gpu.pcie_width));
+    }
+}
+
+/// Usable MB/s per lane, per direction, after line encoding, for a PCIe
+/// generation: Gen 1 250, Gen 2 500, Gen 3 985, Gen 4 1969, Gen 5 3938,
+/// Gen 6 7563. `None` for an unknown generation.
+pub fn pcie_lane_mb_s(generation: Option<u32>) -> Option<u32> {
+    match generation? {
+        1 => Some(250),
+        2 => Some(500),
+        3 => Some(985),
+        4 => Some(1969),
+        5 => Some(3938),
+        6 => Some(7563),
+        _ => None,
+    }
+}
+
+/// `mb_s` as a percent of the link as currently trained (per-lane rate times
+/// `width`), rounded to one decimal. `None` when the generation or width is
+/// unknown or the width is zero. Never the card's or slot's maximum: NVIDIA
+/// drops an idle link to Gen 1, and the percent is of what is trained now.
+pub fn pcie_percent(mb_s: u32, generation: Option<u32>, width: Option<u32>) -> Option<f64> {
+    let capacity = u64::from(pcie_lane_mb_s(generation)?) * u64::from(width?);
+    if capacity == 0 {
+        return None;
+    }
+    let percent = f64::from(mb_s) * 100.0 / capacity as f64;
+    Some((percent * 10.0).round() / 10.0)
 }
 
 /// Run `nvidia-smi` with a timeout and return its stdout, or a reason it
@@ -321,6 +409,10 @@ pub fn parse_query_gpu(output: &str) -> Vec<GpuSample> {
                 clock_memory_mhz: number(fields[13]),
                 pcie_generation: number(fields[14]),
                 pcie_width: number(fields[15]),
+                pcie_rx_mb_s: None,
+                pcie_tx_mb_s: None,
+                pcie_rx_percent: None,
+                pcie_tx_percent: None,
                 fan_percent: number(fields[16]),
             })
         })
@@ -387,6 +479,65 @@ pub fn parse_pmon(output: &str) -> Vec<GpuProcessSample> {
         });
     }
     samples
+}
+
+/// One GPU's PCIe throughput from `dmon -s t`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcieThroughput {
+    /// The `gpu` column.
+    pub gpu_index: u32,
+    /// `rxpci`: MB/s the GPU receives (host to GPU); `None` for `-`.
+    pub rx_mb_s: Option<u32>,
+    /// `txpci`: MB/s the GPU sends (GPU to host); `None` for `-`.
+    pub tx_mb_s: Option<u32>,
+}
+
+/// Parse the output of `nvidia-smi dmon -c 1 -s t`.
+///
+/// Measured on 615:
+///
+/// ```text
+/// # gpu  rxpci  txpci
+/// # Idx   MB/s   MB/s
+///     0    344     28
+/// ```
+///
+/// As with [`parse_pmon`], the first `# gpu ...` header line decides which
+/// column is which, a column the header does not name is `None`, and rows
+/// before a header are skipped. `-` means no sample. NVML measures these over
+/// about 20 ms, so each value is a snapshot rather than a mean over the poll.
+pub fn parse_dmon_pcie(output: &str) -> Vec<PcieThroughput> {
+    let mut columns: Option<(Option<usize>, Option<usize>, Option<usize>)> = None;
+    let mut rows = Vec::new();
+    for line in output.lines().map(str::trim) {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('#') {
+            let names: Vec<&str> = header.split_whitespace().collect();
+            // The second header line holds units (`Idx`, `MB/s`) and must not
+            // replace the names.
+            if names.first() == Some(&"gpu") {
+                let find = |name: &str| names.iter().position(|n| *n == name);
+                columns = Some((find("gpu"), find("rxpci"), find("txpci")));
+            }
+            continue;
+        }
+        let Some((gpu, rx, tx)) = columns else {
+            continue;
+        };
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let at = |index: Option<usize>| index.and_then(|i| fields.get(i).copied());
+        let Some(gpu_index) = at(gpu).and_then(|f| f.parse().ok()) else {
+            continue;
+        };
+        rows.push(PcieThroughput {
+            gpu_index,
+            rx_mb_s: at(rx).and_then(number),
+            tx_mb_s: at(tx).and_then(number),
+        });
+    }
+    rows
 }
 
 /// Where each `pmon` value sits on a row, from the `# gpu pid type ...`
@@ -572,6 +723,114 @@ mod tests {
     fn pmon_empty_and_comment_only() {
         assert!(parse_pmon("").is_empty());
         assert!(parse_pmon("# gpu pid type\n# Idx # C/G\n").is_empty());
+    }
+
+    const DMON: &str = "\
+# gpu  rxpci  txpci
+# Idx   MB/s   MB/s
+    0    344     28
+";
+
+    #[test]
+    fn dmon_fixture() {
+        let rows = parse_dmon_pcie(DMON);
+        assert_eq!(
+            rows,
+            vec![PcieThroughput {
+                gpu_index: 0,
+                rx_mb_s: Some(344),
+                tx_mb_s: Some(28),
+            }]
+        );
+    }
+
+    #[test]
+    fn dmon_dash_fields_are_none() {
+        let rows = parse_dmon_pcie(
+            "# gpu  rxpci  txpci\n# Idx   MB/s   MB/s\n    0      -     28\n    1    5      -\n",
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].rx_mb_s, None);
+        assert_eq!(rows[0].tx_mb_s, Some(28));
+        assert_eq!(rows[1].gpu_index, 1);
+        assert_eq!(rows[1].rx_mb_s, Some(5));
+        assert_eq!(rows[1].tx_mb_s, None);
+    }
+
+    #[test]
+    fn dmon_rows_before_a_header_are_skipped() {
+        assert!(parse_dmon_pcie("    0    344     28\n").is_empty());
+        assert!(parse_dmon_pcie("").is_empty());
+        assert!(parse_dmon_pcie("# gpu rxpci txpci\n# Idx MB/s MB/s\n").is_empty());
+    }
+
+    #[test]
+    fn dmon_header_decides_column_order() {
+        let rows = parse_dmon_pcie("# gpu txpci rxpci\n# Idx MB/s MB/s\n 0 7 9\n");
+        assert_eq!(rows[0].rx_mb_s, Some(9));
+        assert_eq!(rows[0].tx_mb_s, Some(7));
+    }
+
+    #[test]
+    fn lane_rate_per_generation() {
+        for (generation, rate) in [
+            (1, 250),
+            (2, 500),
+            (3, 985),
+            (4, 1969),
+            (5, 3938),
+            (6, 7563),
+        ] {
+            assert_eq!(pcie_lane_mb_s(Some(generation)), Some(rate));
+        }
+        assert_eq!(pcie_lane_mb_s(Some(0)), None);
+        assert_eq!(pcie_lane_mb_s(Some(7)), None);
+        assert_eq!(pcie_lane_mb_s(None), None);
+    }
+
+    #[test]
+    fn percent_of_the_trained_link() {
+        // Brain idle: 344 MB/s on Gen 3 x16 (15,760 MB/s) is 2.2 %.
+        assert_eq!(pcie_percent(344, Some(3), Some(16)), Some(2.2));
+        assert_eq!(pcie_percent(28, Some(3), Some(16)), Some(0.2));
+        assert_eq!(pcie_percent(0, Some(1), Some(1)), Some(0.0));
+        assert_eq!(pcie_percent(250, Some(1), Some(1)), Some(100.0));
+        // The same traffic reads higher on the narrower, slower idle link.
+        assert_eq!(pcie_percent(344, Some(1), Some(16)), Some(8.6));
+        // 1 / 15760 = 0.0063 % rounds to 0.0; 8 / 15760 = 0.0508 rounds to 0.1.
+        assert_eq!(pcie_percent(1, Some(3), Some(16)), Some(0.0));
+        assert_eq!(pcie_percent(8, Some(3), Some(16)), Some(0.1));
+    }
+
+    #[test]
+    fn percent_is_none_when_any_input_is() {
+        assert_eq!(pcie_percent(344, None, Some(16)), None);
+        assert_eq!(pcie_percent(344, Some(3), None), None);
+        assert_eq!(pcie_percent(344, Some(9), Some(16)), None);
+        assert_eq!(pcie_percent(344, Some(3), Some(0)), None);
+    }
+
+    #[test]
+    fn throughput_is_applied_against_the_same_polls_link() {
+        let mut gpus = parse_query_gpu(QUERY);
+        apply_pcie_throughput(&mut gpus, &parse_dmon_pcie(DMON));
+        assert_eq!(gpus[0].pcie_rx_mb_s, Some(344));
+        assert_eq!(gpus[0].pcie_tx_mb_s, Some(28));
+        assert_eq!(gpus[0].pcie_rx_percent, Some(2.2));
+        assert_eq!(gpus[0].pcie_tx_percent, Some(0.2));
+
+        // Unknown link: throughput stays, percent is null.
+        let mut gpus = parse_query_gpu(QUERY);
+        gpus[0].pcie_width = None;
+        apply_pcie_throughput(&mut gpus, &parse_dmon_pcie(DMON));
+        assert_eq!(gpus[0].pcie_rx_mb_s, Some(344));
+        assert_eq!(gpus[0].pcie_rx_percent, None);
+
+        // No dmon row: everything stays null.
+        let mut gpus = parse_query_gpu(QUERY);
+        apply_pcie_throughput(&mut gpus, &[]);
+        assert_eq!(gpus[0].pcie_rx_mb_s, None);
+        assert_eq!(gpus[0].pcie_tx_percent, None);
     }
 
     #[test]

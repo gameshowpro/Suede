@@ -146,6 +146,12 @@ pub fn push_history(buffer: &mut VecDeque<GpuHistoryPoint>, sample: &GpuTelemetr
                 temperature_c: gpu.temperature_c,
                 power_draw_w: gpu.power_draw_w,
                 clock_sm_mhz: gpu.clock_sm_mhz,
+                pcie_generation: gpu.pcie_generation,
+                pcie_width: gpu.pcie_width,
+                pcie_rx_mb_s: gpu.pcie_rx_mb_s,
+                pcie_tx_mb_s: gpu.pcie_tx_mb_s,
+                pcie_rx_percent: gpu.pcie_rx_percent,
+                pcie_tx_percent: gpu.pcie_tx_percent,
             })
             .collect(),
     });
@@ -531,7 +537,11 @@ mod tests {
                 clock_sm_mhz: None,
                 clock_memory_mhz: None,
                 pcie_generation: None,
-                pcie_width: None,
+                pcie_width: Some(16),
+                pcie_rx_mb_s: Some(344),
+                pcie_tx_mb_s: Some(28),
+                pcie_rx_percent: Some(2.2),
+                pcie_tx_percent: Some(0.2),
                 fan_percent: None,
             }],
             processes: Vec::new(),
@@ -548,6 +558,11 @@ mod tests {
         assert_eq!(point.gpus[0].index, 1);
         assert_eq!(point.gpus[0].utilization_gpu_percent, Some(42));
         assert_eq!(point.gpus[0].memory_total_mib, Some(1000));
+        assert_eq!(point.gpus[0].pcie_width, Some(16));
+        assert_eq!(point.gpus[0].pcie_rx_mb_s, Some(344));
+        assert_eq!(point.gpus[0].pcie_tx_mb_s, Some(28));
+        assert_eq!(point.gpus[0].pcie_rx_percent, Some(2.2));
+        assert_eq!(point.gpus[0].pcie_tx_percent, Some(0.2));
     }
 
     #[test]

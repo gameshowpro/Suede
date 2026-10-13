@@ -1713,6 +1713,58 @@
               "null"
             ]
           },
+          "pcieGeneration": {
+            "description": "PCIe generation in use when the sample was taken, so a point can be\nread against the link it was measured on.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcieRxMbS": {
+            "description": "MB/s received by the GPU (host to GPU), from `dmon -s t`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcieRxPercent": {
+            "description": "`pcie_rx_mb_s` as a percent of the link as currently trained\n(`pcie_generation` x `pcie_width`), one decimal; null when any input is.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pcieTxMbS": {
+            "description": "MB/s sent by the GPU (GPU to host).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcieTxPercent": {
+            "description": "`pcie_tx_mb_s` as a percent of the link as currently trained.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pcieWidth": {
+            "description": "PCIe lane count in use when the sample was taken.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "powerDrawW": {
             "description": "Current power draw.",
             "format": "double",
@@ -1943,6 +1995,40 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "pcieRxMbS": {
+            "description": "MB/s received by the GPU (host to GPU), from `dmon -s t`.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcieRxPercent": {
+            "description": "`pcie_rx_mb_s` as a percent of the link as currently trained\n(`pcie_generation` x `pcie_width`), one decimal; null when any input is.\nNVIDIA retrains the link down at idle, so this can move when traffic\ndoes not.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "pcieTxMbS": {
+            "description": "MB/s sent by the GPU (GPU to host).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcieTxPercent": {
+            "description": "`pcie_tx_mb_s` as a percent of the link as currently trained.",
+            "format": "double",
+            "type": [
+              "number",
               "null"
             ]
           },

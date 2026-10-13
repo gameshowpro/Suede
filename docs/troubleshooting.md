@@ -492,7 +492,12 @@ without a terminal.
 is hidden otherwise. Every five seconds Suede runs `nvidia-smi` (about 80 ms
 of wall time, negligible processor use) and shows, per GPU, utilization for
 graphics, memory, decoder and encoder, memory used, temperature, power, clocks
-and the PCIe link. A field the driver does not support shows as empty. The
+and the PCIe link. The two bus figures are the megabytes per second the GPU
+receives from the host ("to GPU") and sends back ("from GPU"), each also shown
+as a percent of the link as currently trained, not of the most the card or slot
+could train to. NVIDIA retrains the link down to a slower generation at idle,
+so the percent can move when the traffic does not. A field the driver does not
+support shows as empty. The
 process table lists each process using the GPU with its share of graphics
 (SM), memory, encoder and decoder, and its framebuffer in MiB. Each process
 is attributed to the Suede app whose process tree it belongs to, and for a
