@@ -142,3 +142,20 @@ touch, optical, or manual gates. Keep operator identity, date, workload,
 candidate hash, observation, and raw evidence for each manual item in the
 Packet 7 record (internal research record, not published). Pi testing remains on hold
 until all required brain acceptance, including manual checks, is complete.
+
+## Panel layout browser check
+
+Run the layout acceptance test with the same external Playwright installation:
+
+```sh
+NODE_PATH=/tmp/suede-ui-tests/node_modules \
+PLAYWRIGHT_BROWSERS_PATH=/tmp/suede-ui-tests/browsers \
+node tests/ui/panel-layout.cjs
+```
+
+It serves the embedded page at `suede.test` with fixture API responses and checks
+column widths and spacing at the responsive breakpoints, live resizing, focus,
+hidden and removed cards, replacement alerts, tabs, and closed dialogs. At wide
+widths it also checks the Displays left/right stacks, the selected output editor
+remaining below Layout, GPU/CPU placement and hiding behavior, and the Apps card
+spanning both columns. Below the breakpoint those groups return to one column.

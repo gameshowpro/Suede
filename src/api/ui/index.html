@@ -59,9 +59,29 @@ h2 { font-size: 15px; font-weight: 700; margin: 0 0 12px; }
 h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted);
   font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
 .grow { flex: 1; }
-main { padding: 18px 20px 60px; max-width: 1180px; margin: 0 auto; }
+main { padding: 18px 20px 60px; max-width: 940px; margin: 0 auto; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-  padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); }
+  padding: 16px; margin-bottom: 16px; box-shadow: var(--shadow); container-type: inline-size; }
+/* Two 900px columns, a 16px gap, and 40px of page margins. JavaScript
+   measures cards into independent stacks without moving their DOM nodes. */
+.panel-grid { --panel-columns: 1; display: grid; grid-template-columns: repeat(var(--panel-columns), minmax(0, 1fr));
+  gap: 16px; align-items: start; max-width: 900px; margin: 0 auto; }
+.panel-grid > .panel, .panel-grid > .alert { overflow-wrap: anywhere; width: 100%; min-width: 0; margin-bottom: 0; }
+.panel-grid.masonry { grid-auto-rows: 1px; row-gap: 0; }
+#alerts:not(:empty) { margin-bottom: 16px; }
+@media (min-width: 1856px) {
+  main { max-width: 1856px; }
+  .panel-grid { --panel-columns: 2; max-width: none; }
+  /* Keep related controls together; telemetry cards share a time axis. */
+  #tab-displays > .panel { --panel-column: 2; }
+  #tab-displays > #layout-panel, #tab-displays > #output-editor { --panel-column: 1; }
+  #tab-system > .panel { --panel-column: 1; }
+  #tab-system > #gpu-panel, #tab-system > #cpu-panel { --panel-column: 2; }
+  #tab-apps > .panel { --panel-span: all; }
+}
+.table-scroll { max-width: 100%; overflow-x: auto; overflow-wrap: normal; }
+.table-scroll th { white-space: nowrap; }
+.table-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .pill { font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 999px;
   border: 1px solid var(--line); white-space: nowrap; }
 #sync { width: 76px; flex-shrink: 0; box-sizing: border-box; padding: 3px 0;
@@ -171,7 +191,7 @@ a { color: var(--accent); }
 .gpu-chart .series.total { stroke-width: 2.5; }
 .gpu-chart .series.others { stroke-dasharray: 2 3; }
 .gpu-legend .swatch.others { border-top-style: dotted; }
-.core-strip { --core: #2a78d6; --hot: #eb6834; display: flex; align-items: flex-end; gap: 2px; height: 40px; margin: 10px 0 0; }
+.core-strip { --core: #2a78d6; --hot: #eb6834; display: flex; align-items: flex-end; gap: 2px; height: 40px; margin: 10px 0 0; overflow-x: auto; }
 @media (prefers-color-scheme: dark) { .core-strip { --core: #3987e5; --hot: #d95926; } }
 .core-strip .core { flex: 1; min-width: 4px; height: 100%; display: flex; align-items: flex-end;
   background: var(--sunken); border-radius: 2px 2px 0 0; }
@@ -179,7 +199,7 @@ a { color: var(--accent); }
 .core-strip .core.hot i { background: var(--hot); }
 .kv th { width: 11em; white-space: nowrap; }
 .feature-grid { display: grid; grid-template-columns: 1fr; gap: 0 28px; }
-@media (min-width: 900px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
+@container (min-width: 760px) { .feature-grid { grid-template-columns: 1fr 1fr; } }
 .feature-grid table { table-layout: fixed; }
 .feature-grid td.chip { width: 15em; white-space: nowrap; }
 .feature-grid td.name { overflow-wrap: anywhere; }
@@ -212,7 +232,7 @@ tr.player-row.selected td { background: color-mix(in srgb, var(--accent) 12%, tr
 tr.player-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 tr.player-detail > td { background: var(--sunken); padding: 12px 14px; }
 .player-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
-@media (min-width: 1000px) { .player-detail-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@container (min-width: 720px) { .player-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .player-detail-grid section { min-width: 0; overflow-x: auto; }
 .player-detail-grid h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
 .player-detail-grid table td, .player-detail-grid table th { padding: 4px 8px; font-size: 13px; vertical-align: top; }
@@ -272,10 +292,11 @@ select, textarea, output { font-family: var(--font-mono); font-size: 13px; font-
 textarea.json { font-variant-ligatures: common-ligatures contextual; font-feature-settings: "liga" 1, "calt" 1, "zero" 1; }
 textarea.json { min-height: 420px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 6px; }
-.fields.wide { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.fields.wide { grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); }
 .span2 { grid-column: span 2; }
+@media (max-width: 560px) { .span2 { grid-column: 1 / -1; } }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-fieldset { border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; margin: 14px 0 0; }
+fieldset { min-width: 0; border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; margin: 14px 0 0; }
 legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
   text-transform: uppercase; letter-spacing: .05em; }
 /* Height is set by renderLayout, which grows the box to keep every display
@@ -356,7 +377,8 @@ pre, pre code { font-variant-ligatures: common-ligatures contextual; font-featur
 #warp-editor [data-handle] { fill: var(--panel); stroke: var(--accent); stroke-width: .004; cursor: grab; }
 #warp-editor [data-handle]:focus { fill: var(--accent); outline: none; }
 #warp-editor [data-handle].rejected { fill: var(--bad); stroke: var(--bad); }
-#warp-error { color: var(--bad); min-height: 1.5em; }
+#warp-error { color: var(--bad); margin: 0; }
+#warp-error:empty { display: none; }
 .mode-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
 .mode-toggle button { border: 0; border-radius: 0; background: transparent; color: var(--ink); }
 .mode-toggle button[aria-pressed="true"] { background: var(--accent); color: white; }
@@ -452,7 +474,7 @@ window.addEventListener("error", (event) => {
 </header>
 
 <main>
-  <div id="alerts"></div>
+  <div id="alerts" class="panel-grid"></div>
 
   <nav role="tablist">
     <button role="tab" aria-selected="true" data-tab="displays">Displays</button>
@@ -464,13 +486,13 @@ window.addEventListener("error", (event) => {
   </nav>
 
   <!-- Displays -->
-  <section id="tab-displays">
+  <section id="tab-displays" class="panel-grid">
     <!-- Page-level so it is visible in both Simple and Warp: shared crop and
          content-scale edits (editSharedContent) can fail in Simple mode too,
          and Save stays blocked on this error regardless of which mode's
          controls happen to be showing. -->
     <p id="warp-error" role="alert"></p>
-    <div class="panel">
+    <div class="panel" id="layout-panel">
       <h2>Layout</h2>
       <fieldset id="warp-canvas">
         <legend>Canvas</legend>
@@ -495,7 +517,7 @@ window.addEventListener("error", (event) => {
         </div>
       </div>
       <p class="hint" id="warp-capability" role="status"></p>
-      <table id="output-table"><thead><tr><th>Output</th><th>Display</th><th>Status</th><th>Resolution</th></tr></thead><tbody></tbody></table>
+      <div class="table-scroll" role="region" aria-label="Displays" tabindex="0"><table id="output-table"><thead><tr><th>Output</th><th>Display</th><th>Status</th><th>Resolution</th></tr></thead><tbody></tbody></table></div>
       <!-- The commissioning action: freeze every attached display's settled
            mode/scale/transform into stated intent in one preview, so the
            wall stops drifting the moment it looks right. -->
@@ -531,11 +553,7 @@ window.addEventListener("error", (event) => {
             <option value="sync">Sync — animated frame counter, for a high-speed camera</option>
           </select>
         </div>
-        <p class="hint">Shown immediately on every display in the layout;
-          choose <strong>None</strong> to put the content back. It is never
-          written to disk, so a restart clears it too. The grid names each
-          output visibly, so a photo of the wall says exactly which
-          connector drives which display.</p>
+        <p class="hint">Shown immediately on every display; choose <strong>None</strong> to restore content. The pattern is temporary and clears on restart. <a data-docs-path="configuration/#projection-test-patterns" target="_blank" rel="noopener noreferrer">Learn about test patterns</a>.</p>
       </div>
     </div>
     <div class="panel hidden" id="output-editor">
@@ -571,7 +589,7 @@ window.addEventListener("error", (event) => {
 
       <fieldset id="shared-content">
         <legend>Shared content selection</legend>
-        <p class="hint">Simple and Warp use this same slice crop and content scale (100% = 1:1 pixel sampling). Destination pins remain Warp calibration.</p>
+        <p class="hint">Simple and Warp share this crop and content scale (100% = 1:1 pixels); destination pins are Warp calibration. <a data-docs-path="configuration/#projection-geometry" target="_blank" rel="noopener noreferrer">Learn about projection geometry</a>.</p>
         <div class="fields">
           <div><label for="slice-x">Crop X (canvas px)</label><input id="slice-x" type="number" step="any" data-config-field="slice"></div>
           <div><label for="slice-y">Crop Y (canvas px)</label><input id="slice-y" type="number" step="any" data-config-field="slice"></div>
@@ -625,11 +643,7 @@ window.addEventListener("error", (event) => {
 
     <div class="panel" id="edge-blending-panel">
       <h2>Edge blending</h2>
-      <p class="hint">The overlaps come from the layout above: drag the
-        displays so they overlap exactly as the beams do on the surface — every
-        seam its own amount. Suede renders the app once into that canvas and
-        slices it per projector; with blending on, each seam is faded from
-        both sides so the doubled light adds up to one seamless picture.</p>
+      <p class="hint">Set display overlaps to match the projector beams; blending fades both sides of each seam. <a data-docs-path="configuration/#projection-edge-blending" target="_blank" rel="noopener noreferrer">Learn about projection and edge blending</a>.</p>
       <p class="hint" id="pj-idle" hidden><strong>These settings are inactive:
         no displays overlap and no shared canvas is configured.</strong> Position displays so they overlap
         — as the projector beams do on the wall — or calibrate geometry to engage blending.</p>
@@ -658,10 +672,7 @@ window.addEventListener("error", (event) => {
         <div><label for="pj-slew">Maximum lift change per second</label><input id="pj-slew" type="number" min="0.000001" max="10" step="any" value="0.1"></div>
       </div>
       </div><p class="hint" id="pj-lift-status" hidden></p>
-      <p class="hint">Gamma shapes the fall-off — the projectors' transfer
-        curve, usually 2.2. If seams glow on dark scenes (projector black is
-        not zero light), raise the compensation until the rest of the picture
-        matches them.</p>
+      <p class="hint">Gamma shapes the seam fall-off (usually 2.2). Raise black compensation if seams glow in dark scenes. <a data-docs-path="configuration/#projection-edge-blending" target="_blank" rel="noopener noreferrer">Learn about blending and black lift</a>.</p>
     </div>
 
     <div class="panel" id="frame-timing-panel">
@@ -676,45 +687,24 @@ window.addEventListener("error", (event) => {
             <option value="gpu">GPU</option>
           </select></div>
       </div>
-      <p class="hint">Off, every display takes each frame together and the
-        next frame waits until all of them have taken it. On, each display
-        takes the newest frame as soon as it is ready — only for displays
-        that cannot be made to share a refresh rate, and the wall stops being
-        in step.</p>
-      <p class="hint">Auto blends on the GPU when the compositor and driver
-        support it, and falls back to the CPU otherwise — the slicer logs
-        which it picked and why. CPU always uses the fallback path. GPU
-        forces the GPU path and refuses to start if it is unavailable,
-        rather than silently running slower.</p>
+      <p class="hint">Leave free run off to keep displays in step. Turn it on only for mismatched refresh rates; displays may then show different frames. <a data-docs-path="how-it-works/#keeping-the-displays-in-step" target="_blank" rel="noopener noreferrer">Learn about frame synchronization</a>.</p>
+      <p class="hint">Auto prefers GPU blending and falls back to CPU. Forcing GPU prevents startup if it is unavailable. <a data-docs-path="how-it-works/#where-the-blend-runs" target="_blank" rel="noopener noreferrer">Learn about renderer choices</a>.</p>
       <div id="pj-timing" hidden style="margin-top:14px">
         <h3 style="margin:0 0 8px">Telemetry</h3>
         <p class="hint" id="pj-timing-silent" hidden>The slicer is running.
           No frames have been reported yet — the loop only runs while the
           content is drawing.</p>
-        <table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table>
-        <table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
+        <div class="table-scroll" role="region" aria-label="Frame timing summary" tabindex="0"><table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table></div>
+        <div class="table-scroll" role="region" aria-label="Timing by output" tabindex="0"><table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
           <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th><th>Request to present</th><th>GPU span</th>
-        </tr></thead><tbody id="pj-timing-outputs"></tbody></table>
-        <p class="hint" id="pj-timing-hint">Measured by the slicer over each
-          <span id="pj-timing-interval">interval</span> using validated protocol display timestamps. Request to
-          present starts immediately before the Wayland feedback request or
-          direct submission; it is not capture-to-glass or photon latency.
-          Offset is how far apart the displays showed the same frame; a
-          straddle is a frame they showed on different refreshes. A gate
-          hold is a commit the wall delayed past a canvas period waiting for
-          an output to report presenting the previous frame — the others
-          repeated a frame rather than move on without it. Lag is a
-          per-output histogram (zero/one/two/three-or-more) of how many whole
-          refreshes behind the earliest output this one presented — read it
-          against a photograph to tell a presentation-path slip from the
-          display's own processing latency. Healthy: a steady offset of a few
-          milliseconds and no straddles.</p>
+        </tr></thead><tbody id="pj-timing-outputs"></tbody></table></div>
+        <p class="hint" id="pj-timing-hint">These measurements describe presentation timing, not capture-to-glass latency. <a data-docs-path="how-it-works/#reading-frame-timing" target="_blank" rel="noopener noreferrer">Reading frame timing</a>.</p>
       </div>
     </div>
     <dialog id="arrange-dialog" aria-labelledby="arrange-title">
       <form method="dialog">
         <h2 id="arrange-title">Arrange outputs</h2>
-        <p class="hint">Enabled outputs are placed left to right, then top to bottom, in the order listed below. The daemon does the arithmetic. Overlap sends the two overlaps you set below exactly — the daemon never adjusts either one — and derives the content scale (100% = 1:1 pixel sampling) that covers the canvas: the axis with less room to spare fills it exactly, and the other centers a black overhang past the canvas's edge — the line below says how much, and which canvas aspect would remove it. "Use all canvas pixels" (the default) accepts that overhang, so the slack spills past the canvas's edges and those slice regions render black. "Keep slices inside the canvas" instead shrinks the grid to fit, so the slack becomes an unprojected canvas band there rather than any overhang. An edge output whose slice would fall off the canvas entirely is refused outright, in either case. Scale sends the content scale instead and gets both overlaps back.</p>
+        <p class="hint">Outputs fill rows in the listed order. Choose overlap or scale to keep fixed. Using all pixels may add black overhang; keeping slices inside may leave canvas unused. <a data-docs-path="configuration/#grid-arrangement" target="_blank" rel="noopener noreferrer">Learn about grid arrangement</a>.</p>
         <div class="row arrange-mode-row">
           <div class="mode-toggle" role="group" aria-label="Arrange by">
             <button type="button" id="arrange-mode-overlap" aria-pressed="true">Overlap</button>
@@ -740,15 +730,13 @@ window.addEventListener("error", (event) => {
   </section>
 
   <!-- Apps -->
-  <section id="tab-apps" class="hidden">
+  <section id="tab-apps" class="panel-grid hidden">
     <div class="panel">
       <h2>Managed applications</h2>
-      <p class="hint">One application is active at a time, and it always
-        covers the whole canvas — every display, with the overlaps handled by
-        Suede. The rest of the list is a library to switch between.</p>
-      <table id="apps"><thead><tr>
+      <p class="hint">One application runs at a time across the whole canvas. Keep others here to switch between.</p>
+      <div class="table-scroll" role="region" aria-label="Applications" tabindex="0"><table id="apps"><thead><tr>
         <th>Id</th><th>State</th><th>PID</th><th>Restarts</th><th>Detail</th><th></th>
-      </tr></thead><tbody></tbody></table>
+      </tr></thead><tbody></tbody></table></div>
       <p class="hint" id="apps-empty">No applications configured yet.</p>
       <div class="row" style="margin-top:12px">
         <button class="action" id="a-new">Add application</button>
@@ -768,23 +756,14 @@ window.addEventListener("error", (event) => {
           <input id="a-uri" placeholder="http://media-server.local/render/1"></div>
         <div class="span2" id="a-program-row"><label for="a-program">Browser binary</label>
           <input id="a-program" placeholder="leave empty to search for one">
-          <p class="hint">Empty searches for a browser and ignores any that is
-            a snap. Name one to settle it — a bare name is looked up on
-            <span class="mono">PATH</span>, a path is used as given. Naming a
-            snap is honored; Suede then puts the profile where a confined
-            snap can write.</p></div>
+          <p class="hint">Leave empty to search for a non-snap browser. A name is resolved on <span class="mono">PATH</span>; a path is used as given. <a data-docs-path="configuration/#applications" target="_blank" rel="noopener noreferrer">Learn about application launchers</a>.</p></div>
         <div id="a-grant-capture-row"><label for="a-grant-capture">Grant camera and microphone</label>
           <input type="checkbox" role="switch" class="switch" id="a-grant-capture">
-          <p class="hint">Lets the page list capture devices by name and pick
-            one, without a permission prompt.</p></div>
+          <p class="hint">Lets the page select camera and microphone devices without a permission prompt.</p></div>
         <div><label for="a-audio">Audio</label><select id="a-audio"></select></div>
         <div id="a-gain-row"><label for="a-gain">Level (dB)</label>
           <input id="a-gain" type="number" step="0.5" min="-100" max="0" value="0">
-          <p class="hint">Applied to that sink whenever this app is reconciled.
-            0&nbsp;dB is unity and the sensible answer for a digital output: every
-            decibel taken here is resolution thrown away before the link, which
-            nothing downstream can put back. Attenuate at the amplifier instead.
-            &minus;100&nbsp;dB is silence.</p></div>
+          <p class="hint">Held on this app’s sink; 0 dB is unity and −100 dB is silence. Keep digital output at 0 dB and attenuate at the amplifier. <a data-docs-path="configuration/#audio-routing" target="_blank" rel="noopener noreferrer">Learn about audio routing</a>.</p></div>
         <div><label for="a-heartbeat">Content watchdog</label>
           <input type="checkbox" role="switch" class="switch" id="a-heartbeat"></div>
       </div>
@@ -807,9 +786,7 @@ window.addEventListener("error", (event) => {
 
       <fieldset>
         <legend>Command</legend>
-        <p class="hint">What this application would actually be launched as,
-          resolved on this machine. Nothing here is a reconstruction — the
-          daemon reports it, so a preset can never differ from what runs.</p>
+        <p class="hint">The resolved command reported by the daemon is what will run.</p>
         <div class="invocation" id="a-preview-command">—</div>
         <p class="hint" id="a-preview-profile"></p>
       </fieldset>
@@ -821,10 +798,8 @@ window.addEventListener("error", (event) => {
           <b class="app">blue</b> yours, <span class="uri">green</span> the expanded URI.</p>
         <label for="a-extra-args" style="margin-top:10px">Add your own</label>
         <textarea id="a-extra-args" rows="3" spellcheck="false"
-          placeholder="--force-dark-mode&#10;--lang=en-GB"></textarea>
-        <p class="hint">One per line, appended after the preset and before the
-          URI. A preset argument can be countermanded by repeating it here with
-          a different value, since the later one wins.</p>
+          placeholder="--force-dark-mode&#10;--lang=en-US"></textarea>
+        <p class="hint">One per line, after preset arguments and before the URI; later arguments can override preset values. <a data-docs-path="configuration/#applications" target="_blank" rel="noopener noreferrer">Learn about application arguments</a>.</p>
       </fieldset>
 
       <fieldset>
@@ -833,18 +808,12 @@ window.addEventListener("error", (event) => {
         <label for="a-env" style="margin-top:10px">Add your own</label>
         <textarea id="a-env" rows="3" spellcheck="false"
           placeholder="LIBVA_DRIVER_NAME=nvidia&#10;NVD_BACKEND=direct"></textarea>
-        <p class="hint">One <span class="mono">NAME=value</span> per line.
-          Applied last, so these override anything the preset sets — this is
-          where graphics acceleration is usually configured.</p>
+        <p class="hint">Enter one <span class="mono">NAME=value</span> per line. These are applied last and can override preset environment values.</p>
       </fieldset>
 
       <fieldset id="a-cap-fieldset">
         <legend>Capabilities</legend>
-        <p class="hint">Whether this configuration will hardware-decode is
-          known to nobody but the browser itself, on this machine's GPU, with
-          these exact arguments — so ask it. This launches the browser against
-          a test page; <b>a window appears on the appliance's displays</b> for
-          a few seconds while it measures.</p>
+        <p class="hint">Checks browser decode and graphics support with this configuration. It opens a browser window on the appliance’s displays for a few seconds. <a data-docs-path="configuration/#applications" target="_blank" rel="noopener noreferrer">Learn about capability checks</a>.</p>
         <div class="row">
           <button class="action ghost" id="a-capabilities">Check capabilities</button>
           <span class="hint" id="a-cap-status"></span>
@@ -863,16 +832,13 @@ window.addEventListener("error", (event) => {
   </section>
 
   <!-- Backgrounds -->
-  <section id="tab-wallpapers" class="hidden">
+  <section id="tab-wallpapers" class="panel-grid hidden">
     <div class="panel">
       <h2>Backgrounds</h2>
-      <p class="hint">A background bundles an image, how it is scaled, and the
-        color behind it. Define one here, then pick it by name on the Displays
-        tab — so every display shares one definition instead of four copies
-        that drift apart.</p>
-      <table id="backgrounds"><thead><tr>
+      <p class="hint">Define a reusable image, scaling mode, and fill color, then assign it to displays. <a data-docs-path="configuration/#named-backgrounds" target="_blank" rel="noopener noreferrer">Learn about named backgrounds</a>.</p>
+      <div class="table-scroll" role="region" aria-label="Backgrounds" tabindex="0"><table id="backgrounds"><thead><tr>
         <th></th><th>Name</th><th>Image</th><th>Scaling</th><th>Color</th><th>Used by</th><th></th>
-      </tr></thead><tbody></tbody></table>
+      </tr></thead><tbody></tbody></table></div>
       <p class="hint" id="backgrounds-empty">None defined yet.</p>
       <div class="row" style="margin-top:12px">
         <button class="action" id="bg-new">Define a background</button>
@@ -898,8 +864,7 @@ window.addEventListener("error", (event) => {
           </div>
           <p class="hint" id="bg-color-note"></p></div>
       </div>
-      <p class="hint">The color shows wherever the image does not reach, and on
-        its own if you choose no image. Blank means black.</p>
+      <p class="hint">Color fills areas the image does not cover, or the whole background if no image is selected. Blank means black.</p>
       <div class="row" style="margin-top:12px">
         <button class="action" id="bg-save">Save</button>
         <button class="action ghost" id="bg-cancel">Cancel</button>
@@ -925,24 +890,15 @@ window.addEventListener("error", (event) => {
   </section>
 
   <!-- Audio and video I/O -->
-  <section id="tab-audio" class="hidden">
+  <section id="tab-audio" class="panel-grid hidden">
     <div class="panel">
       <h2>Audio outputs</h2>
       <p class="hint">The outputs PipeWire can play to. Each application picks
         one on the <a href="#" id="sinks-apps-link">Apps</a> tab; this list is what
         it picks from.</p>
-      <table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th>Level</th><th></th></tr></thead><tbody></tbody></table>
+      <div class="table-scroll" role="region" aria-label="Audio outputs" tabindex="0"><table id="sinks"><thead><tr><th>Identifier</th><th>Description</th><th>Level</th><th></th></tr></thead><tbody></tbody></table></div>
       <p class="hint" id="sinks-empty">No sinks reported. Is PipeWire running?</p>
-      <p class="hint"><b>default</b> marks the sink an application gets when
-        its audio is set to &ldquo;use default on each launch&rdquo;. That is
-        decided afresh every time the application starts, so an app set that
-        way follows this pill wherever it moves — plug in a headset and it
-        may move. Locking an application to a named sink pins it instead.
-        The choice belongs to PipeWire rather than to Suede, so it is shown
-        here but cannot be changed here; WirePlumber remembers it across
-        reboots. Set it from the machine with
-        <span class="mono">wpctl set-default &lt;id&gt;</span>.
-        <b>silent</b> marks a sink that discards whatever reaches it.</p>
+      <p class="hint"><b>default</b> is selected afresh on each app launch, so an app using the default follows PipeWire when it changes; a named sink stays fixed. Set the system default with <span class="mono">wpctl set-default &lt;id&gt;</span>. <b>silent</b> discards audio. <a data-docs-path="configuration/#audio-routing" target="_blank" rel="noopener noreferrer">Learn about audio routing</a>.</p>
     </div>
     <div class="panel">
       <h2>Audio inputs</h2>
@@ -950,21 +906,21 @@ window.addEventListener("error", (event) => {
         without being allowed to enumerate them itself: a kiosk browser
         labels an audio device by its Description, and a video device below
         by its Card.</p>
-      <table id="audio-inputs"><thead><tr><th>Identifier</th><th>Description</th><th>Card</th></tr></thead><tbody></tbody></table>
+      <div class="table-scroll" role="region" aria-label="Audio inputs" tabindex="0"><table id="audio-inputs"><thead><tr><th>Identifier</th><th>Description</th><th>Card</th></tr></thead><tbody></tbody></table></div>
       <p class="hint" id="audio-inputs-empty">No audio inputs reported. Is PipeWire running?</p>
     </div>
     <div class="panel">
       <h2>Video inputs</h2>
-      <table id="video-inputs"><thead><tr><th>Identifier</th><th>Description</th><th>Device</th><th>Card</th></tr></thead><tbody></tbody></table>
+      <div class="table-scroll" role="region" aria-label="Video inputs" tabindex="0"><table id="video-inputs"><thead><tr><th>Identifier</th><th>Description</th><th>Device</th><th>Card</th></tr></thead><tbody></tbody></table></div>
       <p class="hint" id="video-inputs-empty">No video inputs reported. Is WirePlumber's v4l2 monitor enabled?</p>
     </div>
   </section>
 
   <!-- System -->
-  <section id="tab-system" class="hidden">
+  <section id="tab-system" class="panel-grid hidden">
     <div class="panel">
       <h2>System</h2>
-      <table id="system"><tbody></tbody></table>
+      <div class="table-scroll" role="region" aria-label="System information" tabindex="0"><table id="system"><tbody></tbody></table></div>
       <div class="row" style="margin-top:14px">
         <button class="action ghost" id="power-reboot">Restart this machine</button>
         <button class="action ghost" id="power-poweroff">Shut down this machine</button>
@@ -976,7 +932,7 @@ window.addEventListener("error", (event) => {
       <div id="gpu"></div>
       <p class="hint" id="gpu-note" hidden></p>
       <h3>Processes on the GPU</h3>
-      <table id="gpu-processes"></table>
+      <div class="table-scroll" role="region" aria-label="GPU processes" tabindex="0"><table id="gpu-processes"></table></div>
     </div>
     <div class="panel" id="pipeline-panel" hidden>
       <h2>Slicer pipeline</h2>
@@ -1017,7 +973,7 @@ window.addEventListener("error", (event) => {
   </section>
 
   <!-- Raw config -->
-  <section id="tab-config" class="hidden">
+  <section id="tab-config" class="panel-grid hidden">
     <div class="panel">
       <h2>Desired state document</h2>
       <p class="hint">Every field, including any the forms do not cover.</p>
@@ -5170,7 +5126,8 @@ function renderCpu() {
       <td>${fmt(r.percent, 1, " %")}</td><td>${fmt(r.corePercent, 0, " %")}</td>
       <td>${fmt(r.rssMib, 0, " MiB")}</td></tr>`).join("")}</tbody></table>`
     : `<p class="hint">No processes found.</p>`;
-  $("cpu").innerHTML = facts + cpuChart(c) + strip + `<h3>Processes and apps</h3>` + table;
+  $("cpu").innerHTML = facts + cpuChart(c) + strip +
+    `<h3>Processes and apps</h3><div class="table-scroll" role="region" aria-label="CPU processes and apps" tabindex="0">${table}</div>`;
 }
 function renderGpuAndBrowsers() { renderGpu(); renderPipeline(); renderCpu(); renderBrowsers(); }
 
@@ -5395,6 +5352,65 @@ function connect() {
     setBrowserReports(JSON.parse(e.data));
     renderGpuAndBrowsers();
   });
+}
+
+// Independent panel stacks. Explicit grid placement preserves DOM/focus order
+// and keeps each panel in its column when live telemetry changes its height.
+// Measure border boxes so borders and padding count toward the 16px gap.
+for (const grid of document.querySelectorAll(".panel-grid")) {
+  let pending = false;
+  const observed = new Set();
+  const items = () => [...grid.children].filter((item) =>
+    item.matches(".panel, .alert, #warp-error"));
+  const schedule = () => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => {
+      pending = false;
+      if (!grid.getClientRects().length) return;
+      const columns = Number(getComputedStyle(grid).getPropertyValue("--panel-columns"));
+      const nextRow = Array(columns).fill(1);
+      let index = 0;
+      if (!grid.classList.contains("masonry")) grid.classList.add("masonry");
+      const placements = items().filter((item) => item.getClientRects().length).map((item) => {
+        const style = getComputedStyle(item);
+        const fullWidth = item.id === "warp-error" || style.getPropertyValue("--panel-span").trim() === "all";
+        const preferredColumn = Number(style.getPropertyValue("--panel-column"));
+        // Tabs can declare a column; other groups keep alternating columns.
+        const column = fullWidth ? 0 : Math.min(columns - 1, preferredColumn ? preferredColumn - 1 : index++ % columns);
+        return { item, fullWidth, column };
+      });
+      // Assign widths before measuring: wrapping changes at the breakpoint.
+      for (const { item, fullWidth, column } of placements) {
+        item.style.gridColumn = fullWidth ? "1 / -1" : String(column + 1);
+      }
+      for (const { item, fullWidth, column } of placements) {
+        const height = Math.ceil(item.getBoundingClientRect().height);
+        if (!height) continue;
+        const row = fullWidth ? Math.max(...nextRow) : nextRow[column];
+        item.style.gridRow = `${row} / span ${height}`;
+        if (fullWidth) nextRow.fill(row + height + 16);
+        else nextRow[column] = row + height + 16;
+      }
+    });
+  };
+  const resize = new ResizeObserver(schedule);
+  resize.observe(grid);
+  const refresh = () => {
+    const current = new Set(items());
+    for (const item of observed) {
+      if (!current.has(item)) { resize.unobserve(item); observed.delete(item); }
+    }
+    for (const item of current) {
+      if (!observed.has(item)) { resize.observe(item, { box: "border-box" }); observed.add(item); }
+    }
+    schedule();
+  };
+  // Alerts are replaced on updates; hidden panels and tabs can reappear.
+  new MutationObserver(refresh).observe(grid, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ["class", "hidden"],
+  });
+  refresh();
 }
 
 window.addEventListener("resize", () => { renderLayout(); drawWarp(); });

@@ -469,13 +469,16 @@ The canvas output itself is given the participating outputs' refresh rate —
 the fastest of them, when they differ, since a canvas slower than an output
 would starve it.
 
-Measuring it: `GET /projection/stats` (and the `projection_stats_changed`
+### Reading frame timing {: #reading-frame-timing }
+
+`GET /projection/stats` (and the `projection_stats_changed`
 event) report the inter-output presentation offset (mean/max milliseconds,
 read from `wp_presentation`), straddles (frames the outputs showed on
 different refreshes), gate holds, superseded frames, stalls, and per-output
 presented/discarded counts, zero-copy presented count, and measured refresh,
 alongside the canvas and presented frame rates and the per-frame cost
-breakdown. The web UI shows all of this in the Projection panel. A non-zero
+breakdown. The web UI shows these measurements in the Frame timing panel on
+the Displays tab. A non-zero
 `zeroCopyPresented` proves the compositor scanned that output's buffer
 straight out to the display controller for at least one frame this interval,
 with no compositing pass in between. A steady offset of a few milliseconds with

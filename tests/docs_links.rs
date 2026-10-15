@@ -15,6 +15,10 @@ const SOURCES: &[(&str, &str)] = &[
         "src/model/observed.rs",
         include_str!("../src/model/observed.rs"),
     ),
+    (
+        "src/api/ui/index.html",
+        include_str!("../src/api/ui/index.html"),
+    ),
 ];
 
 fn repo_root() -> PathBuf {

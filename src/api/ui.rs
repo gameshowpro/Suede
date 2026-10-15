@@ -9,6 +9,7 @@
 //! Disabled when a bearer token is configured — a page that had to embed the
 //! token would defeat it.
 
+use axum::extract::State;
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
@@ -85,8 +86,47 @@ pub fn router() -> Router<ApiState> {
     router
 }
 
-async fn index() -> impl IntoResponse {
-    Html(INDEX)
+async fn index(State(state): State<ApiState>) -> impl IntoResponse {
+    Html(render_docs_links(INDEX, |path| {
+        state.bootstrap.docs_url(path)
+    }))
+}
+
+/// Replace static documentation path markers with links using the configured
+/// documentation base URL. Links do not load external resources automatically.
+fn render_docs_links(html: &str, docs_url: impl Fn(&str) -> String) -> String {
+    const MARKER: &str = "data-docs-path=\"";
+    let mut rendered = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find(MARKER) {
+        let value_start = start + MARKER.len();
+        let Some(end_offset) = rest[value_start..].find('"') else {
+            rendered.push_str(rest);
+            return rendered;
+        };
+        let value_end = value_start + end_offset;
+        rendered.push_str(&rest[..start]);
+        let path = rest[value_start..value_end].trim_start_matches('/');
+        let url = docs_url(path);
+        rendered.push_str("href=\"");
+        push_html_attribute(&mut rendered, &url);
+        rendered.push('"');
+        rest = &rest[value_end + 1..];
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+fn push_html_attribute(output: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '"' => output.push_str("&quot;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(character),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +136,29 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    #[test]
+    fn documentation_paths_use_the_configured_base_and_are_attribute_escaped() {
+        let rendered = render_docs_links(
+            r#"<a data-docs-path="configuration/#projection-geometry">docs</a>"#,
+            |path| format!("https://docs.example.test/root/?q=\"<x>&/{path}"),
+        );
+        assert_eq!(
+            rendered,
+            r#"<a href="https://docs.example.test/root/?q=&quot;&lt;x&gt;&amp;/configuration/#projection-geometry">docs</a>"#
+        );
+    }
+
+    #[test]
+    fn rendered_documentation_links_resolve_from_the_root() {
+        let rendered = render_docs_links(
+            r#"<a data-docs-path="configuration/#projection-geometry">docs</a>"#,
+            |path| format!("https://docs.example.test/{path}"),
+        );
+        assert!(rendered
+            .contains(r#"href="https://docs.example.test/configuration/#projection-geometry""#));
+        assert!(!rendered.contains("data-docs-path"));
+    }
 
     async fn fetch_root(token: Option<&str>) -> (StatusCode, String) {
         let harness = harness(token);
@@ -118,6 +181,12 @@ mod tests {
         let (status, body) = fetch_root(None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("<title>Suede</title>"));
+        let expected = format!(
+            r#"href="{}configuration/#projection-geometry""#,
+            crate::config::DEFAULT_DOCS_BASE_URL
+        );
+        assert!(body.contains(&expected));
+        assert!(!body.contains("data-docs-path"));
     }
 
     #[tokio::test]
