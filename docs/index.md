@@ -1,11 +1,14 @@
-# Suede
+---
+title: Suede
+---
 
-<p>
+<h1 class="home-title" id="suede">
   <picture>
     <source srcset="generated/artwork/icon-readme.avif" type="image/avif">
-    <img src="generated/artwork/icon-readme.png" width="128" height="128" alt="Suede icon">
+    <img src="generated/artwork/icon-readme.png" width="128" height="128" alt="">
   </picture>
-</p>
+  <span>Suede</span>
+</h1>
 
 Suede is a daemon with a name that is a hilarious pun on the word "Swayed". It turns a Linux box running [Sway](https://swaywm.org/) into a remotely manageable display appliance.
 

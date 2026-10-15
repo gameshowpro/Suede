@@ -6,6 +6,7 @@ repo_name: gameshowpro/Suede
 
 theme:
   name: material
+  font: false
   logo: generated/artwork/icon-docs.png
   favicon: generated/artwork/favicon.ico
   custom_dir: docs/overrides
@@ -36,6 +37,7 @@ theme:
     - content.code.copy
 
 extra_css:
+  - generated/fonts/fonts.css
   - assets/stylesheets/extra.css
 
 docs_dir: docs
@@ -106,10 +108,12 @@ plugins:
 
 hooks:
   - scripts/artwork_hook.py
+  - scripts/fonts_hook.py
 
 watch:
   - artwork
   - scripts/artwork
+  - fonts
 
 extra:
   version: !ENV [SUEDE_DOCS_VERSION, "dev"]

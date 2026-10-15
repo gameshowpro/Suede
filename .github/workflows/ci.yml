@@ -46,6 +46,7 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'artwork/**'
+              - 'fonts/**'
               # The build script decides what the binary says it is, and how
               # it is compiled for another architecture. Neither was listed,
               # so a commit changing only build.rs skipped every job and the
@@ -77,6 +78,8 @@ jobs:
               - 'artwork/**'
               - 'scripts/artwork/**'
               - 'scripts/artwork_hook.py'
+              - 'fonts/**'
+              - 'scripts/fonts_hook.py'
               - 'Cargo.lock'
       - name: Resolve change outputs
         id: resolve

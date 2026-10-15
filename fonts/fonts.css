@@ -1,0 +1,37 @@
+/* Shared by the embedded application and MkDocs. All URLs stay local. */
+@font-face {
+  font-family: "Plus Jakarta Sans";
+  src: url("PlusJakartaSans-Variable.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 200 800;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Plus Jakarta Sans";
+  src: url("PlusJakartaSans-Italic-Variable.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 200 800;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cascadia Code";
+  src: url("CascadiaCode.woff2") format("woff2");
+  font-style: normal;
+  font-weight: 200 700;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Cascadia Code";
+  src: url("CascadiaCodeItalic.woff2") format("woff2");
+  font-style: italic;
+  font-weight: 200 700;
+  font-display: swap;
+}
+
+:root {
+  --font-sans: "Plus Jakarta Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "Cascadia Code", ui-monospace, Consolas, monospace;
+}

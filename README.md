@@ -1,6 +1,4 @@
-# Suede
-
-<img src="https://suede.gameshow.pro/generated/artwork/icon-readme.png" alt="Suede icon" width="128" height="128">
+<h1><img src="https://suede.gameshow.pro/generated/artwork/icon-readme.png" alt="" width="128" height="128" align="middle"> Suede</h1>
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/gameshowpro/Suede/ci.yml?branch=main&logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/actions)
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/releases)

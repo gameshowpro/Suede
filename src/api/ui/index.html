@@ -23,8 +23,12 @@
 <meta property="og:image:alt" content="Suede's blue suede panels and flowing inlay">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="/assets/artwork/social-card.png">
+<link rel="stylesheet" href="/assets/fonts/fonts.css">
+<link rel="preload" href="/assets/fonts/PlusJakartaSans-Variable.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="preload" href="/assets/fonts/CascadiaCode.woff2" as="font" type="font/woff2" crossorigin>
 <style>
 :root {
+  --font-feature-data: "tnum" 1, "zero" 1, "liga" 0, "calt" 0;
   --bg: #f5f6f8; --panel: #fff; --sunken: #f0f2f5; --ink: #16191d; --muted: #667085;
   --line: #e2e6ea; --accent: #3b5bdb; --ok: #2f9e44; --warn: #b8860b; --bad: #c92a2a;
   --shadow: 0 1px 3px rgba(0,0,0,.07);
@@ -38,14 +42,22 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink);
-  font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
-header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 13px 20px;
+  font: 15px/1.55 var(--font-sans); font-weight: 400; }
+header { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; min-height: 56px; padding: 4px 20px;
   background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
-.app-icon { width: 32px; height: 32px; flex: 0 0 32px; }
-h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
-h2 { font-size: 15px; margin: 0 0 12px; }
+.app-brand { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.app-icon { display: block; width: 48px; height: 48px; flex: 0 0 48px; }
+.app-icon img { display: block; width: 100%; height: 100%; }
+.header-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap;
+  gap: 8px; margin-left: auto; }
+h1 { font-size: 20px; line-height: 1.2; font-weight: 700; margin: 0; letter-spacing: -.02em; }
+@media (max-width: 76.234375em) {
+  .app-brand { gap: 6px; }
+  .app-icon { width: 40px; height: 40px; flex-basis: 40px; }
+}
+h2 { font-size: 15px; font-weight: 700; margin: 0 0 12px; }
 h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted);
-  text-transform: uppercase; letter-spacing: .04em; }
+  font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
 .grow { flex: 1; }
 main { padding: 18px 20px 60px; max-width: 1180px; margin: 0 auto; }
 .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -107,7 +119,8 @@ dialog::backdrop { background: rgba(0,0,0,.45); }
 dialog .dialog-body { padding: 18px; max-height: calc(100vh - 170px); overflow-y: auto; }
 dialog .dialog-body > h2 { margin-top: 0; }
 .invocation { background: var(--sunken); border: 1px solid var(--line); border-radius: 7px;
-  padding: 9px 11px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px;
+  padding: 9px 11px; font-family: var(--font-mono); font-size: 12px;
+  font-variant-numeric: tabular-nums slashed-zero; font-feature-settings: var(--font-feature-data);
   line-height: 1.55; overflow-x: auto; }
 .invocation .preset { color: var(--muted); }
 .invocation .app { color: var(--accent); font-weight: 600; }
@@ -201,7 +214,7 @@ tr.player-detail > td { background: var(--sunken); padding: 12px 14px; }
 .player-detail-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
 @media (min-width: 1000px) { .player-detail-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 .player-detail-grid section { min-width: 0; overflow-x: auto; }
-.player-detail-grid h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+.player-detail-grid h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
 .player-detail-grid table td, .player-detail-grid table th { padding: 4px 8px; font-size: 13px; vertical-align: top; }
 .player-detail-grid td.mono { overflow-wrap: anywhere; }
 .player-detail-grid h5 { margin: 10px 0 4px; font-size: 13px; }
@@ -225,11 +238,12 @@ tr.player-detail > td { background: var(--sunken); padding: 12px 14px; }
   background-size: 24px 100%; animation: pbar-live 1.2s linear infinite; }
 @keyframes pbar-live { to { background-position: 24px 0; } }
 @media (prefers-reduced-motion: reduce) { .pbar.live i { animation: none; } }
-.ptime { font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.ptime { font: 12px var(--font-mono); white-space: nowrap; font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: var(--font-feature-data); font-variant-ligatures: none; }
 
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
-th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 tr:last-child td { border-bottom: 0; }
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
 input, select, textarea { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
@@ -252,7 +266,10 @@ input[type=checkbox].switch:checked { background: var(--accent); border-color: v
 input[type=checkbox].switch:checked::after { transform: translateX(18px); background: #fff; }
 input[type=checkbox].switch:disabled { opacity: .45; cursor: not-allowed; }
 input[type=checkbox].switch:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-textarea { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+input:not([type="checkbox"]):not([type="radio"]):not([type="color"]):not([type="file"]),
+select, textarea, output { font-family: var(--font-mono); font-size: 13px; font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: var(--font-feature-data); font-variant-ligatures: none; }
+textarea.json { font-variant-ligatures: common-ligatures contextual; font-feature-settings: "liga" 1, "calt" 1, "zero" 1; }
 textarea.json { min-height: 420px; }
 .fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 6px; }
 .fields.wide { grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
@@ -260,7 +277,7 @@ textarea.json { min-height: 420px; }
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 fieldset { border: 1px solid var(--line); border-radius: 9px; padding: 12px 14px; margin: 14px 0 0; }
 legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
-  text-transform: uppercase; letter-spacing: .04em; }
+  text-transform: uppercase; letter-spacing: .05em; }
 /* Height is set by renderLayout, which grows the box to keep every display
    rectangle readable; this is only what it looks like before that runs. */
 #layout { position: relative; background: var(--sunken); border: 1px dashed var(--line);
@@ -297,7 +314,14 @@ legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
 td .thumb { width: 58px; height: 34px; object-fit: cover; border-radius: 5px;
   border: 1px solid var(--line); background: #0b1020; display: block; }
 .muted { color: var(--muted); }
-.mono { font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+.mono, code, pre { font-family: var(--font-mono); font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: var(--font-feature-data); font-variant-ligatures: none; }
+.mono { font-size: 13px; }
+.display-box, #version, .gpu-chart .axis-label, .gpu-chart .marker-label {
+  font-family: var(--font-mono); font-variant-numeric: tabular-nums slashed-zero;
+  font-feature-settings: var(--font-feature-data); font-variant-ligatures: none;
+}
+pre, pre code { font-variant-ligatures: common-ligatures contextual; font-feature-settings: "liga" 1, "calt" 1, "zero" 1; }
 .hidden { display: none; }
 #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
   background: var(--ink); color: var(--bg); padding: 10px 18px; border-radius: 8px;
@@ -360,18 +384,18 @@ dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--li
 .arrange-order-row.disabled { opacity: .6; }
 .arrange-order-pos { color: var(--muted); font-size: 12px; width: 1.4em; text-align: right; flex: none; }
 .arrange-order-name { flex: 1; font-size: 13px; min-width: 0; }
-.arrange-order-raster { color: var(--muted); font-size: 12px; font-family: ui-monospace, Consolas, monospace; flex: none; }
+.arrange-order-raster { color: var(--muted); font-size: 12px; font-family: var(--font-mono); font-feature-settings: var(--font-feature-data); font-variant-numeric: tabular-nums slashed-zero; font-variant-ligatures: none; flex: none; }
 .arrange-order-row button.action.ghost { padding: 2px 8px; font-size: 12px; flex: none; }
 .warp-matrix { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; margin: 14px 0; align-items: stretch; }
 @media (max-width: 760px) { .warp-matrix { grid-template-columns: 1fr 1fr; } }
 .warp-cell { background: var(--sunken); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
 .warp-cell.warp-center { border-color: color-mix(in srgb, var(--accent) 50%, var(--line)); background: color-mix(in srgb, var(--accent) 7%, var(--sunken)); }
 .warp-cell.warp-empty { background: transparent; border: 1px dashed transparent; }
-.warp-cell-title { font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .03em; }
+.warp-cell-title { font-size: 11px; font-weight: 600; color: var(--muted); margin-bottom: 6px; text-transform: uppercase; letter-spacing: .05em; }
 .warp-pair { display: flex; gap: 8px; }
 .warp-pair > div { flex: 1; min-width: 0; }
 .warp-pair label { font-size: 11px; margin-bottom: 2px; }
-.warp-pair input { padding: 5px 7px; font-size: 13px; font-family: ui-monospace, Consolas, monospace; }
+.warp-pair input { padding: 5px 7px; font-size: 13px; }
 </style>
 </head>
 <body>
@@ -385,7 +409,7 @@ window.addEventListener("error", (event) => {
     banner = document.createElement("div");
     banner.id = "js-error";
     banner.style.cssText = "background:#c92a2a;color:#fff;padding:10px 20px;" +
-      "font:14px system-ui;position:sticky;top:0;z-index:99;display:flex;gap:12px";
+      "font:14px var(--font-sans);position:sticky;top:0;z-index:99;display:flex;gap:12px";
     const text = document.createElement("span");
     text.id = "js-error-text";
     text.style.cssText = "flex:1";
@@ -396,7 +420,7 @@ window.addEventListener("error", (event) => {
     const close = document.createElement("button");
     close.textContent = "Dismiss";
     close.style.cssText = "background:#fff3;color:#fff;border:0;border-radius:6px;" +
-      "padding:2px 10px;font:600 13px system-ui;cursor:pointer";
+      "padding:2px 10px;font:600 13px var(--font-sans);cursor:pointer";
     close.onclick = () => banner.remove();
     banner.append(text, close);
     document.body.prepend(banner);
@@ -411,17 +435,20 @@ window.addEventListener("error", (event) => {
 });
 </script>
 <header>
-  <picture class="app-icon">
-    <source srcset="/assets/artwork/icon-header.avif" type="image/avif">
-    <img src="/assets/artwork/icon-header.png" width="32" height="32" alt="">
-  </picture>
-  <h1>Suede</h1>
+  <div class="app-brand">
+    <picture class="app-icon">
+      <source srcset="/assets/artwork/icon-header.avif" type="image/avif">
+      <img src="/assets/artwork/icon-header.png" width="48" height="48" alt="">
+    </picture>
+    <h1>Suede</h1>
+  </div>
   <span class="pill muted" id="version">—</span>
-  <span class="grow"></span>
-  <button type="button" class="header-action" id="pj-cancel" title="Revert to saved configuration">Revert</button>
-  <button type="button" class="header-action" id="pj-save" title="Save configuration to disk">Save</button>
-  <span class="pill muted" id="live">connecting…</span>
-  <span class="pill muted" id="sync">—</span>
+  <div class="header-actions">
+    <button type="button" class="header-action" id="pj-cancel" title="Revert to saved configuration">Revert</button>
+    <button type="button" class="header-action" id="pj-save" title="Save configuration to disk">Save</button>
+    <span class="pill muted" id="live">connecting…</span>
+    <span class="pill muted" id="sync">—</span>
+  </div>
 </header>
 
 <main>

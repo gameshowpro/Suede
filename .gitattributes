@@ -20,3 +20,7 @@
 *.deb binary
 *.woff binary
 *.woff2 binary
+
+# Preserve upstream font license bytes, including their original whitespace,
+# so the checksums in fonts/sources.json also hold after a fresh checkout.
+fonts/*-LICENSE.txt -text whitespace=-blank-at-eol,cr-at-eol

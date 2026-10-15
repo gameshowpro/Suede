@@ -76,7 +76,7 @@ if [[ "$FAILED" -eq 0 ]]; then
   # Naming what was not covered, so this banner cannot be read as more than
   # it is. Only when docs could actually have changed - otherwise it is noise
   # that teaches you to ignore the line.
-  if [[ "$STAGE" == "all" ]] && ! git diff --quiet --exit-code HEAD -- docs mkdocs.yml artwork scripts/artwork scripts/artwork_hook.py 2>/dev/null; then
+  if [[ "$STAGE" == "all" ]] && ! git diff --quiet --exit-code HEAD -- docs mkdocs.yml artwork scripts/artwork scripts/artwork_hook.py fonts scripts/fonts_hook.py 2>/dev/null; then
     echo "(docs not built - you changed them; run: ./scripts/dev-check.sh docs)"
   fi
 else

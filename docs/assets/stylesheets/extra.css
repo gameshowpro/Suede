@@ -1,21 +1,77 @@
-/* Match the 72 px header asset to Material's 24 CSS pixel logo slot. */
-.md-header__button.md-logo img {
-  width: 24px;
-  height: 24px;
+/* Use the same locally served font files as the standalone API reference. */
+:root {
+  --md-text-font: var(--font-sans);
+  --md-code-font: var(--font-mono);
 }
 
-.md-typeset > p:first-of-type img[alt="Suede icon"] {
+/* The artwork's transparent framing needs a larger box than a solid icon. */
+.md-header__inner {
+  min-height: 2.8rem;
+}
+
+.md-header__button.md-logo {
+  display: flex;
+  align-items: center;
+  padding: 0;
+}
+
+.md-header__button.md-logo picture {
   display: block;
-  width: 128px;
-  height: 128px;
+}
+
+.md-header__button.md-logo img {
+  width: 48px;
+  height: 48px;
+}
+
+.md-header .md-header__title {
+  min-width: 0;
+  margin-left: 0.2rem;
+  font-size: 1rem;
+  letter-spacing: -0.02em;
+}
+
+.md-header__button[for="__drawer"] {
+  order: -1;
+}
+
+@media (max-width: 76.234375em) {
+  .md-header__button.md-logo img {
+    width: 40px;
+    height: 40px;
+  }
+
+  .md-header .md-header__title {
+    margin-left: 0.1rem;
+  }
+}
+
+.md-typeset .home-title {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin: 0 0 1.25rem;
+  font-size: clamp(2rem, 6vw, 3rem);
+  line-height: 1.1;
+  color: var(--md-default-fg-color);
+}
+
+.home-title picture {
+  display: block;
+  flex: 0 0 auto;
+}
+
+.md-typeset .home-title img {
+  display: block;
+  width: clamp(80px, 12vw, 128px);
+  height: auto;
   object-fit: contain;
-  margin: 0 auto 1.5rem;
 }
 
 /* Feature cards on the home page. */
 .md-typeset .grid.cards > ul {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
   gap: 1rem;
   padding: 0;
   margin: 1em 0;
@@ -49,4 +105,20 @@
 /* Sway commands and PipeWire node names read better slightly tighter. */
 .md-typeset code {
   font-size: 0.85em;
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-variant-ligatures: none;
+}
+
+.md-typeset h1,
+.md-typeset h2,
+.md-typeset h3,
+.md-typeset h4,
+.md-typeset h5,
+.md-typeset h6 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+
+.md-typeset pre code {
+  font-variant-ligatures: common-ligatures contextual;
 }

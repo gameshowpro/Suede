@@ -38,8 +38,8 @@ Node, or system graphics libraries. Dependencies are locked by the root
 
 | Consumer | Generated file | Pixel size | Display size |
 | --- | --- | --- | --- |
-| Application header | `icon-header.avif` / `.png` | 96 × 96 | 32 × 32 CSS px |
-| MkDocs header | `icon-docs.avif` / `.png` | 72 × 72 | 24 × 24 CSS px |
+| Application header | `icon-header.avif` / `.png` | 144 × 144 | 48 × 48 CSS px (40 × 40 on smaller screens) |
+| MkDocs header | `icon-docs.avif` / `.png` | 144 × 144 | 48 × 48 CSS px (40 × 40 on smaller screens) |
 | Documentation home | `icon-readme.avif` / `.png` | 384 × 384 | 128 × 128 CSS px |
 | GitHub README | `icon-readme.png` | 384 × 384 | 128 × 128 CSS px |
 | Social preview cards | `social-card.png` | 1200 × 630 | Determined by the consuming service |

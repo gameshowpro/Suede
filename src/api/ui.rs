@@ -3,7 +3,8 @@
 //! A single self-contained page, embedded in the binary at compile time. It
 //! uses nothing but the public API, so it doubles as a worked example of every
 //! endpoint. The page needs no frontend toolchain; Cargo generates its artwork
-//! from the canonical sources and embeds every asset in the same binary.
+//! from the canonical sources and embeds every asset, including local fonts,
+//! in the same binary.
 //!
 //! Disabled when a bearer token is configured — a page that had to embed the
 //! token would defeat it.
@@ -18,10 +19,54 @@ use super::ApiState;
 const INDEX: &str = include_str!("ui/index.html");
 include!(concat!(env!("OUT_DIR"), "/artwork.rs"));
 
+// Canonical WOFF2 files are already web-ready; embed them without conversion.
+// Keep their licenses available alongside the fonts in distributed binaries.
+const FONTS: &[(&str, &str, &[u8])] = &[
+    (
+        "fonts.css",
+        "text/css; charset=utf-8",
+        include_bytes!("../../fonts/fonts.css"),
+    ),
+    (
+        "PlusJakartaSans-Variable.woff2",
+        "font/woff2",
+        include_bytes!("../../fonts/PlusJakartaSans-Variable.woff2"),
+    ),
+    (
+        "PlusJakartaSans-Italic-Variable.woff2",
+        "font/woff2",
+        include_bytes!("../../fonts/PlusJakartaSans-Italic-Variable.woff2"),
+    ),
+    (
+        "CascadiaCode.woff2",
+        "font/woff2",
+        include_bytes!("../../fonts/CascadiaCode.woff2"),
+    ),
+    (
+        "CascadiaCodeItalic.woff2",
+        "font/woff2",
+        include_bytes!("../../fonts/CascadiaCodeItalic.woff2"),
+    ),
+    (
+        "PlusJakartaSans-LICENSE.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../../fonts/PlusJakartaSans-LICENSE.txt"),
+    ),
+    (
+        "CascadiaCode-LICENSE.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../../fonts/CascadiaCode-LICENSE.txt"),
+    ),
+];
+
 pub fn router() -> Router<ApiState> {
     let mut router = Router::new().route("/", get(index));
-    // Register only generated assets, never paths into the host filesystem.
-    for &(name, mime, bytes) in ARTWORK {
+    // Register only embedded assets, never paths into the host filesystem.
+    for (directory, &(name, mime, bytes)) in ARTWORK
+        .iter()
+        .map(|asset| ("artwork", asset))
+        .chain(FONTS.iter().map(|asset| ("fonts", asset)))
+    {
         let serve = move || async move {
             (
                 [
@@ -32,8 +77,8 @@ pub fn router() -> Router<ApiState> {
                 bytes,
             )
         };
-        router = router.route(&format!("/assets/artwork/{name}"), get(serve));
-        if name == "favicon.ico" {
+        router = router.route(&format!("/assets/{directory}/{name}"), get(serve));
+        if directory == "artwork" && name == "favicon.ico" {
             router = router.route("/favicon.ico", get(serve));
         }
     }
@@ -82,15 +127,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artwork_is_embedded_and_served_with_its_media_type() {
+    async fn artwork_and_fonts_are_embedded_and_served_with_their_media_types() {
         let harness = harness(None);
-        for &(name, mime, expected) in ARTWORK {
+        for (directory, &(name, mime, expected)) in ARTWORK
+            .iter()
+            .map(|asset| ("artwork", asset))
+            .chain(FONTS.iter().map(|asset| ("fonts", asset)))
+        {
             let response = harness
                 .router
                 .clone()
                 .oneshot(
                     Request::builder()
-                        .uri(format!("/assets/artwork/{name}"))
+                        .uri(format!("/assets/{directory}/{name}"))
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -106,12 +155,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artwork_obeys_ui_visibility_and_unknown_assets_are_not_served() {
+    async fn assets_obey_ui_visibility_and_unknown_assets_are_not_served() {
         for (token, path) in [
             (Some("secret"), "/assets/artwork/icon-header.png"),
             (Some("secret"), "/assets/artwork/icon-header.avif"),
             (Some("secret"), "/favicon.ico"),
+            (Some("secret"), "/assets/fonts/fonts.css"),
+            (Some("secret"), "/assets/fonts/CascadiaCode.woff2"),
             (None, "/assets/artwork/not-an-icon.png"),
+            (None, "/assets/fonts/not-a-font.woff2"),
         ] {
             let harness = harness(token);
             let mut request = Request::builder().uri(path);

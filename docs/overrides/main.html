@@ -2,6 +2,7 @@
 
 {% block extrahead %}
   {{ super() }}
+  <link rel="preload" href="{{ 'generated/fonts/PlusJakartaSans-Variable.woff2' | url }}" as="font" type="font/woff2" crossorigin>
   <link rel="icon" href="{{ 'generated/artwork/favicon-32x32.png' | url }}" type="image/png" sizes="32x32">
   <link rel="icon" href="{{ 'generated/artwork/favicon.svg' | url }}" type="image/svg+xml" sizes="any">
   <link rel="apple-touch-icon" href="{{ 'generated/artwork/apple-touch-icon-152x152.png' | url }}" sizes="152x152">

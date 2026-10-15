@@ -1,0 +1,28 @@
+{
+  "CascadiaCode-LICENSE.txt": {
+    "sha256": "51882cd3cdba4e16f220f44ddb08a635c38c44ea6e0975db2574f4be6f958238",
+    "url": "https://raw.githubusercontent.com/microsoft/cascadia-code/v2407.24/LICENSE"
+  },
+  "CascadiaCode.woff2": {
+    "sha256": "3ec1f7e7250c055d35504a1500e8a9ba12b26f25214a86da6537e28abc60dccc",
+    "url": "https://github.com/microsoft/cascadia-code/releases/download/v2407.24/CascadiaCode-2407.24.zip",
+    "archive_path": "woff2/CascadiaCode.woff2"
+  },
+  "CascadiaCodeItalic.woff2": {
+    "sha256": "7b38c6e24c4f114ecdbc73c9114bf59cd7e998309a8a2ee54ef1e0289481405f",
+    "url": "https://github.com/microsoft/cascadia-code/releases/download/v2407.24/CascadiaCode-2407.24.zip",
+    "archive_path": "woff2/CascadiaCodeItalic.woff2"
+  },
+  "PlusJakartaSans-Italic-Variable.woff2": {
+    "sha256": "c2b725042062d631489ce126ba1ebccf387453aacd8a46579631e8ec77004ec3",
+    "url": "https://raw.githubusercontent.com/tokotype/PlusJakartaSans/18d1cd2f7ea10481919d2f05c1f7064b7307fc26/fonts/webfonts/PlusJakartaSans-Italic%5Bwght%5D.woff2"
+  },
+  "PlusJakartaSans-LICENSE.txt": {
+    "sha256": "995c7199cab65954f545996326755daee7b63cc6b42b06c13da1f9502ab08a99",
+    "url": "https://raw.githubusercontent.com/tokotype/PlusJakartaSans/18d1cd2f7ea10481919d2f05c1f7064b7307fc26/OFL.txt"
+  },
+  "PlusJakartaSans-Variable.woff2": {
+    "sha256": "49c62cf1fb70f225ea113361f0134a48858c3a7d0175173aa3e38a0c6c8539d2",
+    "url": "https://raw.githubusercontent.com/tokotype/PlusJakartaSans/18d1cd2f7ea10481919d2f05c1f7064b7307fc26/fonts/webfonts/PlusJakartaSans%5Bwght%5D.woff2"
+  }
+}

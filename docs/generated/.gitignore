@@ -3,5 +3,7 @@
 #   scalar.js     — vendored Scalar bundle
 # Derived by scripts/artwork_hook.py during MkDocs builds:
 #   artwork/      — icons, header images, and social cards
+# Copied from fonts/ by scripts/fonts_hook.py during MkDocs builds:
+#   fonts/        — local WOFF2 fonts, stylesheet, and licenses
 *
 !.gitignore

@@ -20,6 +20,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>API reference — Suede</title>
 <link rel="icon" href="../generated/artwork/favicon.ico">
+<link rel="stylesheet" href="../generated/fonts/fonts.css">
+<link rel="preload" href="../generated/fonts/PlusJakartaSans-Variable.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="icon" type="image/png" sizes="32x32" href="../generated/artwork/favicon-32x32.png">
 <link rel="icon" type="image/svg+xml" sizes="any" href="../generated/artwork/favicon.svg">
 <link rel="apple-touch-icon" sizes="180x180" href="../generated/artwork/apple-touch-icon.png">
@@ -51,7 +53,7 @@
     position: fixed; top: 0; left: 0; right: 0; height: 44px; z-index: 10;
     box-sizing: border-box; display: flex; align-items: center; gap: 14px;
     padding: 0 14px; background: #3f51b5; color: #fff;
-    font: 600 14px/1 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 600 14px/1 var(--font-sans);
   }
   #topbar a { color: #fff; text-decoration: none; opacity: .92; }
   #topbar a:hover { opacity: 1; text-decoration: underline; }
@@ -61,12 +63,12 @@
      blank white page, which says nothing about what went wrong. */
   #fallback {
     display: none; max-width: 46em; margin: 18vh auto 0; padding: 44px 1.5em 0;
-    font: 15px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+    font: 15px/1.6 var(--font-sans);
     color: #333;
   }
   @media (prefers-color-scheme: dark) { #fallback { color: #ddd; } }
   #fallback h1 { font-size: 1.3em; }
-  #fallback code { background: rgb(128 128 128 / .18); padding: .1em .35em;
+  #fallback code { font-family: var(--font-mono); background: rgb(128 128 128 / .18); padding: .1em .35em;
     border-radius: 4px; }
 </style>
 </head>
@@ -94,7 +96,8 @@
      <code>../generated/openapi.json</code>.</p>
 </div>
 
-<script id="api-reference" data-url="../generated/openapi.json"></script>
+<script id="api-reference" data-url="../generated/openapi.json"
+  data-configuration="{&quot;withDefaultFonts&quot;:false,&quot;customCss&quot;:&quot;:root { --scalar-font: var(--font-sans); --scalar-font-code: var(--font-mono); } .scalar-api-reference code, .scalar-api-reference pre, .scalar-api-reference input, .scalar-api-reference textarea { font-family: var(--font-mono); font-variant-ligatures: none; font-variant-numeric: tabular-nums slashed-zero; } .scalar-api-reference pre, .scalar-api-reference pre code { font-variant-ligatures: common-ligatures contextual; }&quot;}"></script>
 <script src="../generated/scalar.js"></script>
 
 <script>
