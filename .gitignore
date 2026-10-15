@@ -3,6 +3,11 @@
 /site
 *.deb
 
+# Icon concepts, export packages, and previews are local working artifacts.
+# Canonical artwork lives in /artwork; application derivatives live in Cargo's
+# OUT_DIR and documentation derivatives in docs/generated/.
+/output/
+
 # Binaries built for deployment to a test machine
 /suede-x86_64
 

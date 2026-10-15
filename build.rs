@@ -11,6 +11,7 @@
 //! — the last release, how far past it, and exactly which commit.
 
 fn main() {
+    generate_artwork();
     // A source tarball has no git, and CI would rather state the answer than
     // have it rediscovered; both go through this variable.
     println!("cargo:rerun-if-env-changed=SUEDE_BUILD_ID");
@@ -87,6 +88,27 @@ fn main() {
         format!("{version} ({id})")
     };
     println!("cargo:rustc-env=SUEDE_VERSION_STRING={shown}");
+}
+
+/// Generate and embed the web artwork on the build host, including cross builds.
+/// Nothing generated is written into the source tree or needed at runtime.
+fn generate_artwork() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    println!("cargo:rerun-if-changed=artwork");
+    println!("cargo:rerun-if-changed=scripts/artwork");
+    let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("Cargo OUT_DIR"));
+    let assets = suede_artwork::generate_web(&root.join("artwork"), &output.join("artwork"))
+        .expect("generate web artwork from artwork/ sources");
+    let mut index = String::from("const ARTWORK: &[(&str, &str, &[u8])] = &[\n");
+    for asset in assets {
+        let path = output.join("artwork").join(&asset.name);
+        index.push_str(&format!(
+            "    ({:?}, {:?}, include_bytes!({:?})),\n",
+            asset.name, asset.mime, path
+        ));
+    }
+    index.push_str("];\n");
+    std::fs::write(output.join("artwork.rs"), index).expect("write embedded artwork index");
 }
 
 /// The id from `.build-id`, or `None` when nobody wrote one.

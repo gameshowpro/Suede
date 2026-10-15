@@ -6,6 +6,9 @@ repo_name: gameshowpro/Suede
 
 theme:
   name: material
+  logo: generated/artwork/icon-docs.png
+  favicon: generated/artwork/favicon.ico
+  custom_dir: docs/overrides
   palette:
     - media: "(prefers-color-scheme)"
       toggle:
@@ -36,6 +39,8 @@ extra_css:
   - assets/stylesheets/extra.css
 
 docs_dir: docs
+exclude_docs: |
+  overrides/
 use_directory_urls: true
 edit_uri: edit/main/docs/
 not_in_nav: |
@@ -98,6 +103,13 @@ markdown_extensions:
 
 plugins:
   - search
+
+hooks:
+  - scripts/artwork_hook.py
+
+watch:
+  - artwork
+  - scripts/artwork
 
 extra:
   version: !ENV [SUEDE_DOCS_VERSION, "dev"]

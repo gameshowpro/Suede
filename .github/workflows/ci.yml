@@ -45,6 +45,7 @@ jobs:
               - 'scripts/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'artwork/**'
               # The build script decides what the binary says it is, and how
               # it is compiled for another architecture. Neither was listed,
               # so a commit changing only build.rs skipped every job and the
@@ -73,6 +74,10 @@ jobs:
               - 'src/**'
               - 'Cargo.toml'
               - 'scripts/build-docs.sh'
+              - 'artwork/**'
+              - 'scripts/artwork/**'
+              - 'scripts/artwork_hook.py'
+              - 'Cargo.lock'
       - name: Resolve change outputs
         id: resolve
         shell: bash
@@ -110,10 +115,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
       # Proves the OpenAPI document builds with no compositor and no network,
       # which is what the docs job depends on.
@@ -167,7 +172,7 @@ jobs:
         id: version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
+            | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='suede'))")
           echo "version=$version" >> $GITHUB_OUTPUT
           echo "tag=v$version" >> $GITHUB_OUTPUT
 
@@ -451,7 +456,7 @@ jobs:
         id: version
         run: |
           version=$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import json,sys;print(json.load(sys.stdin)['packages'][0]['version'])")
+            | python3 -c "import json,sys;print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='suede'))")
           echo "tag=v$version" >> $GITHUB_OUTPUT
 
       - name: Build the site

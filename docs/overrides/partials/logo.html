@@ -1,0 +1,13 @@
+{#-
+  Based on Material for MkDocs' partials/logo.html.
+  Keep its configured logo fallback and built-in icon behavior.
+-#}
+{% if config.theme.logo %}
+  <picture>
+    <source srcset="{{ 'generated/artwork/icon-docs.avif' | url }}" type="image/avif">
+    <img src="{{ config.theme.logo | url }}" alt="logo">
+  </picture>
+{% else %}
+  {% set icon = config.theme.icon.logo or "material/library" %}
+  {% include ".icons/" ~ icon ~ ".svg" %}
+{% endif %}

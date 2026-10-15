@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title">
+  <title id="title">Suede</title>
+  <defs>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#1683ff"/><stop offset="1" stop-color="#174bd4"/></linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="0" y2="1"><stop stop-color="#b5e6ff"/><stop offset="1" stop-color="#82cbfa"/></linearGradient>
+    <clipPath id="panels"><path d="M44 100 H140 A24 24 0 0 1 164 124 V388 A24 24 0 0 1 140 412 H44 A24 24 0 0 1 20 388 V124 A24 24 0 0 1 44 100 Z M208 100 H304 A24 24 0 0 1 328 124 V388 A24 24 0 0 1 304 412 H208 A24 24 0 0 1 184 388 V124 A24 24 0 0 1 208 100 Z M372 100 H468 A24 24 0 0 1 492 124 V388 A24 24 0 0 1 468 412 H372 A24 24 0 0 1 348 388 V124 A24 24 0 0 1 372 100 Z"/></clipPath>
+  </defs>
+  <g fill="url(#blue)">
+    <rect x="20" y="100" width="144" height="312" rx="24"/>
+    <rect x="184" y="100" width="144" height="312" rx="24"/>
+    <rect x="348" y="100" width="144" height="312" rx="24"/>
+  </g>
+  <path clip-path="url(#panels)" fill="url(#wave)" d="M0 239 C58 207 110 181 164 201 C221 221 257 282 328 289 C382 294 431 268 512 220 L512 274 C441 316 388 340 326 331 C252 320 216 260 162 245 C108 230 57 259 0 291 Z"/>
+</svg>

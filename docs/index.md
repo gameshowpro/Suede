@@ -1,5 +1,12 @@
 # Suede
 
+<p>
+  <picture>
+    <source srcset="generated/artwork/icon-readme.avif" type="image/avif">
+    <img src="generated/artwork/icon-readme.png" width="128" height="128" alt="Suede icon">
+  </picture>
+</p>
+
 Suede is a daemon with a name that is a hilarious pun on the word "Swayed". It turns a Linux box running [Sway](https://swaywm.org/) into a remotely manageable display appliance.
 
 You describe the state you want — which displays are on, at what mode and position, which browsers show which pages, where their audio goes — and Suede keeps reality matching it. Through reboots, display hotplugs, and application crashes, with no operator on site.

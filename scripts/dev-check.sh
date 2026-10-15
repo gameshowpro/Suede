@@ -50,18 +50,18 @@ fi
 if [[ "$STAGE" == "fix" ]]; then
   # Apply formatting and report remaining clippy findings in full.
   cargo fmt --all
-  cargo clippy --all-targets 2>&1 | grep -vE '^\s*(Compiling|Checking|Finished)' | head -120
+  cargo clippy --workspace --all-targets 2>&1 | grep -vE '^\s*(Compiling|Checking|Finished)' | head -120
   exit 0
 fi
 
 if [[ "$STAGE" == "all" || "$STAGE" == "lint" ]]; then
   run_stage "en-US spelling" scripts/check-en-us.sh
   run_stage "cargo fmt" cargo fmt --all -- --check
-  run_stage "cargo clippy" cargo clippy --all-targets -- -D warnings
+  run_stage "cargo clippy" cargo clippy --workspace --all-targets -- -D warnings
 fi
 
 if [[ "$STAGE" == "all" || "$STAGE" == "test" ]]; then
-  run_stage "cargo test" cargo test
+  run_stage "cargo test" cargo test --workspace
 fi
 
 if [[ "$STAGE" == "all" || "$STAGE" == "smoke" ]]; then
@@ -76,7 +76,7 @@ if [[ "$FAILED" -eq 0 ]]; then
   # Naming what was not covered, so this banner cannot be read as more than
   # it is. Only when docs could actually have changed - otherwise it is noise
   # that teaches you to ignore the line.
-  if [[ "$STAGE" == "all" ]] && ! git diff --quiet --exit-code HEAD -- docs mkdocs.yml 2>/dev/null; then
+  if [[ "$STAGE" == "all" ]] && ! git diff --quiet --exit-code HEAD -- docs mkdocs.yml artwork scripts/artwork scripts/artwork_hook.py 2>/dev/null; then
     echo "(docs not built - you changed them; run: ./scripts/dev-check.sh docs)"
   fi
 else

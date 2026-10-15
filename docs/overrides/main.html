@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <link rel="icon" href="{{ 'generated/artwork/favicon-32x32.png' | url }}" type="image/png" sizes="32x32">
+  <link rel="icon" href="{{ 'generated/artwork/favicon.svg' | url }}" type="image/svg+xml" sizes="any">
+  <link rel="apple-touch-icon" href="{{ 'generated/artwork/apple-touch-icon-152x152.png' | url }}" sizes="152x152">
+  <link rel="apple-touch-icon" href="{{ 'generated/artwork/apple-touch-icon-167x167.png' | url }}" sizes="167x167">
+  <link rel="apple-touch-icon" href="{{ 'generated/artwork/apple-touch-icon.png' | url }}" sizes="180x180">
+  <link rel="mask-icon" href="{{ 'generated/artwork/safari-pinned-tab.svg' | url }}" color="#3b5bdb">
+  <link rel="manifest" href="{{ 'generated/artwork/site.webmanifest' | url }}">
+  <meta name="msapplication-config" content="{{ 'generated/artwork/browserconfig.xml' | url }}">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="{{ page.title or config.site_name }}">
+  <meta property="og:description" content="{{ page.meta.description if page.meta and page.meta.description else config.site_description }}">
+  <meta property="og:url" content="{{ page.canonical_url }}">
+  <meta property="og:image" content="{{ config.site_url.rstrip('/') }}/generated/artwork/social-card.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Suede's blue suede panels and flowing inlay">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ page.title or config.site_name }}">
+  <meta name="twitter:description" content="{{ page.meta.description if page.meta and page.meta.description else config.site_description }}">
+  <meta name="twitter:image" content="{{ config.site_url.rstrip('/') }}/generated/artwork/social-card.png">
+{% endblock %}

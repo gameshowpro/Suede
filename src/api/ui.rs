@@ -2,12 +2,13 @@
 //!
 //! A single self-contained page, embedded in the binary at compile time. It
 //! uses nothing but the public API, so it doubles as a worked example of every
-//! endpoint. It is deliberately build-step free: a reference client should be
-//! readable, and CI should not need an npm toolchain to ship it.
+//! endpoint. The page needs no frontend toolchain; Cargo generates its artwork
+//! from the canonical sources and embeds every asset in the same binary.
 //!
 //! Disabled when a bearer token is configured — a page that had to embed the
 //! token would defeat it.
 
+use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::Router;
@@ -15,9 +16,28 @@ use axum::Router;
 use super::ApiState;
 
 const INDEX: &str = include_str!("ui/index.html");
+include!(concat!(env!("OUT_DIR"), "/artwork.rs"));
 
 pub fn router() -> Router<ApiState> {
-    Router::new().route("/", get(index))
+    let mut router = Router::new().route("/", get(index));
+    // Register only generated assets, never paths into the host filesystem.
+    for &(name, mime, bytes) in ARTWORK {
+        let serve = move || async move {
+            (
+                [
+                    (header::CONTENT_TYPE, mime),
+                    (header::CACHE_CONTROL, "no-cache"),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+                ],
+                bytes,
+            )
+        };
+        router = router.route(&format!("/assets/artwork/{name}"), get(serve));
+        if name == "favicon.ico" {
+            router = router.route("/favicon.ico", get(serve));
+        }
+    }
+    router
 }
 
 async fn index() -> impl IntoResponse {
@@ -59,6 +79,52 @@ mod tests {
     async fn the_ui_is_absent_in_token_mode() {
         let (status, _) = fetch_root(Some("secret")).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn artwork_is_embedded_and_served_with_its_media_type() {
+        let harness = harness(None);
+        for &(name, mime, expected) in ARTWORK {
+            let response = harness
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/assets/artwork/{name}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(response.headers()[header::CONTENT_TYPE], mime, "{name}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn artwork_obeys_ui_visibility_and_unknown_assets_are_not_served() {
+        for (token, path) in [
+            (Some("secret"), "/assets/artwork/icon-header.png"),
+            (Some("secret"), "/assets/artwork/icon-header.avif"),
+            (Some("secret"), "/favicon.ico"),
+            (None, "/assets/artwork/not-an-icon.png"),
+        ] {
+            let harness = harness(token);
+            let mut request = Request::builder().uri(path);
+            if let Some(token) = token {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = harness
+                .router
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     #[test]

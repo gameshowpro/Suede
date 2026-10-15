@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="2048" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Suede</title>
+  <desc id="desc">Three upright cobalt panels crossed by a pale blue flowing inlay.</desc>
+  <defs>
+    <linearGradient id="cobalt" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1683ff"/>
+      <stop offset="0.52" stop-color="#0864ed"/>
+      <stop offset="1" stop-color="#174bd4"/>
+    </linearGradient>
+    <linearGradient id="inlay" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#b5e6ff"/>
+      <stop offset="1" stop-color="#82cbfa"/>
+    </linearGradient>
+    <filter id="nap" x="-12%" y="-8%" width="124%" height="116%" color-interpolation-filters="sRGB">
+      <feTurbulence type="fractalNoise" baseFrequency="0.72" numOctaves="2" seed="14" result="grain"/>
+      <feColorMatrix in="grain" type="saturate" values="0" result="mono"/>
+      <feComponentTransfer in="mono" result="fineGrain">
+        <feFuncA type="table" tableValues="0 0.1"/>
+      </feComponentTransfer>
+      <feComposite in="fineGrain" in2="SourceAlpha" operator="in" result="maskedGrain"/>
+      <feBlend in="SourceGraphic" in2="maskedGrain" mode="soft-light" result="blended"/>
+      <feComposite in="blended" in2="SourceAlpha" operator="in"/>
+    </filter>
+    <filter id="lift" x="-20%" y="-14%" width="140%" height="140%" color-interpolation-filters="sRGB">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="3.2" result="blur"/>
+      <feOffset in="blur" dy="3" result="offset"/>
+      <feComponentTransfer in="offset" result="shadow">
+        <feFuncA type="linear" slope="0.24"/>
+      </feComponentTransfer>
+      <feMerge><feMergeNode in="shadow"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <clipPath id="panels">
+      <rect x="78" y="134" width="112" height="238" rx="17"/>
+      <rect x="200" y="134" width="112" height="238" rx="17"/>
+      <rect x="322" y="134" width="112" height="238" rx="17"/>
+    </clipPath>
+  </defs>
+  <g filter="url(#lift)">
+    <g filter="url(#nap)" fill="url(#cobalt)">
+      <rect x="78" y="134" width="112" height="238" rx="17"/>
+      <rect x="200" y="134" width="112" height="238" rx="17"/>
+      <rect x="322" y="134" width="112" height="238" rx="17"/>
+    </g>
+    <path clip-path="url(#panels)" filter="url(#nap)" fill="url(#inlay)" d="M58 239 C105 213 145 193 190 209 C235 225 266 274 322 280 C364 285 403 264 454 229 L454 269 C407 302 365 321 320 314 C262 306 231 258 188 247 C145 236 104 258 58 282 Z"/>
+  </g>
+</svg>

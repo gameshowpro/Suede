@@ -4,6 +4,25 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Suede</title>
+<link rel="icon" href="/favicon.ico" sizes="16x16 24x24 32x32 48x48 64x64 128x128 256x256">
+<link rel="icon" type="image/png" sizes="32x32" href="/assets/artwork/favicon-32x32.png">
+<link rel="icon" type="image/svg+xml" sizes="any" href="/assets/artwork/favicon.svg">
+<link rel="apple-touch-icon" sizes="180x180" href="/assets/artwork/apple-touch-icon.png">
+<link rel="apple-touch-icon" sizes="167x167" href="/assets/artwork/apple-touch-icon-167x167.png">
+<link rel="apple-touch-icon" sizes="152x152" href="/assets/artwork/apple-touch-icon-152x152.png">
+<link rel="mask-icon" href="/assets/artwork/safari-pinned-tab.svg" color="#3b5bdb">
+<link rel="manifest" href="/assets/artwork/site.webmanifest">
+<meta name="theme-color" content="#13151a">
+<meta name="msapplication-config" content="/assets/artwork/browserconfig.xml">
+<meta property="og:title" content="Suede">
+<meta property="og:description" content="Remote management for Sway-based display appliances.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="/assets/artwork/social-card.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="Suede's blue suede panels and flowing inlay">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="/assets/artwork/social-card.png">
 <style>
 :root {
   --bg: #f5f6f8; --panel: #fff; --sunken: #f0f2f5; --ink: #16191d; --muted: #667085;
@@ -22,6 +41,7 @@ body { margin: 0; background: var(--bg); color: var(--ink);
   font: 15px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
 header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 13px 20px;
   background: var(--panel); border-bottom: 1px solid var(--line); position: sticky; top: 0; z-index: 20; }
+.app-icon { width: 32px; height: 32px; flex: 0 0 32px; }
 h1 { font-size: 17px; margin: 0; letter-spacing: -.01em; }
 h2 { font-size: 15px; margin: 0 0 12px; }
 h3 { font-size: 13px; margin: 18px 0 8px; color: var(--muted);
@@ -391,6 +411,10 @@ window.addEventListener("error", (event) => {
 });
 </script>
 <header>
+  <picture class="app-icon">
+    <source srcset="/assets/artwork/icon-header.avif" type="image/avif">
+    <img src="/assets/artwork/icon-header.png" width="32" height="32" alt="">
+  </picture>
   <h1>Suede</h1>
   <span class="pill muted" id="version">—</span>
   <span class="grow"></span>

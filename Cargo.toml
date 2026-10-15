@@ -10,6 +10,14 @@ repository = "https://github.com/gameshowpro/Suede"
 readme = "README.md"
 default-run = "suede"
 
+[workspace]
+members = ["scripts/artwork"]
+default-members = ["."]
+resolver = "2"
+
+[build-dependencies]
+suede-artwork = { path = "scripts/artwork" }
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

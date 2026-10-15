@@ -1,5 +1,7 @@
 # Suede
 
+<img src="https://suede.gameshow.pro/generated/artwork/icon-readme.png" alt="Suede icon" width="128" height="128">
+
 [![Build Status](https://img.shields.io/github/actions/workflow/status/gameshowpro/Suede/ci.yml?branch=main&logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/actions)
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/releases)
 [![License](https://img.shields.io/badge/license-PolyForm%20Small%20Business%201.0.0-blue?style=flat-square)](LICENSE)
