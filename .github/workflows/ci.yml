@@ -16,6 +16,8 @@ permissions:
   contents: write
   pages: write
   id-token: write
+  # Build provenance attestations for the release artifacts.
+  attestations: write
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -75,6 +77,9 @@ jobs:
               - 'src/**'
               - 'Cargo.toml'
               - 'scripts/build-docs.sh'
+              # The apt repository is built into the docs site, so a change to
+              # how it is built only reaches appliances through a docs deploy.
+              - 'scripts/build-apt-repo.sh'
               - 'artwork/**'
               - 'scripts/artwork/**'
               - 'scripts/artwork_hook.py'
@@ -362,6 +367,20 @@ jobs:
             --deb-revision "${{ steps.version.outputs.revision }}" --output \
             suede_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
 
+      # Provenance: a signed statement, held by GitHub, that these exact files
+      # (by digest) were built by this workflow from this commit. Anyone can
+      # check a downloaded package, or one mirrored into the apt repository,
+      # with `gh attestation verify FILE --repo gameshowpro/Suede`. Keyless
+      # (Sigstore), so there is nothing to hold or rotate; the apt signing key
+      # is a different statement, that an index came from CI, and says
+      # nothing about which commit a package was built from.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            suede_${{ steps.version.outputs.version }}_${{ matrix.arch }}.deb
+            suede-unstripped-${{ matrix.arch }}
+
       # The oldest system this package will install on, printed where it can
       # be seen rather than found by digging. Debian 12 and Raspberry Pi OS
       # Bookworm are 2.36; Ubuntu 22.04 is 2.35.
@@ -428,14 +447,20 @@ jobs:
           files: suede_*.deb
           fail_on_unmatched_files: true
 
+  # Waits for the release job, because the apt repository built here mirrors
+  # the GitHub releases: run alongside it and the release being made is not
+  # there yet, so the repository would publish without the newest package and
+  # stay that way until the next docs deploy. A docs-only push skips the
+  # release, which must not stop the docs.
   build-docs:
-    needs: [changes, test]
+    needs: [changes, test, release]
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       github.ref == 'refs/heads/main' &&
       needs.changes.outputs.docs == 'true' &&
-      (needs.test.result == 'success' || needs.test.result == 'skipped')
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.release.result == 'success' || needs.release.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -466,6 +491,25 @@ jobs:
         env:
           SUEDE_DOCS_VERSION: ${{ steps.version.outputs.tag }}
         run: mkdocs build --strict
+
+      # Written into the built site so it ships in the same Pages artifact:
+      # apt cannot follow a package URL that points off the repository, and
+      # Pages cannot redirect one, so the packages themselves are copied in
+      # from the releases. Secrets cannot be tested in a step's `if`, hence
+      # the shell test. Without the key (a fork, a repository that has not
+      # set it up) the repository is left out entirely; publishing it
+      # unsigned would teach operators to trust whatever it serves.
+      - name: Build the apt repository
+        env:
+          APT_SIGNING_KEY: ${{ secrets.APT_SIGNING_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ -z "$APT_SIGNING_KEY" ]; then
+            echo "::notice::APT_SIGNING_KEY is not set; the apt repository was not built"
+            exit 0
+          fi
+          bash scripts/build-apt-repo.sh site/apt
 
       # `--strict` checks links and navigation. It does not check that the
       # markdown still means anything, and it happily published a site where

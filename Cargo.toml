@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 description = "Remote management daemon for Sway-based display appliances"
 authors = ["Hamish Barjonas"]
-license = "PolyForm-Small-Business-1.0.0"
+license = "MPL-2.0"
 repository = "https://github.com/gameshowpro/Suede"
 readme = "README.md"
 default-run = "suede"
@@ -141,12 +141,19 @@ recommends = "libcap2-bin, hwdata"
 # snap; `google-chrome-stable` is in no distribution's archive), so any list
 # here would be wrong somewhere.
 maintainer-scripts = "packaging"
+conf-files = ["/etc/apt/apt.conf.d/51suede-manual-upgrades"]
 assets = [
     ["target/release/suede", "usr/bin/", "755"],
     ["packaging/suede.service", "usr/lib/systemd/user/", "644"],
     ["packaging/provision.sh", "usr/share/suede/", "755"],
     ["packaging/reset-machine.sh", "usr/share/suede/", "755"],
     ["README.md", "usr/share/doc/suede/README.md", "644"],
+    # The fee EULA ships with the package because the package is what it governs.
+    ["OSMFEULA.txt", "usr/share/doc/suede/OSMFEULA.txt", "644"],
+    # Keeps unattended-upgrades from upgrading Suede on a timer: an upgrade
+    # restarts the daemon and blanks the displays. Installed as a conffile so
+    # an operator's edits survive.
+    ["packaging/51suede-manual-upgrades", "etc/apt/apt.conf.d/51suede-manual-upgrades", "644"],
     ["docs/examples/suede.toml", "usr/share/doc/suede/examples/suede.toml", "644"],
     ["docs/examples/four-output-appliance.json", "usr/share/doc/suede/examples/four-output-appliance.json", "644"],
     ["docs/examples/four-output-warp.json", "usr/share/doc/suede/examples/four-output-warp.json", "644"],

@@ -250,19 +250,50 @@ mod tests {
 
     #[test]
     fn the_page_is_self_contained() {
-        // No external origins: an appliance may have no internet access.
+        // An appliance may have no internet access, so nothing the page needs
+        // to render may come from another origin. Hyperlinks are fine: one
+        // to GitHub opens in a new tab and fails harmlessly offline. What
+        // must never leave the appliance is a script or stylesheet.
         for marker in ["http://", "https://"] {
             for line in INDEX.lines() {
-                let is_reference_link =
-                    line.contains("check.docsUrl") || line.contains("placeholder");
-                if line.contains(&format!("src=\"{marker}")) && !is_reference_link {
+                if line.contains("<script") && line.contains(&format!("src=\"{marker}")) {
                     panic!("external script reference: {line}");
                 }
-                if line.contains(&format!("href=\"{marker}")) && !is_reference_link {
+                if line.contains("<link") && line.contains(&format!("href=\"{marker}")) {
                     panic!("external stylesheet reference: {line}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_page_states_its_license_and_fee() {
+        for needle in [
+            "Mozilla Public License",
+            "Open Source Maintenance Fee",
+            r#"data-docs-path="maintenance-fee/#who-pays""#,
+            "https://github.com/sponsors/gameshowpro",
+            r#"id="about-dialog""#,
+            r#"id="fee-dialog""#,
+            r#"class="osmf-mark""#,
+            "suede.feeNoticeAcknowledged",
+        ] {
+            assert!(INDEX.contains(needle), "the page never says {needle:?}");
+        }
+    }
+
+    #[test]
+    fn the_fee_notice_is_dismissable_once() {
+        // Read before it is shown and written when it is dismissed; without
+        // the write it would reappear on every visit.
+        assert!(
+            INDEX.contains(r#"localStorage.getItem("suede.feeNoticeAcknowledged")"#),
+            "the notice never checks whether it was already dismissed"
+        );
+        assert!(
+            INDEX.contains(r#"localStorage.setItem("suede.feeNoticeAcknowledged", "1")"#),
+            "dismissing the notice is never remembered"
+        );
     }
 
     #[test]

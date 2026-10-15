@@ -122,3 +122,5 @@
 .md-typeset pre code {
   font-variant-ligatures: common-ligatures contextual;
 }
+
+.md-typeset img.osmf-wide { height: 56px; width: auto; margin: 0 0 1rem; }

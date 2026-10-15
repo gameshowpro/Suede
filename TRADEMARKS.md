@@ -2,10 +2,10 @@
 
 **Suede** and the Suede name and logo are trademarks of Barjonas LLC.
 
-The [license](LICENSE) grants rights in copyright and patents. It grants no
-rights in the name. This is deliberate and it is normal practice: it means a
-copy of Suede can be identified as such, and something that is *not* Suede
-cannot claim to be.
+The [Mozilla Public License 2.0](LICENSE) grants rights in copyright and
+patents. It grants no rights in the name. This is deliberate and it is normal
+practice: it means a copy of Suede can be identified as such, and something
+that is *not* Suede cannot claim to be.
 
 ## What you may do without asking
 

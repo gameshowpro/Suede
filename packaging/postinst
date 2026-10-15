@@ -69,6 +69,12 @@ Suede is installed.
 
   Already provisioned? Nothing more to do — the service was restarted.
 
+  Suede participates in the Open Source Maintenance Fee. The source is
+  free (MPL-2.0); organizations using this package as part of
+  revenue-generating activities pay a small monthly fee that funds
+  maintenance. Terms: /usr/share/doc/suede/OSMFEULA.txt
+  Details and how to pay: https://suede.gameshow.pro/maintenance-fee/
+
   Documentation: https://suede.gameshow.pro/getting-started/
 EOF
     fi

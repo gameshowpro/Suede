@@ -2,7 +2,8 @@
 
 [![Build Status](https://img.shields.io/github/actions/workflow/status/gameshowpro/Suede/ci.yml?branch=main&logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/actions)
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/releases)
-[![License](https://img.shields.io/badge/license-PolyForm%20Small%20Business%201.0.0-blue?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square)](LICENSE)
+[![Open Source Maintenance Fee](https://img.shields.io/badge/OSMF-participant-37660D?style=flat-square)](OSMFEULA.txt)
 [![Sponsor on GitHub](https://img.shields.io/badge/sponsor-GitHub-EA4AAA?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/gameshowpro)
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&logo=paypal)](https://paypal.me/barjonas)
 
@@ -17,6 +18,25 @@ The [Sway](https://swaywm.org/) compositor already provides everything an unatte
 
 ## Summary
 Suede turns a Linux box running Sway into a remotely manageable display appliance. It exposes a well-documented REST + SSE API (and a bundled reference web UI) for configuring video outputs, routing audio, and launching kiosk-mode browsers — and it persists everything, so the machine boots straight back into its configured state with no operator intervention. Configuration is declarative: you describe the state you want, and Suede's reconciler keeps reality matching it through reboots, display hotplugs, and application crashes.
+
+## Open Source Maintenance Fee
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://suede.gameshow.pro/assets/osmf/osmf-wide-on-dark.svg">
+  <img src="https://suede.gameshow.pro/assets/osmf/osmf-wide-on-light.svg" alt="Open Source Maintenance Fee" height="56" align="right">
+</picture>
+
+This project participates in the [Open Source Maintenance Fee](https://opensourcemaintenancefee.org).
+
+The source is free under the MPL-2.0. Using the official `.deb` releases in
+revenue-generating activities, by an organization with at least USD 10,000 in
+annual gross revenue, requires the fee under [OSMFEULA.txt](OSMFEULA.txt). It
+is per organization, not per appliance: USD 10, 40 or 60 per month for fewer
+than 20, 20 to 100, or more than 100 employees, with one-time annual tiers
+available. Hobbyists, schools, charities and anyone below the threshold owe
+nothing. The fee funds maintenance, not support. Prefer not to pay? Build from
+source instead. To pay, [become a Sponsor](https://github.com/sponsors/gameshowpro).
+Full details: <https://suede.gameshow.pro/maintenance-fee/>
 
 ## Highlights
 
@@ -66,10 +86,25 @@ packaging targeting both.
 
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&label=latest&style=flat-square)](https://github.com/gameshowpro/Suede/releases)
 
-Download the `.deb` for your architecture (`amd64` or `arm64`) from the [Releases](https://github.com/gameshowpro/Suede/releases) page, then:
+From the signed apt repository:
 
 ```bash
-sudo apt install ./suede_*_arm64.deb   # pulls in sway and pipewire; recommends chromium
+sudo curl -fsSL https://suede.gameshow.pro/apt/suede-archive-keyring.gpg \
+  -o /usr/share/keyrings/suede-archive-keyring.gpg
+sudo tee /etc/apt/sources.list.d/suede.sources >/dev/null <<'EOF'
+Types: deb
+URIs: https://suede.gameshow.pro/apt
+Suites: stable
+Components: main
+Signed-By: /usr/share/keyrings/suede-archive-keyring.gpg
+EOF
+sudo apt update
+sudo apt install suede                 # pulls in sway and pipewire
+```
+
+Or download the `.deb` for your architecture (`amd64` or `arm64`) from the [Releases](https://github.com/gameshowpro/Suede/releases) page and install it with `sudo apt install ./suede_*_arm64.deb`. Either way, then:
+
+```bash
 sudo /usr/share/suede/provision.sh     # one-time: auto-login, Sway autostart, kiosk cleanup
 sudo reboot
 ```
@@ -164,23 +199,20 @@ Hi, I'm Hamish Barjonas. I provide custom solutions for the broadcast production
 
 ## License
 
-Suede is **source available**, not open source, and the distinction is worth
-stating plainly: the [PolyForm Small Business License 1.0.0](LICENSE) permits
-use for the benefit of a company with fewer than 100 people and under
-USD 1,000,000 of revenue in the prior tax year. Individuals, hobbyists,
-schools, charities and small production companies are inside that and owe
-nothing. Larger organizations need a
-[commercial license](COMMERCIAL.md) — same code, nothing withheld.
+Suede is open source under the [Mozilla Public License 2.0](LICENSE). You can
+use it, modify it, embed it in your own products and redistribute it. If you
+distribute changes to Suede's own files, those changes must be published under
+the MPL. Combining Suede with your own proprietary code is fine.
 
-Forks inherit these terms, because they are derivative works.
+The official packages are covered by the maintenance fee described
+[above](#open-source-maintenance-fee); the source itself is not.
 
 "Suede" is a trademark; the license covers copyright and patents, not the
 name. See [TRADEMARKS.md](TRADEMARKS.md) for what that does and does not
 allow, which is more permissive than people usually expect.
 
-Contributions are welcome and are asked for under a grant that allows both
-licenses — see [CONTRIBUTING.md](CONTRIBUTING.md) for why.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
+grant that is asked for and why.
 
-Copyright © 2026 Barjonas LLC. Commercial inquiries:
+Copyright © 2026 Barjonas LLC. Support, custom work and fee waivers:
 <https://barjonas.com/#contact>
-

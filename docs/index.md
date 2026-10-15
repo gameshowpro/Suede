@@ -84,6 +84,14 @@ Then open `http://<machine>:9088/` from another computer. The bundled web UI wal
 The rest of the docs use one fixed vocabulary — canvas, slice, warp, output,
 display — defined in full in [How it works](how-it-works.md#vocabulary).
 
+## License and maintenance fee
+
+Suede is open source under the Mozilla Public License 2.0, and participates in the [Open Source Maintenance Fee](https://opensourcemaintenancefee.org).
+
+Organizations with at least USD 10,000 in annual revenue that use the official packages as part of revenue-generating activities pay a small monthly fee, per organization, that funds maintenance. Everyone else, and anyone who builds from source, pays nothing.
+
+[Who pays, and how :material-arrow-right:](maintenance-fee.md){ .md-button }
+
 ## Where it came from
 
 Suede generalizes a production system built for a television studio, where a Raspberry Pi drove multi-display game graphics through Sway's IPC socket. That service worked, but it was welded to one application. Suede is the same idea with the specifics removed: a documented API, persisted state, and no assumptions about what you are putting on the displays.

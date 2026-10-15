@@ -33,13 +33,43 @@
 
 ## Install
 
+=== "From the apt repository"
+
+    Add the project's signed repository once, then install like any other package:
+
+    ```bash
+    sudo curl -fsSL https://suede.gameshow.pro/apt/suede-archive-keyring.gpg \
+      -o /usr/share/keyrings/suede-archive-keyring.gpg
+    sudo tee /etc/apt/sources.list.d/suede.sources >/dev/null <<'EOF'
+    Types: deb
+    URIs: https://suede.gameshow.pro/apt
+    Suites: stable
+    Components: main
+    Signed-By: /usr/share/keyrings/suede-archive-keyring.gpg
+    EOF
+    sudo apt update
+    sudo apt install suede
+    ```
+
+    Later upgrades are `sudo apt update && sudo apt install suede`. The repository carries the newest 20 releases for `amd64` and `arm64`; older ones stay on the [releases page](https://github.com/gameshowpro/Suede/releases).
+
+    Suede never upgrades itself automatically. The package blacklists itself from `unattended-upgrades`, because an upgrade restarts the daemon and that blanks the displays. Upgrade between shows, not during them.
+
+    !!! info "Maintenance fee"
+        The official package is covered by the maintenance-fee EULA, which asks organizations using it as part of revenue-generating activities to pay a small monthly fee. See [Maintenance fee and license](maintenance-fee.md#who-pays) for who pays, and who does not.
+
+    `apt` pulls in `sway`, `swayidle`, `pipewire`, and `pipewire-pulse` automatically. It does **not** pull in a browser: the package declares no relationship to one, because Suede resolves whichever it finds at launch. Install one yourself, as described under the release package tab.
+
 === "From a release package"
 
-    Download the `.deb` for your architecture from the [releases page](https://github.com/gameshowpro/Suede/releases), then:
+    Download the `.deb` for your architecture from the [releases page](https://github.com/gameshowpro/Suede/releases). For more than one appliance, the apt repository tab is the easier path, with no files to copy around. Then:
 
     ```bash
     sudo apt install ./suede_*_arm64.deb
     ```
+
+    !!! info "Maintenance fee"
+        The official package is covered by the maintenance-fee EULA, which asks organizations using it as part of revenue-generating activities to pay a small monthly fee. See [Maintenance fee and license](maintenance-fee.md#who-pays) for who pays, and who does not.
 
     `apt` pulls in `sway`, `swayidle`, `pipewire`, and `pipewire-pulse` automatically. It does **not** pull in a browser: the package declares no relationship to one, because Suede resolves whichever it finds at launch rather than linking against any. Install one yourself.
 

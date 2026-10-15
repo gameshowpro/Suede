@@ -1,0 +1,8 @@
+// Suede restarts itself when it is upgraded, which blanks every display
+// the appliance drives. An upgrade is an operator's decision, taken
+// between shows, never something a timer does overnight.
+//
+// unattended-upgrades already ignores the Suede repository because its
+// origin is not in Allowed-Origins; this keeps that true for a machine
+// whose policy was widened to every origin.
+Unattended-Upgrade::Package-Blacklist { "suede"; };

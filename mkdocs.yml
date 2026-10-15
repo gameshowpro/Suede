@@ -61,6 +61,7 @@ nav:
   # content column. MkDocs copies it through verbatim.
   - API reference: api/index.html
   - Troubleshooting: troubleshooting.md
+  - Maintenance fee: maintenance-fee.md
   - Developer:
       - Architecture: developer/architecture.md
       - GPU timing: developer/gpu-timing.md
@@ -129,4 +130,7 @@ extra:
       link: https://paypal.me/barjonas
       name: Donate via PayPal
 
-copyright: © 2026 Barjonas LLC
+# Material renders HTML here. The link is absolute because this text is
+# copied verbatim into every page, where a relative one would resolve
+# against that page's own directory.
+copyright: '© 2026 Barjonas LLC · MPL-2.0 · <a href="https://suede.gameshow.pro/maintenance-fee/">Maintenance fee</a>'
