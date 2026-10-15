@@ -301,7 +301,26 @@ mod tests {
             .validate(true)
             .unwrap_err()
             .iter()
-            .any(|e| e.contains("transform must be normal")));
+            .any(|e| e.contains("scale must be 1.0")));
+        assert!(!next
+            .validate(true)
+            .unwrap_err()
+            .iter()
+            .any(|e| e.contains("transform")));
+        // Scale 1 with a 90 degree transform is valid in Warp and yields a
+        // swapped (logical) destination.
+        next.outputs[0].scale = Some(1.0);
+        next.outputs[0].mode = Some(crate::model::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        });
+        assert!(next.validate(true).is_ok());
+        let mode = next.outputs[0].effective_mode().unwrap();
+        assert_eq!(
+            next.outputs[0].presentation_dimensions(mode, true),
+            Ok((1080, 1920))
+        );
     }
 
     #[test]

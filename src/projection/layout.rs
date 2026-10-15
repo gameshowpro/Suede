@@ -897,7 +897,12 @@ pub fn canvas_plan_with_correction(
             .geometry
             .as_ref()
             .ok_or("warp output geometry missing")?;
-        geometry.validate_for_output(canvas, mode.width as u32, mode.height as u32)?;
+        // Corners are normalized to the as-viewed raster; scale ignored.
+        let transform = config.effective_transform().unwrap_or_default();
+        let (logical_width, logical_height) =
+            transform.physical_size((mode.width as u32, mode.height as u32));
+        geometry.validate_for_output(canvas, logical_width, logical_height)?;
+        let slice_transform = config.slicer_transform();
         let attached = observed.iter().find(|o| config.r#match.matches(o));
         let output = attached
             .map(|o| o.name.clone())
@@ -926,11 +931,15 @@ pub fn canvas_plan_with_correction(
             },
             source_rect: Some(source),
             geometry: apply_correction.then_some(super::warp::Geometry {
-                corners: geometry
-                    .corners
-                    .map(|p| [p[0] * f64::from(mode.width), p[1] * f64::from(mode.height)]),
+                corners: geometry.corners.map(|p| {
+                    [
+                        p[0] * f64::from(logical_width),
+                        p[1] * f64::from(logical_height),
+                    ]
+                }),
                 center: geometry.center,
             }),
+            transform: slice_transform,
         });
         positions.push((config.r#match.key(), output, destination_width));
     }
@@ -2166,5 +2175,80 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn rotated_plan(
+        transform: crate::model::Transform,
+        scale: Option<f64>,
+    ) -> super::super::blend::CanvasPlan {
+        use crate::model::{
+            CanvasConfig, DesiredState, Mode, OutputConfig, OutputGeometry, OutputMatch,
+            ProjectionConfig, ProjectionMode,
+        };
+        let mode = Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        };
+        let mut desired = DesiredState::new();
+        desired.projection = Some(ProjectionConfig {
+            mode: ProjectionMode::Warp,
+            canvas: Some(CanvasConfig {
+                aspect: 1080.0 / 1920.0,
+                render_width: 1080,
+            }),
+            ..Default::default()
+        });
+        let mut config = OutputConfig::new(OutputMatch::by_name("A"));
+        config.mode = Some(mode);
+        config.transform = Some(transform);
+        config.scale = scale;
+        let full = rect(0.0, 0.0, 1.0, 1.0);
+        config.geometry = Some(OutputGeometry {
+            slice: full,
+            corners: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            center: [0.5, 0.5],
+            raster_footprint: full,
+        });
+        desired.outputs.push(config);
+        let observed = vec![crate::model::Output {
+            name: "A".into(),
+            active: true,
+            make: None,
+            model: None,
+            serial: None,
+            current_mode: Some(mode),
+            modes: vec![mode],
+            rect: crate::model::Rect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            scale: None,
+            transform: None,
+            adaptive_sync_status: None,
+        }];
+        canvas_plan_with_correction(&desired, &observed, true).unwrap()
+    }
+
+    #[test]
+    fn rotated_warp_output_plans_a_logical_raster_and_carries_the_transform() {
+        let plan = rotated_plan(crate::model::Transform::Rotate90, None);
+        let slice = &plan.slices[0];
+        assert_eq!((slice.slice.width, slice.slice.height), (1080, 1920));
+        assert_eq!(slice.transform, crate::model::Transform::Rotate90);
+        let corners = slice.geometry.as_ref().unwrap().corners;
+        assert_eq!(corners[2], [1080.0, 1920.0]);
+        assert_eq!(corners[1], [1080.0, 0.0]);
+        assert_eq!(corners[3], [0.0, 1920.0]);
+    }
+
+    #[test]
+    fn a_compositor_scale_keeps_the_transform_with_the_compositor() {
+        let plan = rotated_plan(crate::model::Transform::Rotate180, Some(1.0));
+        assert_eq!(plan.slices[0].transform, crate::model::Transform::Rotate180);
+        let plan = rotated_plan(crate::model::Transform::Rotate180, Some(2.0));
+        assert_eq!(plan.slices[0].transform, crate::model::Transform::Normal);
     }
 }

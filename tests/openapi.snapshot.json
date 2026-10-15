@@ -3310,7 +3310,7 @@
             "type": "array"
           },
           "corners": {
-            "description": "Output-local normalized destination pins in TL, TR, BR, BL order.",
+            "description": "Output-local normalized destination pins in TL, TR, BR, BL order.\nNormalized to the as-viewed (upright, logical) raster: the picture on\nthe mounted display after any output transform. For 90/270 transforms\nthat raster is `mode.height` by `mode.width`.",
             "items": {
               "items": {
                 "format": "double",

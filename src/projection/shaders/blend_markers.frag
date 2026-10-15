@@ -83,8 +83,12 @@ layout(push_constant) uniform PushConstants {
     // the legacy fixed `(a,b)` path deliberately does not observe them.
     float dynamic_lift;
     uint dynamic_maximum;
-    uint dynamic_padding0;
-    uint dynamic_padding1;
+    // The logical (as-viewed) raster size, at byte 120. Equal to
+    // `width`/`height` unless the slicer owns an axis-swapping output
+    // transform, in which case the target is the physical raster and the
+    // sync shapes (generated on the logical raster) are hit-tested here.
+    uint logical_width;
+    uint logical_height;
 } pc;
 
 layout(location = 0) out vec4 outColor;
@@ -156,14 +160,17 @@ void main() {
                          s.y <= pc.center.y
                              ? s.y / (2.0 * pc.center.y)
                              : 0.5 + (s.y - pc.center.y) / (2.0 * (1.0 - pc.center.y)));
-            // Sync shapes stay in output-local source-pattern coordinates.
-            local = unit * vec2(pc.width, pc.height);
+            // Sync shapes stay in output-local source-pattern coordinates:
+            // the logical raster, which differs from the target only when
+            // the slicer presents a transformed (physical) buffer.
+            local = unit * vec2(pc.logical_width, pc.logical_height);
             // A nonzero transfer entry means this destination pixel is
             // covered.  Clamp its source to a texel center, including when a
             // partially covered edge maps just outside the source rectangle.
             // Uncovered pixels took the table==0 return above.
             local = clamp(local, vec2(0.5),
-                          vec2(float(pc.width) - 0.5, float(pc.height) - 0.5));
+                          vec2(float(pc.logical_width) - 0.5,
+                               float(pc.logical_height) - 0.5));
         }
     }
 

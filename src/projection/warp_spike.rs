@@ -396,6 +396,7 @@ mod tests {
             slices: vec![SliceSpec {
                 source_rect: None,
                 geometry: None,
+                transform: crate::model::Transform::Normal,
                 output: "A".into(),
                 slice: Rect {
                     x: 0,

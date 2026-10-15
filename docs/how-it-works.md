@@ -567,6 +567,26 @@ so the measurement is of the presentation path alone, let it settle, then read
 | `lagFrames`, per output | which display is behind, and by how many whole frames | same, and a lag that survives both arms is the display, not Suede |
 | compositor CPU (`ps -o %cpu` on sway) | one fullscreen pass per output per frame less — in principle | the baseline to beat |
 
+A rotated output no longer reads as a false "no" here: on the GPU renderer at
+scale `1.0` the slicer draws the physical raster and declares it with
+`wl_surface.set_buffer_transform`, so the compositor can flip the buffer
+directly. On the CPU renderer the compositor still rotates, so a rotated
+output is composited.
+
+Measured on [System A](developer/test-systems.md#system-a) on 2026-10-14,
+four 1920x1080 heads with two configured at transform `180`, Simple mode,
+GPU renderer, `allow_overlaps = true`, over one 5 s interval:
+
+| Build | `180` outputs, `zeroCopyPresented` / `presented` | `normal` outputs |
+|---|---|---|
+| compositor rotates (`v0.1.14-57`) | 0 / 300 | 300 / 300 |
+| slicer owns the transform | 300 / 300 | 300 / 300 |
+
+The pictures were the same: `grim` captures of the `grid` pattern under
+every transform (`180`, `90`, `270`, `flipped`, `flipped-90`) differed from
+the compositor-rotated build by at most 1/255 per channel, as expected from
+bilinear sampling at exact texel centers.
+
 A `zeroCopyPresented` of zero while `direct_scanout` is true means the
 compositor refused to flip: the buffer is the wrong size or format for the
 display controller, the output is scaled, or the variable is still set
@@ -590,7 +610,7 @@ Suede provides two distinct projection display modes: **Simple mode** and **Warp
 | **Black Level Compensation** | Fixed or adaptive black lift (see [Adaptive black lift](configuration.md#adaptive-black-lift)) | Fixed or adaptive black lift, same as Simple |
 | **Pipeline Overhead** | Minimal (direct hardware scanning or rectangular blit) | Low GPU fragment shader pass with inverse homography and precomputed transfer tables |
 | **Renderer Compatibility** | GPU and CPU fallback pipelines | Requires the GPU (Vulkan) pipeline; there is no EGL/GLES path |
-| **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity; bilinear interpolation on non-identity pins |
+| **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity; bilinear interpolation on non-identity pins, or on any rotated output (exact at texel centers) |
 
 #### The Shared Virtual Canvas Architecture
 In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Simple and Warp share one virtual canvas and identical output slice crops (`geometry.slice`)**:
@@ -601,7 +621,7 @@ In previous architectures, changing display modes or cropping required separate 
 - **Workflow Benefit**: An operator can arrange output positions and crops in Simple mode, and then switch to Warp mode to calibrate corner pins and center fractions against the physical projection surface without losing their content layout.
 
 #### Automatic Capability Fallback and Retention
-Warp mode requires `allow_overlaps = true`, the GPU renderer (`auto` or `gpu`, never `cpu`), output scale `1.0`, and transform `normal`. If any of that is not met, or the GPU pipeline itself is unavailable:
+Warp mode requires `allow_overlaps = true`, the GPU renderer (`auto` or `gpu`, never `cpu`), output scale `1.0`. Any output transform is allowed: the slicer composes it. If any of that is not met, or the GPU pipeline itself is unavailable:
 - Suede automatically forces the **effective mode to `simple`**.
 - The operator's saved **`warp` settings are safely retained** in configuration.
 - There is no `GET /api/v1/health` route (only `/healthz`, a liveness probe). Warp unavailability is reported as a `warp_unavailable` divergence in `GET /api/v1/status`, and as `geometry.warpAvailable`/`geometry.reason` in `GET /api/v1/projection/stats` — see [Warp mode will not activate](troubleshooting.md#warp-mode-will-not-activate) for the exact reason strings.
@@ -648,7 +668,7 @@ In overlapping projection areas, Suede computes smooth blend ramps with one rule
 - The gate that gives a slice a plain (unramped) weight of `1` is `!blend || stacked`: `blend: false`, or that slice being one side of a near-total (≥80%) overlap stack — not merely having identity pins.
 
 #### 5. Sub-Pixel Border Anti-Aliasing
-When destination pins rotate or keystone a picture within the output raster, the active picture edges cut across the display panel's pixel grid:
+When destination pins rotate or keystone a picture within the output's as-viewed raster (the upright picture after the output transform, so `mode.height × mode.width` for 90/270 and flipped-90/270), the active picture edges cut across the display panel's pixel grid:
 - Without filtering, high-contrast borders produce visible stair-stepping and jagged edges.
 - Suede's fragment pipeline calculates sub-pixel geometric coverage at the picture boundary.
 - The coverage factor attenuates both the picture gain and any applied black lift, yielding smooth, razor-sharp anti-aliased borders.
@@ -658,6 +678,7 @@ For each output pixel, the GPU fragment shader:
 1. Inverse-maps output raster coordinates $(x_{\text{out}}, y_{\text{out}})$ into continuous canvas coordinates $(u, v)$ via inverse homography and center remap.
 2. Samples the canvas:
    - **Identity geometry**: Retains an exact integer texel sampling path for 1:1 pixel-perfect rendering.
+   - **Rotated output** (transform other than `normal`, GPU renderer): always takes the bilinear path, even with identity pins, and reports `bilinear` sampling. Bilinear is exact at texel centers, so the picture is unchanged.
    - **Non-identity geometry**: Uses hardware bilinear texture filtering (which can slightly soften fine text, recommending a modest increase in UI font scale or render resolution).
 3. Evaluates precomputed transfer tables, indexed in **output raster space** (not canvas space), combining edge-blend ramps, border antialiasing coverage, and black lift.
 

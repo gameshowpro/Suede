@@ -499,8 +499,19 @@ window.addEventListener("error", (event) => {
         <div><label for="o-scale">Display scale (HiDPI) <button class="action ghost pin-toggle" type="button" id="pin-output-scale" aria-pressed="false" aria-label="Pin display scale" title="Pin display scale"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><input id="o-scale" type="number" step="any" min="0.25" data-config-field="scale">
           <span class="hint" id="o-scale-hint"></span>
           <span class="hint">Compositor/OS display scaling (typically 1.0 for most displays; 2.0 for 4K). Not content scale.</span></div>
-        <div><label for="o-transform">Transform <button class="action ghost pin-toggle" type="button" id="pin-transform" aria-pressed="false" aria-label="Pin transform" title="Pin transform"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-transform" data-config-field="transform">
-          <option value="">Leave to sway</option>
+        <div><label for="o-rotation">Transform <button class="action ghost pin-toggle" type="button" id="pin-transform" aria-pressed="false" aria-label="Pin transform" title="Pin transform"><svg aria-hidden="true" viewBox="0 0 16 16"><path d="M10.8 1.5 14.5 5l-1.2 1.2-1 .2-2.2 2.2.8 3.2-.8.8-3.2-2.3-3.4 3.4-.7-.7 3.4-3.4L4 6.4l.8-.8L8 6.4l2.2-2.2.2-1z"/></svg></button></label><select id="o-rotation" aria-label="Rotation">
+          <option value="0">Upright</option>
+          <option value="90">Turned 90° clockwise</option>
+          <option value="180">Upside down</option>
+          <option value="270">Turned 90° counter-clockwise</option>
+        </select>
+          <div class="mode-toggle" role="group" aria-label="Mirror for rear projection" id="o-mirror" style="margin-top:6px">
+            <button type="button" id="mirror-off" aria-pressed="false">Normal</button>
+            <button type="button" id="mirror-on" aria-pressed="false" title="Mirror about the vertical axis as the audience sees it (rear projection)">Mirror</button>
+          </div>
+          <!-- Hidden source of truth: the rotation and mirror controls above compose into it. -->
+          <select id="o-transform" class="hidden" data-config-field="transform">
+          <option value="">Automatic</option>
           <option>normal</option><option>90</option><option>180</option><option>270</option>
           <option>flipped</option><option>flipped-90</option><option>flipped-180</option><option>flipped-270</option>
         </select>
@@ -1558,8 +1569,9 @@ function addToLayout(name) {
   if (!loaded()) return;
   const known = knownOutputs().find((k) => k.name === name);
   const mode = known?.output?.currentMode ?? COMMON_MODES[0];
+  const raster = rasterDimensions({ match: { name }, mode, transform: "normal" });
   const canvas = canvasPixels();
-  const slice = canvas ? { x: 0, y: 0, width: mode.width / canvas.width, height: mode.height / canvas.yDensity } :
+  const slice = canvas ? { x: 0, y: 0, width: raster.width / canvas.width, height: raster.height / canvas.yDensity } :
     { x: 0, y: 0, width: 1, height: 1 };
   (config.outputs ??= []).push({
     match: { name },
@@ -1994,16 +2006,16 @@ function selectOutput(name, redrawLayout = true) {
   if (existing?.mode && !offered.some((m) => modeMatches(m, existing.mode))) {
     offered.unshift(existing.mode);
   }
-  // "Leave to sway" is always offered, whether or not a display is attached
+  // "Automatic" (adopt whatever the display settles on) is always offered, whether or not a display is attached
   // right now: a value can be pinned for a socket that is currently empty
   // (aimed at whatever arrives) and Clear must be able to put it back.
   $("o-mode").innerHTML =
-    `<option value="">Leave to sway</option>` +
+    `<option value="">Automatic</option>` +
     offered.map((m) =>
       `<option value="${m.width}x${m.height}x${m.refreshHz}">${escape(modeLabel(m))}</option>`).join("");
   // Select only the operator's own choice. Falling back to the observed
   // mode here is exactly the bug this fixes: a connector with nothing
-  // configured must show "Leave to sway", not whatever sway happened to
+  // configured must show "Automatic", not whatever sway happened to
   // pick, or opening the editor and pressing Save would silently pin it.
   const wanted = existing?.mode ?? null;
   if (wanted) $("o-mode").value = `${wanted.width}x${wanted.height}x${wanted.refreshHz}`;
@@ -2014,6 +2026,12 @@ function selectOutput(name, redrawLayout = true) {
   $("o-scale").value = existing?.scale ?? "";
   $("o-scale").placeholder = num(existing?.adopted?.scale ?? output?.scale ?? 1, 2);
   $("o-transform").value = existing?.transform ?? "";
+  // A null transform (nothing configured, sway's own) is still valid in the
+  // API, but the rotation select has no "Automatic" entry: a display never
+  // settles on a rotation by itself, so unset only ever means "normal, or
+  // whatever the sway config says". Show the value in effect; nothing is
+  // written until the operator touches the control.
+  syncTransformControls(existing?.adopted?.transform ?? output?.transform ?? "normal");
 
   renderOutputBackgroundChoices(existing?.background);
 
@@ -2122,18 +2140,14 @@ function refreshFieldHints(name) {
   renderFieldProvenance("o-scale-hint", existing?.scale, output?.scale, existing?.adopted, "scale", (v) => `${num(v, 2)}×`);
   renderFieldProvenance("o-transform-hint", existing?.transform, output?.transform, existing?.adopted, "transform", (v) => v);
 
-  // Current Warp supports scale 1 and normal transform only; the backend
-  // rejects anything else on a warp output. Lock the controls rather than
-  // let an edit round-trip into a rejected write, and say why.
+  // Warp supports scale 1 only (any transform is accepted; corners are
+  // normalized to the as-viewed raster); the backend rejects any other scale
+  // on a warp output. Lock the control rather than let an edit round-trip
+  // into a rejected write, and say why.
   const warpLocked = config?.projection?.mode === "warp";
   $("o-scale").disabled = warpLocked;
   $("o-scale").title = warpLocked ? "Warp requires scale 1×; locked while Warp mode is active." : "";
-  $("o-transform").disabled = warpLocked;
-  $("o-transform").title = warpLocked ? "Warp requires the normal transform; locked while Warp mode is active." : "";
-  if (warpLocked) {
-    $("o-scale-hint").textContent += " Locked: Warp requires scale 1×.";
-    $("o-transform-hint").textContent += " Locked: Warp requires the normal transform.";
-  }
+  if (warpLocked) $("o-scale-hint").textContent += " Locked: Warp requires scale 1×.";
 
   for (const [id, key] of [["pin-mode", "mode"], ["pin-output-scale", "scale"], ["pin-transform", "transform"]]) {
     const button = $(id), pinned = existing?.[key] != null;
@@ -2185,13 +2199,16 @@ function outputEdited(field = document.activeElement?.id) {
   } else if (field === "o-transform") entry.transform = $("o-transform").value || null;
   else if (field === "o-bg") entry.background = $("o-bg").value || null;
   else return;
-  // A deliberate output-mode change keeps the viewed content anchored in
-  // canvas pixels and retains the prior scalar enlargement. The normalized
-  // rectangle is intentionally untouched for a render-width-only edit.
-  if (field === "o-mode" && previous?.geometry?.slice && previous.mode && entry.mode) {
+  // A deliberate output-mode or transform change keeps the viewed content
+  // anchored in canvas pixels and retains the prior scalar enlargement (a
+  // rotation swaps the raster's width and height, so the slice follows). The
+  // mode may be adopted rather than explicit, so gate on the raster
+  // dimensions being known. The normalized rectangle is intentionally
+  // untouched for a render-width-only edit.
+  if ((field === "o-mode" || field === "o-transform") && previous?.geometry?.slice) {
     const pixels = canvasPixels(), slice = previous.geometry.slice;
-    if (pixels) {
-      const oldRaster = rasterDimensions(previous), newRaster = rasterDimensions(entry);
+    const oldRaster = rasterDimensions(previous), newRaster = rasterDimensions(entry);
+    if (pixels && oldRaster && newRaster) {
       const scale = oldRaster.width / (slice.width * pixels.width);
       entry.geometry = structuredClone(previous.geometry);
       entry.geometry.slice = {
@@ -2214,6 +2231,37 @@ function outputEdited(field = document.activeElement?.id) {
   refreshFieldHints(selected);
   pushPreview(["o-enable", "o-mode", "o-transform"].includes(field));
 }
+// The visible rotation + mirror controls compose into the hidden
+// #o-transform select, which stays the single source of truth.
+function mirrorOn() {
+  return $("mirror-on").getAttribute("aria-pressed") === "true";
+}
+function setMirror(on) {
+  $("mirror-off").setAttribute("aria-pressed", String(!on));
+  $("mirror-on").setAttribute("aria-pressed", String(on));
+}
+function composeTransform() {
+  const r = $("o-rotation").value;
+  if (mirrorOn()) return r === "0" ? "flipped" : `flipped-${r}`;
+  return r === "0" ? "normal" : r;
+}
+// Reflects #o-transform in the visible controls. `fallback` is the sway
+// spelling shown when the stored value is null (adopted, else observed).
+function syncTransformControls(fallback = "normal") {
+  const value = $("o-transform").value || fallback;
+  const m = /^(flipped)(?:-(90|180|270))?$|^(normal)$|^(90|180|270)$/.exec(value) ||
+    /^(normal)$/.exec("normal");
+  $("o-rotation").value = m[2] ?? m[4] ?? "0";
+  setMirror(!!m[1]);
+}
+function commitTransformControls() {
+  $("o-transform").value = composeTransform();
+  // The existing wiring listens for "input" on the select.
+  $("o-transform").dispatchEvent(new Event("input", { bubbles: true }));
+}
+$("o-rotation").addEventListener("change", commitTransformControls);
+$("mirror-off").addEventListener("click", () => { setMirror(false); commitTransformControls(); });
+$("mirror-on").addEventListener("click", () => { setMirror(true); commitTransformControls(); });
 for (const id of ["o-enable", "o-mode", "o-scale", "o-transform", "o-bg"]) {
   const el = $(id);
   // Same commit-on-change rule as the projection fields above: a number
@@ -2568,7 +2616,7 @@ function renderArrangeOutputs() {
   const outputs = config?.outputs ?? [];
   list.replaceChildren(...outputs.map((entry, index) => {
     const name = entry.match?.name ?? "(unnamed)", disabled = entry.enable === false;
-    const raster = entry.mode ? `${entry.mode.width}×${entry.mode.height}` : "";
+    const dims = rasterDimensions(entry), raster = entry.mode && dims ? `${dims.width}×${dims.height}` : "";
     const row = document.createElement("li");
     row.className = "arrange-order-row" + (disabled ? " disabled" : "");
     const label = document.createElement("span");
@@ -2654,6 +2702,7 @@ function togglePin(key) {
   if (existing?.[key] != null) control.value = "";
   else if (key === "mode") control.value = fields.mode ? `${fields.mode.width}x${fields.mode.height}x${fields.mode.refreshHz}` : "";
   else control.value = fields[key] ?? "";
+  if (key === "transform") syncTransformControls(fields.transform ?? "normal");
   outputEdited(controls[key]);
 }
 $("pin-mode").onclick = () => togglePin("mode");
@@ -3283,7 +3332,7 @@ function renderWarpEditor() {
   const show = !!(warpOutput()?.geometry && visibleWarp);
   $("warp-controls").hidden = !show;
   if ($("output-warp")) $("output-warp").hidden = !show;
-  const mode = warpOutput()?.mode;
+  const mode = rasterDimensions(warpOutput());
   $("warp-editor").style.aspectRatio = mode ? `${mode.width} / ${mode.height}` : "16 / 9";
   drawWarp(); renderWarpNumbers(); renderWarpStatus(); renderCanvas(); renderSharedContent();
 }
@@ -3309,7 +3358,7 @@ function renderWarpStatus() {
     ` Selected output: presentation receipt for control generation ${output.presentedGeneration} (not optical visibility).`;
   if (c?.lastFailure) message += ` ${c.lastFailure.reason ?? c.lastFailure.message ?? "Projection update failed."}`;
   $("warp-status").textContent = message;
-  // Keeps the scale/transform lock and pin-button disabled state honest
+  // Keeps the scale lock and pin-button disabled state honest
   // across a mode toggle or a capability change, without touching any
   // field's value (refreshFieldHints never assigns .value), so it cannot
   // stomp on an edit in progress.
@@ -3317,7 +3366,7 @@ function renderWarpStatus() {
   renderDirtyStatus();
 }
 function oneToOneStatus() {
-  const g = warpOutput()?.geometry, mode = warpOutput()?.mode, c = config?.projection?.canvas;
+  const g = warpOutput()?.geometry, mode = rasterDimensions(warpOutput()), c = config?.projection?.canvas;
   if (!g || !mode || !c) return "One-to-one status unavailable.";
   const h = Math.max(1, Math.round(c.renderWidth / c.aspect));
   const slice = [g.slice.x*c.renderWidth, g.slice.y*c.aspect*h,

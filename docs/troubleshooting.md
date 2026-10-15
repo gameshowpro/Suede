@@ -202,6 +202,12 @@ condition clears. `reason` is one of:
   test pattern so the slicer starts and can negotiate the GPU path; if it
   stays `null`, check the daemon log for the capability probe's own error.
 
+Separately, the document validator refuses to save an output while Warp is
+selected with a scale other than `1.0`, with the message
+`outputs[N].scale must be 1.0 in warp mode until raster scaling is supported`.
+Set that output's `scale` to `1.0` (or clear it) and save again. An output
+transform no longer blocks Warp: the slicer composes it.
+
 A dynamic reason from the running slicer child (a negotiation failure it
 reported itself) can also appear here; it is not one of the four fixed
 messages above and describes its own remediation.
@@ -235,7 +241,8 @@ wall returns to the configured arrangement.
 mode, scale, or transform that Sway reports back, but which the saved
 document cannot actually hold — the leading case is a Warp output whose
 compositor scale settles on anything other than `1.0`, which Warp mode does
-not yet support. Ordinarily Suede pins ("adopts") whatever an output settles
+not yet support. (Only scale can do this in Warp; a transform is always
+acceptable there.) Ordinarily Suede pins ("adopts") whatever an output settles
 on so a reboot keeps today's picture rather than re-negotiating from
 scratch; this is the one case where it deliberately does not, because saving
 that value would produce a document the daemon itself refuses to load again
@@ -560,7 +567,7 @@ DevTools is disabled, see
 A feature status of `video_decode: disabled_software` says the same thing
 for the whole browser. The decode profile list is not a signal: on Linux,
 Chromium leaves it empty even while VA-API decoding works (measured on
-System A with a 1080p H.264 stream on `VaapiVideoDecoder`), so read the
+[System A](developer/test-systems.md#system-a) with a 1080p H.264 stream on `VaapiVideoDecoder`), so read the
 player's decoder, not the list. Software decoding is not a fault by itself,
 but a 4K or several simultaneous streams may not keep up. If the **Hardware video decode** health check warns about
 `nvidia-vaapi-driver`, see [above](#browser-software-rendering).

@@ -67,8 +67,8 @@ fn embedded_fragment_offsets_match_every_rust_push_constant_member() {
         std::mem::offset_of!(PushConstants, source_rect),
         std::mem::offset_of!(PushConstants, dynamic_lift),
         std::mem::offset_of!(PushConstants, dynamic_maximum),
-        std::mem::offset_of!(PushConstants, dynamic_padding),
-        std::mem::offset_of!(PushConstants, dynamic_padding) + 4,
+        std::mem::offset_of!(PushConstants, logical_width),
+        std::mem::offset_of!(PushConstants, logical_height),
     ];
     assert_eq!(structs[&ty].len(), expected.len());
     let actual: Vec<_> = offsets[&ty].values().map(|v| *v as usize).collect();

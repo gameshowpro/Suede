@@ -175,6 +175,26 @@ impl SwayClient for MockSway {
     }
 }
 
+/// Sway reports an output's rect in logical coordinates: the mode swapped
+/// for a 90/270 transform. Keep the mock honest about that.
+fn set_logical_rect_size(output: &mut crate::model::Output) {
+    let Some(mode) = output.current_mode else {
+        return;
+    };
+    let swaps = output
+        .transform
+        .as_deref()
+        .and_then(crate::model::Transform::from_sway)
+        .is_some_and(crate::model::Transform::swaps_axes);
+    let (width, height) = if swaps {
+        (mode.height, mode.width)
+    } else {
+        (mode.width, mode.height)
+    };
+    output.rect.width = width;
+    output.rect.height = height;
+}
+
 /// Apply `output <name> <setting> …` to simulated state.
 ///
 /// Returns whether anything changed. Shared with
@@ -230,8 +250,7 @@ pub(crate) fn apply_output_command(outputs: &mut [Output], command: &str) -> boo
         ("mode", ["--custom", spec, ..]) | ("mode", [spec, ..]) => match parse_mode(spec) {
             Some(mode) => {
                 output.current_mode = Some(mode);
-                output.rect.width = mode.width;
-                output.rect.height = mode.height;
+                set_logical_rect_size(output);
                 if !output.modes.iter().any(|m| m.matches(&mode)) {
                     output.modes.push(mode);
                 }
@@ -256,6 +275,7 @@ pub(crate) fn apply_output_command(outputs: &mut [Output], command: &str) -> boo
         },
         ("transform", [value, ..]) => {
             output.transform = Some((*value).to_string());
+            set_logical_rect_size(output);
             true
         }
         ("adaptive_sync", [value, ..]) => {

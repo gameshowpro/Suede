@@ -174,6 +174,9 @@ pub struct OutputGeometry {
     #[serde(alias = "source")]
     pub slice: CanvasRect,
     /// Output-local normalized destination pins in TL, TR, BR, BL order.
+    /// Normalized to the as-viewed (upright, logical) raster: the picture on
+    /// the mounted display after any output transform. For 90/270 transforms
+    /// that raster is `mode.height` by `mode.width`.
     pub corners: [[f64; 2]; 4],
     #[serde(default = "neutral_center")]
     pub center: [f64; 2],
@@ -224,7 +227,9 @@ impl OutputGeometry {
         Ok(())
     }
 
-    /// Validate the destination pins against one output raster.
+    /// Validate the destination pins against one output raster. `width` and
+    /// `height` are the as-viewed (logical) raster dimensions, already
+    /// swapped for 90/270 transforms.
     pub fn validate_for_output(
         &self,
         canvas: &CanvasConfig,

@@ -48,7 +48,12 @@ struct Key {
 pub struct Output {
     pub index: usize,
     pub name: String,
+    /// The presenter's configured (logical, as-viewed) size: what the spec
+    /// was validated against and what the install check compares.
     pub size: (u32, u32),
+    /// The raster `table`, `dynamic_table` and `warp` are built on: `size`
+    /// through the slice's output transform, which the GPU presenter owns.
+    pub buffer_size: (u32, u32),
     pub warp: Option<Warp>,
     pub table: Vec<(u16, u8)>,
     /// Tagged dynamic shape entries. This is populated only for adaptive
@@ -356,8 +361,13 @@ impl Controller {
             self.requested_generation = self.requested_generation.max(update.generation);
         }
         if let Some(reason) = reason {
-            self.restart_required |=
-                update.session == self.session() && update.version != CONTROL_VERSION;
+            // A version or topology mismatch cannot be resolved by a later
+            // update in this session: the child was built for a different
+            // spec. Flag it so the slicer exits and the daemon respawns it,
+            // rather than rejecting every edit until something else restarts
+            // it.
+            self.restart_required |= update.session == self.session()
+                && (update.version != CONTROL_VERSION || reason.starts_with("topology changed"));
             self.reject(update.generation, reason);
             return;
         }
@@ -436,6 +446,7 @@ pub fn same_topology(a: &SlicerSpec, b: &SlicerSpec) -> bool {
         && a.slices.len() == b.slices.len()
         && a.slices.iter().zip(&b.slices).all(|(sa, sb)| {
             sa.output == sb.output
+                && sa.transform == sb.transform
                 && (if a.layout.is_some() && b.layout.is_some() && a.pattern.is_none() {
                     sa.slice.width == sb.slice.width && sa.slice.height == sb.slice.height
                 } else {
@@ -539,7 +550,7 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
             {
                 return Err("configured output raster differs from presenter dimensions".into());
             }
-            sampling_warp(spec, &slice, (w, h))?;
+            sampling_warp(spec, &slice, (w, h), slice.transform)?;
             Ok(Key {
                 layout: layout
                     .as_ref()
@@ -589,11 +600,43 @@ pub(crate) fn maximum_coverage(spec: &SlicerSpec) -> u32 {
     )
 }
 
+/// The sampler for `slice` on a presenter whose configured (logical) size is
+/// `size` and which applies `transform` itself (`Normal` when it does not
+/// own one). `None` only for an exact integer copy; otherwise the geometry
+/// warp or an identity one, carrying the source rectangle.
+///
+/// A non-normal `transform` always yields a warp built on the physical
+/// raster (`Warp::for_output`), identity pins included: the integer copy
+/// path cannot rotate, and bilinear sampling at exact texel centers draws
+/// the same picture. Its source rectangle is the slice's, or, without one,
+/// the unit-density `[x, y, logical width, logical height]` the copy path
+/// and `Warp::canvas_at`'s fallback both mean. Every caller in the
+/// controller passes `slice.transform`: the controller only runs on the GPU
+/// renderer, which owns every output transform.
 pub(crate) fn sampling_warp(
     spec: &SlicerSpec,
     slice: &SliceSpec,
     size: (u32, u32),
+    transform: crate::model::Transform,
 ) -> Result<Option<Warp>, String> {
+    if !transform.is_normal() {
+        let (corners, center) = slice.geometry.as_ref().map_or_else(
+            || {
+                let (w, h) = (f64::from(size.0), f64::from(size.1));
+                ([[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]], [0.5, 0.5])
+            },
+            |g| (g.corners, g.center),
+        );
+        let source = slice.source_rect.unwrap_or([
+            f64::from(slice.slice.x),
+            f64::from(slice.slice.y),
+            f64::from(size.0),
+            f64::from(size.1),
+        ]);
+        return Warp::for_output(corners, center, size.0, size.1, transform)?
+            .with_source_rect(source)
+            .map(Some);
+    }
     let warp = slice
         .geometry
         .as_ref()
@@ -643,6 +686,9 @@ fn fill_generic<T: Copy>(
     mut value_of: impl FnMut(f64, f64, f64) -> T,
 ) {
     let width = size.0;
+    // Without a warp each pixel is a unit-density integer copy of the
+    // logical raster. `sampling_warp` gives every presenter that owns an
+    // output transform a warp, so a physical raster never gets here.
     for (offset, value) in dest.iter_mut().enumerate() {
         let x = (offset % width as usize) as u32;
         let y = (first_row + offset / width as usize) as u32;
@@ -739,6 +785,15 @@ fn fill_marked<T: Copy>(
     }
 }
 
+/// The logical (pre-transform) raster a table of `size` belongs to: a warp
+/// knows it, and without one there is no transform, so it is `size`.
+fn logical_size(warp: Option<&Warp>, size: (u32, u32)) -> (u32, u32) {
+    warp.map_or(size, |w| {
+        let [width, height] = w.logical_size();
+        (width, height)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fill_rows(
     spec: &SlicerSpec,
@@ -753,7 +808,7 @@ pub(crate) fn fill_rows(
     // The marker variant is chosen once per table, so the ordinary closure
     // below carries no per-pixel test for it.
     if let Some((layout, index)) = layout.filter(|_| spec.highlight_overlaps) {
-        let widths = layout.marker_widths(index, size);
+        let widths = layout.marker_widths(index, logical_size(warp, size));
         fill_marked(
             spec,
             slice,
@@ -802,7 +857,7 @@ pub(crate) fn fill_dynamic_rows(
 ) {
     // Chosen once per table, as in `fill_rows`.
     if let Some((layout, index)) = layout.filter(|_| spec.highlight_overlaps) {
-        let widths = layout.marker_widths(index, size);
+        let widths = layout.marker_widths(index, logical_size(warp, size));
         fill_marked(
             spec,
             slice,
@@ -855,8 +910,15 @@ fn build(
     let mut outputs = Vec::with_capacity(indices.len());
     for &index in indices {
         let slice = &request.keys[index].slice;
-        let (width, height) = sizes[index];
-        let warp = sampling_warp(spec, slice, (width, height))?;
+        let logical = sizes[index];
+        let warp = sampling_warp(spec, slice, logical, slice.transform)?;
+        // Tables are built on the raster the presenter attaches: physical
+        // when it owns an axis-swapping transform.
+        let (width, height) = slice.transform.physical_size(logical);
+        debug_assert!(slice.transform.is_normal() || warp.is_some());
+        debug_assert!(warp
+            .as_ref()
+            .is_none_or(|w| w.output_size() == [width, height]));
         let layout = layout
             .as_ref()
             .map(|l| l.index(&slice.output).map(|i| (l, i)))
@@ -921,7 +983,8 @@ fn build(
             slice: slice.slice,
             index,
             name: slice.output.clone(),
-            size: (width, height),
+            size: logical,
+            buffer_size: (width, height),
             warp,
             table,
             dynamic_table,
@@ -974,6 +1037,7 @@ mod tests {
                         height: 8,
                     },
                     geometry: None,
+                    transform: crate::model::Transform::Normal,
                 })
                 .collect(),
         }
@@ -995,6 +1059,72 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
     }
+    #[test]
+    fn a_rotated_output_builds_physical_tables_through_a_transform_warp() {
+        use crate::model::Transform;
+        let mut spec = fixture();
+        spec.canvas_width = 1920;
+        spec.canvas_height = 1080;
+        spec.slices.truncate(1);
+        spec.slices[0].slice = Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mut normal = Controller::new(&spec, vec![(1920, 1080)], 4).unwrap();
+        let normal = complete(&mut normal);
+        spec.slices[0].transform = Transform::Rotate90;
+        let mut c = Controller::new(&spec, vec![(1920, 1080)], 4).unwrap();
+        let prepared = complete(&mut c);
+        let output = &prepared.outputs[0];
+        assert_eq!(output.size, (1920, 1080));
+        assert_eq!(output.buffer_size, (1080, 1920));
+        assert_eq!(output.table.len(), 1080 * 1920);
+        // Identity pins are not geometric correction, but the rotated
+        // raster still takes the warp path.
+        assert!(!output.has_geometric_correction());
+        let warp = output.warp.as_ref().expect("rotated outputs always warp");
+        assert_eq!(warp.output_size(), [1080, 1920]);
+        assert_eq!(warp.logical_size(), [1920, 1080]);
+        assert_eq!(warp.transform(), Transform::Rotate90);
+        assert_eq!(warp.source_rect(), Some([0.0, 0.0, 1920.0, 1080.0]));
+        // The physical table is the logical one, moved by `to_physical`.
+        assert!(normal.outputs[0].warp.is_none());
+        for (lx, ly) in [
+            (0, 0),
+            (1919, 0),
+            (0, 1079),
+            (1919, 1079),
+            (960, 540),
+            (7, 3),
+        ] {
+            let [px, py] = Transform::Rotate90
+                .to_physical([lx as f64 + 0.5, ly as f64 + 0.5], (1920.0, 1080.0));
+            let physical = (py - 0.5) as usize * 1080 + (px - 0.5) as usize;
+            assert_eq!(
+                output.table[physical],
+                normal.outputs[0].table[ly * 1920 + lx],
+                "logical pixel ({lx}, {ly})"
+            );
+        }
+        // The same holds for pins: the geometry is logical, the warp physical.
+        spec.slices[0].geometry = Some(Geometry {
+            corners: [[10.0, 0.0], [1920.0, 20.0], [1900.0, 1080.0], [0.0, 1060.0]],
+            center: [0.5, 0.5],
+        });
+        let mut c = Controller::new(&spec, vec![(1920, 1080)], 4).unwrap();
+        let prepared = complete(&mut c);
+        let output = &prepared.outputs[0];
+        assert!(output.has_geometric_correction());
+        assert_eq!(output.buffer_size, (1080, 1920));
+        let warp = output.warp.as_ref().unwrap();
+        assert_eq!(warp.output_size(), [1080, 1920]);
+        let tl = warp.destination_at(0.0, 0.0).unwrap();
+        let expected = Transform::Rotate90.to_physical([10.0, 0.0], (1920.0, 1080.0));
+        assert!((tl[0] - expected[0]).abs() < 1e-6 && (tl[1] - expected[1]).abs() < 1e-6);
+    }
+
     fn initialized() -> Controller {
         let mut c = Controller::new(&fixture(), vec![(8, 8); 2], 4).unwrap();
         let initial = complete(&mut c);
@@ -1020,6 +1150,7 @@ mod tests {
                 },
                 source_rect: Some([i as f64 * 4.0, 0.0, 6.0, 8.0]),
                 geometry: None,
+                transform: crate::model::Transform::Normal,
             })
             .collect();
         spec.layout = Some(super::super::layout::LayoutSpec {
@@ -1078,14 +1209,24 @@ mod tests {
     fn explicit_source_origin_is_authoritative_even_with_stale_integer_metadata() {
         let mut spec = fixture();
         spec.slices[0].source_rect = Some([4.0, 0.0, 8.0, 8.0]);
-        let mapping = sampling_warp(&spec, &spec.slices[0], (8, 8))
-            .unwrap()
-            .unwrap();
+        let mapping = sampling_warp(
+            &spec,
+            &spec.slices[0],
+            (8, 8),
+            crate::model::Transform::Normal,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(mapping.canvas_at(0.5, 0.5, [0.0, 0.0]), Some([4.5, 0.5]));
         spec.slices[0].slice.x = 4;
-        assert!(sampling_warp(&spec, &spec.slices[0], (8, 8))
-            .unwrap()
-            .is_none());
+        assert!(sampling_warp(
+            &spec,
+            &spec.slices[0],
+            (8, 8),
+            crate::model::Transform::Normal
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -1733,6 +1874,20 @@ mod tests {
         spec.slices[0].slice.x = i32::MAX;
         assert!(Controller::new(&spec, vec![(8, 8); 2], 4).is_err());
     }
+    #[test]
+    fn a_topology_rejection_asks_for_a_restart() {
+        let mut c = initialized();
+        assert!(!c.requires_restart());
+        let mut rotated = fixture();
+        rotated.slices[0].transform = crate::model::Transform::Rotate180;
+        send(&mut c, 5, rotated);
+        assert!(c.pending.is_none());
+        assert!(
+            c.requires_restart(),
+            "a spec the child was not built for cannot become live later"
+        );
+    }
+
     #[test]
     fn rejected_same_session_generation_cannot_be_replayed() {
         let mut c = initialized();

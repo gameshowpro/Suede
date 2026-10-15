@@ -773,6 +773,7 @@ mod tests {
                     height: 1000,
                 },
                 connected: true,
+                transform: crate::model::Transform::Normal,
             })
             .collect();
         let config = ProjectionConfig {
@@ -897,6 +898,7 @@ mod tests {
                     height: 10,
                 },
                 connected: true,
+                transform: crate::model::Transform::Normal,
             })
             .collect();
         let config = ProjectionConfig {

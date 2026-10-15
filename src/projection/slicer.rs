@@ -220,6 +220,20 @@
 //! silently rescaling: a projector wall is a pixel-exact mapping, and a
 //! scaled output would already be wrong for reasons that have nothing to do
 //! with scanout.
+//!
+//! An output transform is the other way a surface-local buffer stops being
+//! the output's pixel grid: wlroots scans a client buffer out only when its
+//! declared transform equals the output's. On the GPU renderer the slicer
+//! therefore owns the transform ([`owned_transform`]): it draws the
+//! physical raster ([`Presenter::buffer_size`]) through a warp that composes
+//! the rotation (`Warp::for_output`) and declares it with
+//! `wl_surface.set_buffer_transform`, so a rotated output can be flipped
+//! straight to the plane, and when it is composited the compositor's pass is
+//! a plain blit. `configured` stays the logical, as-viewed size everything
+//! the daemon sends is in. Owned outputs always sample bilinearly, even with
+//! identity pins (exact at texel centers), so they report `bilinear`
+//! sampling. The CPU renderer leaves the transform to the compositor as
+//! before: shared memory is never scanned out, so it would gain nothing.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
@@ -264,7 +278,7 @@ use super::pattern::{SyncGroup, SyncRect};
 use super::{dmabuf, gpu};
 use crate::model::{
     CaptureIntervals, FrameCost, LagFrames, OutputTiming, PresentationOffset, ProjectionStats,
-    Renderer, TestPattern, TimingDistribution,
+    Renderer, TestPattern, TimingDistribution, Transform,
 };
 
 /// DRM fourccs the GPU present path asks for, in preference order — see the
@@ -420,10 +434,10 @@ struct WaylandPresenter {
     /// and destroy a `wl_region` for nothing. See the `Configure` handler.
     opaque_for: Option<(u32, u32)>,
     /// This output's current mode in pixels, as `wl_output` reported it
-    /// before the presenters were created. `configured` is surface-local
-    /// (logical), so the two differ exactly when the output is scaled — and
-    /// a buffer that is not the output's pixel grid can never be scanned
-    /// out. Diagnostic only: it decides nothing but the wording of the
+    /// before the presenters were created, before any transform. It is
+    /// compared with [`Presenter::buffer_size`], which matches it unless the
+    /// output is scaled (`configured` is surface-local) — and a buffer that
+    /// is not the output's pixel grid can never be scanned out. Diagnostic only: it decides nothing but the wording of the
     /// startup `scanout candidate:` line. `None` if the compositor never
     /// sent a current mode for it.
     output_mode: Option<(i32, i32)>,
@@ -447,11 +461,25 @@ struct WaylandPresenter {
 
 struct Presenter {
     wayland: Option<WaylandPresenter>,
+    /// The layer surface's `Configure` size: surface-local, i.e. the
+    /// logical (as-viewed) raster. On the direct path, the output mode
+    /// mapped back through the slice's transform. What the daemon's slice
+    /// spec, `warp_update::validate`, sync shapes and the resize check are
+    /// in; buffers, transfer tables and warps are in
+    /// [`Presenter::buffer_size`] instead.
     configured: Option<(u32, u32)>,
+    /// The output transform this presenter applies itself, declared to the
+    /// compositor with `wl_surface.set_buffer_transform`; `Normal` when it
+    /// does not own one and the compositor applies the output's transform
+    /// to a logical buffer, as it always did. Decided once, after the
+    /// renderer is known and before any buffer exists, by
+    /// [`adopt_output_transforms`]; see [`owned_transform`] for the rule.
+    transform: Transform,
     name: String,
     /// Fixed-point per-pixel transfer `(a, b)`: `out = (a·in)>>8 + b`,
-    /// row-major at the configured size. Two-dimensional because seams can
-    /// run on any edge — a grid corner is the product of two ramps.
+    /// row-major at [`Presenter::buffer_size`]. Two-dimensional because
+    /// seams can run on any edge — a grid corner is the product of two
+    /// ramps.
     transfer: Vec<(u16, u8)>,
     /// Tagged shape table for adaptive mode; fixed tables remain byte exact.
     dynamic_table: Option<Vec<u32>>,
@@ -1432,7 +1460,54 @@ impl GateState {
     }
 }
 
+/// Which output transform the slicer applies itself rather than leaving to
+/// the compositor: all of it on the GPU renderer (Wayland or direct), none
+/// on the CPU one. Shared memory can never be scanned out, so on the CPU
+/// path the compositor's rotation costs nothing extra and the slicer keeps
+/// its separable axis samples. `transform` is the slice spec's, which the
+/// daemon already sets to `Normal` for a scaled output (the compositor
+/// must scale that buffer anyway).
+fn owned_transform(gpu: bool, transform: Transform) -> Transform {
+    if gpu {
+        transform
+    } else {
+        Transform::Normal
+    }
+}
+
+/// The `wl_output.transform` value `wl_surface.set_buffer_transform` takes
+/// for a model transform. Both name the same eight protocol values.
+fn wayland_transform(transform: Transform) -> wl_output::Transform {
+    match transform {
+        Transform::Normal => wl_output::Transform::Normal,
+        Transform::Rotate90 => wl_output::Transform::_90,
+        Transform::Rotate180 => wl_output::Transform::_180,
+        Transform::Rotate270 => wl_output::Transform::_270,
+        Transform::Flipped => wl_output::Transform::Flipped,
+        Transform::Flipped90 => wl_output::Transform::Flipped90,
+        Transform::Flipped180 => wl_output::Transform::Flipped180,
+        Transform::Flipped270 => wl_output::Transform::Flipped270,
+    }
+}
+
 impl Presenter {
+    /// Whether this presenter draws the physical raster itself and declares
+    /// its transform to the compositor. Only then can a rotated
+    /// or flipped output be scanned out.
+    fn owns_transform(&self) -> bool {
+        !self.transform.is_normal()
+    }
+
+    /// The size of the buffers this presenter attaches, of its transfer
+    /// tables and of its warp's `output_size`: `configured` itself, or the
+    /// physical raster when the presenter owns an axis-swapping transform.
+    /// Derived rather than stored so it can never disagree with
+    /// `configured` across a resize.
+    fn buffer_size(&self) -> Option<(u32, u32)> {
+        self.configured
+            .map(|size| self.transform.physical_size(size))
+    }
+
     /// This presenter's outstanding answer under `signal`, as of `now`.
     fn gate_entry(&self, signal: GateSignal, now: Instant) -> GateEntry {
         let since = |set: bool, at: Option<Instant>| {
@@ -2651,10 +2726,17 @@ pub fn run_with_shared_input_until(
 
     // One presenter per slice. Direct outputs use their configured physical
     // mode; only Wayland outputs resolve wl_output and create layer surfaces.
+    // Direct presentation is GPU-only, so it owns the slice's transform from
+    // the start: `configured` is the logical raster the physical mode shows
+    // as (`physical_size` of a swapped pair is its own inverse), so
+    // `buffer_size` is the mode again.
     for (index, slice) in spec.slices.iter().enumerate() {
         let (wayland, configured) = if let Some(config) = direct {
             let output = &config.outputs[index];
-            (None, Some((output.width, output.height)))
+            (
+                None,
+                Some(slice.transform.physical_size((output.width, output.height))),
+            )
         } else {
             let target = find(&state, &slice.output)
                 .ok_or_else(|| anyhow::anyhow!("no output named {}", slice.output))?;
@@ -2702,6 +2784,7 @@ pub fn run_with_shared_input_until(
         state.presenters.push(Presenter {
             wayland,
             configured,
+            transform: owned_transform(direct.is_some(), slice.transform),
             name: slice.output.clone(),
             transfer: Vec::new(),
             dynamic_table: None,
@@ -2743,46 +2826,7 @@ pub fn run_with_shared_input_until(
         )
         .map_err(anyhow::Error::msg)?;
     }
-    // How much black each region of the canvas is receiving. Derived from
-    // every slice, because how much a projector must lift depends on how many
-    // *others* light the same pixel — a four-way grid center needs none while
-    // its two-way seams still do. Used only as the fallback for a hand-built
-    // spec with no configured layout at all; every canvas plan the daemon
-    // itself derives resolves both the seam weight and this lift through
-    // `layout::Evaluator` instead (`blend::SlicerSpec::layout`'s doc).
-    let coverage = Coverage::new(super::warp_update::coverage_rects(spec));
-    let layout = spec
-        .layout
-        .as_ref()
-        .map(|l| super::layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height))
-        .transpose()
-        .map_err(anyhow::Error::msg)?;
-    for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
-        let (width, height) = presenter.configured.unwrap();
-        let layout = layout
-            .as_ref()
-            .map(|l| l.index(&slice.output).map(|i| (l, i)))
-            .transpose()
-            .map_err(anyhow::Error::msg)?;
-        // Built at the *presented* size, with no warp yet (this is the
-        // initial bootstrap table, before any control update has built one):
-        // any warp/size mismatch later shows up as identity pixels, not a
-        // panic. Single-threaded here — this runs once at startup, not per
-        // frame — through the same row evaluator `warp_update`'s ongoing
-        // rebuilds use, so there is exactly one place this math lives.
-        let mut transfer = vec![(0u16, 0u8); width as usize * height as usize];
-        super::warp_update::fill_rows(
-            spec,
-            slice,
-            None,
-            &coverage,
-            layout,
-            (width, height),
-            0,
-            &mut transfer,
-        );
-        presenter.transfer = transfer;
-    }
+    bootstrap_transfers(&mut state, spec)?;
 
     if let Some(input) = shared_input {
         anyhow::ensure!(
@@ -2795,6 +2839,7 @@ pub fn run_with_shared_input_until(
             "shared texture requires Vulkan: {}",
             state.gpu_error.as_deref().unwrap_or("GPU unavailable")
         );
+        adopt_output_transforms(&mut state, spec)?;
         create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
         initialize_warp_control(spec, &connection, &mut queue, &mut state)?;
         return run_shared_source(
@@ -2822,6 +2867,7 @@ pub fn run_with_shared_input_until(
                 },
             )?,
         );
+        adopt_output_transforms(&mut state, spec)?;
         create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
         if !animated(pattern) && state.capture.backend == Some(Backend::Gpu) {
             state.static_canvases = build_static_canvases(&mut state, spec, pattern)?;
@@ -2940,6 +2986,7 @@ pub fn run_with_shared_input_until(
     // The backend (and, on the GPU path, the capture image) is decided as
     // of the `arm_copy` above — now create presenter buffers of the right
     // kind for it, before the first capture can possibly complete.
+    adopt_output_transforms(&mut state, spec)?;
     create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
     initialize_warp_control(spec, &connection, &mut queue, &mut state)?;
     let mut next = request_capture(&mut state, &screencopy, &source, &handle);
@@ -3233,6 +3280,7 @@ fn requires_linear_sampling(spec: &SlicerSpec) -> Result<bool, String> {
                 spec,
                 slice,
                 (slice.slice.width as u32, slice.slice.height as u32),
+                slice.transform,
             )?
             .is_some())
     })
@@ -3267,6 +3315,97 @@ fn report_capability(
     );
     println!("{}", serde_json::to_string(&event).unwrap());
     let _ = std::io::stdout().flush();
+}
+
+/// Each presenter's bootstrap transfer table, before any control update has
+/// built one. How much black each region of the canvas is receiving is
+/// derived from every slice, because how much a projector must lift depends
+/// on how many *others* light the same pixel — a four-way grid center needs
+/// none while its two-way seams still do. `coverage` is used only as the
+/// fallback for a hand-built spec with no configured layout at all; every
+/// canvas plan the daemon itself derives resolves both the seam weight and
+/// this lift through `layout::Evaluator` instead
+/// (`blend::SlicerSpec::layout`'s doc).
+///
+/// Built at [`Presenter::buffer_size`] with no warp, except that a
+/// presenter owning its output transform gets the transform-only warp
+/// `sampling_warp` builds for it (also installed as its `warp`, so table
+/// and sampler agree): a physical raster cannot be filled through the
+/// integer copy path. Any later warp/size mismatch shows up as identity
+/// pixels, not a panic. Single-threaded — this runs at startup, not per
+/// frame — through the same row evaluator `warp_update`'s ongoing rebuilds
+/// use, so there is exactly one place this math lives.
+fn bootstrap_transfers(state: &mut State, spec: &SlicerSpec) -> anyhow::Result<()> {
+    let coverage = Coverage::new(super::warp_update::coverage_rects(spec));
+    let layout = spec
+        .layout
+        .as_ref()
+        .map(|l| super::layout::Evaluator::new(l, spec.canvas_width, spec.canvas_height))
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
+    for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
+        let logical = presenter
+            .configured
+            .context("presenter is not configured")?;
+        let (width, height) = presenter
+            .buffer_size()
+            .context("presenter is not configured")?;
+        let layout = layout
+            .as_ref()
+            .map(|l| l.index(&slice.output).map(|i| (l, i)))
+            .transpose()
+            .map_err(anyhow::Error::msg)?;
+        let warp = if presenter.owns_transform() {
+            super::warp_update::sampling_warp(spec, slice, logical, presenter.transform)
+                .map_err(anyhow::Error::msg)?
+        } else {
+            None
+        };
+        let mut transfer = vec![(0u16, 0u8); width as usize * height as usize];
+        super::warp_update::fill_rows(
+            spec,
+            slice,
+            warp.as_ref(),
+            &coverage,
+            layout,
+            (width, height),
+            0,
+            &mut transfer,
+        );
+        presenter.transfer = transfer;
+        presenter.warp = warp;
+    }
+    Ok(())
+}
+
+/// Decide which presenters own their output transform, once the renderer is
+/// known and before any present buffer exists (see [`owned_transform`]).
+/// Each owned Wayland surface declares it with
+/// `wl_surface.set_buffer_transform`: pending state, so the first commit
+/// that attaches a buffer carries it, and it is never changed afterwards —
+/// a transform change between generations fails `same_topology` and
+/// restarts the slicer, exactly like a resize. Presenters whose ownership
+/// changed get their bootstrap tables rebuilt at the new buffer size.
+/// Direct presenters own theirs from construction; nothing changes there.
+fn adopt_output_transforms(state: &mut State, spec: &SlicerSpec) -> anyhow::Result<()> {
+    let gpu = state.direct || state.capture.backend == Some(Backend::Gpu);
+    let mut changed = false;
+    for (presenter, slice) in state.presenters.iter_mut().zip(spec.slices.iter()) {
+        let transform = owned_transform(gpu, slice.transform);
+        changed |= presenter.transform != transform;
+        presenter.transform = transform;
+        if presenter.owns_transform() {
+            if let Some(wayland) = presenter.wayland.as_ref() {
+                wayland
+                    .surface
+                    .set_buffer_transform(wayland_transform(transform));
+            }
+        }
+    }
+    if changed {
+        bootstrap_transfers(state, spec)?;
+    }
+    Ok(())
 }
 
 /// Startup capability reflects the selected source and allocated image, not
@@ -3315,6 +3454,18 @@ fn initialize_warp_control(
         configure_adaptive(state, spec, 0);
         return Ok(());
     }
+    // The controller builds every output through `sampling_warp` with the
+    // slice's own transform, which holds because this renderer owns every
+    // one of them (`owned_transform`). Its sizes are the logical rasters the
+    // spec is validated against; it derives the buffer sizes itself.
+    anyhow::ensure!(
+        state
+            .presenters
+            .iter()
+            .zip(&spec.slices)
+            .all(|(p, s)| p.transform == s.transform),
+        "GPU presenters must own their output transforms before warp control starts"
+    );
     let mut controller = super::warp_update::Controller::new(
         spec,
         state
@@ -3540,16 +3691,17 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     let prepared = controller.poll();
     anyhow::ensure!(
         !controller.requires_restart(),
-        "control version mismatch; restarting slicer"
+        "control update needs a restart (version or topology mismatch); restarting slicer"
     );
     let Some(mut prepared) = prepared else {
         return Ok(());
     };
     let validated = prepared.outputs.iter().all(|output| {
-        state
-            .presenters
-            .get(output.index)
-            .is_some_and(|p| p.name == output.name && p.configured == Some(output.size))
+        state.presenters.get(output.index).is_some_and(|p| {
+            p.name == output.name
+                && p.configured == Some(output.size)
+                && p.buffer_size() == Some(output.buffer_size)
+        })
     });
     let filtering_restart = prepared.outputs.iter().any(|output| output.warp.is_some())
         && state
@@ -3594,8 +3746,8 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
                         .iter()
                         .map(|o| gpu::PackedTransferUpdate {
                             index: o.index,
-                            width: o.size.0,
-                            height: o.size.1,
+                            width: o.buffer_size.0,
+                            height: o.buffer_size.1,
                             table: o
                                 .dynamic_table
                                 .as_deref()
@@ -3609,8 +3761,8 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
                         .iter()
                         .map(|o| gpu::TransferUpdate {
                             index: o.index,
-                            width: o.size.0,
-                            height: o.size.1,
+                            width: o.buffer_size.0,
+                            height: o.buffer_size.1,
                             table: &o.table,
                         })
                         .collect();
@@ -4142,6 +4294,15 @@ fn ensure_capture_buffer(
             if state.renderer == Renderer::Gpu || state.direct {
                 anyhow::bail!("renderer gpu was forced but is unavailable: {reason}");
             }
+            // A surface that already declared a buffer transform cannot be
+            // handed logical shm buffers: the compositor would rotate them
+            // again. Exit instead; the daemon respawns the slicer, which
+            // settles on the CPU path before adopting any transform.
+            if state.presenters.iter().any(Presenter::owns_transform) {
+                anyhow::bail!(
+                    "renderer gpu became unavailable after a rotated output was adopted ({reason}); restarting"
+                );
+            }
             eprintln!("slicer: renderer gpu unavailable ({reason}); falling back to cpu (shm)");
             // Every capture image goes with this drain, including one an
             // asynchronous measurement may still be reading, so that pass
@@ -4525,21 +4686,21 @@ enum ScanoutVerdict {
 /// the allocation already happened, and `chosen_modifier` is what the driver
 /// picked for it; this only words the log line.
 fn scanout_verdict(
-    configured: (u32, u32),
+    buffer_size: (u32, u32),
     output_mode: Option<(i32, i32)>,
     fourcc: u32,
     modifiers: &PresentModifiers,
     compositor_flagged_scanout: bool,
     chosen_modifier: u64,
 ) -> ScanoutVerdict {
-    let (width, height) = configured;
+    let (width, height) = buffer_size;
     if let Some((mode_width, mode_height)) = output_mode {
-        // The slicer never calls `set_buffer_scale`, so the buffer is the
-        // surface-local (logical) size; on a scaled output that is smaller
-        // than the mode and the compositor must scale it, which no plane
-        // here is asked to do. A rotated output reads as a mismatch too —
-        // a false negative in this line only, since the mode is reported
-        // before transform.
+        // The slicer never calls `set_buffer_scale`, so on a scaled output
+        // the buffer is the surface-local (logical) size, smaller than the
+        // mode, and the compositor must scale it, which no plane here is
+        // asked to do. The mode is reported before transform, and so is
+        // `buffer_size`: a presenter that owns its output transform
+        // attaches the physical raster, which matches the mode.
         let matches = (i64::from(width), i64::from(height))
             == (i64::from(mode_width), i64::from(mode_height));
         if !matches {
@@ -4584,18 +4745,38 @@ fn scanout_verdict(
 /// preconditions a wall is failing. It is a diagnostic and never a proof
 /// that scanout happened: `zeroCopyPresented` in `GET /projection/stats`,
 /// read from the compositor's own presentation feedback, is that.
-fn log_scanout_candidate(name: &str, verdict: ScanoutVerdict) {
+fn log_scanout_candidate(
+    name: &str,
+    buffer_size: (u32, u32),
+    transform: Transform,
+    verdict: ScanoutVerdict,
+) {
+    let buffer = scanout_buffer_note(buffer_size, transform);
     match verdict {
         ScanoutVerdict::Yes { fourcc, modifier } => eprintln!(
-            "slicer: output {name}: scanout candidate: yes (fourcc {}, modifier {modifier:#x})",
+            "slicer: output {name}: scanout candidate: yes (fourcc {}, modifier {modifier:#x}); \
+             {buffer}",
             fourcc_name(fourcc)
         ),
         ScanoutVerdict::No(reason) => {
-            eprintln!("slicer: output {name}: scanout candidate: no ({reason})")
+            eprintln!("slicer: output {name}: scanout candidate: no ({reason}); {buffer}")
         }
         ScanoutVerdict::Unconfirmed(reason) => {
-            eprintln!("slicer: output {name}: scanout candidate: unconfirmed ({reason})")
+            eprintln!("slicer: output {name}: scanout candidate: unconfirmed ({reason}); {buffer}")
         }
+    }
+}
+
+/// The scanout line's buffer description: its size, and the output
+/// transform when the slicer applies it itself.
+fn scanout_buffer_note((width, height): (u32, u32), transform: Transform) -> String {
+    if transform.is_normal() {
+        format!("buffer {width}x{height}")
+    } else {
+        format!(
+            "buffer {width}x{height}, transform {} applied by the slicer",
+            transform.as_sway()
+        )
     }
 }
 
@@ -4619,7 +4800,9 @@ fn create_present_buffers(
             .as_mut()
             .context("direct GPU was not initialized")?;
         for (index, presenter) in state.presenters.iter().enumerate() {
-            let (width, height) = presenter.configured.context("direct output has no mode")?;
+            let (width, height) = presenter
+                .buffer_size()
+                .context("direct output has no mode")?;
             gpu.set_transfer(index, width, height, &presenter.transfer)
                 .with_context(|| format!("gpu.set_transfer (direct output {index})"))?;
         }
@@ -4679,7 +4862,7 @@ fn create_present_buffers(
                 .as_mut()
                 .expect("Backend::Gpu implies state.gpu is Some");
             for (index, presenter) in presenters.iter_mut().enumerate() {
-                let (width, height) = presenter.configured.unwrap();
+                let (width, height) = presenter.buffer_size().unwrap();
                 for slot in 0..present_slots(Some(Backend::Gpu)) {
                     let image = create_present_image(gpu, width, height, fourcc, &modifiers)
                         .with_context(|| format!("gpu.create_image (present, output {index})"))?;
@@ -4698,6 +4881,8 @@ fn create_present_buffers(
                     .expect("the loop above pushed GPU_PRESENT_SLOTS buffers");
                 log_scanout_candidate(
                     &presenter.name,
+                    (width, height),
+                    presenter.transform,
                     scanout_verdict(
                         (width, height),
                         presenter.output_mode,
@@ -4715,7 +4900,9 @@ fn create_present_buffers(
         _ => {
             let slots = present_slots(state.capture.backend);
             for (index, presenter) in state.presenters.iter_mut().enumerate() {
-                let (width, height) = presenter.configured.unwrap();
+                // The CPU path never owns a transform, so this is the
+                // configured (logical) size the compositor rotates.
+                let (width, height) = presenter.buffer_size().unwrap();
                 for slot in 0..slots {
                     presenter
                         .buffers
@@ -4726,7 +4913,12 @@ fn create_present_buffers(
                 // read it into a buffer of its own. Said once per output so
                 // the line is present on both paths and the answer is never
                 // ambiguous silence.
-                log_scanout_candidate(&presenter.name, ScanoutVerdict::No("cpu path".to_string()));
+                log_scanout_candidate(
+                    &presenter.name,
+                    (width, height),
+                    presenter.transform,
+                    ScanoutVerdict::No("cpu path".to_string()),
+                );
             }
             Ok(())
         }
@@ -4735,7 +4927,8 @@ fn create_present_buffers(
 
 /// GPU path only: recreate presenter `index`'s [`GPU_PRESENT_SLOTS`] Present
 /// images if its
-/// surface's configured size no longer matches them — a mid-run resize (a
+/// buffer size (the surface's configured size, through any owned transform)
+/// no longer matches them — a mid-run resize (a
 /// changed output mode) rather than the initial configure `create_present_buffers`
 /// already handled. Best-effort: any failure is logged (naming the output
 /// and the step) and leaves the previous, still-valid buffers in place
@@ -4753,7 +4946,7 @@ fn ensure_gpu_present_buffers(
     let Some(presenter) = state.presenters.get(index) else {
         return;
     };
-    let Some((width, height)) = presenter.configured else {
+    let Some((width, height)) = presenter.buffer_size() else {
         return;
     };
     let stale = match presenter.gpu_buffers.first() {
@@ -4820,6 +5013,8 @@ fn ensure_gpu_present_buffers(
         .expect("`rebuilt`, just moved in, holds GPU_PRESENT_SLOTS buffers");
     log_scanout_candidate(
         &name,
+        (width, height),
+        presenter.transform,
         scanout_verdict(
             (width, height),
             presenter.output_mode,
@@ -5436,7 +5631,9 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
     let mut committed_any = false;
 
     for (index, presenter) in presenters.iter_mut().enumerate() {
-        let Some((width, height)) = presenter.configured else {
+        // The shm buffer's size; the CPU path never owns a transform, so
+        // this is also the configured (logical) size.
+        let Some((width, height)) = presenter.buffer_size() else {
             presenter.stale = false;
             continue;
         };
@@ -5845,7 +6042,8 @@ fn present_pattern(
     pattern: crate::model::TestPattern,
 ) -> anyhow::Result<()> {
     for (slice, presenter) in spec.slices.iter().zip(state.presenters.iter_mut()) {
-        let Some((width, height)) = presenter.configured else {
+        // CPU only, which never owns a transform: buffer and logical agree.
+        let Some((width, height)) = presenter.buffer_size() else {
             continue;
         };
         let canvas = static_pattern_rgba(spec, slice, pattern)?;
@@ -6072,6 +6270,8 @@ fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
     let gpu = state.gpu.as_mut().context("direct GPU unavailable")?;
     for &index in &due {
         let p = &state.presenters[index];
+        // Logical, like every sync shape: the shader hit-tests them through
+        // the warp at its logical size, whatever transform the target has.
         let (width, height) = p.configured.context("direct output has no mode")?;
         let groups =
             super::pattern::sync_rects(width, height, frame, &p.name, snapshot_id, unix_ms);
@@ -6371,6 +6571,8 @@ fn present_sync_cpu(
     let mut committed_any = false;
     for d in &due {
         let presenter = &mut presenters[d.index];
+        // Sync shapes are generated on the logical raster; the CPU path
+        // never owns a transform, so that is also the shm buffer's size.
         let Some((width, height)) = presenter.configured else {
             continue;
         };
@@ -6464,6 +6666,8 @@ fn present_sync_gpu(
     };
     for d in &due {
         let presenter = &presenters[d.index];
+        // Logical, not the buffer size: an owned transform's warp carries
+        // the logical size to the shader, which hit-tests shapes there.
         let Some((width, height)) = presenter.configured else {
             continue;
         };
@@ -8830,6 +9034,130 @@ mod tests {
         }
     }
 
+    /// A presenter with no Wayland half, configured at `configured`.
+    fn bare_presenter(name: &str, configured: (u32, u32), slice: crate::model::Rect) -> Presenter {
+        Presenter {
+            wayland: None,
+            configured: Some(configured),
+            transform: Transform::Normal,
+            name: name.into(),
+            transfer: Vec::new(),
+            dynamic_table: None,
+            warp: None,
+            sample: None,
+            sample_revision: None,
+            warp_revision: 0,
+            warp_reported_revision: None,
+            warp_submitted_revision: None,
+            direct_pending_warp: BTreeMap::new(),
+            slice,
+            frame_pending: false,
+            pending_since: None,
+            feedback_pending_for: None,
+            feedback_since: None,
+            stalled: false,
+            stale: false,
+        }
+    }
+
+    #[test]
+    fn owns_transform_is_false_on_cpu_and_true_on_gpu_with_180() {
+        let rect = crate::model::Rect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let mut cpu = bare_presenter("DP-1", (1920, 1080), rect);
+        cpu.transform = owned_transform(false, Transform::Rotate180);
+        assert!(!cpu.owns_transform());
+        assert_eq!(cpu.buffer_size(), Some((1920, 1080)));
+        let mut gpu = bare_presenter("DP-1", (1920, 1080), rect);
+        gpu.transform = owned_transform(true, Transform::Rotate180);
+        assert!(gpu.owns_transform());
+        assert_eq!(gpu.buffer_size(), Some((1920, 1080)));
+        // An axis-swapping transform swaps only the buffer, never
+        // `configured`, and only when owned.
+        let mut cpu = bare_presenter("DP-1", (1080, 1920), rect);
+        cpu.transform = owned_transform(false, Transform::Rotate90);
+        assert_eq!(cpu.buffer_size(), Some((1080, 1920)));
+        let mut gpu = bare_presenter("DP-1", (1080, 1920), rect);
+        gpu.transform = owned_transform(true, Transform::Rotate90);
+        assert_eq!(gpu.configured, Some((1080, 1920)));
+        assert_eq!(gpu.buffer_size(), Some((1920, 1080)));
+        assert_eq!(owned_transform(true, Transform::Normal), Transform::Normal);
+        // The startup scanout line names the owned transform and buffer.
+        assert_eq!(
+            scanout_buffer_note((1920, 1080), Transform::Rotate90),
+            "buffer 1920x1080, transform 90 applied by the slicer"
+        );
+        assert_eq!(
+            scanout_buffer_note((1920, 1080), Transform::Normal),
+            "buffer 1920x1080"
+        );
+        assert_eq!(
+            wayland_transform(Transform::Rotate90),
+            wl_output::Transform::_90
+        );
+        assert_eq!(
+            wayland_transform(Transform::Flipped270),
+            wl_output::Transform::Flipped270
+        );
+    }
+
+    #[test]
+    fn adopting_a_rotated_output_on_the_gpu_rebuilds_the_bootstrap_table_physically() {
+        let mut spec = pattern_spec();
+        // The daemon sends a 90 output's slice in the logical frame.
+        let rect = crate::model::Rect {
+            x: 30,
+            y: 0,
+            width: 180,
+            height: 240,
+        };
+        spec.slices[0].slice = rect;
+        spec.slices[0].transform = Transform::Rotate90;
+        let mut state = bare_state(vec![]);
+        state.presenters = vec![bare_presenter("DP-1", (180, 240), rect)];
+        bootstrap_transfers(&mut state, &spec).unwrap();
+        let logical = state.presenters[0].transfer.clone();
+        assert_eq!(logical.len(), 180 * 240);
+        assert!(state.presenters[0].warp.is_none());
+
+        // The CPU renderer leaves the rotation to the compositor.
+        state.capture.backend = Some(Backend::Cpu);
+        adopt_output_transforms(&mut state, &spec).unwrap();
+        assert!(!state.presenters[0].owns_transform());
+        assert_eq!(state.presenters[0].transfer, logical);
+
+        state.capture.backend = Some(Backend::Gpu);
+        adopt_output_transforms(&mut state, &spec).unwrap();
+        let presenter = &state.presenters[0];
+        assert!(presenter.owns_transform());
+        assert_eq!(presenter.configured, Some((180, 240)));
+        assert_eq!(presenter.buffer_size(), Some((240, 180)));
+        assert_eq!(presenter.transfer.len(), 240 * 180);
+        let warp = presenter
+            .warp
+            .as_ref()
+            .expect("owned transforms always warp");
+        assert_eq!(warp.output_size(), [240, 180]);
+        assert_eq!(warp.logical_size(), [180, 240]);
+        assert_eq!(warp.source_rect(), Some([30.0, 0.0, 180.0, 240.0]));
+        for ly in 0..240usize {
+            for lx in 0..180usize {
+                let [px, py] = Transform::Rotate90
+                    .to_physical([lx as f64 + 0.5, ly as f64 + 0.5], (180.0, 240.0));
+                let physical = (py - 0.5) as usize * 240 + (px - 0.5) as usize;
+                assert_eq!(
+                    presenter.transfer[physical],
+                    logical[ly * 180 + lx],
+                    "logical pixel ({lx}, {ly})"
+                );
+            }
+        }
+    }
+
     fn pattern_spec() -> SlicerSpec {
         serde_json::from_value(serde_json::json!({
             "source":"HEADLESS-1", "canvasWidth":320, "canvasHeight":240,
@@ -9171,6 +9499,7 @@ mod tests {
                 next_buffer: 0,
             }),
             configured: Some((480, 360)),
+            transform: Transform::Normal,
             name: slice.output.clone(),
             transfer: transfer.clone(),
             dynamic_table: None,
@@ -9297,6 +9626,7 @@ mod tests {
                     next_buffer: 0,
                 }),
                 configured: Some((4, 4)),
+                transform: Transform::Normal,
                 name: format!("OUT-{i}"),
                 transfer: vec![(256, 0); 16],
                 dynamic_table: None,

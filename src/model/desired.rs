@@ -459,12 +459,19 @@ impl DesiredState {
         geometry: &OutputGeometry,
         canvas: Option<&CanvasConfig>,
         mode: Option<Mode>,
+        transform: Option<Transform>,
         prefix: &str,
         errors: &mut Vec<String>,
     ) {
         let result = match (canvas, mode) {
             (Some(canvas), Some(mode)) if mode.width > 0 && mode.height > 0 => {
-                geometry.validate_for_output(canvas, mode.width as u32, mode.height as u32)
+                // Corners are normalized to the as-viewed raster.
+                let (width, height) = if transform.is_some_and(Transform::swaps_axes) {
+                    (mode.height, mode.width)
+                } else {
+                    (mode.width, mode.height)
+                };
+                geometry.validate_for_output(canvas, width as u32, height as u32)
             }
             _ => geometry.validate_numbers(canvas),
         };
@@ -485,6 +492,7 @@ impl DesiredState {
                 if let Some(geometry) = &output.geometry {
                     Self::validate_output_geometry_once(
                         geometry,
+                        None,
                         None,
                         None,
                         &format!("outputs[{index}]"),
@@ -575,6 +583,7 @@ impl DesiredState {
                     geometry,
                     projection.canvas.as_ref(),
                     output.effective_mode(),
+                    output.effective_transform(),
                     &prefix,
                     errors,
                 );
@@ -595,15 +604,6 @@ impl DesiredState {
             {
                 errors.push(format!(
                     "{prefix}.scale must be 1.0 in warp mode until raster scaling is supported"
-                ));
-            }
-            if projection.mode == ProjectionMode::Warp
-                && output
-                    .effective_transform()
-                    .is_some_and(|transform| transform != Transform::Normal)
-            {
-                errors.push(format!(
-                    "{prefix}.transform must be normal in warp mode until transformed rasters are supported"
                 ));
             }
             if mode.width <= 0 || mode.height <= 0 {
@@ -910,6 +910,57 @@ impl Transform {
             "flipped-270" => Self::Flipped270,
             _ => return None,
         })
+    }
+
+    /// Serde skip predicate: a normal transform is never serialized.
+    pub fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
+
+    /// Whether the transform reverses handedness (the `flipped*` family).
+    pub fn is_mirror(self) -> bool {
+        matches!(
+            self,
+            Self::Flipped | Self::Flipped90 | Self::Flipped180 | Self::Flipped270
+        )
+    }
+
+    /// Whether the transform exchanges the width and height of the raster.
+    pub fn swaps_axes(self) -> bool {
+        matches!(
+            self,
+            Self::Rotate90 | Self::Rotate270 | Self::Flipped90 | Self::Flipped270
+        )
+    }
+
+    /// Size of the physical (buffer) raster for a logical (as-viewed) one.
+    pub fn physical_size(self, (width, height): (u32, u32)) -> (u32, u32) {
+        if self.swaps_axes() {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
+
+    /// Map a logical pixel-boundary coordinate in a `size` raster to the
+    /// physical raster the slicer draws when it owns the transform.
+    ///
+    /// The whole convention lives in this one `match`. The 90/270 chirality
+    /// follows `wl_surface.set_buffer_transform` and was confirmed on hardware
+    /// against compositor-rotated reference captures.
+    pub fn to_physical(self, [x, y]: [f64; 2], (w, h): (f64, f64)) -> [f64; 2] {
+        match self {
+            Self::Normal => [x, y],
+            Self::Rotate90 => [y, w - x],
+            Self::Rotate180 => [w - x, h - y],
+            Self::Rotate270 => [h - y, x],
+            Self::Flipped => [w - x, y],
+            // 90 applied to (w - x, y).
+            Self::Flipped90 => [y, x],
+            Self::Flipped180 => [x, h - y],
+            // 270 applied to (w - x, y).
+            Self::Flipped270 => [h - y, w - x],
+        }
     }
 }
 
@@ -1287,8 +1338,25 @@ impl OutputConfig {
             .or_else(|| self.adopted.as_ref().and_then(|adopted| adopted.transform))
     }
 
-    /// Destination buffer dimensions. Simple presents in compositor logical
-    /// coordinates; Warp requires a normal, unit-scale physical raster.
+    /// The transform the slicer composes into its own mapping, or `Normal`
+    /// when the compositor keeps it. The slicer presents a physical raster
+    /// only at unit scale (the same tolerance validation uses); at any other
+    /// scale the buffer is logical and the compositor rotates and scales it.
+    pub fn slicer_transform(&self) -> Transform {
+        let unit_scale = self
+            .effective_scale()
+            .is_none_or(|scale| (scale - 1.0).abs() <= f64::EPSILON);
+        if unit_scale {
+            self.effective_transform().unwrap_or_default()
+        } else {
+            Transform::Normal
+        }
+    }
+
+    /// Destination buffer dimensions, in the as-viewed (logical) orientation:
+    /// 90/270 transforms swap width and height. Simple presents in compositor
+    /// logical coordinates; Warp requires a unit-scale raster, and its
+    /// orientation is composed by the slicer.
     /// Validate before casting or allocating, including very small scales.
     pub fn presentation_dimensions(
         &self,
@@ -1303,16 +1371,9 @@ impl OutputConfig {
         if !(scale.is_finite() && scale > 0.0) {
             return Err("output scale must be finite and positive".into());
         }
-        let rotated = !apply_correction
-            && matches!(
-                self.effective_transform(),
-                Some(
-                    Transform::Rotate90
-                        | Transform::Rotate270
-                        | Transform::Flipped90
-                        | Transform::Flipped270
-                )
-            );
+        let rotated = self
+            .effective_transform()
+            .is_some_and(Transform::swaps_axes);
         let (width, height) = if rotated {
             (mode.height, mode.width)
         } else {
@@ -1659,6 +1720,102 @@ fn default_heartbeat_grace() -> u64 {
 mod tests {
     use super::*;
     use crate::model::CanvasRect;
+
+    const ALL_TRANSFORMS: [Transform; 8] = [
+        Transform::Normal,
+        Transform::Rotate90,
+        Transform::Rotate180,
+        Transform::Rotate270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ];
+
+    #[test]
+    fn transform_classification_and_physical_size() {
+        for transform in ALL_TRANSFORMS {
+            let swaps = matches!(
+                transform,
+                Transform::Rotate90
+                    | Transform::Rotate270
+                    | Transform::Flipped90
+                    | Transform::Flipped270
+            );
+            assert_eq!(transform.swaps_axes(), swaps, "{transform:?}");
+            assert_eq!(
+                transform.is_mirror(),
+                transform.as_sway().starts_with("flipped")
+            );
+            assert_eq!(transform.is_normal(), transform == Transform::Normal);
+            let (w, h) = transform.physical_size((4, 3));
+            assert_eq!((w, h), if swaps { (3, 4) } else { (4, 3) });
+            // Applying the size twice for a swapping transform returns it.
+            assert_eq!(transform.physical_size((w, h)), (4, 3));
+        }
+    }
+
+    #[test]
+    fn transform_maps_the_corners_of_a_4_by_3_raster() {
+        // (TL, TR, BR, BL) logical -> physical, per variant.
+        let logical = [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
+        let expected: [(Transform, [[f64; 2]; 4]); 8] = [
+            (Transform::Normal, logical),
+            (
+                Transform::Rotate90,
+                [[0.0, 4.0], [0.0, 0.0], [3.0, 0.0], [3.0, 4.0]],
+            ),
+            (
+                Transform::Rotate180,
+                [[4.0, 3.0], [0.0, 3.0], [0.0, 0.0], [4.0, 0.0]],
+            ),
+            (
+                Transform::Rotate270,
+                [[3.0, 0.0], [3.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
+            ),
+            (
+                Transform::Flipped,
+                [[4.0, 0.0], [0.0, 0.0], [0.0, 3.0], [4.0, 3.0]],
+            ),
+            (
+                Transform::Flipped90,
+                [[0.0, 0.0], [0.0, 4.0], [3.0, 4.0], [3.0, 0.0]],
+            ),
+            (
+                Transform::Flipped180,
+                [[0.0, 3.0], [4.0, 3.0], [4.0, 0.0], [0.0, 0.0]],
+            ),
+            (
+                Transform::Flipped270,
+                [[3.0, 4.0], [3.0, 0.0], [0.0, 0.0], [0.0, 4.0]],
+            ),
+        ];
+        for (transform, want) in expected {
+            let (pw, ph) = transform.physical_size((4, 3));
+            let got = logical.map(|p| transform.to_physical(p, (4.0, 3.0)));
+            assert_eq!(got, want, "{transform:?}");
+            // Every mapped corner is a corner of the physical raster, and the
+            // four are distinct.
+            for corner in got {
+                assert!(
+                    (corner[0] == 0.0 || corner[0] == f64::from(pw))
+                        && (corner[1] == 0.0 || corner[1] == f64::from(ph)),
+                    "{transform:?} {corner:?}"
+                );
+            }
+            for i in 0..4 {
+                for j in i + 1..4 {
+                    assert_ne!(got[i], got[j], "{transform:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_serde_skip_predicate() {
+        assert!(Transform::Normal.is_normal());
+        assert!(!Transform::Rotate270.is_normal());
+    }
 
     #[test]
     fn complete_simple_and_warp_examples_validate_against_the_current_schema() {

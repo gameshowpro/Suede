@@ -536,7 +536,9 @@ const REQUIRED_DEVICE_EXTENSIONS: [&CStr; 5] = [
 
 /// A device's push constants, `#[repr(C)]` to match `blend.frag`'s
 /// `PushConstants` block byte for byte. The legacy eight-u32 prefix is
-/// followed by three vec4 rows, a 16-byte control block, and the source rect.
+/// followed by three vec4 rows, a 16-byte control block, the source rect,
+/// and a final 16-byte block: the adaptive lift state and the logical
+/// raster size. Exactly 128 bytes, the guaranteed minimum.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct PushConstants {
@@ -559,7 +561,12 @@ struct PushConstants {
     source_rect: [f32; 4],
     dynamic_lift: f32,
     dynamic_maximum: u32,
-    dynamic_padding: [u32; 2],
+    /// The logical (as-viewed) raster size. Equal to `width`/`height`
+    /// unless the warp composes an axis-swapping output transform, where
+    /// the target is the physical raster; the shaders hit-test sync shapes,
+    /// which are generated on the logical raster, against these.
+    logical_width: u32,
+    logical_height: u32,
 }
 
 impl PushConstants {
@@ -594,7 +601,8 @@ impl PushConstants {
                 .map(|v| v as f32),
             dynamic_lift: 0.0,
             dynamic_maximum: 0,
-            dynamic_padding: [0; 2],
+            logical_width: warp.map_or(size[0], |w| w.logical_size()[0]),
+            logical_height: warp.map_or(size[1], |w| w.logical_size()[1]),
         }
     }
 
@@ -5183,6 +5191,35 @@ mod tests {
     }
 
     #[test]
+    fn push_constants_carry_logical_dims_for_a_transformed_target() {
+        use crate::model::Transform;
+        let pins = [[0.0, 0.0], [1920.0, 0.0], [1920.0, 1080.0], [0.0, 1080.0]];
+        let warp =
+            super::super::warp::Warp::for_output(pins, [0.5, 0.5], 1920, 1080, Transform::Rotate90)
+                .unwrap()
+                .with_source_rect([0.0, 0.0, 1920.0, 1080.0])
+                .unwrap();
+        let size = warp.output_size();
+        assert_eq!(size, [1080, 1920]);
+        let constants = PushConstants::canvas([0, 0], size, 1080, false, Some(&warp));
+        assert_eq!((constants.width, constants.height), (1080, 1920));
+        assert_eq!(
+            (constants.logical_width, constants.logical_height),
+            (1920, 1080)
+        );
+        let bytes = constants.as_bytes();
+        let word =
+            |offset: usize| u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!((word(120), word(124)), (1920, 1080));
+        // Without a warp, and with a normal one, logical equals the target.
+        let plain = PushConstants::canvas([0, 0], [640, 480], 480, false, None);
+        assert_eq!((plain.logical_width, plain.logical_height), (640, 480));
+        let normal = super::super::warp::Warp::identity(640, 480);
+        let normal = PushConstants::canvas([0, 0], [640, 480], 480, false, Some(&normal));
+        assert_eq!((normal.logical_width, normal.logical_height), (640, 480));
+    }
+
+    #[test]
     fn push_constants_match_warp_shader_layout() {
         assert_eq!(std::mem::size_of::<PushConstants>(), 128);
         assert_eq!(std::mem::offset_of!(PushConstants, inverse_rows), 32);
@@ -5192,6 +5229,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(PushConstants, source_rect), 96);
         assert_eq!(std::mem::offset_of!(PushConstants, dynamic_lift), 112);
         assert_eq!(std::mem::offset_of!(PushConstants, dynamic_maximum), 116);
+        assert_eq!(std::mem::offset_of!(PushConstants, logical_width), 120);
+        assert_eq!(std::mem::offset_of!(PushConstants, logical_height), 124);
         assert_eq!(std::mem::align_of::<PushConstants>(), 4);
         // Vulkan guarantees only 128 bytes of push constants, and a device
         // that offers exactly that must still take this block.

@@ -435,7 +435,7 @@ daemon restart from making a reset generation counter look current.
 | `position` | object \| null | null | `{x, y}` in the global layout |
 | `geometry` | object \| null | null | Shared canvas slice crop plus retained Warp correction; see [Canvas and warp geometry](#projection-geometry) |
 | `scale` | number \| null | null | Output scale factor |
-| `transform` | string \| null | null | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`… |
+| `transform` | string \| null | null | `normal`, `90`, `180`, `270`, `flipped`, `flipped-90`… Rotation names what was done to the display: `90` is a panel turned clockwise. `flipped-N` mirrors about the vertical axis as the audience sees it, then rotates, which is rear projection with a rotated mount; the reference UI shows it as a rotation plus a **Mirror (rear projection)** box. In Warp mode the slicer composes it into the picture; see [Canvas and warp geometry](#projection-geometry) |
 | `adaptiveSync` | bool | `false` | Variable refresh rate |
 | `allowTearing` | bool | `false` | Applied only on Sway 1.10+; reported as a divergence otherwise |
 | `maxRenderTimeMs` | number \| null | null | Frame render deadline; null means off |
@@ -1296,11 +1296,15 @@ canvas height is `H = max(1, round(W/aspect))`, with positive half-way values
 rounded up; `renderWidth` is the chosen allocation, with no separate scale
 field. A slice rectangle's
 continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`.
-Corners are normalized to the output raster and are ordered top-left,
-top-right, bottom-right, bottom-left. A shared canvas requires each enabled
-configured output, including an unattached output, to have geometry and an
-explicit or adopted mode. Warp additionally requires output scale `1.0` and
-transform `normal`; selecting it never clears retained hardware settings.
+Corners are normalized to the output's as-viewed raster (the upright picture
+an operator sees on the mounted display after the output transform) and are
+ordered top-left, top-right, bottom-right, bottom-left. That raster is
+`mode.height × mode.width` for transforms `90`, `270`, `flipped-90`, and
+`flipped-270`, and `mode.width × mode.height` otherwise. A shared canvas
+requires each enabled configured output, including an unattached output, to
+have geometry and an explicit or adopted mode. Warp additionally requires
+output scale `1.0`; any transform is allowed, because the slicer composes it.
+Selecting Warp never clears retained hardware settings.
 Legacy `position` is not a second crop and is not required for fallback.
 The roster has one to eight enabled participants, the
 canvas must be complete, and the appliance must set `allow_overlaps = true`.
@@ -1364,9 +1368,15 @@ limits are unknown and are listed in the response. The endpoint does not
 resize a headless output or probe those limits.
 
 CPU Simple supports fractional crops and content scaling in projection-enabled
-builds. Simple presentation buffers follow the compositor's rotated/scaled
-logical output dimensions, while content scale and density guidance refer to
-the physical raster. Those buffers also obey the output allocation limit.
+builds. Who applies a rotation depends on the renderer. On the GPU renderer
+at output scale `1.0`, the slicer presents a physically oriented buffer and
+declares its orientation with `wl_surface.set_buffer_transform`, so a rotated
+output is eligible for direct scanout and, when it is composited instead,
+costs Sway only a plain blit. On the CPU renderer, or at any other output
+scale, the slicer presents a buffer at the compositor's rotated/scaled logical
+output dimensions and the compositor rotates or scales it as before. Content
+scale and density guidance refer to the physical raster. Those buffers also
+obey the output allocation limit.
 Builds without projection machinery cannot render arbitrary shared crops;
 they report `projection_unavailable`. Direct tiling configurations must not
 configure a shared canvas: it requires `allow_overlaps = true` and a slicer.
@@ -1593,7 +1603,10 @@ none of that policy layered on — read `geometry.effectiveMode` unless the
 question is specifically about the child process. Every mode field
 (`geometry.requestedMode`, `geometry.effectiveMode`, `control.requestedMode`,
 `control.effectiveMode`) and `control.outputs[].samplingMode` use the same
-lowercase strings as `projection.mode` in configuration.
+lowercase strings as `projection.mode` in configuration. `samplingMode` is
+`bilinear` for a rotated output on the GPU renderer even with identity pins,
+because the slicer composes the rotation through the warp; bilinear sampling
+is exact at texel centers, so the picture is unchanged.
 
 Complete schema examples are available for a [simple appliance](examples/four-output-appliance.json)
 and a [warp appliance](examples/four-output-warp.json). The warp example

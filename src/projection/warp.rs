@@ -6,6 +6,12 @@
 //! before the homography is applied.
 //! An optional source rectangle supplies canvas placement and density without
 //! changing local pin geometry. Capture y inversion belongs to the caller.
+//!
+//! [`Warp::for_output`] composes an output transform: pins are given on the
+//! logical (as-viewed) raster and the warp is built directly on the physical
+//! raster the slicer attaches with `wl_surface.set_buffer_transform`.
+
+use crate::model::Transform;
 
 // Frozen bounds for the Phase 1 pixel-coordinate mapping: positive area and
 // convex turns exceed EPS * max(width, height)^2; elimination pivots exceed
@@ -50,7 +56,16 @@ pub struct Warp {
     bounds: [f64; 4], // min x, min y, max x, max y
     identity: bool,
     source_rect: Option<[f64; 4]>,
+    transform: Transform,
+    logical_width: u32,
+    logical_height: u32,
+    /// Source unit-square corner matching each entry of `corners`. The
+    /// identity square, or the mirrored one for mirror transforms.
+    source_square: [[f64; 2]; 4],
 }
+
+const IDENTITY_SQUARE: [[f64; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+const MIRRORED_SQUARE: [[f64; 2]; 4] = [[1.0, 0.0], [0.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
 
 impl Warp {
     /// Build a warp from output pixel-boundary corner pins.
@@ -60,6 +75,29 @@ impl Warp {
         width: u32,
         height: u32,
     ) -> Result<Self, String> {
+        Self::for_output(corners, center, width, height, Transform::Normal)
+    }
+
+    /// Build a warp for an output presented with `transform`.
+    ///
+    /// `corners` are TL, TR, BR, BL pixel-boundary pins on the logical
+    /// (as-viewed) `logical_width`×`logical_height` raster and `center` is in
+    /// the source frame, exactly as for [`Warp::new`]. The result is built on
+    /// the physical raster: [`Warp::output_size`], `coverage`, `source_at`
+    /// and `inverse_rows` take physical pixel coordinates. Rotations keep the
+    /// pin order. Mirrors reverse winding, so the physical quad is reordered
+    /// to `[T(c1), T(c0), T(c3), T(c2)]` and solved from the mirrored source
+    /// square; the inverse still yields true source unit coordinates and the
+    /// center remap is unaffected. With `Transform::Normal` this is exactly
+    /// [`Warp::new`].
+    pub fn for_output(
+        corners: [[f64; 2]; 4],
+        center: [f64; 2],
+        logical_width: u32,
+        logical_height: u32,
+        transform: Transform,
+    ) -> Result<Self, String> {
+        let (width, height) = (logical_width, logical_height);
         if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return Err("warp dimensions must be in 1..=32768".into());
         }
@@ -76,6 +114,21 @@ impl Warp {
         if corners.iter().flatten().any(|v| v.abs() > limit) {
             return Err("warp corners exceed bounded output coordinate range".into());
         }
+        // From here on everything is physical. Rotations and mirrors are
+        // exact on these coordinates and the area and convexity checks are
+        // invariant under them (mirrors after the reorder); the f32 checks
+        // run on the physical rows the shader will use. `Normal` is
+        // bit-identical to the historical `new`.
+        let mapped = corners.map(|p| transform.to_physical(p, (width as f64, height as f64)));
+        let (corners, source_square) = if transform.is_mirror() {
+            (
+                [mapped[1], mapped[0], mapped[3], mapped[2]],
+                MIRRORED_SQUARE,
+            )
+        } else {
+            (mapped, IDENTITY_SQUARE)
+        };
+        let (width, height) = transform.physical_size((logical_width, logical_height));
         let area = signed_area(&corners);
         let scale = (width as f64).max(height as f64).max(1.0);
         if area <= EPS * scale * scale {
@@ -90,11 +143,10 @@ impl Warp {
             }
         }
 
-        let remapped = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        let forward = solve_homography(remapped, corners)?;
+        let forward = solve_homography(source_square, corners)?;
         // A linear denominator cannot change sign over a square unless it
         // does so at a corner.  This rejects projective poles in the source.
-        check_denominator(&forward, &remapped, "source")?;
+        check_denominator(&forward, &source_square, "source")?;
         let inverse = invert3(forward).ok_or_else(|| "warp homography is singular".to_string())?;
         if inverse
             .iter()
@@ -111,7 +163,14 @@ impl Warp {
         ];
         check_denominator(&inverse, &output_rect, "output")?;
         check_f32_denominator(&inverse, &output_rect)?;
-        check_f32_corners(&inverse, &corners, center, width, height)?;
+        check_f32_corners(
+            &inverse,
+            &corners,
+            &source_square,
+            center,
+            logical_width,
+            logical_height,
+        )?;
         let mut edges = [[0.0; 3]; 4];
         for i in 0..4 {
             let a = corners[i];
@@ -134,7 +193,8 @@ impl Warp {
             },
         );
 
-        let identity = center == [0.5, 0.5]
+        let identity = transform == Transform::Normal
+            && center == [0.5, 0.5]
             && corners
                 == [
                     [0.0, 0.0],
@@ -153,6 +213,10 @@ impl Warp {
             bounds,
             identity,
             source_rect: None,
+            transform,
+            logical_width,
+            logical_height,
+            source_square,
         })
     }
 
@@ -173,8 +237,7 @@ impl Warp {
         // Check the actual f32 mapping, including the new scale and offset.
         // A valid local map can lose precision when sampling a larger source.
         let rows = self.inverse.map(|r| r.map(|v| v as f32));
-        let expected = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-        for (p, expected) in self.corners.iter().zip(expected) {
+        for (p, expected) in self.corners.iter().zip(self.source_square) {
             let q = rows.map(|r| r[0] * p[0] as f32 + r[1] * p[1] as f32 + r[2]);
             for axis in 0..2 {
                 let s = q[axis] / q[2];
@@ -200,14 +263,18 @@ impl Warp {
     }
 
     /// Unclamped absolute canvas coordinates, before capture y inversion.
-    /// Existing callers without a source rectangle retain unit pixel density.
+    /// Existing callers without a source rectangle retain unit pixel density;
+    /// the fallback source extent is the logical raster, which differs from
+    /// the output size only under an axis-swapping transform.
     pub fn canvas_at(&self, x: f64, y: f64, fallback_origin: [f64; 2]) -> Option<[f64; 2]> {
         let local = self.source_at(x, y)?;
+        // `source_at` scales by the output size and this divides it back
+        // out, so only the source rectangle sets the canvas density.
         let rect = self.source_rect.unwrap_or([
             fallback_origin[0],
             fallback_origin[1],
-            self.output_width as f64,
-            self.output_height as f64,
+            self.logical_width as f64,
+            self.logical_height as f64,
         ]);
         let point = [
             rect[0] + local[0] / self.output_width as f64 * rect[2],
@@ -224,8 +291,8 @@ impl Warp {
         let rect = self.source_rect.unwrap_or([
             fallback_origin[0],
             fallback_origin[1],
-            self.output_width as f64,
-            self.output_height as f64,
+            self.logical_width as f64,
+            self.logical_height as f64,
         ]);
         for axis in 0..2 {
             let inset = (rect[axis + 2] * 0.5).min(0.5);
@@ -282,12 +349,24 @@ impl Warp {
     }
 
     /// Raster dimensions used to convert the inverse map to source pixels.
+    /// Physical: under an axis-swapping transform this is the logical size
+    /// with width and height exchanged.
     pub fn output_size(&self) -> [u32; 2] {
         [self.output_width, self.output_height]
     }
 
+    /// The output transform this warp composes; `Normal` for [`Warp::new`].
+    pub fn transform(&self) -> Transform {
+        self.transform
+    }
+
+    /// The logical (as-viewed) raster the pins were given on.
+    pub fn logical_size(&self) -> [u32; 2] {
+        [self.logical_width, self.logical_height]
+    }
+
     /// Exact local identity, without a tolerance that could hide a pin edit.
-    /// This alone does not establish integer-exact canvas sampling: the caller
+    /// Always false under a non-normal output transform. This alone does not establish integer-exact canvas sampling: the caller
     /// must also establish an in-bounds integer source origin and unit density
     /// using actual source/output dimensions, including rounded canvas height.
     pub fn is_identity(&self) -> bool {
@@ -311,6 +390,10 @@ impl Warp {
     }
 
     /// Return unclamped local source pixel coordinates for an output boundary.
+    /// Source unit coordinates are scaled by the *output* (physical) size,
+    /// not the logical one. Every daemon-built warp carries a source
+    /// rectangle and `canvas_at` divides by the same size, so this cancels;
+    /// divide by [`Warp::output_size`] to recover unit coordinates.
     pub fn source_at(&self, x: f64, y: f64) -> Option<[f64; 2]> {
         if !x.is_finite() || !y.is_finite() {
             return None;
@@ -440,16 +523,18 @@ fn check_f32_denominator(m: &[[f64; 3]; 3], points: &[[f64; 2]]) -> Result<(), S
     Ok(())
 }
 
+/// `source_square` is the source unit corner for each of `corners`; `width`
+/// and `height` are the logical source extent the error is measured in.
 fn check_f32_corners(
     inverse: &[[f64; 3]; 3],
     corners: &[[f64; 2]; 4],
+    source_square: &[[f64; 2]; 4],
     center: [f64; 2],
     width: u32,
     height: u32,
 ) -> Result<(), String> {
     let rows = inverse.map(|r| r.map(|v| v as f32));
-    let expected = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    for (p, expected) in corners.iter().zip(expected) {
+    for (p, expected) in corners.iter().zip(source_square) {
         let q = rows.map(|r| r[0] * p[0] as f32 + r[1] * p[1] as f32 + r[2]);
         for axis in 0..2 {
             // Match the shader's f32 arithmetic, including its center remap.
@@ -1036,5 +1121,297 @@ mod tests {
             .map(|(x, y)| overscan.coverage(x, y))
             .sum();
         assert_eq!(area, 3.0);
+    }
+
+    const ALL_TRANSFORMS: [Transform; 8] = [
+        Transform::Normal,
+        Transform::Rotate90,
+        Transform::Rotate180,
+        Transform::Rotate270,
+        Transform::Flipped,
+        Transform::Flipped90,
+        Transform::Flipped180,
+        Transform::Flipped270,
+    ];
+
+    fn assert_close(actual: Option<[f64; 2]>, expected: [f64; 2], tolerance: f64) {
+        let actual = actual.expect("finite mapping");
+        for axis in 0..2 {
+            assert!(
+                (actual[axis] - expected[axis]).abs() < tolerance,
+                "{actual:?} != {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn d3_pixel_mapping_sends_logical_corners_to_physical_corners() {
+        let (w, h) = (4, 3);
+        let logical = [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [0.0, 3.0]];
+        for transform in ALL_TRANSFORMS {
+            let (pw, ph) = transform.physical_size((w, h));
+            assert_eq!(transform.physical_size((pw, ph)), (w, h), "{transform:?}");
+            let mut mapped = logical.map(|p| transform.to_physical(p, (w as f64, h as f64)));
+            mapped.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut expected = [
+                [0.0, 0.0],
+                [pw as f64, 0.0],
+                [pw as f64, ph as f64],
+                [0.0, ph as f64],
+            ];
+            expected.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            assert_eq!(mapped, expected, "{transform:?}");
+            assert_eq!(
+                signed_area(&logical.map(|p| transform.to_physical(p, (w as f64, h as f64)))) > 0.0,
+                !transform.is_mirror(),
+                "{transform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn for_output_normal_is_exactly_new() {
+        for (pins, center, width, height) in [
+            (
+                [[0.0, 0.0], [100.0, 0.0], [100.0, 80.0], [0.0, 80.0]],
+                [0.5, 0.5],
+                100,
+                80,
+            ),
+            (
+                [[10.0, 6.0], [310.0, 0.0], [300.0, 190.0], [0.0, 180.0]],
+                [0.3, 0.7],
+                320,
+                200,
+            ),
+        ] {
+            let new = Warp::new(pins, center, width, height).unwrap();
+            let normal = Warp::for_output(pins, center, width, height, Transform::Normal).unwrap();
+            assert_eq!(format!("{new:?}"), format!("{normal:?}"));
+            assert_eq!(new.transform(), Transform::Normal);
+            assert_eq!(new.logical_size(), [width, height]);
+            assert_eq!(new.output_size(), [width, height]);
+        }
+        let identity = Warp::identity(100, 80);
+        assert!(identity.is_identity());
+        assert_eq!(identity.transform(), Transform::Normal);
+    }
+
+    #[test]
+    fn for_output_identity_pins_map_every_physical_pixel_for_every_transform() {
+        let (w, h) = (100u32, 80u32);
+        let pins = [[0.0, 0.0], [100.0, 0.0], [100.0, 80.0], [0.0, 80.0]];
+        for transform in ALL_TRANSFORMS {
+            let warp = Warp::for_output(pins, [0.5, 0.5], w, h, transform).unwrap();
+            let (pw, ph) = transform.physical_size((w, h));
+            assert_eq!(warp.output_size(), [pw, ph], "{transform:?}");
+            assert_eq!(warp.logical_size(), [w, h]);
+            assert_eq!(warp.transform(), transform);
+            assert_eq!(warp.is_identity(), transform == Transform::Normal);
+            assert!(signed_area(&warp.corners) > 0.0, "{transform:?}");
+            let mut seen = vec![false; (pw * ph) as usize];
+            for ly in 0..h {
+                for lx in 0..w {
+                    let logical = [lx as f64 + 0.5, ly as f64 + 0.5];
+                    let physical = transform.to_physical(logical, (w as f64, h as f64));
+                    let (px, py) = (physical[0] - 0.5, physical[1] - 0.5);
+                    assert!(px.fract() == 0.0 && py.fract() == 0.0, "{transform:?}");
+                    assert!(px >= 0.0 && py >= 0.0 && px < pw as f64 && py < ph as f64);
+                    let index = py as usize * pw as usize + px as usize;
+                    assert!(!seen[index], "{transform:?} maps two pixels to one");
+                    seen[index] = true;
+                    // `source_at` is scaled by the physical size (see its
+                    // doc); unit coordinates are the transform-free result.
+                    let source = warp.source_at(physical[0], physical[1]).unwrap();
+                    assert_close(
+                        Some([
+                            source[0] / pw as f64 * w as f64,
+                            source[1] / ph as f64 * h as f64,
+                        ]),
+                        logical,
+                        1e-9,
+                    );
+                    // The production path: a source rectangle (or the
+                    // logical fallback) yields logical pixel centers.
+                    assert_close(
+                        warp.canvas_at(physical[0], physical[1], [0.0; 2]),
+                        logical,
+                        1e-9,
+                    );
+                    assert_close(
+                        warp.destination_at(logical[0] / w as f64, logical[1] / h as f64),
+                        physical,
+                        1e-9,
+                    );
+                    assert_eq!(warp.coverage(px as u32, py as u32), 1.0, "{transform:?}");
+                }
+            }
+            assert!(seen.iter().all(|s| *s));
+            for (x, y) in [
+                (pw, 0),
+                (0, ph),
+                (pw, ph),
+                (pw + 5, ph / 2),
+                (pw / 2, ph + 5),
+            ] {
+                assert_eq!(warp.coverage(x, y), 0.0, "{transform:?} ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn mirror_transforms_keep_positive_winding_and_mirror_the_picture() {
+        let pins = [[0.0, 0.0], [100.0, 0.0], [100.0, 80.0], [0.0, 80.0]];
+        for transform in [
+            Transform::Flipped,
+            Transform::Flipped90,
+            Transform::Flipped180,
+            Transform::Flipped270,
+        ] {
+            let warp = Warp::for_output(pins, [0.5, 0.5], 100, 80, transform).unwrap();
+            assert!(signed_area(&warp.corners) > 0.0, "{transform:?}");
+            assert_eq!(warp.source_square, MIRRORED_SQUARE);
+            // Source (0,0) still lands on the transformed logical TL corner.
+            assert_close(
+                warp.destination_at(0.0, 0.0),
+                transform.to_physical([0.0, 0.0], (100.0, 80.0)),
+                1e-9,
+            );
+        }
+        let flipped = Warp::for_output(pins, [0.5, 0.5], 100, 80, Transform::Flipped).unwrap();
+        // Physical TL pixel shows the logical TR pixel.
+        assert_close(flipped.canvas_at(0.5, 0.5, [0.0; 2]), [99.5, 0.5], 1e-9);
+        assert_close(flipped.source_at(0.5, 0.5), [99.5, 0.5], 1e-9);
+    }
+
+    #[test]
+    fn pinned_corners_and_centers_follow_the_output_transform() {
+        let (w, h) = (320u32, 200u32);
+        let pins = [[10.0, 6.0], [310.0, 0.0], [300.0, 190.0], [0.0, 180.0]];
+        for transform in ALL_TRANSFORMS {
+            for center in [[0.5, 0.5], [0.3, 0.7], [0.99, 0.01]] {
+                let logical = Warp::new(pins, center, w, h).unwrap();
+                let physical = Warp::for_output(pins, center, w, h, transform).unwrap();
+                assert!(!physical.is_identity());
+                for u in [0.0, 0.25, 0.3, 0.499, 0.5, 0.501, 0.75, 1.0] {
+                    for v in [0.0, 0.25, 0.499, 0.5, 0.501, 0.7, 0.75, 1.0] {
+                        let expected = transform.to_physical(
+                            logical.destination_at(u, v).unwrap(),
+                            (w as f64, h as f64),
+                        );
+                        let p = physical.destination_at(u, v);
+                        assert_close(p, expected, 1e-8);
+                        let p = p.unwrap();
+                        // The center remap acts on unmirrored source units.
+                        assert_close(
+                            physical.canvas_at(p[0], p[1], [0.0; 2]),
+                            [u * 320.0, v * 200.0],
+                            1e-8,
+                        );
+                    }
+                }
+                // With unpinned corners the source center lines land on the
+                // transformed logical center lines, mirror or not.
+                let unpinned = Warp::for_output(
+                    [[0.0, 0.0], [320.0, 0.0], [320.0, 200.0], [0.0, 200.0]],
+                    center,
+                    w,
+                    h,
+                    transform,
+                )
+                .unwrap();
+                for t in [0.0, 0.25, 0.5, 1.0] {
+                    assert_close(
+                        unpinned.destination_at(0.5, t),
+                        transform.to_physical(
+                            [center[0] * 320.0, map_center(t, center[1]) * 200.0],
+                            (w as f64, h as f64),
+                        ),
+                        1e-8,
+                    );
+                    assert_close(
+                        unpinned.destination_at(t, 0.5),
+                        transform.to_physical(
+                            [map_center(t, center[0]) * 320.0, center[1] * 200.0],
+                            (w as f64, h as f64),
+                        ),
+                        1e-8,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn for_output_source_rect_round_trips_and_rows_stay_finite() {
+        let pins = [[10.0, 6.0], [310.0, 0.0], [300.0, 190.0], [0.0, 180.0]];
+        let rect = [3.25, -2.125, 640.0, 400.0];
+        for transform in ALL_TRANSFORMS {
+            let warp = Warp::for_output(pins, [0.3, 0.7], 320, 200, transform)
+                .unwrap()
+                .with_source_rect(rect)
+                .unwrap();
+            assert_eq!(warp.source_rect(), Some(rect));
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.4, 0.6)] {
+                let p = warp.destination_at(u, v).unwrap();
+                assert_close(
+                    warp.canvas_at(p[0], p[1], [99.0; 2]),
+                    [rect[0] + u * rect[2], rect[1] + v * rect[3]],
+                    1e-8,
+                );
+            }
+            let rows = warp.inverse_rows();
+            assert!(
+                rows.iter().flatten().all(|v| v.is_finite()),
+                "{transform:?}"
+            );
+            // The f32 rows the shader uses agree with the f64 inverse.
+            let [pw, ph] = warp.output_size();
+            for p in [
+                [0.5, 0.5],
+                [pw as f64 * 0.4, ph as f64 * 0.6],
+                [pw as f64 - 0.5, ph as f64 - 0.5],
+            ] {
+                let q = rows.map(|r| r[0] * p[0] as f32 + r[1] * p[1] as f32 + r[2]);
+                let center = warp.center();
+                let unit: [f64; 2] = std::array::from_fn(|axis| {
+                    let s = q[axis] / q[2];
+                    let c = center[axis];
+                    (if s <= c {
+                        s / (2.0 * c)
+                    } else {
+                        0.5 + (s - c) / (2.0 * (1.0 - c))
+                    }) as f64
+                });
+                let exact = warp.source_at(p[0], p[1]).unwrap();
+                assert!(
+                    (unit[0] * pw as f64 - exact[0]).abs() < 0.01,
+                    "{transform:?}"
+                );
+                assert!(
+                    (unit[1] * ph as f64 - exact[1]).abs() < 0.01,
+                    "{transform:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn for_output_rejects_what_new_rejects() {
+        let rect = [[0.0, 0.0], [100.0, 0.0], [100.0, 80.0], [0.0, 80.0]];
+        for transform in ALL_TRANSFORMS {
+            for pins in [
+                [rect[0], rect[3], rect[2], rect[1]],
+                [rect[0], rect[1], [25.0, 25.0], rect[3]],
+                [[40.0, 40.0], [60.0, 40.0], [90.0, 60.0], [10.0, 60.0]],
+            ] {
+                assert!(
+                    Warp::for_output(pins, [0.5, 0.5], 100, 80, transform).is_err(),
+                    "{transform:?} {pins:?}"
+                );
+            }
+            assert!(Warp::for_output(rect, [0.5, 0.5], 0, 80, transform).is_err());
+            assert!(Warp::for_output(rect, [0.0, 0.5], 100, 80, transform).is_err());
+        }
     }
 }

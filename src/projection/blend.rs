@@ -31,6 +31,9 @@ pub struct Participant {
     /// simply goes unshown. So unplugging one projector never alters what
     /// the others display, and plugging it back in needs no re-authoring.
     pub connected: bool,
+    /// Effective output transform when the output's scale is 1.0 or unset,
+    /// else `Normal`.
+    pub transform: crate::model::Transform,
 }
 
 /// Everything one overlay process needs. Serialized to the `suede blend`
@@ -105,6 +108,10 @@ pub struct SliceSpec {
     pub source_rect: Option<[f64; 4]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub geometry: Option<super::warp::Geometry>,
+    /// Output transform the slicer may own (see the slicer's
+    /// `owns_transform`); `Normal` when the compositor keeps it (scale != 1).
+    #[serde(default, skip_serializing_if = "crate::model::Transform::is_normal")]
+    pub transform: crate::model::Transform,
 }
 
 /// Everything the slicer process needs: capture this, cut it up like that.
@@ -348,11 +355,12 @@ pub fn canvas_plan_with_warp_activation(
         .iter()
         .zip(participants)
         .filter(|(_, participant)| participant.connected)
-        .map(|((name, rect), _)| SliceSpec {
+        .map(|((name, rect), participant)| SliceSpec {
             source_rect: None,
             geometry: None,
             output: name.clone(),
             slice: *rect,
+            transform: participant.transform,
         })
         .collect();
 
@@ -737,6 +745,7 @@ mod tests {
                 height,
             },
             connected: true,
+            transform: crate::model::Transform::Normal,
         }
     }
 
@@ -1479,6 +1488,7 @@ mod tests {
             slices: vec![SliceSpec {
                 source_rect: None,
                 geometry: None,
+                transform: crate::model::Transform::Normal,
                 output: "DP-3".into(),
                 slice: Rect {
                     x: 0,
@@ -1615,5 +1625,29 @@ mod tests {
             dynamic_shade(pack_dynamic_shape(1.0, 0.0, 1), 255, 0.2, 4),
             0
         );
+    }
+
+    #[test]
+    fn slice_spec_transform_is_omitted_when_normal_and_defaults_on_input() {
+        let mut spec = SliceSpec {
+            output: "A".into(),
+            slice: Rect {
+                x: 0,
+                y: 0,
+                width: 10,
+                height: 10,
+            },
+            source_rect: None,
+            geometry: None,
+            transform: crate::model::Transform::Normal,
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("transform"), "{json}");
+        let back: SliceSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.transform, crate::model::Transform::Normal);
+        spec.transform = crate::model::Transform::Flipped90;
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"transform\":\"flipped-90\""), "{json}");
+        assert_eq!(serde_json::from_str::<SliceSpec>(&json).unwrap(), spec);
     }
 }

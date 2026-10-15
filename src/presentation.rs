@@ -1167,6 +1167,7 @@ mod tests {
                     },
                     source_rect: None,
                     geometry: None,
+                    transform: crate::model::Transform::Normal,
                 })
                 .collect(),
         }

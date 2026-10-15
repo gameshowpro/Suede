@@ -1428,6 +1428,11 @@ fn slicer_topology_fingerprint(spec: &SlicerSpec) -> u64 {
         .hash(&mut hasher);
     for slice in &spec.slices {
         slice.output.hash(&mut hasher);
+        // The transform decides each presenter's buffer orientation and its
+        // `set_buffer_transform`, both fixed for the child's lifetime; a
+        // 180 <-> normal change keeps the surface size, so without this the
+        // child would be sent a live update it can only reject.
+        slice.transform.as_sway().hash(&mut hasher);
         if spec.layout.is_some() && spec.pattern.is_none() {
             slice.slice.width.hash(&mut hasher);
             slice.slice.height.hash(&mut hasher);
@@ -1898,6 +1903,7 @@ mod tests {
                 height: 100,
             },
             geometry: None,
+            transform: crate::model::Transform::Normal,
         });
         let gpu_fingerprint = slicer_fingerprint(&gpu, true);
         gpu.gamma = 2.4;
@@ -1911,6 +1917,12 @@ mod tests {
         gpu.slices[0].slice.x = 1;
         assert_ne!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
         gpu.slices[0].slice.x = 0;
+        // Same surface size, different buffer orientation: a restart, not a
+        // live update the child would reject as a topology change.
+        gpu.slices[0].transform = crate::model::Transform::Rotate180;
+        assert_ne!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
+        gpu.slices[0].transform = crate::model::Transform::Normal;
+        assert_eq!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
         gpu.free_run = true;
         assert_ne!(slicer_fingerprint(&gpu, true), gpu_fingerprint);
         assert!(slicer_requests_live_candidate(&gpu));
@@ -1950,6 +1962,7 @@ mod tests {
                 },
                 source_rect: Some(source_rect),
                 geometry: None,
+                transform: crate::model::Transform::Normal,
             });
             let participant_source = CanvasRect {
                 x: 0.0,
@@ -2330,6 +2343,7 @@ mod tests {
             },
             source_rect: Some([0.0, 0.0, 100.0, 100.0]),
             geometry: None,
+            transform: crate::model::Transform::Normal,
         });
         let source = crate::model::CanvasRect {
             x: 0.0,
@@ -2346,11 +2360,14 @@ mod tests {
                 raster_footprint: source,
             }],
         });
-        assert!(
-            super::super::warp_update::sampling_warp(&spec, &spec.slices[0], (100, 100))
-                .unwrap()
-                .is_none()
-        );
+        assert!(super::super::warp_update::sampling_warp(
+            &spec,
+            &spec.slices[0],
+            (100, 100),
+            crate::model::Transform::Normal
+        )
+        .unwrap()
+        .is_none());
         manager.mark_control_requested("public-layout", 0, 0, &spec);
         assert_eq!(
             manager.snapshot.projection_control().requested_mode,

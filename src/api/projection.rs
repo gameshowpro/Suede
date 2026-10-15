@@ -157,22 +157,19 @@ pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayou
                 output.r#match.key()
             ));
         }
-        if output
+        // Positions are compositor (logical) coordinates, so the raster
+        // each output covers is the as-viewed one: swapped for 90/270.
+        let (logical_width, logical_height) = output
             .effective_transform()
-            .is_some_and(|transform| transform != crate::model::Transform::Normal)
-        {
-            return Err(format!(
-                "output {} uses a transform unsupported by warp conversion",
-                output.r#match.key()
-            ));
-        }
+            .unwrap_or_default()
+            .physical_size((width, height));
         let x = i64::from(position.x);
         let y = i64::from(position.y);
         let right = x
-            .checked_add(i64::from(mode.width))
+            .checked_add(i64::from(logical_width))
             .ok_or_else(|| format!("output {} has an overflowing x bound", output.r#match.key()))?;
         let bottom = y
-            .checked_add(i64::from(mode.height))
+            .checked_add(i64::from(logical_height))
             .ok_or_else(|| format!("output {} has an overflowing y bound", output.r#match.key()))?;
         min_x = min_x.min(x);
         min_y = min_y.min(y);
@@ -204,11 +201,15 @@ pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayou
         let position = output
             .position
             .ok_or_else(|| "missing position".to_string())?;
+        let (logical_width, logical_height) = output
+            .effective_transform()
+            .unwrap_or_default()
+            .physical_size((mode.width as u32, mode.height as u32));
         Ok(CanvasRect {
             x: (i64::from(position.x) - min_x) as f64 / width as f64,
             y: (i64::from(position.y) - min_y) as f64 / width as f64,
-            width: f64::from(mode.width) / width as f64,
-            height: f64::from(mode.height) / width as f64,
+            width: f64::from(logical_width) / width as f64,
+            height: f64::from(logical_height) / width as f64,
         })
     };
 
@@ -497,21 +498,18 @@ pub fn recommend_for_state(
                     | Transform::Flipped270
             )
         );
-        let (width, height) = if requested_mode == ProjectionMode::Simple && rotated {
+        let (width, height) = if rotated {
             (height, width)
         } else {
             (width, height)
         };
         if requested_mode == ProjectionMode::Warp
-            && (output
+            && output
                 .effective_scale()
                 .is_some_and(|scale| (scale - 1.0).abs() > f64::EPSILON)
-                || output
-                    .effective_transform()
-                    .is_some_and(|transform| transform != Transform::Normal))
         {
             return Err(format!(
-                "output {} uses a scale or transform unsupported by Warp recommendation",
+                "output {} uses a scale unsupported by Warp recommendation",
                 output.r#match.key()
             ));
         }
@@ -1094,10 +1092,30 @@ mod tests {
         let rotated_without_scale = recommend_for_state(&rotated_state, 0).unwrap();
         assert_eq!(rotated_rec.ideal_width, rotated_without_scale.ideal_width);
 
+        // Converting from positions lays the rotated output out at its
+        // logical (as-viewed) 80x160 rect, as sway does, so the converted
+        // canvas is portrait: it matches an explicit full-canvas portrait
+        // geometry, not the landscape slice above.
         let mut converted_rotated = rotated_state.clone();
         converted_rotated.outputs[0].geometry = None;
         let converted = recommend_for_state(&converted_rotated, 0).unwrap();
-        assert_eq!(rotated_without_scale.ideal_width, converted.ideal_width);
+        let mut explicit_portrait = rotated_state.clone();
+        explicit_portrait.projection.as_mut().unwrap().canvas = Some(CanvasConfig {
+            aspect: 0.5,
+            render_width: 80,
+        });
+        let portrait_slice = CanvasRect {
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 2.0,
+        };
+        let geometry = explicit_portrait.outputs[0].geometry.as_mut().unwrap();
+        geometry.slice = portrait_slice;
+        geometry.raster_footprint = portrait_slice;
+        let portrait = recommend_for_state(&explicit_portrait, 0).unwrap();
+        assert_eq!(portrait.ideal_width, converted.ideal_width);
+        assert_ne!(rotated_without_scale.ideal_width, converted.ideal_width);
     }
 
     #[test]

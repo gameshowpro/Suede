@@ -17,9 +17,10 @@
 //!   batch, so the canvas and windows behave exactly as before.
 //!
 //! What a physical output can be told is what direct presentation can
-//! honor: enable, disable, position, and a mode the display advertises.
-//! Anything else that would change the picture — a scale other than 1, a
-//! transform, adaptive sync, a custom mode — is refused as a failed command,
+//! honor: enable, disable, position, a transform (the slicer rotates the
+//! raster itself), and a mode the display advertises. Anything else that
+//! would change the picture — a scale other than 1, adaptive sync, a custom
+//! mode — is refused as a failed command,
 //! which the reconciler reports as a `command_failed` divergence. Background,
 //! tearing and render-time settings have no meaning without a compositor on
 //! the output and are accepted as no-ops, so an ordinary configuration does
@@ -172,10 +173,12 @@ impl DirectOutputs {
                 Ok(scale) if (scale - 1.0).abs() < 1e-9 => command.to_string(),
                 _ => return refuse("only scale 1 is supported for a directly presented output"),
             },
-            ("transform", [value]) if *value == "normal" => command.to_string(),
-            ("transform", _) => {
-                return refuse("transforms are not supported for a directly presented output")
+            // The slicer composes the rotation into its own mapping, so the
+            // transform is only recorded here for the output to report.
+            ("transform", [value, ..]) if crate::model::Transform::from_sway(value).is_some() => {
+                command.to_string()
             }
+            ("transform", _) => return refuse("unknown transform for a directly presented output"),
             ("adaptive_sync", [value, ..])
                 if matches!(*value, "off" | "disable" | "disabled" | "no" | "false") =>
             {
@@ -428,8 +431,6 @@ mod tests {
         for command in [
             "output DP-1 scale 2",
             "output DP-1 scale 1.5",
-            "output DP-1 transform 90",
-            "output DP-1 transform flipped-180",
             "output DP-1 adaptive_sync on",
             "output DP-1 mode --custom 1920x1080@60Hz",
             "output DP-1 mode 1280x720@60Hz",
@@ -467,6 +468,21 @@ mod tests {
         // `mode WxH` with no rate takes the fastest advertised.
         let mode = output(&client, "DP-1").await.current_mode.unwrap();
         assert_eq!(mode.refresh_hz, 60.0);
+    }
+
+    #[tokio::test]
+    async fn transforms_are_accepted_and_reported() {
+        let inner = headless();
+        let client = client(&inner);
+        for transform in ["90", "flipped-180", "normal"] {
+            client
+                .run_command(&format!("output DP-1 transform {transform}"))
+                .await
+                .expect(transform);
+            let observed = output(&client, "DP-1").await.transform;
+            assert_eq!(observed.as_deref(), Some(transform));
+        }
+        assert!(inner.commands().is_empty(), "nothing forwarded");
     }
 
     #[tokio::test]

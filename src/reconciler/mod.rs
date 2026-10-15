@@ -1007,6 +1007,12 @@ impl Reconciler {
                         name: output.name.clone(),
                         rect: output.rect,
                         connected: true,
+                        transform: desired
+                            .outputs
+                            .iter()
+                            .find(|config| config.r#match.matches(output))
+                            .map(|config| config.slicer_transform())
+                            .unwrap_or_default(),
                     })
                     .collect();
                 overlay = overlay_specs(&participants, &projection);
@@ -1273,6 +1279,16 @@ impl Reconciler {
             let (Some((width, height)), Some(position)) = (size, position) else {
                 continue;
             };
+            // The mode is the physical raster; sway configures the slicer's
+            // surface at the logical one, which a 90/270 output swaps.
+            let (width, height) = if config
+                .effective_transform()
+                .is_some_and(crate::model::Transform::swaps_axes)
+            {
+                (height, width)
+            } else {
+                (width, height)
+            };
             participants.push(Participant {
                 // Absent outputs are named by their match key, which never
                 // collides with a connector name sway would report.
@@ -1286,6 +1302,7 @@ impl Reconciler {
                     height,
                 },
                 connected: matched.is_some(),
+                transform: config.slicer_transform(),
             });
         }
         crate::projection::canvas_plan_with_warp_activation(
