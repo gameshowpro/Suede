@@ -13,12 +13,32 @@
 # committed to git: CI rebuilds the whole repository into the Pages artifact
 # on every docs deploy.
 #
+# Only attested releases are mirrored. A release is kept when it is neither a
+# draft nor a prerelease, has a package for every architecture below, and
+# every one of those packages has a build provenance attestation that
+# `gh attestation verify` accepts as made by this repository's
+# .github/workflows/ci.yml from refs/heads/main. The repository signature only
+# says CI built the index; this is what ties each package in it to a CI build
+# of main, so a release asset replaced by hand after CI built it is refused
+# rather than signed into every appliance's trust.
+#
+# The filter takes the place of a version floor. Releases from before CI
+# recorded attestations have none, so the first release that does is the
+# oldest one served, without a hardcoded version that would need maintaining.
+# A package with no attestation at all (the API answers 404) skips its whole
+# release with a warning. Anything else, a lookup that fails for another
+# reason or an attestation that exists but does not verify, stops the build:
+# treating a GitHub outage as "no attestation" would quietly empty the
+# repository, and an attestation that fails to verify means something is
+# wrong, not missing.
+#
 # Environment:
 #   APT_SIGNING_KEY    ASCII-armored private key, no passphrase. Required.
 #                      There is deliberately no unsigned mode: every appliance
 #                      that trusts this repository would accept whatever it
 #                      served, so without the key the script refuses to run.
-#   APT_KEEP_RELEASES  How many releases to mirror, newest first. Default 20.
+#   APT_KEEP_RELEASES  How many attested releases to mirror, newest first.
+#                      Default 20. Releases the filter skips do not count.
 #                      Every mirrored package is two .deb files in the Pages
 #                      artifact, which has a size limit; older releases stay on
 #                      the GitHub releases page.
@@ -27,7 +47,13 @@
 #   GH_TOKEN           Token for `gh`, as `gh` expects it.
 #   SKIP_DOWNLOAD      Set to 1 to skip GitHub entirely and index whatever is
 #                      already in OUTDIR/pool/main/s/suede/. For testing the
-#                      repository layout and signing without a token.
+#                      repository layout and signing without a token. It
+#                      bypasses the attestation filter: whatever is in the
+#                      pool is indexed and signed, so never use it in CI.
+#   VERIFY_ONLY        Test hook. Set to 1 and pass TAG FILE instead of OUTDIR
+#                      to run only the provenance check on one file and exit:
+#                      0 if it verifies, 3 if it has no attestation, and an
+#                      error (1) for anything else. Needs `gh`, nothing more.
 #
 # The signing key is made once, by a maintainer, and kept only in the
 # repository secret:
@@ -49,13 +75,14 @@ usage() {
   sed -n 's/^#   Usage: //p' "$0" >&2
   exit 2
 }
-[[ $# -eq 1 ]] || usage
-OUTDIR="$1"
 
 KEEP="${APT_KEEP_RELEASES:-20}"
 REPO="${GH_REPO:-gameshowpro/Suede}"
 ARCHES=(amd64 arm64)
 POOL="pool/main/s/suede"
+# Also the most releases examined, so a long unattested history ends the walk
+# instead of downloading every release ever made.
+LIST_LIMIT=200
 
 # In a workflow log, warnings become annotations rather than scrolling past.
 warn() {
@@ -73,6 +100,53 @@ die() {
   fi
   exit 1
 }
+
+# verify_provenance TAG FILE
+# Returns 0 when FILE's attestation verifies, and 1, with a warning, when it
+# has none. Any other outcome stops the build. Written with explicit checks
+# because callers use it as a condition, where `set -e` does not apply.
+verify_provenance() {
+  local tag="$1" file="$2" name digest err
+  name=$(basename "$file")
+  digest=$(sha256sum "$file" | cut -d' ' -f1)
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "$tag: could not hash $name"
+  # `gh attestation verify` exits non-zero both when there is no attestation
+  # and when it cannot reach GitHub. The REST endpoint tells the two apart: a
+  # 404 means none exists for this digest in this repository.
+  if ! err=$(gh api "repos/$REPO/attestations/sha256:$digest" --silent 2>&1 >/dev/null); then
+    if grep -q '(HTTP 404)' <<<"$err"; then
+      warn "$tag: $name has no build provenance attestation; skipping this release"
+      return 1
+    fi
+    printf '%s\n' "$err" >&2
+    die "$tag: could not look up the attestation of $name"
+  fi
+  # The signer workflow and the ref pin it to a CI build of main. --repo alone
+  # would also accept a build from a preview branch, which never went through
+  # review.
+  if ! gh attestation verify "$file" --repo "$REPO" \
+      --signer-workflow "$REPO/.github/workflows/ci.yml" \
+      --source-ref refs/heads/main >&2; then
+    die "$tag: $name has an attestation, but it does not verify as built by $REPO's ci.yml from refs/heads/main"
+  fi
+  return 0
+}
+
+if [[ "${VERIFY_ONLY:-}" == "1" ]]; then
+  [[ $# -eq 2 ]] || die "VERIFY_ONLY=1 takes TAG FILE"
+  [[ -f "$2" ]] || die "$2 is not a file"
+  for tool in gh sha256sum; do
+    command -v "$tool" >/dev/null || die "$tool is not installed"
+  done
+  # Exit 3 rather than 1 for "no attestation", so a test can tell it from
+  # die's exit status.
+  verify_provenance "$1" "$2" || exit 3
+  echo "$1: $(basename "$2") verifies"
+  exit 0
+fi
+
+[[ $# -eq 1 ]] || usage
+OUTDIR="$1"
 
 [[ "$KEEP" =~ ^[1-9][0-9]*$ ]] || die "APT_KEEP_RELEASES must be a positive integer, not '$KEEP'"
 [[ -n "${APT_SIGNING_KEY:-}" ]] || die "APT_SIGNING_KEY is not set; refusing to build an unsigned repository"
@@ -140,21 +214,26 @@ else
 
   echo "==> Listing releases of $REPO"
   # Drafts are excluded: they are not public, so their assets would be the
-  # only copy anyone outside the project could get. Tags are sorted by
-  # version rather than by date, so re-publishing an old release cannot push
-  # a newer one out of the window.
+  # only copy anyone outside the project could get. Prereleases are excluded
+  # too: apt would offer one as an ordinary upgrade to every appliance on the
+  # stable suite. Tags are sorted by version rather than by date, so
+  # re-publishing an old release cannot push a newer one out of the window.
+  # They are walked newest first until $KEEP have been kept, so releases the
+  # attestation filter skips do not use up the window.
   mapfile -t tags < <(
-    gh release list --repo "$REPO" --limit 200 \
+    gh release list --repo "$REPO" --limit "$LIST_LIMIT" \
       --json tagName,isDraft,isPrerelease \
-      --jq '.[] | select(.isDraft | not) | .tagName' \
-      | grep -E '^v[0-9]' | sort -V | tail -n "$KEEP"
+      --jq '.[] | select((.isDraft or .isPrerelease) | not) | .tagName' \
+      | grep -E '^v[0-9]' | sort -V -r
   )
   [[ ${#tags[@]} -gt 0 ]] || die "no releases of $REPO to mirror"
-  echo "    newest ${#tags[@]} (of at most $KEEP): ${tags[*]}"
+  echo "    ${#tags[@]} published releases; keeping the newest $KEEP that are attested"
 
   staging="$(mktemp -d)"
   trap 'cleanup; rm -rf "$staging"' EXIT
+  kept=()
   for tag in "${tags[@]}"; do
+    [[ ${#kept[@]} -lt $KEEP ]] || break
     rm -rf "$staging/debs"
     mkdir "$staging/debs"
     if ! gh release download "$tag" --repo "$REPO" --dir "$staging/debs" \
@@ -169,12 +248,34 @@ else
       cat "$staging/err" >&2
       die "could not download the packages of $tag"
     fi
+    # A release missing an architecture would leave those machines on an
+    # older version while the rest move on, with nothing telling them why.
+    missing=""
+    for arch in "${ARCHES[@]}"; do
+      compgen -G "$staging/debs/suede_*_${arch}.deb" >/dev/null || missing+=" $arch"
+    done
+    if [[ -n "$missing" ]]; then
+      warn "$tag has no package for${missing}; skipping it"
+      continue
+    fi
+    # Every file is checked before any of them reaches the pool, so a release
+    # is mirrored whole or not at all.
+    attested=1
+    for deb in "$staging/debs"/*.deb; do
+      if ! verify_provenance "$tag" "$deb"; then
+        attested=0
+        break
+      fi
+    done
+    [[ "$attested" -eq 1 ]] || continue
     for deb in "$staging/debs"/*.deb; do
       [[ -e "$deb" ]] || continue
       mv "$deb" "$OUTDIR/$POOL/"
     done
+    kept+=("$tag")
     echo "    $tag"
   done
+  echo "    kept ${#kept[@]} of at most $KEEP"
 fi
 
 # ---------------------------------------------------------------------------
@@ -321,8 +422,9 @@ page=$(cat <<'HTML'
 <main>
 <h1>Suede apt repository</h1>
 <p>Official Suede packages for Debian, Ubuntu and Raspberry Pi OS, on
-<code>amd64</code> and <code>arm64</code>. It carries the newest @KEEP@ releases;
-older ones remain on the
+<code>amd64</code> and <code>arm64</code>. It carries the newest @KEEP@ attested
+releases, those whose packages carry a build provenance attestation from the
+project's CI; older ones remain on the
 <a href="https://github.com/@REPO@/releases">GitHub releases page</a>.</p>
 
 <h2>Add it to a machine</h2>

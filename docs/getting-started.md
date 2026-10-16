@@ -51,7 +51,7 @@
     sudo apt install suede
     ```
 
-    Later upgrades are `sudo apt update && sudo apt install suede`. The repository carries the newest 20 releases for `amd64` and `arm64`; older ones stay on the [releases page](https://github.com/gameshowpro/Suede/releases).
+    Later upgrades are `sudo apt update && sudo apt install suede`. The repository holds the newest 20 releases that carry a build provenance attestation, for `amd64` and `arm64`; older releases stay on the [releases page](https://github.com/gameshowpro/Suede/releases).
 
     Suede never upgrades itself automatically. The package blacklists itself from `unattended-upgrades`, because an upgrade restarts the daemon and that blanks the displays. Upgrade between shows, not during them.
 

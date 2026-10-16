@@ -156,7 +156,7 @@ The `build` job records a [build provenance attestation](https://docs.github.com
 gh attestation verify suede_1.2.3_amd64.deb --repo gameshowpro/Suede
 ```
 
-This is a different statement from the apt repository's signature. The repository signature says the package index came from the project's CI; the attestation says which commit a particular file was built from. A cautious integrator wants both.
+This is a different statement from the apt repository's signature. The repository signature says the package index came from the project's CI; the attestation says which commit a particular file was built from. A cautious integrator wants both. The apt repository serves only packages whose attestation verifies against this workflow on `main`, so a release asset replaced after CI built it never reaches an appliance through apt.
 
 ## The apt repository
 
@@ -164,7 +164,7 @@ Appliances install from `https://suede.gameshow.pro/apt/`, which lives inside th
 
 `scripts/build-apt-repo.sh` builds it. In CI the `build-docs` job runs it after `mkdocs build`, writing into `site/apt/`, so the repository ships in the same Pages artifact as the docs. The script:
 
-- downloads the `.deb`s of the newest 20 releases (by tag, in version order) from GitHub Releases, for `amd64` and `arm64`;
+- downloads the `.deb`s of the newest 20 attested releases (by tag, in version order) from GitHub Releases, for `amd64` and `arm64`. Drafts and prereleases are left out. A release is attested when it has a package for both architectures and each package's [build provenance attestation](#provenance) verifies as built by `ci.yml` from `main`. A release whose packages have no attestation, which includes every release before CI started recording them, is skipped with a warning and does not count toward the 20. Any other failure, an attestation that does not verify or a lookup GitHub cannot answer, stops the build rather than quietly dropping releases;
 - generates the `Packages` indexes and a `Release` file with `apt-ftparchive`;
 - signs `Release` with the GPG key in the repository secret `APT_SIGNING_KEY`, producing `Release.gpg` and `InRelease`;
 - publishes the public half of that key.
