@@ -108,6 +108,7 @@ It is idempotent, so re-running it after an upgrade is safe. It will:
 6. Install `sway-session.target` and enable `suede.service`.
 7. Disable and mask competing display managers and compositors.
 8. Open port 9088 in `ufw` or `firewalld`, if one is active. Pass `--no-firewall` to skip this, or `--port N` if you have moved the API.
+9. Ask whether to require an API token, when it has a terminal to ask on. See [Security posture](#security-posture).
 
 Sway is started with direct scanout disabled, because on the default display
 path one application window spans every display and some drivers otherwise
@@ -120,6 +121,20 @@ where the projectors' beams overlap and Suede slices a canvas into them
 instead, pass `--allow-overlaps`, and add `--no-direct-scanout` to have Sway
 composite those slices instead of flipping them. See [Overlapping layouts and
 direct scanout](configuration.md#direct-scanout).
+
+Provisioning asks three questions when it runs at a terminal, and each has exactly one flag that answers it instead. A question is asked only when its own flag is absent, so giving one flag never skips another question. With no terminal and no flag, each question takes its default: nothing about reachability changes and the machine does not reboot.
+
+| Question (default) | Flag |
+|---|---|
+| `Require an API token? [y/N]` (no) | `--token generate`, `--token VALUE` or `--token none` |
+| `Bind Suede to this machine only, for use behind a reverse proxy? [y/N]` (no) | `--local-only yes` or `--local-only no` |
+| `Reboot now to apply everything? [y/N]` (no) | `--reboot yes` or `--reboot no` |
+
+- **Token.** `generate` (the same as answering yes) writes a random token into `~/.config/suede/suede.toml` (owned by the appliance user, mode 600) and prints it once, on the terminal and nowhere else. `VALUE` stores a token you chose and does not echo it. `none` leaves the API open and any existing token alone. Provisioning never replaces a token that is already there without a yes at a terminal, and when one is set the token question is not asked.
+- **Local only.** `yes` binds the API to `127.0.0.1:9088` and skips the firewall rule, for an appliance reached through a [reverse proxy](reverse-proxy.md) or an SSH tunnel. `no` leaves the bind alone, including one that is already on loopback; provisioning says so.
+- **Reboot.** `yes` reboots when it finishes, `no` does not.
+
+The older spellings still work: a bare `--local-only` means `--local-only yes`, and `--no-reboot` means `--reboot no`.
 
 It warns rather than proceeds silently in two cases worth knowing about: if
 something else on the machine already starts Sway — two compositors cannot
@@ -237,9 +252,18 @@ Two things it cannot see, worth ruling out if the command above does not help: a
 
 ## Security posture
 
-Suede is **unauthenticated by default**. The expected deployment is a trusted production LAN, and a web UI served from the same machine would have to hand its credential to every user anyway.
+Suede is **unauthenticated by default**, and listens on every interface. The expected deployment is a trusted production LAN. Pick the row that matches yours:
 
-For less trusted networks, set a bearer token:
+| Your situation | What to do |
+|---|---|
+| A trusted production LAN | Nothing. This is the default |
+| A shared network, with people using the web UI | Put an authenticating [reverse proxy](reverse-proxy.md) in front. People sign in there, and the proxy supplies the token and the HTTPS |
+| Scripts and show control calling the API | Set a bearer token, and have them send `Authorization: Bearer <token>` |
+| Reaching an appliance from outside the site | A VPN, or an SSH tunnel to a loopback-bound appliance (see [Network access](#network-access)). Do not forward the port from the internet |
+
+These combine. The most locked-down shape is a loopback bind, a token, and a reverse proxy that authenticates people and adds the token for them; machines send the token themselves. See [Behind a reverse proxy](reverse-proxy.md).
+
+Set a token with `provision.sh --token generate`, or by hand:
 
 ```toml
 # ~/.config/suede/suede.toml
@@ -248,9 +272,9 @@ token = "a-long-random-string"
 
 or `SUEDE_TOKEN` in the environment. When a token is configured:
 
-- Every endpoint requires `Authorization: Bearer <token>`, except `/healthz` and the loopback-only heartbeat endpoint.
-- **The web UI and the `/docs` page are disabled**, because a page that embedded the token would defeat it. Token mode is for machine-to-machine clients.
+- Every `/api/v1` call requires `Authorization: Bearer <token>`, except `/healthz` and the app-facing routes served on the [local listener](configuration.md#local-listener) (app heartbeats and the capability check), which only answer callers on the appliance itself.
+- The web UI and the `/docs` page are still served, but they embed nothing. A page that held the token would hand it to everyone who opened it. So the UI works only when something in front supplies the token, as the reverse proxy does; opened directly, it says the appliance requires an API token.
 
 With or without a token, Suede refuses state-changing requests that a browser sends for a page on another site, so a hostile web page opened on the same network cannot drive the appliance. Clients that send no `Origin` header (curl, scripts, other servers) and app heartbeats are not affected. To let a trusted page on another origin send them, list it in `allowed_origins`. To answer only to known host names, a defense against DNS rebinding, set `allowed_hosts`. See [Cross-site request protection](configuration.md#cross-site).
 
-There is no TLS. Front Suede with a reverse proxy where transport security matters.
+Suede has no TLS and no user accounts of its own; the reverse proxy provides both.

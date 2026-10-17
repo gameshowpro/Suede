@@ -54,6 +54,7 @@ nav:
   - Getting started: getting-started.md
   - Configuration: configuration.md
   - How it works: how-it-works.md
+  - Behind a reverse proxy: reverse-proxy.md
   - Multiple clients: multi-user.md
   - Unreal Engine: unreal-engine.md
   # A static file, not a page: Scalar is built to own a viewport, so the

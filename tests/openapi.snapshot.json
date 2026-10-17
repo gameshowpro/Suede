@@ -5204,7 +5204,7 @@
             "type": "integer"
           },
           "webUiEnabled": {
-            "description": "True when the reference web UI is being served.",
+            "description": "Always `true` since 0.2.x, when the web UI began to be served in token\nmode as well. Kept so that older clients that read it keep working.",
             "type": "boolean"
           }
         },

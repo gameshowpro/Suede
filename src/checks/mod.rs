@@ -1571,7 +1571,13 @@ impl CheckRunner {
             "API reachable from the network",
             status,
             detail,
-            Some("getting-started/#network-access"),
+            // A loopback bind is the proxy (or tunnel) shape; the proxy page
+            // covers it. A routable bind is about getting through a firewall.
+            Some(if bind.ip().is_loopback() {
+                "reverse-proxy/#behind-a-reverse-proxy"
+            } else {
+                "getting-started/#network-access"
+            }),
         )
     }
 

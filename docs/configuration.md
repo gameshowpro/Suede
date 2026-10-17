@@ -44,7 +44,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 |---|---|---|---|
 | `bind` | `SUEDE_BIND` | `0.0.0.0:9088` | Address the HTTP server binds to |
 | `local_bind` | `SUEDE_LOCAL_BIND` | `127.0.0.1:` one port above `bind` (`9089`) | Loopback address of the local listener, which answers only app heartbeats and the capability check — see [Local listener](#local-listener) |
-| `token` | `SUEDE_TOKEN` | unset | Bearer token; setting it disables the web UI |
+| `token` | `SUEDE_TOKEN` | unset | Bearer token required on every `/api/v1` call. The web UI page is still served but holds no token, so people reach it through a proxy that adds one — see [Behind a reverse proxy](reverse-proxy.md) |
 | `state_dir` | `SUEDE_STATE_DIR` | `$XDG_STATE_HOME/suede` | Where desired state is persisted |
 | `docs_base_url` | `SUEDE_DOCS_BASE_URL` | `https://suede.gameshow.pro/` | Base for health-check documentation links |
 | `power` | `SUEDE_POWER` | `[]` (none) | Host power operations this appliance may perform — see [Host power control](#host-power) |

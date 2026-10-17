@@ -206,7 +206,8 @@ pub async fn get_system(State(state): State<ApiState>) -> Json<SystemInfo> {
         uptime_seconds: state.started_at.elapsed().as_secs(),
         packages: state.checks.package_versions().await,
         supports_tearing: version.as_ref().is_some_and(|v| v.supports_tearing()),
-        web_ui_enabled: !state.bootstrap.auth_enabled(),
+        // Always true since 0.2.x: the UI is served in token mode too.
+        web_ui_enabled: true,
         power_verbs: state.bootstrap.power.clone(),
         // Resolved at startup against the session the daemon found; the
         // file's own answer only where nothing resolved it (tests, mocks).

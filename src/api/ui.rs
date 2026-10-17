@@ -247,6 +247,7 @@ mod tests {
     #[test]
     fn the_page_explains_a_401_and_points_at_the_proxy_docs() {
         assert!(INDEX.contains("This appliance requires an API token"));
+        assert!(INDEX.contains(r#"data-docs-path="reverse-proxy/#behind-a-reverse-proxy""#));
         assert!(INDEX.contains("response.status === 401"));
     }
 

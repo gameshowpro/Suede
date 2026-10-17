@@ -1,0 +1,95 @@
+# Caddy in front of a Suede appliance: people sign in at the proxy, machines
+# bring the API token, and Suede only ever sees a token.
+#
+# Read docs/reverse-proxy.md (https://suede.gameshow.pro/reverse-proxy/) first.
+# Suede must be bound to loopback for this to mean anything:
+#
+#   # ~/.config/suede/suede.toml
+#   bind  = "127.0.0.1:9088"
+#   token = "<a long random string>"
+#
+# or provision with `sudo /usr/share/suede/provision.sh --local-only --token generate`.
+#
+# Caddy needs the same token in its environment so it can add it for people
+# who signed in. With the packaged systemd unit, put this in an override
+# (`systemctl edit caddy`), readable by root only:
+#
+#   [Service]
+#   Environment=SUEDE_TOKEN=<the same string as token above>
+#
+# Validate with:  caddy validate --adapter caddyfile --config Caddyfile
+
+# The name people type. Overridable with SUEDE_HOST in Caddy's environment.
+{$SUEDE_HOST:wall-3.example.com} {
+	# A certificate from Caddy's own CA. Browsers warn until they trust that
+	# CA (`caddy trust` on a machine you control, or install
+	# /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt
+	# elsewhere). It is the right start on a LAN with no public name.
+	#
+	# With a public DNS name that points here and ports 80 and 443 reachable,
+	# delete this line: Caddy then gets a trusted certificate from Let's
+	# Encrypt on its own. For a name only your DNS provider can validate, use
+	# the ACME DNS challenge instead:
+	#   tls {
+	#       dns <provider> <credentials>
+	#   }
+	tls internal
+
+	# The listener for apps and the capability check is not for people. Suede
+	# already answers 404 for these on a loopback bind; refusing them here
+	# keeps that true if someone later changes `bind`.
+	@app_only path /capability-check/* /api/v1/capability-check/*/result /api/v1/apps/*/heartbeat
+	handle @app_only {
+		respond "Not served through the proxy" 404
+	}
+
+	# Compress everything except the event stream, which must reach the browser
+	# as it is written. Compression buffers, and a buffered stream looks like
+	# an appliance that has stopped updating.
+	@compressible not path /api/v1/events
+	encode @compressible zstd gzip
+
+	# A request that already carries a bearer token is a machine (a show
+	# controller, a script). Pass it through untouched; Suede checks the token
+	# itself, so this lets in nothing that a wrong token would not also be
+	# refused by Suede. Only "Bearer ..." qualifies: the Basic header a browser
+	# sends after signing in must not take this path.
+	#
+	# This is safe only because Suede requires a token. Never use this file
+	# with a Suede that has no `token` set: anyone could add any Bearer header,
+	# skip the sign-in below, and reach an API that checks nothing.
+	@machine header Authorization "Bearer *"
+	handle @machine {
+		reverse_proxy 127.0.0.1:9088 {
+			flush_interval -1
+		}
+	}
+
+	# Everyone else signs in here first. Only a request that got past
+	# basic_auth reaches the reverse_proxy below, and that is the only place
+	# the token is added. header_up replaces the browser's Basic header, so
+	# Suede never sees the password.
+	handle {
+		basic_auth {
+			# User, then the output of `caddy hash-password`. The placeholder
+			# below is deliberately not a hash: no password matches it, so every
+			# sign-in is refused until you replace it. A working example hash
+			# would be a working password on any machine where it was left in.
+			# Add one line per person.
+			operator REPLACE_WITH_THE_OUTPUT_OF_caddy_hash-password
+		}
+		# To sign people in with a single sign-on provider instead, replace
+		# basic_auth with a forward_auth block, for example for Authelia:
+		#   forward_auth 127.0.0.1:9091 {
+		#       uri /api/authz/forward-auth
+		#       copy_headers Remote-User Remote-Groups
+		#   }
+		# Everything after it is unchanged.
+
+		reverse_proxy 127.0.0.1:9088 {
+			header_up Authorization "Bearer {env.SUEDE_TOKEN}"
+			# Send each event to the browser the moment Suede writes it.
+			flush_interval -1
+		}
+	}
+}

@@ -219,7 +219,7 @@ Two kinds of configuration exist, and the split is a hard rule: anything that mu
 # $XDG_CONFIG_HOME/suede/suede.toml — bootstrap settings, read once at startup
 bind = "0.0.0.0:9088"        # SUEDE_BIND
 # local_bind = "127.0.0.1:9089"  # SUEDE_LOCAL_BIND — loopback listener for heartbeats and the capability check
-# token = "…"                # SUEDE_TOKEN — enables bearer auth and disables the web UI
+# token = "…"                # SUEDE_TOKEN — requires a bearer token on every /api/v1 call
 # state_dir = "…"            # SUEDE_STATE_DIR — default $XDG_STATE_HOME/suede
 docs_base_url = "https://suede.gameshow.pro/"   # base for health-check docsUrl links
 ```
@@ -287,10 +287,10 @@ Suede depends on an environment it does not own (Sway session, browsers, PipeWir
 
 - Bind address is configurable; default `0.0.0.0:9088` (remote management is the primary use case).
 - **Unauthenticated by default.** The expected deployment is a trusted production LAN, and any same-machine web UI would necessarily expose a shared credential to its users anyway (visible in request headers), so a token is not the default posture.
-- **Optional static bearer token** (`Authorization: Bearer …`), set via config file or environment variable, for deployments on less-trusted networks. When a token is configured: it is required on every endpoint except `/healthz` and `/apps/{id}/heartbeat`, and **the reference web UI is disabled** — serving a UI that embeds the token would defeat it. Token mode is for machine-to-machine API clients that hold the credential properly.
+- **Optional static bearer token** (`Authorization: Bearer …`), set via config file or environment variable, for deployments on less-trusted networks. When a token is configured: it is required on every `/api/v1` call except the app-facing routes on the local listener. The reference web UI page and `/docs` are still served, but they embed no token, so they work only where something in front supplies one: an authenticating reverse proxy that adds the token for people who signed in (see [Behind a reverse proxy](reverse-proxy.md)). Machines hold the token themselves.
 - `/apps/{id}/heartbeat` only answers loopback callers and never requires the token (see [App watchdog](#app-watchdog-heartbeats)). It and the capability check are served on a separate loopback-only local listener, so that a reverse proxy on the same machine cannot make every request look local.
 - Browser requests that change state and come from a page on another site are refused (`allowed_origins`, `allowed_hosts`; see [Cross-site request protection](configuration.md#cross-site)).
-- No TLS: front with a reverse proxy (Caddy, nginx) where transport security is required.
+- No TLS: front with a reverse proxy where transport security or sign-in for people is required. The documented shape is an authenticating proxy for people and the token for machines, with the proxy adding the token; see [Behind a reverse proxy](reverse-proxy.md).
 - `/sway/command` passthrough and `exec`-kind launchers both allow arbitrary process execution as the session user, at the same trust level as the rest of the API. `/sway/command` is always available and is not a privilege boundary: a client that can write configuration can already define an `exec` app that runs any program, so a flag gating only the passthrough endpoint (`allowRawSwayCommands`, retired) protected against nothing a hostile caller could not already do another way.
 - `/system/power` is bootstrap-gated (`power` in `suede.toml`, or `SUEDE_POWER`) rather than API-gated, precisely because it needs to withstand a caller who can write desired state — see [Host power control](configuration.md#host-power). Like the raw-command passthrough, it is not a boundary against a network attacker; that boundary is still the bearer token.
 
@@ -455,8 +455,8 @@ The build is split into phases designed to be implemented **strictly in order**;
 
 ### Phase 7 — Reference web UI
 
-**Scope:** the UI described in [Reference web UI](#reference-web-ui), built in `ui/`, embedded via `rust-embed`, served at `/`; disabled (404 + log line) when a token is configured.
-**Acceptance:** every API endpoint is exercisable through the UI; live SSE updates reflect a display hotplug without refresh; the binary builds with embedded assets in CI; token mode serves no UI bytes.
+**Scope:** the UI described in [Reference web UI](#reference-web-ui), built in `ui/`, embedded via `rust-embed`, served at `/`, in token mode too (the page embeds no token; a proxy supplies it).
+**Acceptance:** every API endpoint is exercisable through the UI; live SSE updates reflect a display hotplug without refresh; the binary builds with embedded assets in CI; in token mode the page is served but every API call needs the token.
 
 ### Phase 8 — Packaging and release
 
@@ -481,7 +481,7 @@ All ten phases are implemented. Verification is 231 unit and integration tests p
 | 4 — Audio routing | Done | Sink enumeration, `PULSE_SINK` at launch, null sink |
 | 5 — Content watchdog | Done | Loopback-only heartbeat, arms on first beat |
 | 6 — Environment checks and fixes | Done | Seven checks, two remediations, `provision.sh` |
-| 7 — Reference web UI | Done | Single embedded page; disabled in token mode |
+| 7 — Reference web UI | Done | Single embedded page; served in token mode too |
 | 8 — Packaging and release | Done | `cargo-deb`, `cross` matrix, tag-and-release |
 | 9 — Documentation site | Done | MkDocs Material, generated API reference, Pages deploy |
 
@@ -496,7 +496,7 @@ Deferred from v1, and worth deciding before release:
 2. **Audio routing** — in scope for v1, via PipeWire: sink enumeration with change events, stable `node.name` identification, per-app sink selection at launch, and null-routing via a Suede-managed null sink. Re-routing relaunches the app in v1; live migration is on the v2 roadmap. (See [Audio routing](#audio-routing).)
 3. **Managing Sway config fragments** — Suede does not silently prepare or mutate the environment. It ships health checks (`GET /system/checks`) with informative, docs-linked failure messages and explicit user-triggered remediations (`POST /system/checks/{id}/fix`) for what the session user can do: its own unit installation and marker-delimited Sway config patching. Root-level provisioning lives in the shipped idempotent `provision.sh`. (See [Environment preparation and health checks](#environment-preparation-and-health-checks).)
 4. **Content watchdog** — accepted: per-app opt-in heartbeat posted every ~10 s; 25 s of silence kills and relaunches the app with stored parameters. No key: the endpoint is loopback-only and otherwise unauthenticated. (See [App watchdog](#app-watchdog-heartbeats).)
-5. **API authentication** — unauthenticated by default (trusted LAN posture). The optional bearer token is for machine-to-machine deployments; configuring it disables the reference web UI, which could not embed the token without exposing it. (See [Security](#security).)
+5. **API authentication** — unauthenticated by default (trusted LAN posture). The optional bearer token is for machine-to-machine deployments; the reference web UI embeds no token, so with one set it works only behind a proxy that adds it for authenticated people. (See [Security](#security).)
 6. **Packaging and release flow** — `cargo-deb` packages installed via `apt install ./…deb` from GitHub Releases, `Cargo.toml` as the single version source with CI tagging. (See [Packaging, install, and upgrade](#packaging-install-and-upgrade).)
 
 ## v2 roadmap

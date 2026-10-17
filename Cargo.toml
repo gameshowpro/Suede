@@ -155,6 +155,7 @@ assets = [
     # an operator's edits survive.
     ["packaging/51suede-manual-upgrades", "etc/apt/apt.conf.d/51suede-manual-upgrades", "644"],
     ["docs/examples/suede.toml", "usr/share/doc/suede/examples/suede.toml", "644"],
+    ["docs/examples/Caddyfile", "usr/share/doc/suede/examples/Caddyfile", "644"],
     ["docs/examples/four-output-appliance.json", "usr/share/doc/suede/examples/four-output-appliance.json", "644"],
     ["docs/examples/four-output-warp.json", "usr/share/doc/suede/examples/four-output-warp.json", "644"],
     ["docs/examples/four-output-shared-canvas.json", "usr/share/doc/suede/examples/four-output-shared-canvas.json", "644"],

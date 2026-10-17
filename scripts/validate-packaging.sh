@@ -254,6 +254,293 @@ expect_gl_yield "gl_yield commented out"  '# gl_yield = "nothing"' USLEEP
 expect_gl_yield "an unrecognized value"   'gl_yield = "busy"'     unset
 
 echo
+echo "Provisioning writes the API token and loopback bind only when asked"
+# The BOOTSTRAP_FUNCTIONS block is the whole of what --token and --local-only
+# do to suede.toml, plus the reboot decision. It runs here against a scratch home as the current user:
+# no root, no firewall, no packages, nothing outside the temp directory. The
+# no-terminal cases run with stdin from /dev/null; the prompt cases run under
+# a pseudo-terminal so `[[ -t 0 ]]` is true, answering what the case says.
+BOOTSTRAP_FUNCTIONS="$(sed -n '/^# BEGIN BOOTSTRAP_FUNCTIONS$/,/^# END BOOTSTRAP_FUNCTIONS$/p' packaging/provision.sh)"
+[[ -n "$BOOTSTRAP_FUNCTIONS" ]] || bad "could not find the BOOTSTRAP_FUNCTIONS block in provision.sh"
+SEC_HOME=""
+SEC_OUT=""
+SEC_TOML=""
+# $1 = answers for the prompts, space separated ("-" for no terminal at all),
+# $2 = TOKEN_MODE, $3 = LOCAL_ONLY ("", yes or no), $4 = existing suede.toml
+# contents (empty for no file), $5 = REBOOT ("", yes or no). The transcript
+# ends with REBOOT=yes or REBOOT=no, the decision, since nothing here reboots. Sets SEC_HOME (the scratch home), SEC_TOML and SEC_OUT (the
+# transcript) for the caller to inspect; sec_done removes the scratch home.
+run_security() {
+  local answers="$1" mode="$2" local_only="$3" existing="$4" reboot="${5:-}"
+  SEC_HOME="$(mktemp -d)"
+  SEC_TOML="$SEC_HOME/.config/suede/suede.toml"
+  if [[ -n "$existing" ]]; then
+    mkdir -p "$SEC_HOME/.config/suede"
+    printf '%s\n' "$existing" > "$SEC_TOML"
+    chmod 644 "$SEC_TOML"
+  fi
+  export SEC_SCRIPT="$BOOTSTRAP_FUNCTIONS
+SUEDE_TOML='$SEC_TOML'; APPLIANCE_USER=\"\$(id -un)\"; SUEDE_PORT=9088
+TOKEN_MODE='$mode'; LOCAL_ONLY='$local_only'; REBOOT='$reboot'
+configure_security
+if reboot_wanted; then echo REBOOT=yes; else echo REBOOT=no; fi"
+  if [[ "$answers" == "-" ]]; then
+    SEC_OUT="$(bash -c "$SEC_SCRIPT" </dev/null 2>&1 | cat)"
+  else
+    SEC_OUT="$(python3 -I - "$answers" <<'PY'
+import os, pty, select, sys
+answers = sys.argv[1].split()
+script = os.environ["SEC_SCRIPT"]
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp("bash", ["bash", "-c", script])
+out, answered = b"", 0
+while True:
+    ready, _, _ = select.select([fd], [], [], 10)
+    if not ready:
+        out += b"\n[timed out waiting for output]\n"
+        break
+    try:
+        data = os.read(fd, 4096)
+    except OSError:
+        break
+    if not data:
+        break
+    out += data
+    while out.count(b"[y/N]") > answered:
+        reply = answers[answered] if answered < len(answers) else "n"
+        os.write(fd, (reply if reply != "_" else "").encode() + b"\r")
+        answered += 1
+os.waitpid(pid, 0)
+sys.stdout.write(out.decode(errors="replace").replace("\r", ""))
+PY
+    )"
+  fi
+}
+sec_done() { rm -rf "${SEC_HOME:?}"; }
+sec_echo() { sed 's/^/        | /' <<<"$SEC_OUT"; }
+sec_mode() { stat -c %a "$SEC_TOML" 2>/dev/null || echo missing; }
+sec_token() { sed -n -E 's/^token = "(.*)"$/\1/p' "$SEC_TOML" 2>/dev/null; }
+sec_check() {  # $1 = label, $2 = 0 for pass
+  if [[ "$2" -eq 0 ]]; then ok "$1"; else bad "$1"; sec_echo; fi
+}
+OLD_TOKEN='token = "original-token-0123456789"'
+
+# 1. No terminal, no flags: nothing changes, not even a file.
+run_security - "" "" ""
+sec_check "no terminal, no flags: no suede.toml appears" "$([[ ! -e "$SEC_TOML" ]]; echo $?)"
+sec_done
+run_security - "" "" 'bind = "0.0.0.0:9088"'
+sec_check "no terminal, no flags: an existing file is untouched" \
+  "$([[ "$(cat "$SEC_TOML")" == 'bind = "0.0.0.0:9088"' && "$(sec_mode)" == 644 ]]; echo $?)"
+sec_done
+
+# 2. --token generate with no terminal: written, mode 600, never printed.
+run_security - generate "" ""
+TOKEN="$(sec_token)"
+sec_check "--token generate: a token of 40 safe characters is written" \
+  "$([[ "$TOKEN" =~ ^[A-Za-z0-9]{40}$ ]]; echo $?)"
+sec_check "--token generate: the file is mode 600 and owned by the user" \
+  "$([[ "$(sec_mode)" == 600 && "$(stat -c %U "$SEC_TOML")" == "$(id -un)" ]]; echo $?)"
+sec_check "--token generate: without a terminal the token is not printed" \
+  "$([[ -n "$TOKEN" && "$SEC_OUT" != *"$TOKEN"* ]]; echo $?)"
+echo "        provisioning transcript (--token generate, no terminal):"; sec_echo
+sec_done
+
+# 3. --token VALUE: stored as given, mode 600 even over a world-readable
+# file, never echoed; the commented example key is rewritten, not duplicated.
+run_security - "a-chosen-token-0123456789" "" '# token = "change-me"
+bind = "0.0.0.0:9088"'
+sec_check "--token VALUE: stored as given, replacing the commented example" \
+  "$([[ "$(sec_token)" == "a-chosen-token-0123456789" && "$(grep -c '^token' "$SEC_TOML")" == 1 ]]; echo $?)"
+sec_check "--token VALUE: a 644 file becomes 600, other keys survive, nothing echoed" \
+  "$([[ "$(sec_mode)" == 600 && "$(grep -c '^bind = ' "$SEC_TOML")" == 1 && "$SEC_OUT" != *a-chosen-token-0123456789* ]]; echo $?)"
+sec_done
+
+# 4. An existing token is never replaced without a yes at a terminal.
+run_security - generate "" "$OLD_TOKEN"
+sec_check "--token generate over an existing token, no terminal: kept" \
+  "$([[ "$(sec_token)" == "original-token-0123456789" ]]; echo $?)"
+echo "        provisioning transcript (existing token, no terminal):"; sec_echo
+sec_done
+run_security "n n" generate "" "$OLD_TOKEN"
+sec_check "--token generate over an existing token, answered n: kept" \
+  "$([[ "$(sec_token)" == "original-token-0123456789" ]]; echo $?)"
+sec_done
+run_security "n y" generate "" "$OLD_TOKEN"
+TOKEN="$(sec_token)"
+sec_check "--token generate over an existing token, answered y: replaced, shown on the terminal" \
+  "$([[ "$TOKEN" =~ ^[A-Za-z0-9]{40}$ && "$SEC_OUT" == *"$TOKEN"* && "$(sec_mode)" == 600 ]]; echo $?)"
+sec_done
+run_security - none "" "$OLD_TOKEN"
+sec_check "--token none leaves an existing token alone" \
+  "$([[ "$(sec_token)" == "original-token-0123456789" ]]; echo $?)"
+sec_done
+run_security - none "" ""
+sec_check "--token none on a fresh home writes nothing" "$([[ ! -e "$SEC_TOML" ]]; echo $?)"
+sec_done
+
+# 5. The token question, under a pseudo-terminal. The pseudo-terminal answers
+# each "[y/N]" in order; unanswered ones get n. With no --local-only flag the
+# local-only question is asked second.
+run_security y "" "" ""
+TOKEN="$(sec_token)"
+sec_check "token prompt answered y: asks, writes a token, shows it once, mode 600" \
+  "$([[ "$SEC_OUT" == *"Require an API token? [y/N]"* && "$TOKEN" =~ ^[A-Za-z0-9]{40}$ && "$SEC_OUT" == *"$TOKEN"* && "$(sec_mode)" == 600 ]]; echo $?)"
+echo "        provisioning transcript (token prompt answered y):"; sec_echo
+sec_done
+run_security n "" "" ""
+sec_check "token prompt answered n: nothing is written" \
+  "$([[ "$SEC_OUT" == *"Require an API token? [y/N]"* && ! -e "$SEC_TOML" ]]; echo $?)"
+sec_done
+run_security _ "" "" ""
+sec_check "token prompt answered with just Enter: nothing is written" "$([[ ! -e "$SEC_TOML" ]]; echo $?)"
+sec_done
+run_security y "" "" "$OLD_TOKEN"
+sec_check "token prompt with a token already set: not asked, token kept" \
+  "$([[ "$SEC_OUT" != *"Require an API token?"* && "$(sec_token)" == "original-token-0123456789" ]]; echo $?)"
+sec_done
+run_security n "" yes ""
+sec_check "--local-only yes does not suppress the token question (answered n: no token)" \
+  "$([[ "$SEC_OUT" == *"Require an API token? [y/N]"* && "$SEC_OUT" != *"Bind Suede to this machine only"* && -z "$(sec_token)" ]]; echo $?)"
+sec_done
+run_security y "" no ""
+TOKEN="$(sec_token)"
+sec_check "--local-only no does not suppress the token question (answered y: token written)" \
+  "$([[ "$SEC_OUT" == *"Require an API token? [y/N]"* && "$TOKEN" =~ ^[A-Za-z0-9]{40}$ && "$(grep -c '^bind' "$SEC_TOML")" == 0 ]]; echo $?)"
+sec_done
+run_security "n y" "" "" ""
+sec_check "--token absent, --local-only absent: both asked, token n then local-only y" \
+  "$([[ "$SEC_OUT" == *"Require an API token? [y/N]"* && "$SEC_OUT" == *"Bind Suede to this machine only, for use behind a reverse proxy? [y/N]"* \
+     && -z "$(sec_token)" && "$(grep '^bind' "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' ]]; echo $?)"
+sec_done
+
+# 6. The local-only question and its flag.
+run_security - "" yes ""
+sec_check "--local-only yes: bind is the loopback address on the port, no terminal needed" \
+  "$([[ "$(grep '^bind' "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' && "$(sec_mode)" == 600 ]]; echo $?)"
+echo "        provisioning transcript (--local-only yes):"; sec_echo
+sec_done
+run_security - "" no 'bind = "0.0.0.0:9088"'
+sec_check "--local-only no: an existing bind is left alone" \
+  "$([[ "$(cat "$SEC_TOML")" == 'bind = "0.0.0.0:9088"' ]]; echo $?)"
+sec_done
+run_security - "" no 'bind = "127.0.0.1:9088"'
+sec_check "--local-only no on a loopback-bound machine: bind left alone, and it says so" \
+  "$([[ "$(cat "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' && "$SEC_OUT" == *"already binds to loopback"* ]]; echo $?)"
+echo "        provisioning transcript (--local-only no, already loopback):"; sec_echo
+sec_done
+run_security "n y" "" "" ""
+sec_check "local-only prompt answered y: asks, writes the loopback bind" \
+  "$([[ "$SEC_OUT" == *"Bind Suede to this machine only, for use behind a reverse proxy? [y/N]"* && "$(grep '^bind' "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' ]]; echo $?)"
+echo "        provisioning transcript (token n, local-only y):"; sec_echo
+sec_done
+run_security "n n" "" "" 'bind = "0.0.0.0:9088"'
+sec_check "local-only prompt answered n: existing bind kept" \
+  "$([[ "$SEC_OUT" == *"Bind Suede to this machine only"* && "$(cat "$SEC_TOML")" == 'bind = "0.0.0.0:9088"' ]]; echo $?)"
+sec_done
+run_security "n _" "" "" ""
+sec_check "local-only prompt answered with just Enter: nothing is written" \
+  "$([[ "$SEC_OUT" == *"Bind Suede to this machine only"* && ! -e "$SEC_TOML" ]]; echo $?)"
+sec_done
+run_security "n n" "" "" 'bind = "127.0.0.1:9088"'
+sec_check "local-only prompt answered n on a loopback-bound machine: bind left alone, says so" \
+  "$([[ "$(cat "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' && "$SEC_OUT" == *"already binds to loopback"* ]]; echo $?)"
+sec_done
+run_security y none "" ""
+sec_check "--token none does not suppress the local-only question (asked, answered y: bind written)" \
+  "$([[ "$SEC_OUT" != *"Require an API token?"* && "$SEC_OUT" == *"Bind Suede to this machine only"* \
+     && "$(grep '^bind' "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' ]]; echo $?)"
+sec_done
+run_security n generate "" ""
+TOKEN="$(sec_token)"
+sec_check "--token generate does not suppress the local-only question (asked, answered n: token only)" \
+  "$([[ "$SEC_OUT" != *"Require an API token?"* && "$SEC_OUT" == *"Bind Suede to this machine only"* \
+     && -n "$TOKEN" && "$(grep -c '^bind' "$SEC_TOML")" == 0 ]]; echo $?)"
+sec_done
+run_security - generate yes 'bind = "0.0.0.0:9088"
+allow_overlaps = true'
+sec_check "--local-only yes with --token generate: bind rewritten once, other keys kept, token set" \
+  "$([[ "$(grep -c '^bind' "$SEC_TOML")" == 1 && "$(grep '^bind' "$SEC_TOML")" == 'bind = "127.0.0.1:9088"' \
+     && "$(grep -c '^allow_overlaps = true' "$SEC_TOML")" == 1 && -n "$(sec_token)" && "$(sec_mode)" == 600 ]]; echo $?)"
+sec_done
+
+# 6b. The reboot question and its flag. Only the decision is exercised.
+run_security - "" "" "" ""
+sec_check "reboot, no terminal, no flag: no reboot" "$([[ "$SEC_OUT" == *REBOOT=no ]]; echo $?)"
+sec_done
+run_security - "" "" "" yes
+sec_check "--reboot yes: reboots without a terminal" "$([[ "$SEC_OUT" == *REBOOT=yes ]]; echo $?)"
+sec_done
+run_security - "" "" "" no
+sec_check "--reboot no: no reboot, no terminal" "$([[ "$SEC_OUT" == *REBOOT=no ]]; echo $?)"
+sec_done
+run_security "n n y" "" "" "" ""
+sec_check "reboot prompt answered y (after the token and local-only questions): reboots" \
+  "$([[ "$SEC_OUT" == *"Reboot now to apply everything? [y/N]"* && "$SEC_OUT" == *REBOOT=yes ]]; echo $?)"
+echo "        provisioning transcript (all three questions, last answered y):"; sec_echo
+sec_done
+run_security "n n n" "" "" "" ""
+sec_check "reboot prompt answered n: no reboot" \
+  "$([[ "$SEC_OUT" == *"Reboot now to apply everything? [y/N]"* && "$SEC_OUT" == *REBOOT=no ]]; echo $?)"
+sec_done
+run_security "n n _" "" "" "" ""
+sec_check "reboot prompt answered with just Enter: no reboot" "$([[ "$SEC_OUT" == *REBOOT=no ]]; echo $?)"
+sec_done
+run_security "y" none yes "" ""
+sec_check "--reboot absent is asked even when both other flags are given (answered y)" \
+  "$([[ "$SEC_OUT" != *"Require an API token?"* && "$SEC_OUT" != *"Bind Suede to this machine only"* \
+     && "$SEC_OUT" == *"Reboot now to apply everything? [y/N]"* && "$SEC_OUT" == *REBOOT=yes ]]; echo $?)"
+sec_done
+run_security "n n" "" "" "" yes
+sec_check "--reboot yes does not suppress the other two questions" \
+  "$([[ "$SEC_OUT" == *"Require an API token?"* && "$SEC_OUT" == *"Bind Suede to this machine only"* \
+     && "$SEC_OUT" != *"Reboot now"* && "$SEC_OUT" == *REBOOT=yes ]]; echo $?)"
+sec_done
+
+# 7. Bad option values and the older spellings. Option parsing runs ahead of
+# the root check, so the real script can be called.
+for bad_args in "--reboot" "--reboot maybe" "--local-only maybe"; do
+  # shellcheck disable=SC2086
+  if OUT="$(bash packaging/provision.sh $bad_args 2>&1)"; then
+    bad "provision.sh $bad_args should be refused"
+  else
+    ok "provision.sh $bad_args is refused: $(head -n1 <<<"$OUT")"
+  fi
+done
+for bad_args in "--token" "--token short" "--token has/slash/in-it-0123456789" '--token a"quoted"token0123456789'; do
+  # shellcheck disable=SC2086
+  if OUT="$(bash packaging/provision.sh $bad_args 2>&1)"; then
+    bad "provision.sh $bad_args should be refused"
+  else
+    ok "provision.sh $bad_args is refused: $(head -n1 <<<"$OUT")"
+  fi
+done
+
+# The option parser alone, to see what each spelling sets. $0 is the real
+# script so --help reads its header.
+ARGUMENT_PARSING="$(sed -n '/^# BEGIN ARGUMENT_PARSING$/,/^# END ARGUMENT_PARSING$/p' packaging/provision.sh)"
+[[ -n "$ARGUMENT_PARSING" ]] || bad "could not find the ARGUMENT_PARSING block in provision.sh"
+parsed() {  # prints "LOCAL_ONLY=<> REBOOT=<> TOKEN_MODE=<>" for the arguments
+  bash -c "set -euo pipefail; $ARGUMENT_PARSING"'
+echo "LOCAL_ONLY=$LOCAL_ONLY REBOOT=$REBOOT TOKEN_MODE=$TOKEN_MODE"' provision.sh "$@" 2>&1
+}
+sec_check "bare --local-only is --local-only yes" "$([[ "$(parsed --local-only)" == "LOCAL_ONLY=yes REBOOT= TOKEN_MODE=" ]]; echo $?)"
+sec_check "bare --local-only before another flag is --local-only yes" \
+  "$([[ "$(parsed --local-only --token none)" == "LOCAL_ONLY=yes REBOOT= TOKEN_MODE=none" ]]; echo $?)"
+sec_check "--local-only yes and --local-only no" \
+  "$([[ "$(parsed --local-only yes)" == "LOCAL_ONLY=yes"* && "$(parsed --local-only no)" == "LOCAL_ONLY=no"* ]]; echo $?)"
+sec_check "--no-reboot is --reboot no" \
+  "$([[ "$(parsed --no-reboot)" == "LOCAL_ONLY= REBOOT=no TOKEN_MODE=" && "$(parsed --reboot no)" == "LOCAL_ONLY= REBOOT=no TOKEN_MODE=" ]]; echo $?)"
+sec_check "--reboot yes" "$([[ "$(parsed --reboot yes)" == "LOCAL_ONLY= REBOOT=yes TOKEN_MODE=" ]]; echo $?)"
+sec_check "no flags leave every answer empty (so a terminal is asked)" \
+  "$([[ "$(parsed --port 9100)" == "LOCAL_ONLY= REBOOT= TOKEN_MODE=" ]]; echo $?)"
+HELP="$(bash packaging/provision.sh --help)"
+sec_check "--help documents the three flags, their values and the older spellings" \
+  "$([[ "$HELP" == *"--token generate|VALUE|none"* && "$HELP" == *"--local-only yes|no"* && "$HELP" == *"--reboot yes|no"* \
+     && "$HELP" == *"bare --local-only"* && "$HELP" == *"--no-reboot"* && "$HELP" != *"set -euo"* ]]; echo $?)"
+
+echo
 echo "nvidia_uvm is configured at boot on NVIDIA machines only"
 UVM_FUNCTION="$(sed -n '/^# BEGIN NVIDIA_UVM_FUNCTION$/,/^# END NVIDIA_UVM_FUNCTION$/p' packaging/provision.sh)"
 [[ -n "$UVM_FUNCTION" ]] || bad "could not find the NVIDIA_UVM_FUNCTION block in provision.sh"

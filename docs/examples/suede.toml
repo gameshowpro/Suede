@@ -25,9 +25,12 @@ bind = "0.0.0.0:9088"
 # Optional bearer token.  Env: SUEDE_TOKEN
 #
 # Leave unset on a trusted production LAN, which is the expected deployment.
-# Setting it requires `Authorization: Bearer <token>` on every endpoint except
-# /healthz and the loopback-only heartbeat endpoint — and disables the
-# reference web UI, which could not embed the token without exposing it.
+# Setting it requires `Authorization: Bearer <token>` on every /api/v1 call
+# except the local listener's app routes. The web UI page is still served, but
+# it embeds no token, so it works only behind a reverse proxy that adds one for
+# people who signed in. See reverse-proxy.md.
+#
+# `provision.sh --token generate` writes a random token here, mode 600.
 # token = "change-me"
 
 # Where the desired-state document is persisted.  Env: SUEDE_STATE_DIR

@@ -8,9 +8,40 @@
 # idempotent — safe to re-run after an upgrade — and it never touches Suede's
 # desired state, which lives in the API and survives package operations.
 #
-#   sudo /usr/share/suede/provision.sh [--user NAME] [--no-reboot]
-#                                      [--port N] [--no-firewall]
-#                                      [--allow-overlaps] [--no-direct-scanout]
+#   sudo /usr/share/suede/provision.sh [--user NAME] [--port N]
+#                                      [--token generate|VALUE|none]
+#                                      [--local-only yes|no]
+#                                      [--reboot yes|no]
+#                                      [--no-firewall] [--allow-overlaps]
+#                                      [--no-direct-scanout]
+#
+# Three questions are asked at a terminal, and each has exactly one flag that
+# answers it instead. A question is asked only when its own flag is absent (one
+# flag never suppresses another question). With no terminal and no flag, each
+# question takes its default answer: nothing changes and the machine is not
+# rebooted.
+#
+#   Question (default)                                   Flag
+#   Require an API token? (no)                           --token generate|VALUE|none
+#   Bind Suede to this machine only, for use behind      --local-only yes|no
+#     a reverse proxy? (no)
+#   Reboot now to apply everything? (no)                 --reboot yes|no
+#
+# --token decides whether the API requires a bearer token. `generate` writes a
+# random 40-character token into the user's suede.toml (owned by the user, mode
+# 600) and shows it once, on the terminal only. VALUE (16 or more of
+# A-Z a-z 0-9 . _ ~ -) stores a token you chose and never echoes it. `none`
+# leaves the API open and any token already there alone. An existing token is
+# never replaced without a yes at a terminal, and when one is already set the
+# token question is not asked.
+#
+# --local-only yes writes `bind = "127.0.0.1:<port>"` into suede.toml and skips
+# the firewall rule: the shape for an appliance reached through a reverse
+# proxy on the same machine or an SSH tunnel. See docs/reverse-proxy.md.
+# `no` leaves the bind alone, including one that is already on loopback.
+#
+# Older spellings still work: a bare --local-only means --local-only yes, and
+# --no-reboot means --reboot no.
 #
 # --allow-overlaps provisions the other display path: outputs may overlap in
 # canvas space, every multi-output layout goes through the slicer, and each
@@ -30,26 +61,60 @@
 
 set -euo pipefail
 
+# BEGIN ARGUMENT_PARSING
 APPLIANCE_USER="${SUDO_USER:-}"
-ASK_REBOOT=1
+REBOOT=""
 # Must match DEFAULT_BIND in src/config.rs.
 SUEDE_PORT=9088
 OPEN_FIREWALL=1
 ALLOW_OVERLAPS=0
 DIRECT_SCANOUT=1
+TOKEN_MODE=""
+LOCAL_ONLY=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --user) APPLIANCE_USER="$2"; shift 2 ;;
-    --no-reboot) ASK_REBOOT=0; shift ;;
+    --no-reboot) REBOOT=no; shift ;;
+    --reboot)
+      REBOOT="${2:-}"
+      case "$REBOOT" in
+        yes|no) ;;
+        *) echo "--reboot needs yes or no" >&2; exit 1 ;;
+      esac
+      shift 2 ;;
     --port) SUEDE_PORT="$2"; shift 2 ;;
     --no-firewall) OPEN_FIREWALL=0; shift ;;
     --allow-overlaps) ALLOW_OVERLAPS=1; shift ;;
     --no-direct-scanout) DIRECT_SCANOUT=0; shift ;;
-    -h|--help) sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --token)
+      TOKEN_MODE="${2:-}"
+      if [[ -z "$TOKEN_MODE" ]]; then
+        echo "--token needs generate, none or a token value" >&2; exit 1
+      fi
+      # A value ends up inside a quoted TOML string and a sed replacement, so
+      # it is held to a character set that needs no escaping in either.
+      case "$TOKEN_MODE" in
+        generate|none) ;;
+        *)
+          if ! [[ "$TOKEN_MODE" =~ ^[A-Za-z0-9._~-]{16,}$ ]]; then
+            echo "--token: a value must be at least 16 characters from A-Z a-z 0-9 . _ ~ -" >&2
+            echo "         (or use --token generate)" >&2
+            exit 1
+          fi ;;
+      esac
+      shift 2 ;;
+    --local-only)
+      # Bare --local-only is the older spelling of --local-only yes.
+      case "${2:-}" in
+        yes|no) LOCAL_ONLY="$2"; shift 2 ;;
+        *) LOCAL_ONLY=yes; shift ;;
+      esac ;;
+    -h|--help) sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
   esac
 done
+# END ARGUMENT_PARSING
 
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "This script must run as root (use sudo)." >&2
@@ -496,15 +561,142 @@ fi
 # Rewrites an existing key, commented or not, rather than appending a second
 # one: TOML takes the first, so an appended line would be read as a no-op and
 # the machine would boot into the wrong path.
+#
+# Kept between BEGIN/END BOOTSTRAP_FUNCTIONS markers so
+# scripts/validate-packaging.sh can lift the functions out and run them against
+# a scratch home. They use SUEDE_TOML, APPLIANCE_USER, SUEDE_PORT, TOKEN_MODE
+# LOCAL_ONLY and REBOOT, all set before they are called.
+# BEGIN BOOTSTRAP_FUNCTIONS
 set_bootstrap_key() {
-  local key="$1" value="$2" comment="$3"
+  local key="$1" value="$2" comment="$3" shown="$2"
+  # A token never reaches the log of a provisioning run.
+  [[ "$key" == "token" ]] && shown='"(hidden)"'
   if grep -qE "^[[:space:]]*#?[[:space:]]*$key[[:space:]]*=" "$SUEDE_TOML"; then
     sed -i -E "s|^[[:space:]]*#?[[:space:]]*$key[[:space:]]*=.*|$key = $value|" "$SUEDE_TOML"
   else
     printf '\n%s\n%s = %s\n' "$comment" "$key" "$value" >> "$SUEDE_TOML"
   fi
-  echo "  $SUEDE_TOML: $key = $value"
+  echo "  $SUEDE_TOML: $key = $shown"
 }
+
+token_is_set() {
+  grep -qE '^[[:space:]]*token[[:space:]]*=' "$SUEDE_TOML" 2>/dev/null
+}
+
+# Created only when something is about to be written, owner-only from the
+# start: the file may end up holding a token.
+ensure_suede_toml() {
+  local group
+  group="$(id -gn "$APPLIANCE_USER")"
+  install -d -o "$APPLIANCE_USER" -g "$group" "$(dirname "$SUEDE_TOML")"
+  [[ -e "$SUEDE_TOML" ]] || install -m 600 -o "$APPLIANCE_USER" -g "$group" /dev/null "$SUEDE_TOML"
+}
+
+random_token() {
+  head -c 48 /dev/urandom | base64 -w0 | tr -d '/+=' | cut -c1-40
+}
+
+# Asks one yes/no question on the terminal; only ever called when stdin is one.
+# Anything but an answer starting with y (including Enter) is no.
+ask_yes_no() {
+  local answer
+  read -r -p "$1" answer || answer=""
+  [[ "${answer,,}" == y* ]]
+}
+
+# Decide and write the two security settings. Each question is asked only when
+# there is a terminal and its own flag (--token, --local-only) is absent; with
+# no terminal it takes its default, so the API stays open and the bind alone.
+# Never replaces a token that is already there without a yes at the terminal,
+# and never prints one anywhere but the terminal. Leaves LOCAL_ONLY as yes or
+# no for the firewall step.
+configure_security() {
+  local token="" shown_token=0
+  local have_tty=0
+  [[ -t 0 ]] && have_tty=1
+
+  if [[ -z "$TOKEN_MODE" && "$have_tty" -eq 1 ]]; then
+    if token_is_set; then
+      echo "  A token is already set in $SUEDE_TOML; leaving it."
+    elif ask_yes_no "Require an API token? [y/N] "; then
+      TOKEN_MODE=generate
+    fi
+  fi
+
+  if [[ -z "$LOCAL_ONLY" && "$have_tty" -eq 1 ]]; then
+    if ask_yes_no "Bind Suede to this machine only, for use behind a reverse proxy? [y/N] "; then
+      LOCAL_ONLY=yes
+    else
+      LOCAL_ONLY=no
+    fi
+  fi
+  [[ -n "$LOCAL_ONLY" ]] || LOCAL_ONLY=no
+
+  case "$TOKEN_MODE" in
+    "") ;;
+    none) echo "  token: none requested; any token already set is left as it is" ;;
+    *)
+      if token_is_set; then
+        if [[ "$have_tty" -eq 1 ]] \
+           && ask_yes_no "A token is already set in $SUEDE_TOML. Replace it? [y/N] "; then
+          :
+        else
+          echo "  token: already set; not replaced (rerun at a terminal to replace it)"
+          TOKEN_MODE=""
+        fi
+      fi
+      if [[ -n "$TOKEN_MODE" ]]; then
+        if [[ "$TOKEN_MODE" == generate ]]; then
+          token="$(random_token)"
+          shown_token=1
+        else
+          token="$TOKEN_MODE"
+        fi
+        # Mode first, so the file is never readable by others while it holds
+        # the token.
+        ensure_suede_toml
+        chmod 600 "$SUEDE_TOML"
+        set_bootstrap_key token "\"$token\"" \
+"# Every API request must carry this as \`Authorization: Bearer <token>\`.
+# Anything that fronts the appliance for people (a reverse proxy) supplies it
+# for them. Keep this file readable by the appliance user only."
+        chown "$APPLIANCE_USER:$(id -gn "$APPLIANCE_USER")" "$SUEDE_TOML"
+        chmod 600 "$SUEDE_TOML"
+        if [[ "$shown_token" -eq 1 && -t 1 ]]; then
+          echo
+          echo "  API token (shown once; it is stored in $SUEDE_TOML):"
+          echo "    $token"
+          echo
+        elif [[ "$shown_token" -eq 1 ]]; then
+          echo "  The generated token is stored in $SUEDE_TOML. It is not shown"
+          echo "  here because this output is not a terminal."
+        fi
+      fi ;;
+  esac
+
+  if [[ "$LOCAL_ONLY" == yes ]]; then
+    ensure_suede_toml
+    set_bootstrap_key bind "\"127.0.0.1:${SUEDE_PORT}\"" \
+"# Reachable from this machine only: a reverse proxy here or an SSH tunnel is
+# the way in. The local listener for apps stays one port above."
+  elif grep -qE '^[[:space:]]*bind[[:space:]]*=[[:space:]]*"127\.' "$SUEDE_TOML" 2>/dev/null; then
+    echo "  bind: $SUEDE_TOML already binds to loopback; left as it is (local-only: no)"
+  fi
+  return 0
+}
+
+# Whether to reboot at the end: --reboot yes|no, otherwise asked at a terminal,
+# otherwise no.
+reboot_wanted() {
+  case "$REBOOT" in
+    yes) return 0 ;;
+    no) return 1 ;;
+  esac
+  [[ -t 0 ]] || return 1
+  echo
+  ask_yes_no "Reboot now to apply everything? [y/N] "
+}
+# END BOOTSTRAP_FUNCTIONS
 
 if [[ "$ALLOW_OVERLAPS" -eq 1 || "$DIRECT_SCANOUT" -eq 0 ]]; then
   step "Recording the display path in suede.toml"
@@ -539,6 +731,17 @@ if [[ "$ALLOW_OVERLAPS" -eq 1 || "$DIRECT_SCANOUT" -eq 0 ]]; then
       echo "        Apply the direct-scanout check's fix, then restart sway."
     fi
   fi
+fi
+
+# --- 4c. API token and loopback bind -----------------------------------
+#
+# Defaults stay open: nothing here writes unless a flag asked for it or a
+# person at a terminal said yes. LOCAL_ONLY stays empty (treated as no) when
+# nothing was asked.
+SUEDE_TOML="$USER_HOME/.config/suede/suede.toml"
+if [[ -n "$TOKEN_MODE" || -n "$LOCAL_ONLY" || -t 0 ]]; then
+  step "Securing the API"
+  configure_security
 fi
 
 # --- 5. sway-session.target ---------------------------------------------
@@ -601,7 +804,9 @@ step "Opening the API port"
 # drops rather than rejects — so a correctly running Suede times out from the
 # network and looks like a machine that is switched off. This is the one place
 # in provisioning with the privileges to fix that.
-if [[ "$OPEN_FIREWALL" -eq 0 ]]; then
+if [[ "$LOCAL_ONLY" == yes ]]; then
+  echo "  skipped (--local-only: nothing outside this machine should reach it)"
+elif [[ "$OPEN_FIREWALL" -eq 0 ]]; then
   echo "  skipped (--no-firewall)"
 elif command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -1 | grep -q "Status: active"; then
   if ufw status 2>/dev/null | grep -qE "^${SUEDE_PORT}(/tcp)?[[:space:]]"; then
@@ -627,8 +832,15 @@ cat <<EOF
   Service:      suede.service (systemd user unit)
 
   After a reboot the machine will log in, start sway, and start Suede.
-  Open http://$(hostname):9088/ from another computer to configure it.
+  Open http://$(hostname):${SUEDE_PORT}/ from another computer to configure it.
 EOF
+if [[ "$LOCAL_ONLY" == yes ]]; then
+  cat <<EOF2
+
+  --local-only: the API answers on 127.0.0.1:${SUEDE_PORT} only. Reach it through
+  a reverse proxy on this machine or an SSH tunnel; see docs/reverse-proxy.md.
+EOF2
+fi
 
 if [[ -n "${GROUPS_CHANGED:-}" ]]; then
   cat <<'EOF'
@@ -653,9 +865,7 @@ if [[ -n "${RIVAL_SWAY:-}" ]]; then
 EOF
 fi
 
-if [[ "$ASK_REBOOT" -eq 1 ]]; then
-  echo
-  read -r -p "Reboot now to apply everything? [y/N] " answer
-  [[ "${answer,,}" == "y" ]] && reboot
+if reboot_wanted; then
+  reboot
 fi
 exit 0

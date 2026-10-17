@@ -545,7 +545,8 @@ pub struct SystemInfo {
     pub packages: Vec<PackageVersion>,
     /// Feature gates resolved from the detected Sway version.
     pub supports_tearing: bool,
-    /// True when the reference web UI is being served.
+    /// Always `true` since 0.2.x, when the web UI began to be served in token
+    /// mode as well. Kept so that older clients that read it keep working.
     pub web_ui_enabled: bool,
     /// Host power operations this appliance permits. Empty means none; the web
     /// UI uses it to disable and explain its buttons rather than offering ones
