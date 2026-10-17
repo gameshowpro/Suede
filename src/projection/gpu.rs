@@ -4418,6 +4418,9 @@ pub(crate) fn pack_transfer(a: u16, b: u8) -> u32 {
     )
 }
 
+// Only the debug-build tripwire in `replace_packed_transfers` and the tests
+// call this; release builds skip the walk, so the function would be dead code.
+#[cfg(any(debug_assertions, test))]
 fn validate_packed_transfer(entry: u32) -> anyhow::Result<()> {
     // Bits 28..29 are the marker tag in both formats, so they are masked out
     // of every reserved-range check below rather than being rejected.
