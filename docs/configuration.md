@@ -43,6 +43,7 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | Key | Environment | Default | Meaning |
 |---|---|---|---|
 | `bind` | `SUEDE_BIND` | `0.0.0.0:9088` | Address the HTTP server binds to |
+| `local_bind` | `SUEDE_LOCAL_BIND` | `127.0.0.1:` one port above `bind` (`9089`) | Loopback address of the local listener, which answers only app heartbeats and the capability check — see [Local listener](#local-listener) |
 | `token` | `SUEDE_TOKEN` | unset | Bearer token; setting it disables the web UI |
 | `state_dir` | `SUEDE_STATE_DIR` | `$XDG_STATE_HOME/suede` | Where desired state is persisted |
 | `docs_base_url` | `SUEDE_DOCS_BASE_URL` | `https://suede.gameshow.pro/` | Base for health-check documentation links |
@@ -239,6 +240,52 @@ Neither setting authenticates anyone. They stop a browser from being used
 against the appliance, not a client that talks to it directly. That is what
 the network and the bearer token are for (see
 [Security posture](getting-started.md#security-posture)).
+
+### Local listener {: #local-listener }
+
+Three routes are called by page content running on the appliance itself,
+which cannot hold the API token: app heartbeats
+(`POST /api/v1/apps/{id}/heartbeat`), the capability check's page
+(`GET /capability-check/{id}`) and its report
+(`POST /api/v1/capability-check/{id}/result`). They need no token. Instead,
+they only answer callers on this machine.
+
+That only means something on a listener nothing else can reach through a
+loopback connection. A reverse proxy on the same machine forwards every
+request it accepts from loopback, so on a listener behind one, "the caller
+is local" proves nothing. Suede therefore serves these routes on a second,
+local listener, which serves nothing else:
+
+```toml
+local_bind = "127.0.0.1:9089"   # the default: loopback, one port above bind
+```
+
+- `local_bind` must be a loopback address (`127.0.0.1`, any `127.x.y.z`, or
+  `[::1]`). Anything else fails startup with an error naming the key. So does
+  a `local_bind` on the same port as `bind` when the addresses overlap
+  (`0.0.0.0` overlaps every loopback address).
+- Launched apps are handed the local listener: `{heartbeatUrl}` expands to
+  `http://127.0.0.1:9089/api/v1/apps/<id>/heartbeat`, and the capability check
+  opens its page there. The heartbeat route carries the same CORS headers
+  there as on the main port, so pages served from another origin, or from
+  `file://`, still post heartbeats.
+- Every other path on the local listener answers `404`, naming the main
+  address. `/healthz`, the web UI and the rest of the API are only on `bind`.
+- Never point a reverse proxy at the local listener.
+
+What the main listener does with these routes depends on `bind`:
+
+- **Bound to a routable address** (the default `0.0.0.0:9088`): they still
+  answer loopback callers there too, so content that hardcodes
+  `http://127.0.0.1:9088/api/v1/...` keeps working.
+- **Bound to loopback** (`127.0.0.1:9088`, the reverse proxy and SSH tunnel
+  shapes): they answer `404` there, with a message naming the local
+  listener, because every caller of a loopback listener is loopback.
+
+New content should post to the `{heartbeatUrl}` it is given rather than
+building the address itself, so it keeps working whichever way the
+appliance is bound. `SUEDE_LOCAL_BIND` overrides the key. With `--bind` on the
+command line and no `local_bind`, the default follows the new port.
 
 ### Overlapping layouts and direct scanout {: #direct-scanout }
 

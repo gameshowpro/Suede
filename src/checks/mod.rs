@@ -197,12 +197,18 @@ fn assess_reachability(
     last_remote: Option<std::net::IpAddr>,
 ) -> (CheckStatus, String) {
     if bind.ip().is_loopback() {
+        // A reverse proxy on this machine forwards from loopback too, so a
+        // proxied appliance and a merely local one look identical from here;
+        // saying which it is would be a guess.
         return (
             CheckStatus::Pass,
             format!(
-                "bound to {bind}, so the API answers only on this machine. \
+                "bound to {bind}, so the API answers only on this machine: either it is \
+                 meant to be local-only, or a reverse proxy on this machine fronts it. \
+                 Suede cannot tell which, because both look the same from here. \
                  Reach it from elsewhere with `ssh -L {port}:127.0.0.1:{port} <host>`, \
-                 or bind a routable address to expose it.",
+                 put a reverse proxy in front of it (see the linked page), or bind a \
+                 routable address to expose it.",
                 port = bind.port()
             ),
         );
@@ -4729,6 +4735,15 @@ mod tests {
         // The tunnel command is the answer to "why can I not open the page",
         // so it belongs in the detail rather than only in the documentation.
         assert!(detail.contains("ssh -L 9088:127.0.0.1:9088"));
+    }
+
+    #[test]
+    fn a_loopback_bind_does_not_pretend_to_know_whether_a_proxy_fronts_it() {
+        let (status, detail) =
+            assess_reachability(addr("127.0.0.1:9088"), HostFirewall::None, false, None);
+        assert_eq!(status, CheckStatus::Pass);
+        assert!(detail.contains("reverse proxy"), "{detail}");
+        assert!(detail.contains("cannot tell which"), "{detail}");
     }
 
     #[test]

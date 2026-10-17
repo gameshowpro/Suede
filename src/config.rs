@@ -23,6 +23,7 @@ pub const DEFAULT_DOCS_BASE_URL: &str = "https://suede.gameshow.pro/";
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     bind: Option<String>,
+    local_bind: Option<String>,
     token: Option<String>,
     state_dir: Option<PathBuf>,
     docs_base_url: Option<String>,
@@ -66,6 +67,18 @@ struct FileConfig {
 pub struct BootstrapConfig {
     /// Address the HTTP server binds to.
     pub bind: SocketAddr,
+    /// Where the local listener binds, when set explicitly; `None` means
+    /// [`Self::local_bind`]'s default, the loopback address one port above
+    /// [`Self::bind`].
+    ///
+    /// The local listener serves only what page content on this machine
+    /// calls — app heartbeats and the capability check — and is what
+    /// launched apps are told to use. Kept apart from the main listener
+    /// because those routes are authorized by the caller being on this
+    /// machine, and a reverse proxy on this machine makes every request to
+    /// the main listener look like that. Stored unresolved, so a `--bind`
+    /// override moves the default along with it.
+    pub local_bind: Option<SocketAddr>,
     /// Optional static bearer token. When set, the reference web UI is disabled.
     pub token: Option<String>,
     /// Directory holding the persisted desired state.
@@ -219,6 +232,7 @@ impl Default for BootstrapConfig {
     fn default() -> Self {
         Self {
             bind: DEFAULT_BIND.parse().expect("valid default bind address"),
+            local_bind: None,
             token: None,
             state_dir: crate::util::state_dir(),
             docs_base_url: DEFAULT_DOCS_BASE_URL.to_string(),
@@ -285,6 +299,38 @@ pub enum ConfigError {
         #[source]
         source: std::net::AddrParseError,
     },
+    #[error("invalid local_bind address {value:?}: {source}")]
+    LocalBindParse {
+        value: String,
+        #[source]
+        source: std::net::AddrParseError,
+    },
+    /// The local listener's routes trust any caller that reaches them, on
+    /// the grounds that only this machine can; an address anything else can
+    /// reach would make that false, so it is refused rather than served.
+    #[error(
+        "local_bind {value} is not a loopback address. The local listener answers app \
+         heartbeats and the capability check without a token, because only this machine \
+         can reach it; bind it to 127.0.0.1 or [::1] (e.g. local_bind = \"127.0.0.1:9089\"), \
+         or remove local_bind to use the default, one port above bind"
+    )]
+    LocalBindNotLoopback { value: SocketAddr },
+    /// Two listeners cannot share a port on overlapping addresses; caught
+    /// here so the error names the two settings instead of being an
+    /// "address in use" that looks like another process holding the port.
+    #[error(
+        "local_bind {local} collides with bind {bind}: both would listen on port {port}. \
+         Give local_bind a different port (or remove it to use the default, one port above bind)",
+        port = local.port()
+    )]
+    LocalBindCollides { local: SocketAddr, bind: SocketAddr },
+    /// The default is one port above `bind`, which does not exist above
+    /// 65535.
+    #[error(
+        "bind {bind} uses the highest port, so the local listener has no default port above \
+         it; set local_bind explicitly, e.g. local_bind = \"127.0.0.1:9089\""
+    )]
+    LocalBindNoDefault { bind: SocketAddr },
     /// A typo here must not silently disable the feature: better a daemon
     /// that refuses to start than one that quietly grants no power at all
     /// while the operator believes `power = ["reboot"]` took effect.
@@ -382,6 +428,17 @@ impl BootstrapConfig {
                 source,
             })?;
         }
+        if let Some(local) = env_or(file.local_bind, "SUEDE_LOCAL_BIND") {
+            config.local_bind =
+                Some(
+                    local
+                        .parse()
+                        .map_err(|source| ConfigError::LocalBindParse {
+                            value: local.clone(),
+                            source,
+                        })?,
+                );
+        }
         config.token = env_or(file.token, "SUEDE_TOKEN").filter(|t| !t.is_empty());
         if let Some(dir) = std::env::var("SUEDE_STATE_DIR")
             .ok()
@@ -471,6 +528,47 @@ impl BootstrapConfig {
         self.token.is_some()
     }
 
+    /// The local listener's address: `local_bind` if set, else loopback one
+    /// port above [`Self::bind`] — `127.0.0.1:9089` beside the default bind.
+    ///
+    /// Refuses an address that is not loopback, and one that would listen
+    /// on the same port as `bind` on an overlapping address. Called at
+    /// startup after every override is applied, so a refusal stops the
+    /// daemon before it serves anything. Port 0 (an ephemeral port, as tests
+    /// use) on `bind` derives port 0 here too, and never collides.
+    pub fn local_bind(&self) -> Result<SocketAddr, ConfigError> {
+        let local = match self.local_bind {
+            Some(local) => local,
+            None => {
+                let port = match self.bind.port() {
+                    0 => 0,
+                    port => port
+                        .checked_add(1)
+                        .ok_or(ConfigError::LocalBindNoDefault { bind: self.bind })?,
+                };
+                let ip = if self.bind.is_ipv6() && self.bind.ip().is_loopback() {
+                    std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                };
+                SocketAddr::new(ip, port)
+            }
+        };
+        if !local.ip().is_loopback() {
+            return Err(ConfigError::LocalBindNotLoopback { value: local });
+        }
+        // An unspecified bind (`0.0.0.0`, `[::]`) covers loopback too, so the
+        // same port collides whichever loopback address the local one names.
+        let overlapping = self.bind.ip().is_unspecified() || self.bind.ip() == local.ip();
+        if local.port() != 0 && local.port() == self.bind.port() && overlapping {
+            return Err(ConfigError::LocalBindCollides {
+                local,
+                bind: self.bind,
+            });
+        }
+        Ok(local)
+    }
+
     /// Whether the compositor is expected to run *with* direct scanout — that
     /// is, started without `WLR_SCENE_DISABLE_DIRECT_SCANOUT`.
     ///
@@ -541,8 +639,9 @@ impl BootstrapConfig {
         )
     }
 
-    /// Warn loudly about an unauthenticated, non-loopback deployment.
-    pub fn log_security_posture(&self) {
+    /// Warn loudly about an unauthenticated, non-loopback deployment, and
+    /// say where page content on this machine is answered.
+    pub fn log_security_posture(&self, local: SocketAddr) {
         if self.auth_enabled() {
             tracing::info!("bearer token configured; reference web UI is disabled");
         } else if !self.bind.ip().is_loopback() {
@@ -550,6 +649,25 @@ impl BootstrapConfig {
                 bind = %self.bind,
                 "serving without authentication on a non-loopback address; \
                  set SUEDE_TOKEN if this network is not trusted"
+            );
+        }
+        if self.bind.ip().is_loopback() {
+            // Every caller of a loopback listener is loopback, a reverse
+            // proxy's forwarded requests included, so the main listener
+            // cannot tell page content on this machine from anyone else.
+            tracing::info!(
+                bind = %self.bind,
+                local = %local,
+                "API bound to loopback, so it is reachable only from this machine or through \
+                 a proxy on it; app heartbeats and the capability check are answered only on \
+                 the local listener"
+            );
+        } else {
+            tracing::info!(
+                bind = %self.bind,
+                local = %local,
+                "launched apps post heartbeats to the local listener; loopback callers may \
+                 still post them to the main port too"
             );
         }
         // Worth its own line, unconditionally: this is the one bootstrap
@@ -1276,4 +1394,109 @@ mod tests {
         }
     }
 
+    fn with_binds(bind: &str, local: Option<&str>) -> BootstrapConfig {
+        BootstrapConfig {
+            bind: bind.parse().unwrap(),
+            local_bind: local.map(|local| local.parse().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn local_bind_defaults_to_loopback_one_port_above_bind() {
+        let local = |bind| with_binds(bind, None).local_bind().unwrap().to_string();
+        assert_eq!(local(DEFAULT_BIND), "127.0.0.1:9089");
+        assert_eq!(local("127.0.0.1:9088"), "127.0.0.1:9089");
+        assert_eq!(local("192.168.1.50:7000"), "127.0.0.1:7001");
+        assert_eq!(local("[::]:9088"), "127.0.0.1:9089");
+        // An IPv6-only loopback machine keeps its family.
+        assert_eq!(local("[::1]:9088"), "[::1]:9089");
+        // An ephemeral bind gets an ephemeral local listener, not port 1.
+        assert_eq!(local("127.0.0.1:0"), "127.0.0.1:0");
+    }
+
+    #[test]
+    fn the_highest_bind_port_needs_an_explicit_local_bind() {
+        let error = with_binds("0.0.0.0:65535", None)
+            .local_bind()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("set local_bind explicitly"), "{error}");
+        assert_eq!(
+            with_binds("0.0.0.0:65535", Some("127.0.0.1:9089"))
+                .local_bind()
+                .unwrap()
+                .to_string(),
+            "127.0.0.1:9089"
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_local_bind_is_refused_with_a_clear_error() {
+        for bad in ["0.0.0.0:9089", "192.168.1.50:9089", "[::]:9089"] {
+            let error = with_binds(DEFAULT_BIND, Some(bad))
+                .local_bind()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("not a loopback address"), "{bad}: {error}");
+            assert!(error.contains(bad), "{bad}: {error}");
+            assert!(error.contains("127.0.0.1"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_local_bind_on_the_main_port_is_refused_naming_both_settings() {
+        for (bind, local) in [
+            ("127.0.0.1:9088", "127.0.0.1:9088"),
+            // The unspecified address covers loopback as well.
+            ("0.0.0.0:9088", "127.0.0.1:9088"),
+            ("[::]:9088", "[::1]:9088"),
+        ] {
+            let error = with_binds(bind, Some(local))
+                .local_bind()
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("collides"), "{bind} {local}: {error}");
+            assert!(error.contains(bind), "{bind} {local}: {error}");
+            assert!(error.contains(local), "{bind} {local}: {error}");
+        }
+        // Another loopback address on the same port does not overlap a
+        // specific bind, and two ephemeral ports never collide.
+        assert!(with_binds("127.0.0.1:9088", Some("127.0.0.2:9088"))
+            .local_bind()
+            .is_ok());
+        assert!(with_binds("127.0.0.1:0", Some("127.0.0.1:0"))
+            .local_bind()
+            .is_ok());
+    }
+
+    /// One test, like the allowed-hosts test, because `SUEDE_LOCAL_BIND` is
+    /// process-wide state.
+    #[test]
+    fn local_bind_is_read_from_file_and_env() {
+        let _guard = env_lock();
+        // Safety: the whole test holds `env_lock`.
+        unsafe { std::env::remove_var("SUEDE_LOCAL_BIND") };
+
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert_eq!(config.local_bind, None);
+        assert_eq!(config.local_bind().unwrap().to_string(), "127.0.0.1:9089");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+        std::fs::write(&path, "local_bind = \"127.0.0.1:7100\"\n").unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.local_bind().unwrap().to_string(), "127.0.0.1:7100");
+
+        unsafe { std::env::set_var("SUEDE_LOCAL_BIND", "[::1]:7200") };
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.local_bind().unwrap().to_string(), "[::1]:7200");
+
+        // Unparseable fails at load, naming the key.
+        unsafe { std::env::set_var("SUEDE_LOCAL_BIND", "localhost:9089") };
+        let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+        assert!(error.contains("local_bind"), "{error}");
+        assert!(error.contains("localhost:9089"), "{error}");
+        unsafe { std::env::remove_var("SUEDE_LOCAL_BIND") };
+    }
 }

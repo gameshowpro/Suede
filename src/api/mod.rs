@@ -473,8 +473,34 @@ pub fn raster_lookup(snapshot: &Snapshot) -> impl Fn(&OutputConfig) -> Option<(u
     }
 }
 
-/// Build the complete application router.
+/// Build the main listener's router: the whole API, the UI and the docs.
+///
+/// The three app-facing routes — heartbeats, the capability page and its
+/// result — are authorized by the caller being on this machine. That holds
+/// on a routable bind, where off-box callers arrive with their own address,
+/// so they keep answering loopback callers here for content that hardcodes
+/// the main port. On a loopback bind it proves nothing: every caller is
+/// loopback, including whatever a reverse proxy on this machine forwards.
+/// There they answer 404 naming the local listener ([`local_router`]),
+/// which is what launched apps are given.
 pub fn router(state: ApiState) -> Router {
+    let app_facing_here = !state.bootstrap.bind.ip().is_loopback();
+    let heartbeat = if app_facing_here {
+        post(apps::heartbeat)
+    } else {
+        post(served_only_locally)
+    };
+    let capability_result = if app_facing_here {
+        post(capabilities::post_result)
+    } else {
+        post(served_only_locally)
+    };
+    let capability_page = if app_facing_here {
+        get(capabilities::page)
+    } else {
+        get(served_only_locally)
+    };
+
     let api = Router::new()
         // Observed state.
         .route("/outputs", get(observed::list_outputs))
@@ -509,29 +535,12 @@ pub fn router(state: ApiState) -> Router {
             "/apps/capabilities/measure",
             post(capabilities::measure_subject),
         )
-        .route(
-            "/capability-check/{id}/result",
-            post(capabilities::post_result),
-        )
+        .route("/capability-check/{id}/result", capability_result)
         .route("/apps/{id}/status", get(apps::get_app_status))
         .route("/apps/{id}/restart", post(apps::restart_app))
         .route("/apps/{id}/activate", post(apps::activate_app))
         .route("/apps/{id}/deactivate", post(apps::deactivate_app))
-        .route(
-            "/apps/{id}/heartbeat",
-            // Heartbeats come from page content, which may be served from a
-            // different origin or port than the appliance's own API (or
-            // loaded over `file://`), so this one route answers preflight
-            // and carries `Access-Control-Allow-*`. The rest of the API
-            // stays same-origin only; scoping the layer to this route
-            // (rather than the whole router) keeps it that way.
-            post(apps::heartbeat).layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([Method::POST])
-                    .allow_private_network(true),
-            ),
-        )
+        .route("/apps/{id}/heartbeat", heartbeat.layer(heartbeat_cors()))
         // Desired state.
         .route(
             "/config",
@@ -607,7 +616,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/healthz", get(health))
         // Mounted regardless of token mode: the appliance's own browser is
         // what fetches it, and that browser cannot hold the token.
-        .route("/capability-check/{id}", get(capabilities::page))
+        .route("/capability-check/{id}", capability_page)
         .route("/api-docs/openapi.json", get(docs::openapi_json));
 
     // A web UI would have to embed the token to work, which would defeat it.
@@ -621,6 +630,85 @@ pub fn router(state: ApiState) -> Router {
     ))
     .layer(tower_http::trace::TraceLayer::new_for_http())
     .with_state(state)
+}
+
+/// Build the local listener's router: the three app-facing routes and
+/// nothing else.
+///
+/// The local listener is always bound to loopback (see
+/// [`BootstrapConfig::local_bind`]), and is never what a reverse proxy
+/// forwards to, so a loopback caller here really is page content on this
+/// machine. The handlers keep their own loopback checks regardless. No
+/// token is asked for — page content cannot hold one, which is why these
+/// routes are authorized by locality in the first place — but the Host and
+/// cross-site checks still apply, so a page elsewhere cannot use a browser
+/// on this machine to post a capability result.
+pub fn local_router(state: ApiState) -> Router {
+    Router::new()
+        .route(
+            "/api/v1/apps/{id}/heartbeat",
+            post(apps::heartbeat).layer(heartbeat_cors()),
+        )
+        .route(
+            "/api/v1/capability-check/{id}/result",
+            post(capabilities::post_result),
+        )
+        .route("/capability-check/{id}", get(capabilities::page))
+        .fallback(not_on_the_local_listener)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            guard_local,
+        ))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Heartbeats come from page content, which may be served from a different
+/// origin or port than the appliance's own API (or loaded over `file://`),
+/// so this one route answers preflight and carries `Access-Control-Allow-*`
+/// on whichever listener serves it. The rest of the API stays same-origin
+/// only; scoping the layer to this route (rather than the whole router)
+/// keeps it that way.
+fn heartbeat_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST])
+        .allow_private_network(true)
+}
+
+/// An app-facing route asked of the main listener while it is bound to
+/// loopback; see [`router`].
+async fn served_only_locally(State(state): State<ApiState>) -> ApiError {
+    ApiError::NotFound(format!(
+        "this route is served only on the local listener while the API is bound to \
+         loopback ({bind}): every caller of a loopback listener is local, a reverse proxy's \
+         requests included, so being local proves nothing here. Use the api_base Suede \
+         hands launched apps, {api_base}",
+        bind = state.bootstrap.bind,
+        api_base = state.supervisor.launch_context().api_base,
+    ))
+}
+
+/// Anything but the three app-facing routes, asked of the local listener.
+async fn not_on_the_local_listener(State(state): State<ApiState>) -> ApiError {
+    ApiError::NotFound(format!(
+        "this listener serves only app heartbeats and the capability check; the API, the \
+         web UI and /healthz are on {bind}",
+        bind = state.bootstrap.bind,
+    ))
+}
+
+/// The local listener's request filter: [`authenticate`]'s Host and
+/// cross-site checks, without the token or the reachability evidence (every
+/// caller here is loopback).
+async fn guard_local(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    check_host(&state.bootstrap, &request)?;
+    check_cross_site(&state.bootstrap, &request)?;
+    Ok(next.run(request).await)
 }
 
 /// Liveness. Unversioned and never authenticated.
@@ -929,7 +1017,11 @@ pub mod test_support {
             LaunchContext {
                 profiles_root: dir.path().join("profiles"),
                 log_root: dir.path().join("logs"),
-                api_base: "http://127.0.0.1:9088/api/v1".into(),
+                // What `main` hands launched apps: the local listener.
+                api_base: format!(
+                    "http://{}/api/v1",
+                    bootstrap.local_bind().expect("a valid local listener")
+                ),
                 browser_devtools: true,
             },
             // Unrestricted: API-level tests exercise the app lifecycle
@@ -1493,6 +1585,184 @@ mod tests {
         }
     }
 
+    /// `request` from a loopback peer, as either listener's server would
+    /// deliver it.
+    fn from_loopback(mut request: HttpRequest<Body>) -> HttpRequest<Body> {
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                40000,
+            ))));
+        request
+    }
+
+    async fn local_status_of(
+        harness: &super::test_support::Harness,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = local_router(harness.state.clone())
+            .oneshot(from_loopback(request))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    #[tokio::test]
+    async fn the_local_listener_serves_nothing_but_the_app_facing_routes() {
+        let harness = harness(None);
+        for (method, uri) in [
+            ("GET", "/healthz"),
+            ("GET", "/"),
+            ("GET", "/docs"),
+            ("GET", "/api-docs/openapi.json"),
+            ("GET", "/api/v1/status"),
+            ("GET", "/api/v1/config"),
+            ("GET", "/api/v1/events"),
+            ("POST", "/api/v1/reconcile"),
+            ("POST", "/api/v1/apps/renderer/restart"),
+            ("POST", "/api/v1/apps/capabilities"),
+        ] {
+            let request = HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let (status, body) = local_status_of(&harness, request).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {uri}");
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains("only app heartbeats and the capability check"),
+                "{method} {uri}: {detail}"
+            );
+            assert!(detail.contains("0.0.0.0:9088"), "{method} {uri}: {detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_local_listener_reaches_the_app_facing_handlers() {
+        // Each answers from its own handler, not the fallback: an unknown
+        // app, and checks nobody is waiting for.
+        let harness = harness(None);
+        for (method, uri, expected) in [
+            ("POST", "/api/v1/apps/ghost/heartbeat", "no app named ghost"),
+            (
+                "POST",
+                "/api/v1/capability-check/deadbeef/result",
+                "no capability check",
+            ),
+            ("GET", "/capability-check/deadbeef", "no capability check"),
+        ] {
+            let mut builder = HttpRequest::builder().method(method).uri(uri);
+            let body = if method == "POST" && uri.ends_with("/result") {
+                builder = builder.header("content-type", "application/json");
+                Body::from(
+                    r#"{"userAgent":"t","webgpu":false,"videoDecoderApi":false,"notes":[],"codecs":[]}"#,
+                )
+            } else {
+                Body::empty()
+            };
+            let (status, body) = local_status_of(&harness, builder.body(body).unwrap()).await;
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(
+                status == StatusCode::NOT_FOUND && detail.contains(expected),
+                "{method} {uri}: {status} {detail}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_local_listener_asks_for_no_token() {
+        let harness = harness(Some("secret"));
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/apps/ghost/heartbeat")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = local_status_of(&harness, request).await;
+        // The handler's own 404, not a 401.
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["detail"].as_str().unwrap().contains("no app named"));
+    }
+
+    #[tokio::test]
+    async fn the_local_listener_still_refuses_a_cross_site_capability_result() {
+        // A page elsewhere must not be able to use this machine's browser to
+        // post a report; heartbeats are the only cross-site route.
+        let harness = harness(None);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/capability-check/deadbeef/result")
+            .header("host", "127.0.0.1:9089")
+            .header("origin", "http://evil.example")
+            .header("sec-fetch-site", "cross-site")
+            .header("content-type", "text/plain")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (status, body) = local_status_of(&harness, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["detail"].as_str().unwrap().contains("allowed_origins"));
+    }
+
+    #[tokio::test]
+    async fn a_loopback_main_bind_sends_the_capability_routes_to_the_local_listener() {
+        for uri in [
+            "/capability-check/deadbeef",
+            "/api/v1/capability-check/deadbeef/result",
+        ] {
+            let harness = super::test_support::harness_with_bootstrap(|bootstrap| {
+                bootstrap.bind = "127.0.0.1:9088".parse().unwrap();
+            });
+            let method = if uri.ends_with("/result") {
+                "POST"
+            } else {
+                "GET"
+            };
+            let request = HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"userAgent":"t","webgpu":false,"videoDecoderApi":false,"notes":[],"codecs":[]}"#))
+                .unwrap();
+            let response = harness
+                .router
+                .clone()
+                .oneshot(from_loopback(request))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            let detail = body_json(response).await["detail"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(detail.contains("local listener"), "{uri}: {detail}");
+            assert!(detail.contains("127.0.0.1:9089"), "{uri}: {detail}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_routable_main_bind_keeps_serving_the_capability_routes() {
+        let harness = harness(None);
+        let request = HttpRequest::builder()
+            .uri("/capability-check/deadbeef")
+            .body(Body::empty())
+            .unwrap();
+        let response = harness
+            .router
+            .clone()
+            .oneshot(from_loopback(request))
+            .await
+            .unwrap();
+        // The handler's own answer: nothing is waiting under that id.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(body_json(response).await["detail"]
+            .as_str()
+            .unwrap()
+            .contains("no capability check"));
+    }
+
+    #[test]
     fn host_without_port_keeps_ipv6_brackets() {
         assert_eq!(host_without_port("example.com:9088"), "example.com");
         assert_eq!(host_without_port("example.com"), "example.com");

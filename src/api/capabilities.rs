@@ -359,17 +359,14 @@ pub async fn boot_measure(state: ApiState) {
         return;
     }
 
-    // The browser can only fetch its page once the daemon answers; poll our
-    // own health endpoint rather than guessing at server startup timing.
+    // The browser can only fetch its page once the daemon answers; poll the
+    // listener it will fetch from rather than guessing at server startup
+    // timing. That is the local listener, which serves nothing at its root,
+    // so any HTTP answer at all — its 404 included — means it is serving.
     let base = state.supervisor.launch_context().api_base.clone();
-    let healthz = format!(
-        "{}/healthz",
-        base.trim_end_matches('/')
-            .trim_end_matches("/api/v1")
-            .trim_end_matches('/')
-    );
+    let probe = format!("{}/", api_root(&base));
     for _ in 0..50 {
-        if crate::probe::status_of(&healthz, Duration::from_secs(1))
+        if crate::probe::status_of(&probe, Duration::from_secs(1))
             .await
             .is_ok()
         {
@@ -524,7 +521,9 @@ pub async fn get_last(State(state): State<ApiState>) -> ApiResult<Json<LastMeasu
 
 /// The served test page. Public in token mode — the browser cannot hold the
 /// token — but only for the machine's own browser, and only while its check
-/// is the one waiting.
+/// is the one waiting. The check points the browser at the local listener
+/// (see [`crate::api::local_router`]); the main listener serves it too only
+/// while bound to a routable address.
 pub async fn page(
     State(state): State<ApiState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -543,6 +542,13 @@ pub async fn page(
     Ok(Html(PAGE))
 }
 
+/// The capability page's report.
+///
+/// Posted by the page Suede serves to its own browser, on the local
+/// listener (`local_bind`, `127.0.0.1:9089` by default) the page is loaded
+/// from. The main listener answers it too, from loopback callers, only
+/// while it is bound to a routable address; bound to loopback, it answers
+/// 404 naming the local listener.
 #[utoipa::path(
     post, path = "/api/v1/capability-check/{id}/result", tag = "apps",
     params(("id" = String, Path, description = "The check id from the page's own URL")),
@@ -550,7 +556,9 @@ pub async fn page(
     responses(
         (status = 204, description = "Report accepted"),
         (status = 403, description = "Only the local machine may report"),
-        (status = 404, description = "No check with that id is waiting"),
+        (status = 404, description = "No check with that id is waiting, or this is \
+                        the main listener bound to loopback, where only the local \
+                        listener serves this route"),
     )
 )]
 pub async fn post_result(
@@ -615,7 +623,7 @@ fn firefox_profile(app: &AppConfig, context: &launcher::LaunchContext) -> Option
         .then(|| context.profiles_root.join(CHECK_ID))
 }
 
-/// `http://127.0.0.1:9088/api/v1` → `http://127.0.0.1:9088`.
+/// `http://127.0.0.1:9089/api/v1` → `http://127.0.0.1:9089`.
 fn api_root(api_base: &str) -> &str {
     let base = api_base.trim_end_matches('/');
     base.strip_suffix("/api/v1").unwrap_or(base)

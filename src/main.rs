@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
 use tokio::sync::watch;
 
@@ -317,11 +318,15 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     if let Some(bind) = args.bind {
         bootstrap.bind = bind.parse()?;
     }
+    // Resolved after `--bind`, so the default follows it, and before
+    // anything starts, so a refused address stops the daemon here.
+    let local_bind = bootstrap.local_bind()?;
     let bootstrap = Arc::new(bootstrap);
 
     tracing::info!(
         version = suede::VERSION_STRING,
         bind = %bootstrap.bind,
+        local_bind = %local_bind,
         state_dir = %bootstrap.state_dir.display(),
         allow_overlaps = bootstrap.allow_overlaps,
         direct_scanout = bootstrap.direct_scanout,
@@ -335,7 +340,7 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     if bootstrap.presentation == suede::model::PresentationMode::Direct {
         tracing::warn!("presentation = \"direct\" is experimental");
     }
-    bootstrap.log_security_posture();
+    bootstrap.log_security_posture(local_bind);
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let events = EventHub::new();
@@ -402,6 +407,25 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         monitor
     };
 
+    // --- listeners ---
+    // Bound before anything is launched: apps are handed the local
+    // listener's address, which with an ephemeral port is only known once
+    // bound, and a port that cannot be had should stop the daemon before it
+    // has started anything it would then leave behind. Connections arriving
+    // before the servers below start wait in the accept queue.
+    let listener = tokio::net::TcpListener::bind(bootstrap.bind)
+        .await
+        .with_context(|| format!("cannot listen on bind {}", bootstrap.bind))?;
+    let local_listener = tokio::net::TcpListener::bind(local_bind)
+        .await
+        .with_context(|| {
+            format!(
+                "cannot listen on local_bind {local_bind}, the local listener for app \
+                 heartbeats and the capability check; set local_bind to a free loopback port"
+            )
+        })?;
+    let local_address = local_listener.local_addr()?;
+
     // --- core ---
     let supervisor = Arc::new(Supervisor::new(
         sway.clone(),
@@ -409,8 +433,10 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
         LaunchContext {
             profiles_root: bootstrap.state_dir.join("profiles"),
             log_root: bootstrap.state_dir.join("logs"),
-            // Loopback: the browsers posting heartbeats run on this machine.
-            api_base: format!("http://127.0.0.1:{}/api/v1", bootstrap.bind.port()),
+            // The local listener: the browsers posting heartbeats and the
+            // capability check run on this machine, and it is the one
+            // listener where a loopback caller proves that.
+            api_base: format!("http://{local_address}/api/v1"),
             browser_devtools: bootstrap.browser_devtools,
         },
         bootstrap.allowed_programs.clone(),
@@ -537,17 +563,37 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     // the stored measurement no longer describes this machine.
     tokio::spawn(api::capabilities::boot_measure(state.clone()));
 
-    let listener = tokio::net::TcpListener::bind(bootstrap.bind).await?;
     tracing::info!(address = %listener.local_addr()?, "listening");
-    // Once the socket is bound, the daemon is genuinely up. Under
-    // `Type=notify` systemd holds dependent units until this arrives, so it
-    // goes here rather than at the top of main.
+    tracing::info!(
+        address = %local_address,
+        "listening for app heartbeats and the capability check"
+    );
+    // Once both sockets are bound and about to be served, the daemon is
+    // genuinely up. Under `Type=notify` systemd holds dependent units until
+    // this arrives, so it goes here rather than at the top of main.
     suede::watchdog::notify_ready();
 
+    // Connection info is what lets the app-facing routes be loopback-only,
+    // on both listeners.
+    let local_server = axum::serve(
+        local_listener,
+        api::local_router(state.clone()).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown({
+        // Follows the main server's shutdown rather than listening for the
+        // signal itself, so a direct session ending stops both as well.
+        let mut shutdown = shutdown_rx.clone();
+        async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
     let session_for_shutdown = direct_session.clone();
     let server = axum::serve(
         listener,
-        // Connection info is what lets the heartbeat endpoint be loopback-only.
         api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(async move {
@@ -579,11 +625,21 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
     // The clock starts only once shutdown has actually been requested
     // (`shutdown_tx.send(true)` above, from a signal or a direct session
     // ending), never from server startup: an otherwise-idle daemon with an
-    // open event stream must never time out on its own.
-    let mut server = std::pin::pin!(std::future::IntoFuture::into_future(server));
+    // open event stream must never time out on its own. The bound covers
+    // both listeners: they drain together, and the daemon moves on once
+    // both have finished or the grace runs out.
+    let servers = async {
+        tokio::try_join!(
+            std::future::IntoFuture::into_future(server),
+            std::future::IntoFuture::into_future(local_server),
+        )
+    };
+    let mut servers = std::pin::pin!(servers);
     let mut shutdown_signaled = shutdown_rx.clone();
     tokio::select! {
-        result = &mut server => result?,
+        result = &mut servers => {
+            result?;
+        }
         _ = async {
             while !*shutdown_signaled.borrow() {
                 if shutdown_signaled.changed().await.is_err() {

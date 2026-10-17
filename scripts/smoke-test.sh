@@ -7,6 +7,11 @@ set -uo pipefail
 
 PORT="${PORT:-7099}"
 BASE="http://127.0.0.1:${PORT}"
+# The local listener, which answers only app heartbeats and the capability
+# check. Named explicitly rather than left to its default (one above PORT)
+# so the checks below cannot drift from what the daemon was told.
+LOCAL_PORT="${LOCAL_PORT:-$((PORT + 1))}"
+LOCAL_BASE="http://127.0.0.1:${LOCAL_PORT}"
 BIN="${BIN:-./target/debug/suede}"
 PASS=0
 FAIL=0
@@ -38,7 +43,7 @@ trap cleanup EXIT
 start_daemon() {
   # The stand-in app is `sleep`, which no browser allowlist admits; name it
   # explicitly rather than widening the default the daemon ships with.
-  SUEDE_ALLOWED_PROGRAMS=sleep \
+  SUEDE_ALLOWED_PROGRAMS=sleep,fake-browser SUEDE_LOCAL_BIND="127.0.0.1:${LOCAL_PORT}" \
     "$BIN" run --mock --bind "127.0.0.1:${PORT}" >>"$LOG" 2>&1 &
   DAEMON_PID=$!
   for _ in $(seq 1 50); do
@@ -51,8 +56,9 @@ start_daemon() {
 
 status_of() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
 json_of() { curl -s "$@"; }
+detail_of() { curl -s "$@" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("detail",""))'; }
 
-echo "Starting daemon on port ${PORT}"
+echo "Starting daemon on port ${PORT}, local listener on ${LOCAL_PORT}"
 start_daemon || exit 1
 
 echo
@@ -146,10 +152,51 @@ check "app is running" "running" \
   "$(json_of "${BASE}/api/v1/apps/renderer-1/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["state"])')"
 APP_PID="$(json_of "${BASE}/api/v1/apps/renderer-1/status" | python3 -c 'import sys,json;print(json.load(sys.stdin)["pid"])')"
 check "app has a pid" "true" "$([[ -n "$APP_PID" && "$APP_PID" != "None" ]] && echo true || echo false)"
-check "loopback heartbeat is accepted" "204" \
-  "$(status_of -X POST "${BASE}/api/v1/apps/renderer-1/heartbeat")"
+check "heartbeat on the local listener is accepted" "204" \
+  "$(status_of -X POST "${LOCAL_BASE}/api/v1/apps/renderer-1/heartbeat")"
 check "unknown app heartbeat is 404" "404" \
-  "$(status_of -X POST "${BASE}/api/v1/apps/ghost/heartbeat")"
+  "$(status_of -X POST "${LOCAL_BASE}/api/v1/apps/ghost/heartbeat")"
+# Bound to loopback, every caller of the main port is local, a reverse
+# proxy included, so loopback proves nothing there.
+check "heartbeat on the loopback main port is refused" "404" \
+  "$(status_of -X POST "${BASE}/api/v1/apps/renderer-1/heartbeat")"
+check "the refusal names the local listener" "true" \
+  "$([[ "$(detail_of -X POST "${BASE}/api/v1/apps/renderer-1/heartbeat")" == *"${LOCAL_BASE}/api/v1"* ]] && echo true || echo false)"
+check "the local listener serves nothing else" "404 404 404" \
+  "$(status_of "${LOCAL_BASE}/healthz") $(status_of "${LOCAL_BASE}/api/v1/status") $(status_of -X POST "${LOCAL_BASE}/api/v1/reconcile")"
+check "apps are handed the local listener" "${LOCAL_BASE}/api/v1/apps/kiosk/heartbeat" \
+  "$(curl -s -X POST "${BASE}/api/v1/apps/preview" -H 'content-type: application/json' \
+     -d '{"id":"kiosk","launcher":{"kind":"chromium-kiosk","uri":"{heartbeatUrl}"}}' \
+     | python3 -c 'import sys,json;print([a["value"] for a in json.load(sys.stdin)["args"] if a["source"]=="uri"][0])')"
+
+# A stand-in browser for the capability check: fetch the page it is pointed
+# at, then post a report the way the real page does, relative to the page.
+# The fetch is logged before the report goes out, because the daemon ends
+# the browser as soon as the report arrives.
+FAKE_BROWSER="${CONFIG_DIR}/fake-browser"
+FETCHES="${CONFIG_DIR}/fetches"
+cat >"$FAKE_BROWSER" <<FAKE
+#!/usr/bin/env bash
+for arg in "\$@"; do [[ "\$arg" == http://* ]] && url="\$arg"; done
+page=\$(curl -s -o /dev/null -w '%{http_code}' "\$url")
+root="\${url%/capability-check/*}"
+id="\${url##*/}"
+echo "\$url \$page" >>"$FETCHES"
+curl -s -o /dev/null -X POST -H 'content-type: application/json' \\
+  -H "origin: \$root" -H 'sec-fetch-site: same-origin' \\
+  -d '{"userAgent":"smoke","webgpu":false,"videoDecoderApi":false,"notes":[],"codecs":[]}' \\
+  "\$root/api/v1/capability-check/\$id/result"
+FAKE
+chmod +x "$FAKE_BROWSER"
+CAPABILITY="$(curl -s -X POST "${BASE}/api/v1/apps/capabilities?timeoutSeconds=10" \
+  -H 'content-type: application/json' \
+  -d "{\"id\":\"kiosk\",\"launcher\":{\"kind\":\"chromium-kiosk\",\"uri\":\"about:blank\",\"program\":\"${FAKE_BROWSER}\"}}")"
+check "capability check completes through the local listener" "True" \
+  "$(echo "$CAPABILITY" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("completed"))' 2>/dev/null)"
+# The report is posted relative to the page, as the real page does, so a
+# completed check plus the page's URL shows both used the local listener.
+check "the capability page was served by the local listener" "true" \
+  "$(grep -qE "^${LOCAL_BASE}/capability-check/[^ ]+ 200\$" "$FETCHES" 2>/dev/null && echo true || echo false)"
 
 echo "  ...killing the app process to prove it is relaunched"
 kill -9 "$APP_PID" 2>/dev/null

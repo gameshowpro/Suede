@@ -238,13 +238,22 @@ pub async fn deactivate_app(
     state.commit(next, "apps", query.wait).await.map(Json)
 }
 
+/// Watchdog heartbeat from an app's page content.
+///
+/// Post to the `{heartbeatUrl}` Suede substitutes at launch, which names the
+/// local listener (`local_bind`, `127.0.0.1:9089` by default). The main
+/// listener answers loopback callers too, for content that hardcodes it,
+/// only while it is bound to a routable address; bound to loopback, it
+/// answers 404 naming the local listener.
 #[utoipa::path(
     post, path = "/api/v1/apps/{id}/heartbeat", tag = "apps",
     params(("id" = String, Path, description = "App identifier")),
     responses(
         (status = 204, description = "Heartbeat recorded"),
         (status = 403, description = "Only loopback callers may post heartbeats"),
-        (status = 404, description = "No such app"),
+        (status = 404, description = "No such app, or this is the main listener \
+                        bound to loopback, where only the local listener serves \
+                        heartbeats"),
     )
 )]
 pub async fn heartbeat(
@@ -622,6 +631,167 @@ mod tests {
         let (status, headers, _) = send_with_headers(&harness, request, "127.0.0.1:1").await;
         assert_eq!(status, StatusCode::OK);
         assert!(headers.get("access-control-allow-origin").is_none());
+    }
+
+    /// Start one managed app on a harness whose main listener binds `bind`.
+    async fn with_app_bound(bind: &str, id: &str) -> Harness {
+        let bind = bind.parse().unwrap();
+        let harness = crate::api::test_support::harness_with_bootstrap(|bootstrap| {
+            bootstrap.bind = bind;
+        });
+        harness
+            .state
+            .store
+            .update(|state| {
+                state.apps.push(sleeper(id));
+                state.active_app = Some(id.to_string());
+            })
+            .unwrap();
+        harness.state.reconciler.reconcile().await;
+        harness
+    }
+
+    /// Send `request` from `peer` to the local listener's router.
+    async fn send_local(
+        harness: &Harness,
+        request: Request<Body>,
+        peer: &str,
+    ) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+        let mut request = request;
+        let address: SocketAddr = peer.parse().unwrap();
+        request.extensions_mut().insert(ConnectInfo(address));
+        let response = crate::api::local_router(harness.state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, headers, bytes.to_vec())
+    }
+
+    /// The proxy shape: every caller of a loopback main listener is
+    /// loopback, a reverse proxy included, so a heartbeat there proves
+    /// nothing and is turned away toward the local listener — where the
+    /// same heartbeat is accepted.
+    #[tokio::test]
+    async fn a_loopback_main_bind_refuses_heartbeats_naming_the_local_listener() {
+        let harness = with_app_bound("127.0.0.1:9088", "renderer").await;
+        assert_eq!(
+            harness.state.supervisor.launch_context().api_base,
+            "http://127.0.0.1:9089/api/v1"
+        );
+
+        let (status, body) = send(
+            &harness,
+            post("/api/v1/apps/renderer/heartbeat"),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("local listener"), "{detail}");
+        assert!(detail.contains("http://127.0.0.1:9089/api/v1"), "{detail}");
+        assert!(harness
+            .state
+            .supervisor
+            .status("renderer")
+            .await
+            .unwrap()
+            .last_heartbeat
+            .is_none());
+
+        let (status, _, _) = send_local(
+            &harness,
+            post("/api/v1/apps/renderer/heartbeat"),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(harness
+            .state
+            .supervisor
+            .status("renderer")
+            .await
+            .unwrap()
+            .last_heartbeat
+            .is_some());
+        harness.state.supervisor.shutdown().await;
+    }
+
+    /// The default shape: content that hardcodes the main port keeps working.
+    #[tokio::test]
+    async fn a_routable_main_bind_keeps_answering_loopback_heartbeats() {
+        let harness = with_app_bound("0.0.0.0:9088", "renderer").await;
+        let (status, _) = send(
+            &harness,
+            post("/api/v1/apps/renderer/heartbeat"),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = send_local(
+            &harness,
+            post("/api/v1/apps/renderer/heartbeat"),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        harness.state.supervisor.shutdown().await;
+    }
+
+    /// Pages on other origins, or on `file://`, still post heartbeats to the
+    /// local listener, so it carries the same CORS layer and preflight.
+    #[tokio::test]
+    async fn the_local_listener_answers_cross_origin_heartbeats_and_their_preflight() {
+        let harness = with_app_bound("127.0.0.1:9088", "renderer").await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/apps/renderer/heartbeat")
+            .header("Host", "127.0.0.1:9089")
+            .header("Origin", "null")
+            .header("Sec-Fetch-Site", "cross-site")
+            .header("Content-Type", "text/plain")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_local(&harness, request, "127.0.0.1:1").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+
+        let preflight = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/v1/apps/renderer/heartbeat")
+            .header("Origin", "http://content.example")
+            .header("Access-Control-Request-Method", "POST")
+            .header("Access-Control-Request-Private-Network", "true")
+            .body(Body::empty())
+            .unwrap();
+        let (status, headers, _) = send_local(&harness, preflight, "127.0.0.1:1").await;
+        assert!(status.is_success(), "{status}");
+        assert_eq!(headers.get("access-control-allow-origin").unwrap(), "*");
+        assert_eq!(
+            headers.get("access-control-allow-private-network").unwrap(),
+            "true"
+        );
+        harness.state.supervisor.shutdown().await;
+    }
+
+    /// The local listener is bound to loopback, so this cannot happen in
+    /// practice; the handler's own check stays as the second line.
+    #[tokio::test]
+    async fn the_local_listener_still_refuses_a_remote_peer() {
+        let harness = with_app_bound("127.0.0.1:9088", "renderer").await;
+        let (status, _, _) = send_local(
+            &harness,
+            post("/api/v1/apps/renderer/heartbeat"),
+            "192.168.1.20:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        harness.state.supervisor.shutdown().await;
     }
 
     /// Without `?wait=`, a status read right after activation can land

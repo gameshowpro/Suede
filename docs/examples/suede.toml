@@ -11,6 +11,17 @@
 # Address the HTTP server binds to.  Env: SUEDE_BIND
 bind = "0.0.0.0:9088"
 
+# The local listener, which answers only app heartbeats and the capability
+# check, the routes page content on this machine calls without a token.
+# Env: SUEDE_LOCAL_BIND
+#
+# Must be a loopback address; defaults to 127.0.0.1 one port above bind.
+# Launched apps are handed this address in {heartbeatUrl}. While bind is
+# routable, the main port also still answers those routes from loopback;
+# bound to loopback (behind a reverse proxy), it refuses them, because a
+# proxy's requests are loopback too. See configuration.md#local-listener.
+# local_bind = "127.0.0.1:9089"
+
 # Optional bearer token.  Env: SUEDE_TOKEN
 #
 # Leave unset on a trusted production LAN, which is the expected deployment.

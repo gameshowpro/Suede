@@ -5779,6 +5779,7 @@
     },
     "/api/v1/apps/{id}/heartbeat": {
       "post": {
+        "description": "Post to the `{heartbeatUrl}` Suede substitutes at launch, which names the\nlocal listener (`local_bind`, `127.0.0.1:9089` by default). The main\nlistener answers loopback callers too, for content that hardcodes it,\nonly while it is bound to a routable address; bound to loopback, it\nanswers 404 naming the local listener.",
         "operationId": "heartbeat",
         "parameters": [
           {
@@ -5799,9 +5800,10 @@
             "description": "Only loopback callers may post heartbeats"
           },
           "404": {
-            "description": "No such app"
+            "description": "No such app, or this is the main listener bound to loopback, where only the local listener serves heartbeats"
           }
         },
+        "summary": "Watchdog heartbeat from an app's page content.",
         "tags": [
           "apps"
         ]
@@ -5897,6 +5899,7 @@
     },
     "/api/v1/capability-check/{id}/result": {
       "post": {
+        "description": "Posted by the page Suede serves to its own browser, on the local\nlistener (`local_bind`, `127.0.0.1:9089` by default) the page is loaded\nfrom. The main listener answers it too, from loopback callers, only\nwhile it is bound to a routable address; bound to loopback, it answers\n404 naming the local listener.",
         "operationId": "post_result",
         "parameters": [
           {
@@ -5927,9 +5930,10 @@
             "description": "Only the local machine may report"
           },
           "404": {
-            "description": "No check with that id is waiting"
+            "description": "No check with that id is waiting, or this is the main listener bound to loopback, where only the local listener serves this route"
           }
         },
+        "summary": "The capability page's report.",
         "tags": [
           "apps"
         ]

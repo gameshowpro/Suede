@@ -209,6 +209,8 @@ ssh -L 9088:127.0.0.1:9088 appliance
 # then open http://localhost:9088/
 ```
 
+The same loopback bind is what a reverse proxy on the appliance forwards to. Bound to loopback, the main port no longer accepts app heartbeats or the capability check's report, because every caller there is local, the proxy's forwarded requests included. Those go to the local listener on `127.0.0.1:9089` instead, which is what launched apps are given in `{heartbeatUrl}`. Content that hardcodes `http://127.0.0.1:9088/api/v1/apps/<id>/heartbeat` needs updating to use the URL it is given. See [Local listener](configuration.md#local-listener).
+
 ### When it will not connect
 
 A host firewall is the usual culprit, and its signature is distinctive: the connection **times out** rather than being refused, because the default policy drops packets instead of rejecting them. From the outside that is indistinguishable from a machine that is switched off — and every health check still passes, because they all run from inside.
