@@ -49,6 +49,25 @@ docs_base_url = "https://suede.gameshow.pro/"
 # is meant to constrain. See configuration.md#allowed-programs.
 # allowed_programs = ["chromium", "google-chrome-stable"]
 
+# Origins, besides the appliance's own, whose browser pages may send
+# state-changing requests (anything but GET, HEAD and OPTIONS).
+# Env: SUEDE_ALLOWED_ORIGINS (comma-separated)
+#
+# Empty by default. A request from a browser that says it came from another
+# site is refused with 403; requests with no Origin header (curl, scripts,
+# other servers) and app heartbeats are not affected. Write each entry the way
+# a browser sends Origin: scheme://host[:port], no path. Adds no CORS headers.
+# See configuration.md#cross-site.
+# allowed_origins = ["https://control.example.com"]
+
+# Host names the appliance answers to, besides loopback; a defense against
+# DNS rebinding.  Env: SUEDE_ALLOWED_HOSTS (comma-separated)
+#
+# Empty by default, meaning any Host. When set, a request whose Host header
+# names anything else is refused with 403. List every name and address
+# clients use, without scheme or port. See configuration.md#cross-site.
+# allowed_hosts = ["wall-3.local", "192.168.1.50"]
+
 # Whether outputs may overlap in canvas space.
 #
 # Left false (the default, shown here commented out for a plain tiling

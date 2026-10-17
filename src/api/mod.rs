@@ -635,12 +635,17 @@ async fn health(State(state): State<ApiState>) -> Response {
     (StatusCode::OK, axum::Json(body)).into_response()
 }
 
+/// The app heartbeat route, which page content calls.
+fn is_heartbeat(path: &str) -> bool {
+    path.starts_with("/api/v1/apps/") && path.ends_with("/heartbeat")
+}
+
 /// Paths reachable without a bearer token even when one is configured.
 fn is_public(path: &str) -> bool {
     path == "/healthz"
         // Heartbeats come from page content, which cannot hold the API token;
         // that endpoint is restricted to loopback callers instead.
-        || (path.starts_with("/api/v1/apps/") && path.ends_with("/heartbeat"))
+        || is_heartbeat(path)
         // The capability check's page and report follow the same rule: page
         // content cannot hold the token, so both are loopback-restricted and
         // gated on the one-time id instead.
@@ -664,6 +669,11 @@ async fn authenticate(
         state.checks.note_client(peer.0.ip());
     }
 
+    // Before the token: these refuse what a browser was tricked into
+    // sending, which matters most in open mode, where nothing else would.
+    check_host(&state.bootstrap, &request)?;
+    check_cross_site(&state.bootstrap, &request)?;
+
     let Some(expected) = state.bootstrap.token.as_deref() else {
         return Ok(next.run(request).await);
     };
@@ -682,6 +692,168 @@ async fn authenticate(
         Some(token) if constant_time_eq(token, expected) => Ok(next.run(request).await),
         _ => Err(ApiError::Unauthorized),
     }
+}
+
+/// The authority the request was addressed to: the `Host` header, or the
+/// request target's own authority when a client sent an absolute URI.
+fn request_authority(request: &Request) -> Option<&str> {
+    request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        })
+}
+
+/// The host part of an authority, without the port; an IPv6 literal keeps
+/// its brackets, as `allowed_hosts` stores it.
+fn host_without_port(authority: &str) -> &str {
+    if authority.starts_with('[') {
+        return authority
+            .find(']')
+            .map_or(authority, |end| &authority[..=end]);
+    }
+    authority
+        .rsplit_once(':')
+        .map_or(authority, |(host, _)| host)
+}
+
+/// Whether `host` names this machine's loopback interface.
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Refuse a request addressed to a host name the operator did not list.
+///
+/// The DNS-rebinding defense: a hostile name pointed at the appliance's
+/// address makes a browser treat the appliance as that site, same origin
+/// and all, so neither CORS nor [`check_cross_site`] can tell. Only the
+/// `Host` header still says which name the browser thought it was talking
+/// to. Loopback names always pass: Suede hands its own launched apps and the
+/// capability check `127.0.0.1` URLs, and no rebinding can produce one.
+fn check_host(bootstrap: &BootstrapConfig, request: &Request) -> ApiResult<()> {
+    if bootstrap.allowed_hosts.is_empty() {
+        return Ok(());
+    }
+    let Some(authority) = request_authority(request) else {
+        return Err(ApiError::Forbidden(
+            "request refused: it has no Host header, and allowed_hosts is set; \
+             send the host name the appliance is reached by"
+                .into(),
+        ));
+    };
+    let host = host_without_port(authority).to_ascii_lowercase();
+    if is_loopback_host(&host) || bootstrap.allowed_hosts.contains(&host) {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(format!(
+        "request refused: Host {host:?} is not in allowed_hosts; add it to allowed_hosts \
+         in suede.toml (or SUEDE_ALLOWED_HOSTS) and restart the daemon if this appliance \
+         is meant to answer to that name"
+    )))
+}
+
+/// Refuse a state-changing request a browser sent on behalf of a page from
+/// another site.
+///
+/// CORS already stops a foreign page from sending JSON (that needs a
+/// preflight this API never answers), but a form post, a `text/plain` body
+/// or an empty POST is sent without asking, and the appliance would act on
+/// it before the browser hid the response. So the browser's own account of
+/// where the request came from is checked instead. `Sec-Fetch-Site` is the
+/// authority when present, since every current browser sets it and a page
+/// cannot forge it; it also keeps a reverse proxy that rewrites `Host` from
+/// breaking the same-origin UI. Older browsers send only `Origin`, which is
+/// compared with `Host`. A request with neither came from curl, a script or
+/// another server, none of which a hostile page can drive, so it passes.
+///
+/// Heartbeats are exempt: page content served from anywhere, or from
+/// `file://` (`Origin: null`), posts them by design, and the route is
+/// loopback-only and changes nothing but a liveness timestamp.
+fn check_cross_site(bootstrap: &BootstrapConfig, request: &Request) -> ApiResult<()> {
+    if matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    ) || is_heartbeat(request.uri().path())
+    {
+        return Ok(());
+    }
+    let headers = request.headers();
+    let origin = headers
+        .get(header::ORIGIN)
+        .map(|value| value.to_str().unwrap_or("").to_ascii_lowercase());
+    let allowed = || {
+        origin
+            .as_deref()
+            .is_some_and(|origin| bootstrap.allowed_origins.iter().any(|a| a == origin))
+    };
+    let origin_text = origin.as_deref().map_or_else(
+        || "no Origin header".to_string(),
+        |origin| format!("Origin {origin:?}"),
+    );
+    let remedy = "add the page's origin to allowed_origins in suede.toml (or \
+                  SUEDE_ALLOWED_ORIGINS) and restart the daemon if that site is trusted";
+
+    let fetch_site = headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok());
+    match fetch_site {
+        Some(site @ ("cross-site" | "same-site")) => {
+            if allowed() {
+                return Ok(());
+            }
+            return Err(ApiError::Forbidden(format!(
+                "cross-site request refused: the browser sent Sec-Fetch-Site {site:?} \
+                 ({origin_text}); {remedy}"
+            )));
+        }
+        // The browser vouches for the page being this origin, or for the
+        // user having started the request themselves.
+        Some("same-origin" | "none") => return Ok(()),
+        _ => {}
+    }
+
+    let Some(origin) = origin.as_deref() else {
+        return Ok(());
+    };
+    let own = request_authority(request).map(str::to_ascii_lowercase);
+    if own
+        .as_deref()
+        .is_some_and(|own| same_authority(origin, own))
+        || allowed()
+    {
+        return Ok(());
+    }
+    Err(ApiError::Forbidden(format!(
+        "cross-origin request refused: Origin {origin:?} does not match Host {:?}; {remedy}",
+        own.as_deref().unwrap_or("")
+    )))
+}
+
+/// Whether a lowercase `Origin` names the lowercase `Host` authority, port
+/// included. A port left implicit on one side and spelled out as the
+/// scheme's default on the other still matches.
+fn same_authority(origin: &str, host: &str) -> bool {
+    let Some((scheme, authority)) = origin.split_once("://") else {
+        // `null`, from a sandboxed or `file://` page, names no host at all.
+        return false;
+    };
+    let default_port = match scheme {
+        "http" => ":80",
+        "https" => ":443",
+        _ => return false,
+    };
+    authority.strip_suffix(default_port).unwrap_or(authority)
+        == host.strip_suffix(default_port).unwrap_or(host)
 }
 
 /// Compare without leaking length or position through timing.
@@ -1079,6 +1251,253 @@ mod tests {
         assert!(is_public("/api/v1/capability-check/abc123/result"));
         // Launching a browser on the displays is an operator action.
         assert!(!is_public("/api/v1/apps/capabilities"));
+    }
+
+    /// A POST to `/api/v1/reconcile` from a browser, carrying whatever
+    /// headers the case under test needs. `reconcile` has no body and needs
+    /// no token in open mode, which is what made it the original exploit.
+    fn reconcile_post(headers: &[(&str, &str)]) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/reconcile")
+            .header("host", "appliance.local:9088");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    async fn status_of(
+        harness: super::test_support::Harness,
+        request: HttpRequest<Body>,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = harness.router.oneshot(request).await.unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    #[tokio::test]
+    async fn a_cross_origin_form_post_is_refused_naming_the_header_and_the_setting() {
+        let (status, body) = status_of(
+            harness(None),
+            reconcile_post(&[
+                ("origin", "http://evil.example"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["status"], 403);
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("http://evil.example"), "{detail}");
+        assert!(detail.contains("Host"), "{detail}");
+        assert!(detail.contains("allowed_origins"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_post_without_an_origin_header_succeeds_as_curl_sends_it() {
+        let (status, _) = status_of(
+            harness(None),
+            reconcile_post(&[("content-type", "application/x-www-form-urlencoded")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_post_from_an_older_browser_succeeds() {
+        let (status, _) = status_of(
+            harness(None),
+            reconcile_post(&[("origin", "http://appliance.local:9088")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_same_origin_post_succeeds_even_when_a_proxy_rewrote_the_host() {
+        // A proxy that forwards with its own upstream `Host` makes `Origin`
+        // and `Host` disagree; the browser's `Sec-Fetch-Site` still vouches.
+        let (status, _) = status_of(
+            harness(None),
+            reconcile_post(&[
+                ("origin", "https://suede.example.com"),
+                ("sec-fetch-site", "same-origin"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_post_from_an_allowed_origin_succeeds() {
+        let harness = super::test_support::harness_with_bootstrap(|bootstrap| {
+            bootstrap.allowed_origins = vec!["https://control.example.com".into()];
+        });
+        let (status, _) = status_of(
+            harness,
+            reconcile_post(&[
+                ("origin", "https://control.example.com"),
+                ("sec-fetch-site", "cross-site"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_allowed_origin_also_passes_an_older_browser_without_sec_fetch_site() {
+        let harness = super::test_support::harness_with_bootstrap(|bootstrap| {
+            bootstrap.allowed_origins = vec!["https://control.example.com".into()];
+        });
+        let (status, _) = status_of(
+            harness,
+            reconcile_post(&[("origin", "https://control.example.com")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_site_cross_site_is_refused_even_without_an_origin() {
+        let (status, body) = status_of(
+            harness(None),
+            reconcile_post(&[("sec-fetch-site", "cross-site")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("Sec-Fetch-Site"), "{detail}");
+        assert!(detail.contains("allowed_origins"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn sec_fetch_site_same_site_is_refused_unless_the_origin_is_allowed() {
+        let (status, _) = status_of(
+            harness(None),
+            reconcile_post(&[
+                ("origin", "http://other.local:9088"),
+                ("sec-fetch-site", "same-site"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_foreign_origin_cannot_post_in_token_mode_even_with_the_token() {
+        // Refused before the token is looked at: a browser that holds a
+        // token (through a proxy that injects it) is the one to protect.
+        let (status, body) = status_of(
+            harness(Some("secret")),
+            reconcile_post(&[
+                ("origin", "http://evil.example"),
+                ("authorization", "Bearer secret"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body["detail"].as_str().unwrap().contains("allowed_origins"));
+    }
+
+    #[tokio::test]
+    async fn a_get_with_a_foreign_origin_succeeds() {
+        let request = HttpRequest::builder()
+            .uri("/api/v1/status")
+            .header("host", "appliance.local:9088")
+            .header("origin", "http://evil.example")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = status_of(harness(None), request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn an_origin_matches_a_host_that_spells_out_the_default_port() {
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/v1/reconcile")
+            .header("host", "appliance.local:80")
+            .header("origin", "http://appliance.local")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = status_of(harness(None), request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_null_origin_is_refused_outside_the_heartbeat_route() {
+        let (status, _) = status_of(harness(None), reconcile_post(&[("origin", "null")])).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn any_host_is_answered_while_allowed_hosts_is_empty() {
+        let request = HttpRequest::builder()
+            .uri("/api/v1/status")
+            .header("host", "rebound.evil.example:9088")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = status_of(harness(None), request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn allowed_hosts_refuses_an_unlisted_host_naming_the_setting() {
+        let harness = super::test_support::harness_with_bootstrap(|bootstrap| {
+            bootstrap.allowed_hosts = vec!["suede.example.com".into()];
+        });
+        // A GET too: rebinding is about reading the API as much as writing.
+        let request = HttpRequest::builder()
+            .uri("/api/v1/status")
+            .header("host", "rebound.evil.example:9088")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = status_of(harness, request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("rebound.evil.example"), "{detail}");
+        assert!(detail.contains("allowed_hosts"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn allowed_hosts_accepts_a_listed_host_on_any_port_and_any_case() {
+        let harness = super::test_support::harness_with_bootstrap(|bootstrap| {
+            bootstrap.allowed_hosts = vec!["suede.example.com".into()];
+        });
+        let request = HttpRequest::builder()
+            .uri("/api/v1/status")
+            .header("host", "Suede.Example.com:9088")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = status_of(harness, request).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn allowed_hosts_always_accepts_loopback_names() {
+        // Launched apps and the capability check are handed 127.0.0.1 URLs
+        // by Suede itself.
+        for host in ["127.0.0.1:9088", "localhost:9088", "[::1]:9088"] {
+            let harness = super::test_support::harness_with_bootstrap(|bootstrap| {
+                bootstrap.allowed_hosts = vec!["suede.example.com".into()];
+            });
+            let request = HttpRequest::builder()
+                .uri("/api/v1/status")
+                .header("host", host)
+                .body(Body::empty())
+                .unwrap();
+            let (status, _) = status_of(harness, request).await;
+            assert_eq!(status, StatusCode::OK, "{host}");
+        }
+    }
+
+    fn host_without_port_keeps_ipv6_brackets() {
+        assert_eq!(host_without_port("example.com:9088"), "example.com");
+        assert_eq!(host_without_port("example.com"), "example.com");
+        assert_eq!(host_without_port("[fd00::1]:9088"), "[fd00::1]");
+        assert_eq!(host_without_port("[fd00::1]"), "[fd00::1]");
     }
 
     #[test]

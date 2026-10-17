@@ -588,6 +588,27 @@ mod tests {
         harness.state.supervisor.shutdown().await;
     }
 
+    /// Content loaded over `file://` or in a sandbox posts with
+    /// `Origin: null`, and Chromium marks it cross-site; the cross-site
+    /// request filter must not refuse it, because heartbeats are meant to
+    /// come from pages served anywhere.
+    #[tokio::test]
+    async fn a_cross_site_heartbeat_with_a_null_origin_succeeds_from_loopback() {
+        let harness = with_app("renderer").await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/v1/apps/renderer/heartbeat")
+            .header("Host", "127.0.0.1:9088")
+            .header("Origin", "null")
+            .header("Sec-Fetch-Site", "cross-site")
+            .header("Content-Type", "text/plain")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = send(&harness, request, "127.0.0.1:1").await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        harness.state.supervisor.shutdown().await;
+    }
+
     /// The CORS layer is scoped to the heartbeat route only; every other
     /// endpoint must stay same-origin.
     #[tokio::test]

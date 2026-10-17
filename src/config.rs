@@ -36,6 +36,12 @@ struct FileConfig {
     /// default) — `serde`'s usual "missing means empty" would conflate the
     /// two, and they mean opposite things.
     allowed_programs: Option<Vec<String>>,
+    /// Raw strings, like `power`: a malformed entry must become a
+    /// [`ConfigError::AllowedOrigin`] naming it, and the same parse has to
+    /// serve the `SUEDE_ALLOWED_ORIGINS` override.
+    allowed_origins: Option<Vec<String>>,
+    /// Raw strings, for the same reason as `allowed_origins`.
+    allowed_hosts: Option<Vec<String>>,
     allow_overlaps: Option<bool>,
     /// `Option`, not a bare `bool`, so an *explicit* `direct_scanout = true`
     /// can be told apart from an absent key. They resolve to the same value
@@ -91,6 +97,28 @@ pub struct BootstrapConfig {
     /// In the file rather than in desired state, because desired state is
     /// written through the API this is meant to constrain.
     pub allowed_programs: Vec<String>,
+    /// Origins, besides the appliance's own, whose browser pages may send
+    /// state-changing requests (anything but GET, HEAD and OPTIONS).
+    ///
+    /// Empty by default, which is what the same-origin web UI, curl and
+    /// server-to-server clients need: only a browser names a foreign
+    /// `Origin`, and a page on another site posting a form at the appliance
+    /// is exactly the request this refuses. Entries are stored the way a
+    /// browser serializes `Origin` (lowercase, no default port, no trailing
+    /// slash), so the comparison can be a plain string match. Relaxes the
+    /// check only; it adds no CORS headers, so a cross-origin page still
+    /// cannot read the responses.
+    pub allowed_origins: Vec<String>,
+    /// Host names the API answers to, lowercase and without a port.
+    ///
+    /// Empty by default, meaning any `Host`. When set, a request naming
+    /// another host is refused: that is the defense against DNS rebinding,
+    /// where a hostile name is pointed at the appliance's address so a
+    /// browser treats the appliance as that site. Loopback names are always
+    /// accepted on top of the list, because Suede itself hands launched
+    /// apps and the capability check `http://127.0.0.1:...` URLs, and no
+    /// rebinding attack can make a browser send a loopback `Host`.
+    pub allowed_hosts: Vec<String>,
     /// Whether outputs may overlap in canvas space — the one setting that
     /// decides which of the two display paths this machine runs.
     ///
@@ -198,6 +226,8 @@ impl Default for BootstrapConfig {
             systemd_user_dir: default_systemd_user_dir(),
             power: Vec::new(),
             allowed_programs: default_allowed_programs(),
+            allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
             allow_overlaps: false,
             direct_scanout: true,
             presentation: PresentationMode::Wayland,
@@ -301,6 +331,22 @@ pub enum ConfigError {
     /// Same reasoning as [`ConfigError::AlignOutputs`].
     #[error("invalid SUEDE_BROWSER_DEVTOOLS {value:?}; accepted values are true, false")]
     BrowserDevtools { value: String },
+    /// An entry that can never equal a browser's `Origin` would silently
+    /// leave the client it was meant for refused, so it fails startup
+    /// instead — the same reasoning as [`ConfigError::PowerVerb`].
+    #[error(
+        "invalid allowed_origins entry {value:?}; write an origin the way a browser sends it, \
+         scheme://host[:port] with an http or https scheme and no path, \
+         e.g. \"https://control.example.com\""
+    )]
+    AllowedOrigin { value: String },
+    /// Same reasoning as [`ConfigError::AllowedOrigin`]: a URL or a
+    /// `host:port` pasted here would never match a `Host` header.
+    #[error(
+        "invalid allowed_hosts entry {value:?}; write a host name or address with no scheme \
+         or port, e.g. \"suede.example.com\" or \"[fd00::1]\""
+    )]
+    AllowedHost { value: String },
 }
 
 impl BootstrapConfig {
@@ -351,6 +397,16 @@ impl BootstrapConfig {
         config.power = parse_power(power_source(file.power))?;
         config.allowed_programs =
             allowed_programs_source(file.allowed_programs).unwrap_or_else(default_allowed_programs);
+        config.allowed_origins = env_list_or(file.allowed_origins, "SUEDE_ALLOWED_ORIGINS")
+            .unwrap_or_default()
+            .iter()
+            .map(|value| normalize_origin(value))
+            .collect::<Result<_, _>>()?;
+        config.allowed_hosts = env_list_or(file.allowed_hosts, "SUEDE_ALLOWED_HOSTS")
+            .unwrap_or_default()
+            .iter()
+            .map(|value| normalize_host(value))
+            .collect::<Result<_, _>>()?;
         config.allow_overlaps = file.allow_overlaps.unwrap_or(false);
         // An absent key resolves to the same `true` as an explicit one; only
         // the explicit one is an error on a tiling appliance, because only it
@@ -503,6 +559,18 @@ impl BootstrapConfig {
         if !self.power.is_empty() {
             tracing::info!(verbs = ?self.power, "host power control is enabled");
         }
+        if !self.allowed_origins.is_empty() {
+            tracing::info!(
+                origins = ?self.allowed_origins,
+                "state-changing requests are also accepted from pages on these origins"
+            );
+        }
+        if !self.allowed_hosts.is_empty() {
+            tracing::info!(
+                hosts = ?self.allowed_hosts,
+                "requests are only answered for these host names and loopback"
+            );
+        }
     }
 }
 
@@ -513,18 +581,25 @@ fn env_or(file_value: Option<String>, var: &str) -> Option<String> {
         .or(file_value)
 }
 
-/// Raw power-verb spellings from `SUEDE_POWER` (comma-separated, wins
-/// outright) or the file list — same all-or-nothing precedence as every
-/// other `env_or` field, just shaped for a list instead of a scalar.
-fn power_source(file_value: Option<Vec<String>>) -> Vec<String> {
-    match std::env::var("SUEDE_POWER").ok().filter(|v| !v.is_empty()) {
-        Some(value) => value
-            .split(',')
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .collect(),
-        None => file_value.unwrap_or_default(),
+/// A list from `var` (comma-separated, wins outright) or the file — same
+/// all-or-nothing precedence as [`env_or`], just shaped for a list instead
+/// of a scalar. `None` only when neither names one.
+fn env_list_or(file_value: Option<Vec<String>>, var: &str) -> Option<Vec<String>> {
+    match std::env::var(var).ok().filter(|v| !v.is_empty()) {
+        Some(value) => Some(
+            value
+                .split(',')
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .collect(),
+        ),
+        None => file_value,
     }
+}
+
+/// Raw power-verb spellings from `SUEDE_POWER` or the file list.
+fn power_source(file_value: Option<Vec<String>>) -> Vec<String> {
+    env_list_or(file_value, "SUEDE_POWER").unwrap_or_default()
 }
 
 /// Raw program names from `SUEDE_ALLOWED_PROGRAMS` (comma-separated, wins
@@ -537,18 +612,68 @@ fn power_source(file_value: Option<Vec<String>>) -> Vec<String> {
 /// would make an explicit empty list indistinguishable from no opinion at
 /// all, and they mean opposite things.
 fn allowed_programs_source(file_value: Option<Vec<String>>) -> Option<Vec<String>> {
-    match std::env::var("SUEDE_ALLOWED_PROGRAMS")
-        .ok()
-        .filter(|v| !v.is_empty())
+    env_list_or(file_value, "SUEDE_ALLOWED_PROGRAMS")
+}
+
+/// An `allowed_origins` entry in the form browsers serialize `Origin`:
+/// lowercase, with no trailing slash and no default port. Normalized here,
+/// once, so the per-request comparison is a plain string match and an
+/// operator who wrote `https://Control.example.com:443/` still gets what
+/// they meant.
+fn normalize_origin(value: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::AllowedOrigin {
+        value: value.to_string(),
+    };
+    let lower = value.trim().to_ascii_lowercase();
+    let lower = lower.strip_suffix('/').unwrap_or(&lower);
+    let (scheme, authority) = lower.split_once("://").ok_or_else(invalid)?;
+    let default_port = match scheme {
+        "http" => ":80",
+        "https" => ":443",
+        _ => return Err(invalid()),
+    };
+    // `Authority` accepts userinfo, which no `Origin` ever carries.
+    if authority.contains('@') {
+        return Err(invalid());
+    }
+    let parsed = authority
+        .parse::<axum::http::uri::Authority>()
+        .map_err(|_| invalid())?;
+    if parsed.as_str() != authority || parsed.host().is_empty() {
+        return Err(invalid());
+    }
+    // `Authority` accepts a port it cannot read, and then reports none.
+    if let Some(port) = authority[parsed.host().len()..].strip_prefix(':') {
+        if port.parse::<u16>().is_err() {
+            return Err(invalid());
+        }
+    }
+    let authority = authority.strip_suffix(default_port).unwrap_or(authority);
+    Ok(format!("{scheme}://{authority}"))
+}
+
+/// An `allowed_hosts` entry: lowercase, no scheme, no port. An IPv6 literal
+/// keeps its brackets, as it appears in a `Host` header.
+fn normalize_host(value: &str) -> Result<String, ConfigError> {
+    let invalid = || ConfigError::AllowedHost {
+        value: value.to_string(),
+    };
+    let host = value.trim().to_ascii_lowercase();
+    let valid = if let Some(inner) = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
     {
-        Some(value) => Some(
-            value
-                .split(',')
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .collect(),
-        ),
-        None => file_value,
+        inner.parse::<std::net::Ipv6Addr>().is_ok()
+    } else {
+        !host.is_empty()
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    };
+    if valid {
+        Ok(host)
+    } else {
+        Err(invalid())
     }
 }
 
@@ -1035,4 +1160,120 @@ mod tests {
 
         unsafe { std::env::remove_var("SUEDE_ALLOWED_PROGRAMS") };
     }
+
+    /// One test, like the allowed-programs test, because
+    /// `SUEDE_ALLOWED_ORIGINS` is process-wide state.
+    #[test]
+    fn allowed_origins_default_to_none_and_are_normalized_from_file_and_env() {
+        let _guard = env_lock();
+        // Safety: the whole test holds `env_lock`.
+        unsafe { std::env::remove_var("SUEDE_ALLOWED_ORIGINS") };
+
+        // Absent: no foreign origin is trusted, which is today's behavior
+        // for every client that does not come from a browser on another site.
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(config.allowed_origins.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+
+        // Stored the way a browser sends `Origin`: lowercase, no trailing
+        // slash, no default port — and a non-default port kept.
+        std::fs::write(
+            &path,
+            "allowed_origins = [\"https://Control.Example.com:443/\", \"http://10.0.0.5:8080\"]\n",
+        )
+        .unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.allowed_origins,
+            vec![
+                "https://control.example.com".to_string(),
+                "http://10.0.0.5:8080".to_string()
+            ]
+        );
+
+        // The environment wins outright over the file.
+        unsafe {
+            std::env::set_var(
+                "SUEDE_ALLOWED_ORIGINS",
+                "http://a.example:80, https://b.example, http://[FD00::1]:9088",
+            )
+        };
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.allowed_origins,
+            vec![
+                "http://a.example".to_string(),
+                "https://b.example".to_string(),
+                "http://[fd00::1]:9088".to_string()
+            ]
+        );
+        unsafe { std::env::remove_var("SUEDE_ALLOWED_ORIGINS") };
+
+        // Entries no browser could ever send fail startup, naming the entry,
+        // rather than leaving the client they were meant for refused.
+        for bad in [
+            "control.example.com",
+            "null",
+            "file://",
+            "ftp://control.example.com",
+            "https://control.example.com/ui",
+            "https://user@control.example.com",
+            "https://control.example.com:http",
+        ] {
+            std::fs::write(&path, format!("allowed_origins = [{bad:?}]\n")).unwrap();
+            let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+            assert!(error.contains("allowed_origins"), "{bad}: {error}");
+            assert!(error.contains(bad), "{bad}: {error}");
+        }
+    }
+
+    /// One test, like the allowed-origins test, because
+    /// `SUEDE_ALLOWED_HOSTS` is process-wide state.
+    #[test]
+    fn allowed_hosts_default_to_any_and_are_read_from_file_and_env() {
+        let _guard = env_lock();
+        // Safety: the whole test holds `env_lock`.
+        unsafe { std::env::remove_var("SUEDE_ALLOWED_HOSTS") };
+
+        let config = BootstrapConfig::load(Some(Path::new("/nonexistent/suede.toml"))).unwrap();
+        assert!(config.allowed_hosts.is_empty(), "absent means any Host");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("suede.toml");
+        std::fs::write(
+            &path,
+            "allowed_hosts = [\"Suede.Example.com\", \"192.168.1.50\", \"[fd00::1]\"]\n",
+        )
+        .unwrap();
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(
+            config.allowed_hosts,
+            vec![
+                "suede.example.com".to_string(),
+                "192.168.1.50".to_string(),
+                "[fd00::1]".to_string()
+            ]
+        );
+
+        unsafe { std::env::set_var("SUEDE_ALLOWED_HOSTS", "wall-3.local") };
+        let config = BootstrapConfig::load(Some(&path)).unwrap();
+        assert_eq!(config.allowed_hosts, vec!["wall-3.local".to_string()]);
+        unsafe { std::env::remove_var("SUEDE_ALLOWED_HOSTS") };
+
+        // A URL or a port can never equal the host part of a `Host` header.
+        for bad in [
+            "https://suede.example.com",
+            "suede.example.com:9088",
+            "fd00::1",
+            "suede example",
+        ] {
+            std::fs::write(&path, format!("allowed_hosts = [{bad:?}]\n")).unwrap();
+            let error = BootstrapConfig::load(Some(&path)).unwrap_err().to_string();
+            assert!(error.contains("allowed_hosts"), "{bad}: {error}");
+            assert!(error.contains(bad), "{bad}: {error}");
+        }
+    }
+
 }

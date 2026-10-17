@@ -48,6 +48,8 @@ Read from `$XDG_CONFIG_HOME/suede/suede.toml` (usually `~/.config/suede/suede.to
 | `docs_base_url` | `SUEDE_DOCS_BASE_URL` | `https://suede.gameshow.pro/` | Base for health-check documentation links |
 | `power` | `SUEDE_POWER` | `[]` (none) | Host power operations this appliance may perform — see [Host power control](#host-power) |
 | `allowed_programs` | `SUEDE_ALLOWED_PROGRAMS` | the browsers Suede knows how to drive | Programs applications may launch — see [Allowed programs](#allowed-programs) |
+| `allowed_origins` | `SUEDE_ALLOWED_ORIGINS` | `[]` (none) | Origins, besides the appliance's own, whose browser pages may send state-changing requests — see [Cross-site request protection](#cross-site) |
+| `allowed_hosts` | `SUEDE_ALLOWED_HOSTS` | `[]` (any host) | Host names the appliance answers to, besides loopback; a defense against DNS rebinding — see [Cross-site request protection](#cross-site) |
 | `allow_overlaps` | — | `false` | Whether outputs may overlap in canvas space, and so which display path this machine runs — see [Overlapping layouts and direct scanout](#direct-scanout) |
 | `direct_scanout` | — | `true` | Whether the compositor may flip the slicer's buffers straight to the display controllers; only meaningful with `allow_overlaps = true` — see [Overlapping layouts and direct scanout](#direct-scanout) |
 | `presentation` | — | `"wayland"` | **Experimental.** `"wayland"` or `"direct"`: which display path the login session starts — see [Experimental: direct presentation](#experimental-direct-presentation). `"direct"` without `allow_overlaps = true` resolves to effective `wayland` with a reason instead of failing to start; an unrecognized value fails startup. `GET /api/v1/system` reports `requested`, `effective`, and why they differ, if they do |
@@ -153,6 +155,90 @@ restart timer, which could never do anything but fail again.
     holds against a hostile client is the network and the bearer token — see
     [Raw Sway commands](#raw-sway-commands). Do not treat this list as more
     than what it is.
+
+### Cross-site request protection {: #cross-site }
+
+Any web page a person on the appliance's network opens can make their browser
+send requests to the appliance. Browsers stop a foreign page from sending
+JSON, because that needs a CORS preflight the API never answers. A form post,
+a `text/plain` body or an empty `POST` is sent without asking, though, and
+`POST /api/v1/reconcile` or an app restart would take effect before the
+browser hid the response. In token mode, a browser behind a proxy that adds
+the token for its users is in the same position. So Suede checks every request
+other than `GET`, `HEAD` and `OPTIONS` itself, before it looks at the token:
+
+- **`Sec-Fetch-Site: cross-site` or `same-site`:** refused, unless the
+  request's `Origin` is listed in `allowed_origins`. Every current browser
+  sends this header and a page cannot change it. `same-origin` and `none` are
+  accepted, so the web UI keeps working behind a reverse proxy that rewrites
+  `Host`.
+- **No `Sec-Fetch-Site`, but an `Origin`** (an older browser): `Origin` is
+  compared with the `Host` the request was sent to, port included. A mismatch
+  is refused unless the origin is listed. `Origin: null`, which sandboxed and
+  `file://` pages send, never matches.
+- **Neither header:** accepted. curl, scripts and server-to-server clients
+  send neither, and a hostile page cannot make a browser leave them out.
+
+App heartbeats (`POST /api/v1/apps/{id}/heartbeat`) are exempt. Page content
+served from anywhere, including `file://`, posts them by design. The route
+only accepts loopback callers and records nothing but a timestamp (see
+[Local listener](#local-listener)).
+
+A refusal is `403` with a problem body that names the header and the setting
+that would allow it:
+
+```
+cross-origin request refused: Origin "http://evil.example" does not match
+Host "appliance:9088"; add the page's origin to allowed_origins in suede.toml
+(or SUEDE_ALLOWED_ORIGINS) and restart the daemon if that site is trusted
+```
+
+**`allowed_origins`** lists the pages, other than the appliance's own UI,
+that you trust to send these requests, for example a show-control dashboard
+served from another machine:
+
+```toml
+allowed_origins = ["https://control.example.com", "http://10.0.0.5:8080"]
+```
+
+Write each entry the way a browser sends `Origin`: `scheme://host[:port]`,
+`http` or `https`, with no path. Case, a trailing slash and a default port
+(`:80`, `:443`) are normalized away. An entry no browser could send, such as
+a bare host name, a path or `null`, fails startup and names the entry, so a
+typo cannot leave the client refused without anyone noticing.
+`SUEDE_ALLOWED_ORIGINS` overrides the list, comma-separated.
+
+The setting only relaxes this check. It adds no CORS headers, so a page on a
+listed origin can send form posts and body-less actions such as
+`POST /api/v1/apps/{id}/restart`, but cannot read the responses or send JSON,
+which still needs a preflight.
+
+**`allowed_hosts`** defends against DNS rebinding. A hostile site can point
+its own host name at the appliance's address, and the browser then treats the
+appliance as that site: same origin, so neither CORS nor the check above can
+tell. Only the `Host` header still shows the name the browser thought it was
+using. With `allowed_hosts` set, a request for any other name is refused with
+`403`, for every method including `GET`:
+
+```toml
+allowed_hosts = ["wall-3.local", "192.168.1.50"]
+```
+
+List every name and address people and clients use to reach the appliance,
+without scheme or port. An IPv6 address keeps its brackets (`"[fd00::1]"`).
+Any port matches. Loopback names (`localhost`, `127.0.0.1`, `[::1]`) are
+always accepted on top of the list, because Suede hands its own launched apps
+and the capability check `http://127.0.0.1:...` URLs, and DNS rebinding cannot
+produce a loopback `Host`. A reverse proxy that forwards the original `Host`
+needs its public name listed; one that sends `127.0.0.1:9088` instead passes
+as loopback. An entry with a scheme or a port fails startup.
+`SUEDE_ALLOWED_HOSTS` overrides the list, comma-separated. Empty, the
+default, answers to any host.
+
+Neither setting authenticates anyone. They stop a browser from being used
+against the appliance, not a client that talks to it directly. That is what
+the network and the bearer token are for (see
+[Security posture](getting-started.md#security-posture)).
 
 ### Overlapping layouts and direct scanout {: #direct-scanout }
 

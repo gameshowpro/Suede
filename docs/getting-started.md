@@ -249,4 +249,6 @@ or `SUEDE_TOKEN` in the environment. When a token is configured:
 - Every endpoint requires `Authorization: Bearer <token>`, except `/healthz` and the loopback-only heartbeat endpoint.
 - **The web UI and the `/docs` page are disabled**, because a page that embedded the token would defeat it. Token mode is for machine-to-machine clients.
 
+With or without a token, Suede refuses state-changing requests that a browser sends for a page on another site, so a hostile web page opened on the same network cannot drive the appliance. Clients that send no `Origin` header (curl, scripts, other servers) and app heartbeats are not affected. To let a trusted page on another origin send them, list it in `allowed_origins`. To answer only to known host names, a defense against DNS rebinding, set `allowed_hosts`. See [Cross-site request protection](configuration.md#cross-site).
+
 There is no TLS. Front Suede with a reverse proxy where transport security matters.
