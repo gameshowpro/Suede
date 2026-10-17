@@ -389,6 +389,20 @@ pre, pre code { font-variant-ligatures: common-ligatures contextual; font-featur
   background: color-mix(in srgb, var(--bg) 72%, transparent);
   backdrop-filter: blur(3px); }
 #offline.show { display: flex; }
+/* The page needs a token it was never given: opaque, above everything, and
+   with nothing behind it that looks usable. */
+#auth-required { position: fixed; inset: 0; z-index: 300; display: none;
+  align-items: center; justify-content: center; padding: 20px;
+  background: var(--bg); overflow: auto; }
+#auth-required.show { display: flex; }
+#auth-required .card { background: var(--panel); border: 1px solid var(--line);
+  border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.28);
+  padding: 26px 30px; max-width: 36em; }
+#auth-required h2 { margin: 0 0 10px; font-size: 19px; }
+#auth-required p { margin: 0 0 14px; color: var(--muted); }
+#auth-required .row { margin-top: 18px; align-items: center; }
+#auth-required a.action { background: var(--accent); color: #fff; padding: 7px 14px;
+  border-radius: 7px; text-decoration: none; }
 #offline .card { background: var(--panel); border: 1px solid var(--line);
   border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.28);
   padding: 22px 26px; max-width: 34em; text-align: center; }
@@ -1147,6 +1161,19 @@ window.addEventListener("error", (event) => {
     </div>
   </div>
 </div>
+<div id="auth-required" role="alertdialog" aria-modal="true" aria-labelledby="auth-heading">
+  <div class="card">
+    <h2 id="auth-heading">This appliance requires an API token</h2>
+    <p>The appliance refused this page's requests because they carried no token. The page
+      holds no credential of its own: it works only when it is opened through the
+      authenticating proxy your administrator set up, which supplies the token for you.</p>
+    <p>Open the appliance through that proxy's address. If you are the administrator, the
+      documentation explains how to set the proxy up.</p>
+    <div class="row">
+      <button class="action ghost" id="auth-reload">Try again</button>
+    </div>
+  </div>
+</div>
 <script>
 const API = "/api/v1";
 const $ = (id) => document.getElementById(id);
@@ -1183,8 +1210,21 @@ const presetById = (id) => presets().find((p) => p.id === id);
 
 // --- helpers -------------------------------------------------------------
 
+// Set once the appliance has answered 401: it wants a token this page cannot
+// supply, so reconnecting would only repeat the refusal.
+let authRequired = false;
+function showAuthRequired() {
+  authRequired = true;
+  clearTimeout(retryTimer); clearInterval(countdownTimer);
+  if (stream) { stream.close(); stream = null; }
+  $("offline").classList.remove("show");
+  $("auth-required").classList.add("show");
+}
+$("auth-reload").onclick = () => location.reload();
+
 async function rawApi(path, options, metadata) {
   const response = await fetch(API + path, options);
+  if (response.status === 401) showAuthRequired();
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`;
     try { detail = (await response.json()).detail || detail; } catch {}
@@ -5457,6 +5497,7 @@ $("offline-retry").onclick = () => { attempt = 0; connect(); };
 $("offline-reload").onclick = () => location.reload();
 
 function connect() {
+  if (authRequired) return;
   clearTimeout(retryTimer);
   clearInterval(countdownTimer);
   // Opening the stream is not instant: a host that is unreachable rather
@@ -5614,7 +5655,7 @@ for (const grid of document.querySelectorAll(".panel-grid")) {
 }
 
 window.addEventListener("resize", () => { renderLayout(); drawWarp(); });
-loadAll().catch((error) => toast(error.message, true));
+loadAll().catch((error) => { if (error.status !== 401) toast(error.message, true); });
 // ?nosse: load once and stay static. For automated checks (a headless
 // browser's virtual clock never drains an endless event stream) — not for
 // people, who want the live view.

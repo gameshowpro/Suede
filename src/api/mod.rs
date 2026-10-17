@@ -619,10 +619,11 @@ pub fn router(state: ApiState) -> Router {
         .route("/capability-check/{id}", capability_page)
         .route("/api-docs/openapi.json", get(docs::openapi_json));
 
-    // A web UI would have to embed the token to work, which would defeat it.
-    if !state.bootstrap.auth_enabled() {
-        app = app.merge(docs::scalar_router()).merge(ui::router());
-    }
+    // The web UI and the Scalar docs page are served in token mode too. They
+    // are static and embed no credential (see `is_static_page`); the UI's own
+    // API calls succeed only when something in front of Suede, an
+    // authenticating proxy, adds the token.
+    app = app.merge(docs::scalar_router()).merge(ui::router());
 
     app.layer(axum::middleware::from_fn_with_state(
         state.clone(),
@@ -728,9 +729,24 @@ fn is_heartbeat(path: &str) -> bool {
     path.starts_with("/api/v1/apps/") && path.ends_with("/heartbeat")
 }
 
+/// The bundled UI, the Scalar docs page and the OpenAPI document: static
+/// bytes compiled into the binary, holding no state and no credential (Scalar
+/// embeds the OpenAPI document in its own page, so gating the JSON alone would
+/// protect nothing). They are served without a token so that a browser
+/// reaching the appliance directly gets the page that explains the 401 its API
+/// calls then receive, instead of a bare JSON error. Every API call the UI
+/// makes still needs the token, which only a proxy in front can supply.
+fn is_static_page(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/favicon.ico" | "/docs" | "/api-docs/openapi.json"
+    ) || path.starts_with("/assets/")
+}
+
 /// Paths reachable without a bearer token even when one is configured.
 fn is_public(path: &str) -> bool {
     path == "/healthz"
+        || is_static_page(path)
         // Heartbeats come from page content, which cannot hold the API token;
         // that endpoint is restricted to loopback callers instead.
         || is_heartbeat(path)
@@ -1311,20 +1327,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scalar_docs_are_absent_in_token_mode() {
-        let harness = harness(Some("secret"));
-        let response = harness
-            .router
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/docs")
-                    .header("authorization", "Bearer secret")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    async fn docs_and_the_openapi_document_are_served_in_token_mode_without_a_token() {
+        // Static documents with no credential in them (Scalar embeds the
+        // OpenAPI document itself), so they follow the UI.
+        for path in ["/docs", "/api-docs/openapi.json"] {
+            let harness = harness(Some("secret"));
+            let response = harness
+                .router
+                .oneshot(
+                    HttpRequest::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
     }
 
     #[test]

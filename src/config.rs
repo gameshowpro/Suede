@@ -79,7 +79,8 @@ pub struct BootstrapConfig {
     /// the main listener look like that. Stored unresolved, so a `--bind`
     /// override moves the default along with it.
     pub local_bind: Option<SocketAddr>,
-    /// Optional static bearer token. When set, the reference web UI is disabled.
+    /// Optional static bearer token. When set, every API call needs it. The reference web
+    /// UI is still served but only works behind a proxy that adds it.
     pub token: Option<String>,
     /// Directory holding the persisted desired state.
     pub state_dir: PathBuf,
@@ -523,7 +524,7 @@ impl BootstrapConfig {
         Ok(config)
     }
 
-    /// True when a bearer token is configured, which also disables the web UI.
+    /// True when a bearer token is configured.
     pub fn auth_enabled(&self) -> bool {
         self.token.is_some()
     }
@@ -643,7 +644,10 @@ impl BootstrapConfig {
     /// say where page content on this machine is answered.
     pub fn log_security_posture(&self, local: SocketAddr) {
         if self.auth_enabled() {
-            tracing::info!("bearer token configured; reference web UI is disabled");
+            tracing::info!(
+                "bearer token configured; the reference web UI is served but its API calls \
+                 need the token, which only an authenticating proxy in front can add"
+            );
         } else if !self.bind.ip().is_loopback() {
             tracing::warn!(
                 bind = %self.bind,

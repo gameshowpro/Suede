@@ -6,8 +6,10 @@
 //! from the canonical sources and embeds every asset, including local fonts,
 //! in the same binary.
 //!
-//! Disabled when a bearer token is configured — a page that had to embed the
-//! token would defeat it.
+//! Served in token mode too. The page embeds no credential: its API calls
+//! succeed only when something in front of Suede, an authenticating proxy,
+//! adds the token. Without one the first call returns 401 and the page shows
+//! a full-page explanation.
 
 use axum::extract::State;
 use axum::http::header;
@@ -206,9 +208,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_ui_is_absent_in_token_mode() {
-        let (status, _) = fetch_root(Some("secret")).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+    async fn the_ui_is_served_in_token_mode_and_embeds_no_token() {
+        // Without the token header: a browser that reached the appliance
+        // directly must get the page that explains the 401, not a JSON error.
+        let harness = harness(Some("secret-token-value"));
+        let response = harness
+            .router
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("<title>Suede</title>"));
+        assert!(!body.contains("secret-token-value"));
+        assert!(body.contains("id=\"auth-required\""));
+        assert!(!body.contains("data-docs-path"));
+    }
+
+    #[tokio::test]
+    async fn the_ui_does_not_open_the_api_in_token_mode() {
+        let harness = harness(Some("secret"));
+        let response = harness
+            .router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/outputs")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn the_page_explains_a_401_and_points_at_the_proxy_docs() {
+        assert!(INDEX.contains("This appliance requires an API token"));
+        assert!(INDEX.contains("response.status === 401"));
     }
 
     #[tokio::test]
@@ -273,27 +312,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assets_obey_ui_visibility_and_unknown_assets_are_not_served() {
-        for (token, path) in [
-            (Some("secret"), "/assets/artwork/icon-header.png"),
-            (Some("secret"), "/assets/artwork/icon-header.avif"),
-            (Some("secret"), "/favicon.ico"),
-            (Some("secret"), "/assets/fonts/fonts.css"),
-            (Some("secret"), "/assets/fonts/CascadiaCode.woff2"),
-            (None, "/assets/artwork/not-an-icon.png"),
-            (None, "/assets/fonts/not-a-font.woff2"),
+    async fn assets_are_served_in_token_mode_and_unknown_assets_are_not() {
+        // Static, credential-free files: served without a token so the page
+        // renders (and can explain the 401) before any proxy is in play.
+        for (token, path, expected) in [
+            (
+                Some("secret"),
+                "/assets/artwork/icon-header.png",
+                StatusCode::OK,
+            ),
+            (
+                Some("secret"),
+                "/assets/artwork/icon-header.avif",
+                StatusCode::OK,
+            ),
+            (Some("secret"), "/favicon.ico", StatusCode::OK),
+            (Some("secret"), "/assets/fonts/fonts.css", StatusCode::OK),
+            (
+                Some("secret"),
+                "/assets/fonts/CascadiaCode.woff2",
+                StatusCode::OK,
+            ),
+            (Some("secret"), "/assets/legal/LICENSE.txt", StatusCode::OK),
+            // Unknown paths under /assets/ get past the token check and then
+            // 404 like anywhere else; they never reach the host filesystem.
+            (
+                Some("secret"),
+                "/assets/legal/not-a-license.txt",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                Some("secret"),
+                "/assets/../Cargo.toml",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                None,
+                "/assets/artwork/not-an-icon.png",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                None,
+                "/assets/fonts/not-a-font.woff2",
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                None,
+                "/assets/legal/not-a-license.txt",
+                StatusCode::NOT_FOUND,
+            ),
         ] {
             let harness = harness(token);
-            let mut request = Request::builder().uri(path);
-            if let Some(token) = token {
-                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-            }
             let response = harness
                 .router
-                .oneshot(request.body(Body::empty()).unwrap())
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(response.status(), expected, "{path}");
         }
     }
 
