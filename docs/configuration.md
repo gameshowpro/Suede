@@ -119,6 +119,9 @@ restriction entirely, and an empty list (`allowed_programs = []`) permits
 nothing, exactly as an empty allowlist means everywhere else in Suede — a
 legitimate way to freeze a machine so that no application can start at all.
 
+The capability check (`POST /api/v1/apps/capabilities`) obeys the list too: it
+refuses with 403 any program that an application launch would refuse.
+
 Like `power`, this lives in the bootstrap file rather than in desired state:
 desired state — including which program an application launches — is
 writable through the very API this key is meant to constrain, so a gate the

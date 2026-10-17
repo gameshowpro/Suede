@@ -727,13 +727,22 @@ pub mod test_support {
     /// `POST /system/power` tests need every permission combination from
     /// empty (the default) to fully permitted.
     pub fn harness_with_power(token: Option<&str>, verbs: &[crate::model::PowerVerb]) -> Harness {
+        harness_with_bootstrap(|bootstrap| {
+            bootstrap.token = token.map(str::to_string);
+            bootstrap.power = verbs.to_vec();
+        })
+    }
+
+    /// Like [`harness`], with whatever bootstrap settings `configure` makes
+    /// — for request filtering that only a bootstrap key turns on.
+    pub fn harness_with_bootstrap(configure: impl FnOnce(&mut BootstrapConfig)) -> Harness {
         let dir = tempfile::tempdir().unwrap();
-        let bootstrap = Arc::new(BootstrapConfig {
-            token: token.map(str::to_string),
+        let mut bootstrap = BootstrapConfig {
             state_dir: dir.path().to_path_buf(),
-            power: verbs.to_vec(),
             ..BootstrapConfig::default()
-        });
+        };
+        configure(&mut bootstrap);
+        let bootstrap = Arc::new(bootstrap);
         let sway = Arc::new(MockSway::with_fixtures());
         let audio = Arc::new(MockAudio::with_devices());
         let store = Arc::new(StateStore::ephemeral(dir.path().to_path_buf()));

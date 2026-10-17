@@ -160,6 +160,26 @@ impl Drop for Slot {
     }
 }
 
+/// Refuses `program` unless `allowed_programs` permits it, in the
+/// supervisor's words, so the capability check cannot run what an app
+/// launch could not.
+fn refuse_unlisted(state: &ApiState, app: &AppConfig, program: &std::path::Path) -> ApiResult<()> {
+    if crate::config::program_name_matches(&state.bootstrap.allowed_programs, program) {
+        return Ok(());
+    }
+    let name = program
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| program.display().to_string());
+    Err(ApiError::Forbidden(format!(
+        "app `{}` asks to launch `{name}`, which is not in `allowed_programs`; \
+         add it to suede.toml (or SUEDE_ALLOWED_PROGRAMS) and restart the daemon, \
+         or change the app's launcher.",
+        app.id
+    )))
+}
+
 /// The measurement itself, shared by the API handler and the boot check.
 ///
 /// Launches `app`'s configuration against the test page, waits for the
@@ -198,6 +218,10 @@ pub async fn measure(
             launcher::candidates_for(&check_app).join(", ")
         )));
     };
+    // The supervisor's rule, applied here too: this path spawns whatever
+    // program the request names, so it must not widen what `allowed_programs`
+    // permits. Refused before anything is created or spawned.
+    refuse_unlisted(state, app, &chosen)?;
     let key = MeasurementKey::new(app, &chosen);
     // Without the DevTools pipe: this spawn does not put anything on fds 3
     // and 4, and Chromium given the flag without them exits at once.
@@ -206,6 +230,16 @@ pub async fn measure(
         ..context.clone()
     };
     let spec = launcher::build(&check_app, &spec_context, Some(&chosen));
+
+    let program = launcher::resolve_program(&spec.programs).ok_or_else(|| {
+        ApiError::BadRequest(format!(
+            "none of these programs is installed: {}",
+            spec.programs.join(", ")
+        ))
+    })?;
+    // The program actually executed; checked as well as `chosen`, in case
+    // the two ever differ.
+    refuse_unlisted(state, app, &program)?;
 
     // Its own profile, started clean every time — including for Firefox,
     // which the preset leaves profileless and which would otherwise hand the
@@ -228,13 +262,6 @@ pub async fn measure(
     }
     let log = std::fs::File::create(&log_path)
         .map_err(|error| ApiError::Internal(format!("cannot open the check log: {error}")))?;
-
-    let program = launcher::resolve_program(&spec.programs).ok_or_else(|| {
-        ApiError::BadRequest(format!(
-            "none of these programs is installed: {}",
-            spec.programs.join(", ")
-        ))
-    })?;
 
     let mut command = tokio::process::Command::new(&program);
     command
@@ -671,10 +698,15 @@ async fn terminate(mut child: tokio::process::Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::test_support::{harness, Harness};
+    use crate::api::test_support::{harness, harness_with_bootstrap, Harness};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    /// A harness whose allowlist admits `/bin/true`, the stand-in browser.
+    fn allowing_true() -> Harness {
+        harness_with_bootstrap(|b| b.allowed_programs = vec!["true".into()])
+    }
 
     fn kiosk(program: &str) -> serde_json::Value {
         serde_json::json!({
@@ -829,7 +861,7 @@ mod tests {
     /// — and the measurement is remembered for the health check.
     #[tokio::test]
     async fn a_report_completes_the_check_and_is_remembered() {
-        let harness = harness(None);
+        let harness = allowing_true();
         let state = harness.state.clone();
         let router = harness.router.clone();
 
@@ -897,7 +929,7 @@ mod tests {
     /// out — and the failure is remembered too.
     #[tokio::test]
     async fn an_early_exit_is_reported_as_such() {
-        let harness = harness(None);
+        let harness = allowing_true();
         let (status, body) = send(
             &harness,
             post_json(
@@ -938,7 +970,7 @@ mod tests {
     /// The alert-card trigger: no body, the configured app is the subject.
     #[tokio::test]
     async fn measure_without_a_body_uses_the_configured_app() {
-        let harness = harness(None);
+        let harness = allowing_true();
         harness
             .state
             .store
@@ -1106,5 +1138,66 @@ mod tests {
             }
             other => panic!("launcher changed kind: {other:?}"),
         }
+    }
+
+    /// A program missing from `allowed_programs` is refused with 403 before
+    /// anything is spawned or created.
+    #[tokio::test]
+    async fn an_unlisted_program_is_refused_and_never_runs() {
+        let harness = harness(None);
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker");
+        let script = dir.path().join("evil.sh");
+        std::fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (status, body) = send(
+            &harness,
+            post_json(
+                "/api/v1/apps/capabilities?timeoutSeconds=5",
+                &kiosk(script.to_str().unwrap()),
+            ),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("evil.sh") && text.contains("allowed_programs"),
+            "{text}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "the refused program must not run");
+        assert!(harness.state.capabilities.pending_id().is_none());
+        assert!(harness.state.capability_store.latest().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_empty_allowlist_refuses_everything() {
+        let harness = harness_with_bootstrap(|b| b.allowed_programs = vec![]);
+        let (status, _) = send(
+            &harness,
+            post_json("/api/v1/apps/capabilities", &kiosk("/bin/true")),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_allowlist_admits_any_program() {
+        let harness = harness_with_bootstrap(|b| b.allowed_programs = vec!["*".into()]);
+        let (status, _) = send(
+            &harness,
+            post_json(
+                "/api/v1/apps/capabilities?timeoutSeconds=30",
+                &kiosk("/bin/true"),
+            ),
+            "127.0.0.1:1",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 }
