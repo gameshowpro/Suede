@@ -9,6 +9,7 @@ any generated files:
 | `suede.svg` | Editable vector interpretation with procedural suede texture and shadow. It approximates the PNG rather than embedding it. |
 | `suede-small.svg` | Optically simplified source for small icons: larger panels, clear gaps, no texture or shadow. |
 | `suede-mono.svg` | Monochrome source with the wave cut out of the panel silhouettes. |
+| `gameshowpro-light.svg` | Game Show Pro logo for light backgrounds; the maintainer's brand asset, not generated from the Suede sources. The About box inlines a copy whose "Pro" lettering uses `currentColor` so it follows the theme; this file stays unmodified. |
 
 The two specialized SVGs are maintained design sources, not resized exports.
 When changing the identity, update these deliberate small-size and monochrome
@@ -40,6 +41,7 @@ Node, or system graphics libraries. Dependencies are locked by the root
 | --- | --- | --- | --- |
 | Application header | `icon-header.avif` / `.png` | 144 × 144 | 48 × 48 CSS px (40 × 40 on smaller screens) |
 | MkDocs header | `icon-docs.avif` / `.png` | 144 × 144 | 48 × 48 CSS px (40 × 40 on smaller screens) |
+| Application About box | `icon-readme.avif` / `.png` | 384 × 384 | 128 × 128 CSS px |
 | Documentation home | `icon-readme.avif` / `.png` | 384 × 384 | 128 × 128 CSS px |
 | GitHub README | `icon-readme.png` | 384 × 384 | 128 × 128 CSS px |
 | Social preview cards | `social-card.png` | 1200 × 630 | Determined by the consuming service |

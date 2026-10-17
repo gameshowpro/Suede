@@ -158,9 +158,23 @@ a { color: var(--accent); }
 button.pill { background: transparent; line-height: inherit; cursor: pointer; transition: all .15s ease; }
 button.pill:hover { color: var(--ink); border-color: var(--muted); background: var(--sunken); }
 button.pill:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-.about-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }
+.about-brand { display: flex; align-items: center; gap: 16px; margin-bottom: 14px; }
+.about-brand .about-logo { display: block; width: 128px; height: 128px; flex: 0 0 128px; }
+.about-brand .about-logo img { display: block; width: 100%; height: 100%; }
+@media (max-width: 30em) {
+  .about-brand { flex-direction: column; align-items: flex-start; }
+}
 .about-brand h2 { margin: 0; font-size: 20px; line-height: 1.2; letter-spacing: -.02em; }
 .about-brand p { margin: 2px 0 0; }
+.about-credit { display: flex; align-items: center; gap: 12px; margin: 16px 0 0; padding-top: 14px;
+  border-top: 1px solid var(--line); }
+.about-credit a { display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 13px; text-decoration: none; }
+.about-credit a:hover { color: var(--ink); }
+.about-credit a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+.gsp-logo { display: block; width: 48px; height: 48px; flex: 0 0 48px; color: var(--ink); }
+.page-footer { margin: 28px 20px 20px; padding-top: 14px; border-top: 1px solid var(--line);
+  text-align: center; color: var(--muted); font-size: 13px; }
+.page-footer .sep { margin: 0 .5em; }
 .fee-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
 .fee-brand h2 { margin: 0; }
 .osmf-mark { width: 40px; height: 48px; flex: none; }
@@ -281,7 +295,7 @@ tr.player-detail > td { background: var(--sunken); padding: 12px 14px; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
 th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-tr:last-child td { border-bottom: 0; }
+tr:last-child td, tbody tr:last-child th { border-bottom: 0; }
 label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 500; }
 input, select, textarea { width: 100%; padding: 7px 10px; border: 1px solid var(--line);
   border-radius: 7px; background: var(--sunken); color: var(--ink); font: inherit; }
@@ -1005,6 +1019,10 @@ window.addEventListener("error", (event) => {
   </section>
 </main>
 
+<footer class="page-footer">
+  <span id="footer-version">Suede —</span><span class="sep" aria-hidden="true">·</span>© 2026 Barjonas LLC<span class="sep" aria-hidden="true">·</span><button type="button" class="link-button" id="footer-about">About</button>
+</footer>
+
 <div id="toast"></div>
 
 <!-- About and the maintenance-fee notice sit outside <main>, like the header
@@ -1012,9 +1030,9 @@ window.addEventListener("error", (event) => {
 <dialog id="about-dialog" aria-labelledby="about-heading">
   <div class="dialog-body">
     <div class="about-brand">
-      <picture class="app-icon">
-        <source srcset="/assets/artwork/icon-header.avif" type="image/avif">
-        <img src="/assets/artwork/icon-header.png" width="48" height="48" alt="">
+      <picture class="about-logo">
+        <source srcset="/assets/artwork/icon-readme.avif" type="image/avif">
+        <img src="/assets/artwork/icon-readme.png" width="128" height="128" alt="">
       </picture>
       <div>
         <h2 id="about-heading">Suede</h2>
@@ -1025,13 +1043,28 @@ window.addEventListener("error", (event) => {
     <h3>License</h3>
     <p>Open source under the Mozilla Public License 2.0. Suede participates in the Open Source Maintenance Fee: organizations that use the official packages as part of revenue-generating activities pay a small monthly fee that funds maintenance.</p>
     <p class="dialog-links">
-      <a data-docs-path="getting-started/#install" target="_blank" rel="noopener noreferrer">Documentation</a>
+      <a data-docs-path="" target="_blank" rel="noopener noreferrer">Documentation</a>
+      <a href="/assets/legal/LICENSE.txt" target="_blank" rel="noopener noreferrer">License</a>
+      <a href="/assets/legal/OSMFEULA.txt" target="_blank" rel="noopener noreferrer">Maintenance-fee EULA</a>
       <a data-docs-path="maintenance-fee/#who-pays" target="_blank" rel="noopener noreferrer">Maintenance fee</a>
       <a href="https://github.com/gameshowpro/Suede" target="_blank" rel="noopener noreferrer">Source on GitHub</a>
       <a href="https://github.com/sponsors/gameshowpro" target="_blank" rel="noopener noreferrer">Sponsor</a>
     </p>
     <p><button type="button" class="link-button" id="about-fee-again">Show the maintenance-fee notice again</button></p>
     <p class="hint">Suede is a trademark of Barjonas LLC. © 2026 Barjonas LLC.</p>
+    <div class="about-credit">
+      <a href="https://github.com/gameshowpro" target="_blank" rel="noopener noreferrer">
+<svg class="gsp-logo" role="img" aria-label="Game Show Pro" viewBox="0 0 128 128" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linejoin:round;stroke-miterlimit:2;">
+<path d="M88.19,91.416c0.161,11.778 -8.475,24.39 -8.475,24.39l-22.034,0l2.497,-4.995l-50,0c0,-55.192 44.808,-100 100,-100l0,8.339c-19.693,8.618 -33.776,29.329 -44.49,47.786c-12.512,21.554 22.448,20.583 22.502,24.48Z" style="fill:#8d0000;"/>
+<path d="M110.178,24.223c-18.926,10.967 -33.934,27.96 -42.388,48.347c-0.751,1.838 -0.538,3.93 0.569,5.579c1.107,1.649 2.963,2.638 4.949,2.638c2.218,0.019 4.721,0.019 7.327,0.019c5.258,0 10.141,2.722 12.907,7.194c2.765,4.472 3.018,10.057 0.669,14.761l-9.041,18.1l-10.009,0l10.695,-21.389c0.927,-1.854 0.828,-4.056 -0.261,-5.82c-1.09,-1.764 -3.015,-2.837 -5.088,-2.838l-8.113,-0.002c-5.014,-0.001 -9.685,-2.542 -12.411,-6.75c-2.726,-4.208 -3.135,-9.51 -1.087,-14.086c10.162,-22.661 28.516,-40.862 51.283,-50.825l0,5.073Z" style="fill:#ff50ff;"/>
+<g>
+<path d="M86.215,58.274c-0.877,0 -1.83,0 -2.681,0.722c-1.031,0.902 -1.031,2.04 -1.031,3.282l0,13.192l1.908,0l0,-6.084l1.418,0c2.037,0 3.944,0 5.517,-1.418c1.263,-1.137 1.727,-2.766 1.727,-4.138c0,-1.371 -0.464,-3.001 -1.727,-4.138c-1.573,-1.418 -3.351,-1.418 -5.13,-1.418Zm0,1.805c1.65,0 2.784,0 3.79,0.906c0.696,0.621 1.16,1.604 1.16,2.845c0,1.242 -0.464,2.225 -1.16,2.846c-1.005,0.905 -2.269,0.905 -4.176,0.905l-1.418,0l0,-5.303c0,-1.061 0,-1.63 0.438,-1.966c0.309,-0.233 0.67,-0.233 1.366,-0.233Z" fill="currentColor" style="fill-rule:nonzero;"/>
+<path d="M98.693,62.992c-1.186,0 -2.681,0.361 -3.686,1.547c-1.031,1.212 -1.031,2.423 -1.031,4.511l0,6.419l1.805,0l0,-6.419c0,-1.624 0,-2.707 0.619,-3.429c0.49,-0.593 1.366,-0.928 2.294,-0.928c0.438,0 0.851,0.077 1.212,0.206l0.541,-1.624c-0.516,-0.18 -1.109,-0.284 -1.753,-0.284Z" fill="currentColor" style="fill-rule:nonzero;"/>
+<path d="M105.267,64.667c1.134,0 2.011,0.464 2.526,1.237c0.567,0.851 0.567,2.062 0.567,3.377c0,1.315 0,2.526 -0.567,3.377c-0.516,0.773 -1.392,1.237 -2.526,1.237c-1.134,0 -2.011,-0.464 -2.526,-1.237c-0.567,-0.851 -0.567,-2.062 -0.567,-3.377c0,-1.315 0,-2.526 0.567,-3.377c0.516,-0.773 1.392,-1.237 2.526,-1.237Zm0,-1.701c-1.83,0 -3.326,0.825 -4.151,2.191c-0.748,1.237 -0.748,2.655 -0.748,4.125c0,1.469 0,2.887 0.748,4.125c0.825,1.366 2.32,2.191 4.151,2.191c1.83,0 3.326,-0.825 4.151,-2.191c0.748,-1.237 0.748,-2.655 0.748,-4.125c0,-1.469 0,-2.887 -0.748,-4.125c-0.825,-1.366 -2.32,-2.191 -4.151,-2.191Z" fill="currentColor" style="fill-rule:nonzero;"/></g>
+<rect x="0" y="0" width="128" height="128" style="fill:none;"/>
+</svg>
+      <span>A Game Show Pro project</span></a>
+    </div>
   </div>
   <div class="dialog-foot">
     <button type="button" class="action ghost" id="about-close" autofocus>Close</button>
@@ -4147,6 +4180,7 @@ function renderStatus() {
 function renderSystem(system) {
   systemInfo = system;
   $("version").textContent = "v" + system.suedeVersion;
+  $("footer-version").textContent = "Suede v" + system.suedeVersion;
   // Several appliances open side by side are told apart by their tabs.
   document.title = system.hostname ? `Suede - ${system.hostname}` : "Suede";
   const rows = [
@@ -4278,7 +4312,9 @@ function renderAbout() {
     .map(([k, v]) => `<tr><th>${escape(k)}</th><td class="mono">${escape(v)}</td></tr>`).join("");
 }
 
-$("version").onclick = () => { renderAbout(); $("about-dialog").showModal(); };
+function openAbout() { renderAbout(); $("about-dialog").showModal(); }
+$("version").onclick = openAbout;
+$("footer-about").onclick = openAbout;
 $("about-close").onclick = () => $("about-dialog").close();
 
 // Information, not enforcement: shown once per browser and appliance origin,

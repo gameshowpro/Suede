@@ -60,6 +60,21 @@ const FONTS: &[(&str, &str, &[u8])] = &[
     ),
 ];
 
+// The license texts the About box links to, served from the appliance so they
+// work offline and always match the installed version.
+const LEGAL: &[(&str, &str, &[u8])] = &[
+    (
+        "LICENSE.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../../LICENSE"),
+    ),
+    (
+        "OSMFEULA.txt",
+        "text/plain; charset=utf-8",
+        include_bytes!("../../OSMFEULA.txt"),
+    ),
+];
+
 pub fn router() -> Router<ApiState> {
     let mut router = Router::new().route("/", get(index));
     // Register only embedded assets, never paths into the host filesystem.
@@ -67,6 +82,7 @@ pub fn router() -> Router<ApiState> {
         .iter()
         .map(|asset| ("artwork", asset))
         .chain(FONTS.iter().map(|asset| ("fonts", asset)))
+        .chain(LEGAL.iter().map(|asset| ("legal", asset)))
     {
         let serve = move || async move {
             (
@@ -196,12 +212,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artwork_and_fonts_are_embedded_and_served_with_their_media_types() {
+    async fn artwork_fonts_and_legal_texts_are_embedded_and_served_with_their_media_types() {
         let harness = harness(None);
         for (directory, &(name, mime, expected)) in ARTWORK
             .iter()
             .map(|asset| ("artwork", asset))
             .chain(FONTS.iter().map(|asset| ("fonts", asset)))
+            .chain(LEGAL.iter().map(|asset| ("legal", asset)))
         {
             let response = harness
                 .router
@@ -220,6 +237,38 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(bytes.as_ref(), expected, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_license_texts_are_served_as_plain_text() {
+        for (name, needle) in [
+            ("LICENSE.txt", "Mozilla Public License"),
+            ("OSMFEULA.txt", "Open Source Maintenance Fee"),
+        ] {
+            let response = harness(None)
+                .router
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/assets/legal/{name}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{name}");
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/plain; charset=utf-8",
+                "{name}"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert!(
+                String::from_utf8_lossy(&bytes).contains(needle),
+                "{name} never says {needle:?}"
+            );
         }
     }
 
@@ -277,6 +326,10 @@ mod tests {
             r#"id="fee-dialog""#,
             r#"class="osmf-mark""#,
             "suede.feeNoticeAcknowledged",
+            "/assets/legal/LICENSE.txt",
+            "/assets/legal/OSMFEULA.txt",
+            r#"aria-label="Game Show Pro""#,
+            r#"id="footer-about""#,
         ] {
             assert!(INDEX.contains(needle), "the page never says {needle:?}");
         }

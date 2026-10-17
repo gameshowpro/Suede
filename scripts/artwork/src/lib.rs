@@ -30,10 +30,8 @@ pub fn generate_docs(source_dir: &Path, out_dir: &Path) -> Result<Vec<Asset>, Bo
     let mut assets = generate_web_with_paths(source_dir, out_dir, WebPaths::docs())?;
     // Find and retain the soft-shadow bounds once; every target derives from this same frame.
     let native = cropped_visible(&load_native(source_dir)?);
-    for (name, size) in [("icon-docs", 144), ("icon-readme", 384)] {
-        let image = fit_transparent(&native, size, size)?;
-        write_page_image(out_dir, name, &image, &mut assets)?;
-    }
+    let image = fit_transparent(&native, 144, 144)?;
+    write_page_image(out_dir, "icon-docs", &image, &mut assets)?;
     Ok(assets)
 }
 
@@ -82,6 +80,9 @@ fn generate_web_with_paths(
     // retained rectangle keep their original alpha, including the soft shadow.
     let header = fit_transparent(&native, 144, 144)?;
     write_page_image(out_dir, "icon-header", &header, &mut assets)?;
+    // The About box and the documentation home both show this one at 128 CSS px.
+    let readme = fit_transparent(&native, 384, 384)?;
+    write_page_image(out_dir, "icon-readme", &readme, &mut assets)?;
 
     copy_asset(
         source_dir,
