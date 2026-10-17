@@ -373,6 +373,51 @@ mod tests {
         }
     }
 
+    /// Every `"..."`-quoted value that follows `prefix` in `source`.
+    fn quoted_after<'a>(source: &'a str, prefix: &str) -> Vec<&'a str> {
+        source
+            .split(prefix)
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"').map(|(value, _)| value))
+            .collect()
+    }
+
+    /// The ids passed whole to a lookup call such as `$("name")`. A literal
+    /// followed by anything but `)` is the start of a computed id
+    /// (`$("power-" + verb)`), which no static check can resolve.
+    fn looked_up<'a>(source: &'a str, call: &str) -> Vec<&'a str> {
+        source
+            .split(call)
+            .skip(1)
+            .filter_map(|rest| {
+                let (value, after) = rest.split_once('"')?;
+                after.starts_with(')').then_some(value)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_element_the_script_looks_up_exists() {
+        // A lookup of an id the page no longer has returns null, and the
+        // first property access on it throws, abandoning the rest of that
+        // render. Removing the interval span from the telemetry hint did
+        // exactly that: the telemetry tables stopped filling in, and nothing
+        // failed until an operator opened the page.
+        let defined: std::collections::BTreeSet<&str> = quoted_after(INDEX, "id=\"")
+            .into_iter()
+            .chain(quoted_after(INDEX, ".id = \""))
+            .collect();
+        let missing: Vec<&str> = looked_up(INDEX, "$(\"")
+            .into_iter()
+            .chain(looked_up(INDEX, "getElementById(\""))
+            .filter(|id| !defined.contains(id))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the script looks up ids no markup or script defines: {missing:?}"
+        );
+    }
+
     #[test]
     fn the_page_is_self_contained() {
         // An appliance may have no internet access, so nothing the page needs
