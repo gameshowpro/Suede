@@ -31,7 +31,7 @@ const CHECK_SETTLE: std::time::Duration = std::time::Duration::from_millis(1500)
     // The build identity, not just the release number: "0.1.0" cannot
     // distinguish the build that has a fix in it from the one that does not.
     version = suede::VERSION_STRING,
-    about = "Remote management daemon for Sway-based display appliances"
+    about = "Build a display appliance on Linux, manage it from anywhere."
 )]
 struct Cli {
     #[command(subcommand)]

@@ -449,7 +449,7 @@ mod tests {
             "suede.feeNoticeAcknowledged",
             "/assets/legal/LICENSE.txt",
             "/assets/legal/OSMFEULA.txt",
-            r#"aria-label="Game Show Pro""#,
+            r#"aria-label="GameshowPro""#,
             r#"id="footer-about""#,
         ] {
             assert!(INDEX.contains(needle), "the page never says {needle:?}");

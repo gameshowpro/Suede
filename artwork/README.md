@@ -9,7 +9,7 @@ any generated files:
 | `suede.svg` | Editable vector interpretation with procedural suede texture and shadow. It approximates the PNG rather than embedding it. |
 | `suede-small.svg` | Optically simplified source for small icons: larger panels, clear gaps, no texture or shadow. |
 | `suede-mono.svg` | Monochrome source with the wave cut out of the panel silhouettes. |
-| `gameshowpro-light.svg` | Game Show Pro logo for light backgrounds; the maintainer's brand asset, not generated from the Suede sources. The About box inlines a copy whose "Pro" lettering uses `currentColor` so it follows the theme; this file stays unmodified. |
+| `gameshowpro-light.svg` | GameshowPro logo for light backgrounds; the maintainer's brand asset, not generated from the Suede sources. The About box inlines a copy whose "Pro" lettering uses `currentColor` so it follows the theme; this file stays unmodified. |
 
 The two specialized SVGs are maintained design sources, not resized exports.
 When changing the identity, update these deliberate small-size and monochrome

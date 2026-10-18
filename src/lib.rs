@@ -1,4 +1,4 @@
-//! Suede — remote management daemon for Sway-based display appliances.
+//! Suede — Build a display appliance on Linux, manage it from anywhere.
 //!
 //! The daemon is organized around one idea: clients write *desired state*, and a
 //! reconciler continuously drives the live Sway session toward it. Observed

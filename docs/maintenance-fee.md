@@ -15,7 +15,7 @@ Nothing in Suede checks whether you have paid. The web UI shows a notice once, t
 
 ## Who pays
 
-The fee applies to an organization, or an individual, with **at least USD 10,000 in annual gross revenue** that uses Suede's **official packages** as part of revenue-generating activities. The official packages are the `.deb` files published on the [GitHub releases page](https://github.com/gameshowpro/Suede/releases) and served from the project's apt repository.
+The fee applies to an organization or a self-employed professional with **at least USD 10,000 in annual gross revenue** that uses Suede's **official packages** as part of revenue-generating activities. The official packages are the `.deb` files published on the [GitHub releases page](https://github.com/gameshowpro/Suede/releases) and served from the project's apt repository.
 
 Revenue-generating use is the ordinary professional case:
 
@@ -30,31 +30,37 @@ Nobody else owes anything. Hobbyists, schools, churches and charities, evaluatio
 
 The fee is **per organization**, not per appliance. One payment covers every appliance the organization runs and every product built on them.
 
-It is owed once, by the organization whose revenue-generating activity the appliances serve. For an integrator that is usually the client: the integrator builds and installs the system, and the client runs the show and takes the revenue. If the integrator rents the system out or operates it as a service, the integrator pays. Real arrangements are often less tidy than that. If yours does not fit, [ask](https://barjonas.com/#contact).
+It is owed once, by **whoever owns the appliances** that run Suede: the organization or self-employed professional whose machines they are, or the rental company for rented equipment. Productions are usually a chain of companies subcontracting each other, and every link earns revenue from the same show, so ownership is what decides. Companies further along the chain, who receive a service from those appliances without owning them, owe nothing for them.
+
+- A freelancer who brings their own appliances pays once, and that covers every job and every client.
+- A freelancer operating a services company's appliances owes nothing for that work. The services company pays.
+- A system sold and installed at a venue belongs to the venue, so the venue pays. A system an integrator rents out or operates as a service stays the integrator's, so the integrator pays.
+
+Anyone may pay on behalf of the owner, for example a services company covering the freelancers it hires, or an integrator covering a client as part of the deal. If your arrangement does not fit, [ask](https://barjonas.com/#contact).
 
 ## What it costs
 
-The tier is set by the number of employees in the paying organization. Pay monthly, or once for a year.
+The tier is set by the number of people in the organization that owns the appliances. [How to count them](#how-do-we-count-employees) is answered below. Pay monthly, or once for a year.
 
 | Organization size | Monthly | Annual (one-time) |
 |---|---|---|
-| Small: fewer than 20 employees | USD 10 | USD 120 |
-| Medium: 20 to 100 employees | USD 40 | USD 480 |
+| Small: fewer than 10 employees | USD 10 | USD 120 |
+| Medium: 10 to 100 employees | USD 40 | USD 480 |
 | Large: more than 100 employees | USD 60 | USD 720 |
 
 You choose your own tier, on the honor system. Nothing asks for proof and nothing verifies it.
 
 ## How to pay
 
-Payment goes through [GitHub Sponsors](https://github.com/sponsors/gameshowpro).
+Payment goes through [GitHub Sponsors](https://github.com/sponsors/gameshowpro?metadata_project=suede&metadata_source=docs).
 
-1. Open the [sponsor page](https://github.com/sponsors/gameshowpro) while signed in to GitHub. Sponsor from your organization's GitHub account rather than a personal one, so the payment and its receipts carry the organization's name.
+1. Open the [sponsor page](https://github.com/sponsors/gameshowpro?metadata_project=suede&metadata_source=docs) while signed in to GitHub. Sponsor from your organization's GitHub account rather than a personal one, so the payment and its receipts carry the organization's name.
 2. Pick the maintenance-fee tier named for your organization's size, monthly or one-time.
 3. Pay by card, or by invoice if your accounts department needs one. GitHub's invoiced billing works in three steps: enable it for your organization, pay the invoice GitHub sends, then sponsor from the resulting balance.
 
 Receipts come from GitHub.
 
-[Pay via GitHub Sponsors](https://github.com/sponsors/gameshowpro){ .md-button .md-button--primary }
+[Pay via GitHub Sponsors](https://github.com/sponsors/gameshowpro?metadata_project=suede&metadata_source=docs){ .md-button .md-button--primary }
 
 ## Exemptions
 
@@ -128,6 +134,19 @@ The fee funds maintenance: keeping Suede working on current Sway, current driver
 ### Do we pay per appliance?
 
 No. One payment covers every appliance your organization runs.
+
+### How do we count employees?
+
+Count the people who regularly work for the organization that owns the appliances, as it is across a typical year:
+
+- **Everyone on the payroll counts as one,** full-time or part-time. Count heads, not hours.
+- **Owners and partners who work in the business count.**
+- **Freelancers who work mainly for you count.** Someone who spends most of their working time on your jobs is part of your team, whatever their contract says. Freelancers you book job by job, who also work for others, do not.
+- **Use a typical month, not your busiest week.** Crew brought in for a single show or season do not count.
+- **Count the whole group.** If the owner belongs to a group of companies, count the group, not just the company whose name is on the equipment.
+- **A self-employed professional working alone counts as one,** and pays the small tier.
+
+When your size changes, move to the new tier at your next payment. If you are close to a border, use your best estimate. Nobody checks.
 
 ### We only use Suede on one show a year
 

@@ -4,7 +4,7 @@
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/releases)
 [![License](https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square)](LICENSE)
 [![Open Source Maintenance Fee](https://img.shields.io/badge/OSMF-participant-37660D?style=flat-square)](OSMFEULA.txt)
-[![Sponsor on GitHub](https://img.shields.io/badge/sponsor-GitHub-EA4AAA?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/gameshowpro)
+[![Sponsor on GitHub](https://img.shields.io/badge/sponsor-GitHub-EA4AAA?style=flat-square&logo=github-sponsors)](https://github.com/sponsors/gameshowpro?metadata_project=suede&metadata_source=readme)
 [![Donate via PayPal](https://img.shields.io/badge/Donate-PayPal-blue.svg?style=flat-square&logo=paypal)](https://paypal.me/barjonas)
 
 <!-- md-exclude-start -->
@@ -29,13 +29,14 @@ Suede turns a Linux box running Sway into a remotely manageable display applianc
 This project participates in the [Open Source Maintenance Fee](https://opensourcemaintenancefee.org).
 
 The source is free under the MPL-2.0. Using the official `.deb` releases in
-revenue-generating activities, by an organization with at least USD 10,000 in
-annual gross revenue, requires the fee under [OSMFEULA.txt](OSMFEULA.txt). It
-is per organization, not per appliance: USD 10, 40 or 60 per month for fewer
-than 20, 20 to 100, or more than 100 employees, with one-time annual tiers
+revenue-generating activities, by an organization or self-employed professional
+with at least USD 10,000 in annual gross revenue, requires the fee under
+[OSMFEULA.txt](OSMFEULA.txt). Whoever owns the appliances pays, once, not per
+appliance or per job: USD 10, 40 or 60 per month for fewer
+than 10, 10 to 100, or more than 100 employees, with one-time annual tiers
 available. Hobbyists, schools, charities and anyone below the threshold owe
 nothing. The fee funds maintenance, not support. Prefer not to pay? Build from
-source instead. To pay, [become a Sponsor](https://github.com/sponsors/gameshowpro).
+source instead. To pay, [become a Sponsor](https://github.com/sponsors/gameshowpro?metadata_project=suede&metadata_source=readme).
 Full details: <https://suede.gameshow.pro/maintenance-fee/>
 
 ## Highlights
@@ -195,7 +196,7 @@ Suede is also built to make it easy for your LLM of choice to help you operate i
 
 ## Authors
 
-Hi, I'm Hamish Barjonas. I provide custom solutions for the broadcast production, live entertainment, and sports industries. Yes, including game shows. See more details [here](https://www.barjonas.com). As a keen FOSS advocate, I try to keep as much non-customer-specific code open for the wider community as possible, under the Game Show Pro umbrella. If you're in a related industry, I'd love to collaborate! You can contact me [here](https://barjonas.com/#contact).
+Hi, I'm Hamish Barjonas. I provide custom solutions for the broadcast production, live entertainment, and sports industries. Yes, including game shows. See more details [here](https://www.barjonas.com). As a keen FOSS advocate, I try to keep as much non-customer-specific code open for the wider community as possible, under the GameshowPro umbrella. If you're in a related industry, I'd love to collaborate! You can contact me [here](https://barjonas.com/#contact).
 
 ## License
 

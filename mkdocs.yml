@@ -1,5 +1,5 @@
 site_name: Suede
-site_description: Remote management for Sway-based display appliances. Configure outputs, route audio, supervise kiosk browsers, project onto overlapping and warped surfaces, and survive reboots.
+site_description: Build a display appliance on Linux, manage it from anywhere. Configure outputs, route audio, supervise kiosk browsers, project onto overlapping and warped surfaces, and survive reboots.
 site_url: https://suede.gameshow.pro/
 repo_url: https://github.com/gameshowpro/Suede
 repo_name: gameshowpro/Suede
@@ -125,7 +125,7 @@ extra:
       link: https://github.com/gameshowpro/Suede
       name: GitHub Repository
     - icon: fontawesome/solid/heart
-      link: https://github.com/sponsors/gameshowpro
+      link: https://github.com/sponsors/gameshowpro?metadata_project=suede&metadata_source=docs-footer
       name: Sponsor on GitHub
     - icon: fontawesome/brands/paypal
       link: https://paypal.me/barjonas

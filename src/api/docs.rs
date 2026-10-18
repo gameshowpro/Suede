@@ -37,9 +37,7 @@ impl Modify for SecurityAddon {
 #[openapi(
     info(
         title = "Suede",
-        description = "Remote management for Sway-based display appliances. \
-                       Clients write desired state; a reconciler drives the live \
-                       session toward it.",
+        description = "Build a display appliance on Linux, manage it from anywhere.",
         license(
             name = "MPL-2.0",
             url = "https://github.com/gameshowpro/Suede/blob/main/LICENSE"
