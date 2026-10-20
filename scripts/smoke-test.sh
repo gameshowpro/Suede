@@ -215,10 +215,15 @@ check "app was relaunched with a new pid" "true" \
 
 echo
 echo "Events"
+# Wait for this curl by pid, never with a bare `wait`: the command substitution
+# inherits the parent's job table, so a bare `wait` also waits on the daemon,
+# which is not this subshell's child. On the GitHub runner that spun forever
+# printing "pid N is not a child of this shell" until the runner died.
 SSE="$(timeout 6 curl -sN "${BASE}/api/v1/events" &
+       sse_pid=$!
        sleep 1
        curl -s -X POST "${BASE}/api/v1/reconcile" >/dev/null
-       wait)" || true
+       wait "$sse_pid")" || true
 check "SSE delivers named events" "true" \
   "$([[ "$SSE" == *"event: "* ]] && echo true || echo false)"
 
