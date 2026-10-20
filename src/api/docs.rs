@@ -37,7 +37,7 @@ impl Modify for SecurityAddon {
 #[openapi(
     info(
         title = "Suede",
-        description = "Build a display appliance on Linux, manage it from anywhere.",
+        description = env!("CARGO_PKG_DESCRIPTION"),
         license(
             name = "MPL-2.0",
             url = "https://github.com/gameshowpro/Suede/blob/main/LICENSE"

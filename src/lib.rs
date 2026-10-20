@@ -1,4 +1,4 @@
-//! Suede — Build a display appliance on Linux, manage it from anywhere.
+#![doc = concat!("Suede: ", env!("CARGO_PKG_DESCRIPTION"))]
 //!
 //! The daemon is organized around one idea: clients write *desired state*, and a
 //! reconciler continuously drives the live Sway session toward it. Observed

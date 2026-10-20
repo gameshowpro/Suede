@@ -105,9 +105,18 @@ pub fn router() -> Router<ApiState> {
 }
 
 async fn index(State(state): State<ApiState>) -> impl IntoResponse {
-    Html(render_docs_links(INDEX, |path| {
-        state.bootstrap.docs_url(path)
-    }))
+    Html(render_index(|path| state.bootstrap.docs_url(path)))
+}
+
+/// Placeholder in the page for the one-line description, which is written once,
+/// in `Cargo.toml`.
+const TAGLINE_TOKEN: &str = "{{tagline}}";
+
+/// The page with its documentation links and tagline filled in.
+fn render_index(docs_url: impl Fn(&str) -> String) -> String {
+    let mut tagline = String::new();
+    push_html_attribute(&mut tagline, env!("CARGO_PKG_DESCRIPTION"));
+    render_docs_links(INDEX, docs_url).replace(TAGLINE_TOKEN, &tagline)
 }
 
 /// Replace static documentation path markers with links using the configured
@@ -205,6 +214,13 @@ mod tests {
         );
         assert!(body.contains(&expected));
         assert!(!body.contains("data-docs-path"));
+        // The tagline comes from Cargo.toml, in both places, with no token left.
+        let tagline = env!("CARGO_PKG_DESCRIPTION");
+        assert!(body.contains(&format!(
+            r#"<meta property="og:description" content="{tagline}">"#
+        )));
+        assert!(body.contains(&format!(r#"<p class="hint">{tagline}</p>"#)));
+        assert!(!body.contains(TAGLINE_TOKEN));
     }
 
     #[tokio::test]
