@@ -529,6 +529,16 @@ jobs:
             echo "::notice::APT_SIGNING_KEY is not set; the apt repository was not built"
             exit 0
           fi
+          # Installed rather than assumed: the Ubuntu 26 runner image dropped
+          # apt-utils (apt-ftparchive), and the step failed without it.
+          missing=""
+          for tool in apt-ftparchive:apt-utils gpg:gnupg gpgv:gpgv dpkg-deb:dpkg; do
+            command -v "${tool%%:*}" >/dev/null || missing="$missing ${tool#*:}"
+          done
+          if [ -n "$missing" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends $missing
+          fi
           bash scripts/build-apt-repo.sh site/apt
 
       # `--strict` checks links and navigation. It does not check that the
