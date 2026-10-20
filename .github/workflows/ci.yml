@@ -109,6 +109,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.app == 'true' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    # The job normally takes about six minutes. Without a limit, a hung step
+    # holds the runner for GitHub's six-hour default (a looping smoke test once
+    # ran for 76 minutes before the runner died).
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -151,6 +155,7 @@ jobs:
           python3 -c "import json;d=json.load(open('/tmp/openapi.json'));print(len(d['paths']),'paths')"
 
       - name: End-to-end smoke test
+        timeout-minutes: 10
         run: |
           cargo build
           BIN=target/debug/suede bash scripts/smoke-test.sh
