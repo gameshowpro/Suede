@@ -278,3 +278,5 @@ or `SUEDE_TOKEN` in the environment. When a token is configured:
 With or without a token, Suede refuses state-changing requests that a browser sends for a page on another site, so a hostile web page opened on the same network cannot drive the appliance. Clients that send no `Origin` header (curl, scripts, other servers) and app heartbeats are not affected. To let a trusted page on another origin send them, list it in `allowed_origins`. To answer only to known host names, a defense against DNS rebinding, set `allowed_hosts`. See [Cross-site request protection](configuration.md#cross-site).
 
 Suede has no TLS and no user accounts of its own; the reverse proxy provides both.
+
+To report a vulnerability, see the [security policy](https://github.com/gameshowpro/Suede/blob/main/SECURITY.md).

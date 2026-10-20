@@ -1,5 +1,7 @@
 <h1><img src="https://suede.gameshow.pro/generated/artwork/icon-readme.png" alt="" width="128" height="128" align="middle"> Suede</h1>
 
+Build a display appliance on Linux, manage it from anywhere.
+
 [![Build Status](https://img.shields.io/github/actions/workflow/status/gameshowpro/Suede/ci.yml?branch=main&logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/actions)
 [![Latest Release](https://img.shields.io/github/v/release/gameshowpro/Suede?logo=github&style=flat-square)](https://github.com/gameshowpro/Suede/releases)
 [![License](https://img.shields.io/badge/license-MPL--2.0-blue?style=flat-square)](LICENSE)
@@ -188,6 +190,7 @@ curl -N http://media-server:9088/api/v1/events
 - [How it works](https://suede.gameshow.pro/how-it-works/) - the projection pipeline: the path of a frame, where the blend runs, and how the displays are kept in step.
 - [API reference](https://suede.gameshow.pro/api/) - the full REST + SSE API, browsable via Scalar.
 - [Troubleshooting](https://suede.gameshow.pro/troubleshooting/) - failure modes and the health checks that catch them.
+- [Security policy](SECURITY.md) - how to report a vulnerability privately, and which versions get fixes.
 
 ## AI Disclosure
 As a project started in 2026, yes, substantial parts of this application were built using AI tools. I could never have achieved the application scope, automation, test framework, and quality of documentation in my spare time without it. Be assured that the design, concept, functional testing, and documentation proof-reading burned many human neuron hours.

@@ -30,6 +30,8 @@ Nobody else owes anything. Hobbyists, schools, churches and charities, evaluatio
 
 The fee is **per organization**, not per appliance. One payment covers every appliance the organization runs and every product built on them.
 
+The fee is also **per application**. It covers Suede. Other GameshowPro applications, such as [BgRaster](https://bgraster.gameshow.pro/), have their own. If you use more than one, [ask](https://barjonas.com/#contact) about paying for them together.
+
 It is owed once, by **whoever owns the appliances** that run Suede: the organization or self-employed professional whose machines they are, or the rental company for rented equipment. Productions are usually a chain of companies subcontracting each other, and every link earns revenue from the same show, so ownership is what decides. Companies further along the chain, who receive a service from those appliances without owning them, owe nothing for them.
 
 - A freelancer who brings their own appliances pays once, and that covers every job and every client.

@@ -159,6 +159,10 @@ gh attestation verify suede_1.2.3_amd64.deb --repo gameshowpro/Suede
 
 This is a different statement from the apt repository's signature. The repository signature says the package index came from the project's CI; the attestation says which commit a particular file was built from. A cautious integrator wants both. The apt repository serves only packages whose attestation verifies against this workflow on `main`, so a release asset replaced after CI built it never reaches an appliance through apt.
 
+## The tagline
+
+Suede's one-line description is written once, as `description` in `Cargo.toml`. Everything else derives it: the Debian package description (cargo-deb), the CLI `--help` text, the crate documentation, the OpenAPI `info.description`, the web UI (the `{{tagline}}` placeholder in `src/api/ui/index.html`, filled in when the page is served), and the documentation site (`scripts/tagline_hook.py` sets `site_description` and `extra.tagline`, and the home page title). `README.md` cannot be templated, so a test in `tests/readme_tagline.rs` fails when it drifts. The GitHub repository description cannot be written by CI's token, so CI warns with the exact `gh repo edit` command when it differs, and the maintainer syncs it by hand.
+
 ## The apt repository
 
 Appliances install from `https://suede.gameshow.pro/apt/`, which lives inside the GitHub Pages site. It is generated, never committed.

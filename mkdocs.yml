@@ -1,5 +1,7 @@
 site_name: Suede
-site_description: Build a display appliance on Linux, manage it from anywhere. Configure outputs, route audio, supervise kiosk browsers, project onto overlapping and warped surfaces, and survive reboots.
+# Set by scripts/tagline_hook.py: the tagline from Cargo.toml followed by
+# extra.description_detail.
+site_description: ""
 site_url: https://suede.gameshow.pro/
 repo_url: https://github.com/gameshowpro/Suede
 repo_name: gameshowpro/Suede
@@ -111,13 +113,17 @@ plugins:
 hooks:
   - scripts/artwork_hook.py
   - scripts/fonts_hook.py
+  - scripts/tagline_hook.py
 
 watch:
   - artwork
   - scripts/artwork
   - fonts
+  - Cargo.toml
 
 extra:
+  # extra.tagline is filled in from Cargo.toml by scripts/tagline_hook.py.
+  description_detail: Configure outputs, route audio, supervise kiosk browsers, project onto overlapping and warped surfaces, and survive reboots.
   version: !ENV [SUEDE_DOCS_VERSION, "dev"]
   generator: false
   social:
