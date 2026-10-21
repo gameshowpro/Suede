@@ -63,6 +63,7 @@ const verifyGrid = async (page, selector, columns) => {
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, colorScheme: 'light' });
     const page = await context.newPage();
     page.on('pageerror', error => failures.push(error.message));
+    await page.addInitScript(() => localStorage.setItem('suede.feeNoticeAcknowledged', '1'));
     await page.route('**/*', async route => {
       const url = new URL(route.request().url());
       const respond = (body, headers = {}) => route.fulfill({ status: 200, contentType: 'application/json',
@@ -81,6 +82,8 @@ const verifyGrid = async (page, selector, columns) => {
       if (path === '/config') return respond(fixture, {
         'x-config-generation': '0', 'x-config-epoch': 'layout-fixture', etag: `"${fixture.revision ?? 0}"`,
       });
+      if (path === '/profiles') return respond([{ id: 'layout-profile', name: 'Layout profile', description: 'Fixture',
+        includes: { displays: true, backgrounds: true, apps: true, activeApp: true, settings: true } }]);
       if (path === '/av') return respond({ audioOutputs: [], audioInputs: [], videoInputs: [] });
       if (path === '/system') return respond({ suedeVersion: 'test', uptimeSeconds: 1, packages: [] });
       if (path === '/status') return respond({ state: 'synced', divergences: [] });
@@ -95,6 +98,31 @@ const verifyGrid = async (page, selector, columns) => {
     await page.goto('http://suede.test/?nosse');
     await page.waitForFunction(() => configGeneration === '0' && document.querySelector('#tab-config'));
     await waitForLayout(page);
+
+    // Live config events and window resizes still arrive while the diagram's
+    // tab is hidden. A negative scale would produce invalid CSS dimensions
+    // that browsers discard. Returning to Displays must redraw the diagram.
+    await page.locator('nav button[data-tab="profiles"]').click();
+    await page.evaluate(() => {
+      queueConfigEvent({ config: structuredClone(config), generation: '1', epoch: 'layout-fixture' });
+      window.dispatchEvent(new Event('resize'));
+    });
+    await page.waitForFunction(() => configGeneration === '1');
+    assert(await page.locator('#layout').evaluate(el => Number(el.dataset.scale) > 0),
+      'hidden layout updates must not produce a negative drawing scale');
+    await page.locator('nav button[data-tab="displays"]').click();
+    await page.waitForFunction(() => Number(document.querySelector('#layout').dataset.scale) > 0);
+    assert((await page.locator('.canvas-frame').boundingBox()).width > 0,
+      'returning to Displays redraws the shared canvas');
+    await page.evaluate(() => {
+      const layout = document.querySelector('#layout');
+      layout.style.width = '10px';
+      renderLayout();
+      if (!(Number(layout.dataset.scale) > 0)) throw new Error('narrow container produced a negative drawing scale');
+      layout.style.removeProperty('width');
+      renderLayout();
+    });
+    assert.deepEqual(failures, [], 'layout updates must not throw browser errors');
 
     // The initially hidden config tab must be measured only after activation.
     await page.locator('nav button[data-tab="config"]').click();
@@ -193,8 +221,24 @@ const verifyGrid = async (page, selector, columns) => {
     await page.setViewportSize({ width: 320, height: 800 });
     await waitForColumns(page, '#tab-config', 1);
     await verifyGrid(page, '#tab-config', 1);
+    await page.locator('nav button[data-tab="profiles"]').click();
+    await waitForColumns(page, '#tab-profiles', 1);
+    await page.waitForFunction(() => document.querySelector('#profile-table tbody tr'));
+    let profileCard = (await metrics(page, '#tab-profiles > .panel'))[0];
+    assert(profileCard.width <= 900 && profileCard.width <= 320,
+      `System Profiles fits a compact viewport: ${profileCard.width}px`);
+    const profileTableRegion = (await metrics(page, '#tab-profiles .table-scroll'))[0];
+    assert(profileTableRegion.width <= profileCard.width,
+      `profile table scroll region stays inside its card: ${profileTableRegion.width}px > ${profileCard.width}px`);
+    await page.setViewportSize({ width: 1856, height: 1000 });
+    await waitForColumns(page, '#tab-profiles', 2);
+    profileCard = (await metrics(page, '#tab-profiles > .panel'))[0];
+    assert(profileCard.width <= 900, `System Profiles card remains capped: ${profileCard.width}px`);
     await page.emulateMedia({ colorScheme: 'dark' });
-    await verifyGrid(page, '#tab-config', 1);
+    closeTo((await metrics(page, '#tab-profiles > .panel'))[0].width, profileCard.width, 0,
+      'System Profiles width does not change with color scheme');
+    await page.locator('nav button[data-tab="config"]').click();
+    await waitForColumns(page, '#tab-config', 2);
     await page.setViewportSize({ width: 2560, height: 1000 });
     await waitForColumns(page, '#tab-config', 2);
     await verifyGrid(page, '#tab-config', 2);

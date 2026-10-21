@@ -33,7 +33,7 @@ pub struct VersionedConfig {
 }
 
 impl VersionedConfig {
-    fn new(document: DesiredState, version: StateVersion) -> Self {
+    pub(super) fn new(document: DesiredState, version: StateVersion) -> Self {
         Self { document, version }
     }
 }
@@ -99,7 +99,7 @@ pub struct WaitQuery {
     pub wait: Option<u64>,
 }
 
-fn precondition(headers: &HeaderMap) -> ApiResult<StatePrecondition> {
+pub(super) fn precondition(headers: &HeaderMap) -> ApiResult<StatePrecondition> {
     Ok(StatePrecondition {
         revision: parse_condition(headers, header::IF_MATCH.as_str(), "If-Match")?,
         generation: parse_condition(headers, IF_CONFIG_GENERATION_HEADER, "If-Config-Generation")?,

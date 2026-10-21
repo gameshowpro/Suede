@@ -542,6 +542,9 @@ async fn serve(config_path: Option<PathBuf>, args: RunArgs) -> anyhow::Result<()
 
     // --- server ---
     let state = ApiState {
+        profiles: Arc::new(suede::profiles::ProfileStore::new(
+            bootstrap.state_dir.join("system-profiles"),
+        )),
         bootstrap: bootstrap.clone(),
         store,
         snapshot,

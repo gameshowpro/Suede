@@ -7,6 +7,9 @@ pub mod docs;
 pub mod events;
 pub mod json;
 pub mod observed;
+#[cfg(test)]
+mod profile_tests;
+pub mod profiles;
 pub mod projection;
 pub mod ui;
 pub mod wallpapers;
@@ -49,6 +52,7 @@ pub struct ApiState {
     pub trigger: ReconcileTrigger,
     pub checks: Arc<CheckRunner>,
     pub wallpapers: Arc<crate::wallpapers::WallpaperStore>,
+    pub profiles: Arc<crate::profiles::ProfileStore>,
     pub capabilities: Arc<capabilities::CapabilityChecks>,
     pub capability_store: Arc<crate::capabilities::CapabilityStore>,
     /// Runs `POST /system/power`'s permitted verb. A trait object, like
@@ -146,7 +150,7 @@ impl ApiState {
     /// committed literally: `preserve_retained`'s calibration refill does
     /// not run.
     ///
-    /// Used only by the geometry/canvas DELETE routes. An ordinary
+    /// Used by profile activation and the geometry/canvas DELETE routes. An ordinary
     /// Simple-mode PUT that omits `geometry` or `canvas` means "leave this
     /// alone", so [`validate_configuration_against`] refills it from the
     /// previous document — and would silently undo an explicit clear made
@@ -593,6 +597,20 @@ pub fn router(state: ApiState) -> Router {
                 .put(config_routes::put_projection_arrangement),
         )
         .route("/config/revert", post(config_routes::revert_config))
+        .route("/profiles", get(profiles::list).post(profiles::create))
+        .route(
+            "/profiles/import",
+            post(profiles::import).layer(axum::extract::DefaultBodyLimit::max(
+                crate::profiles::MAX_PROFILE_BYTES,
+            )),
+        )
+        .route(
+            "/profiles/{id}",
+            get(profiles::download)
+                .put(profiles::update)
+                .delete(profiles::delete),
+        )
+        .route("/profiles/{id}/activate", post(profiles::activate))
         // Imperative escape hatches.
         .route("/reconcile", post(observed::reconcile_now))
         .route("/sway/command", post(observed::run_sway_command))
@@ -1073,6 +1091,9 @@ pub mod test_support {
         let power = Arc::new(observed::power_mock::MockPower::default());
 
         let state = ApiState {
+            profiles: Arc::new(crate::profiles::ProfileStore::new(
+                dir.path().join("system-profiles"),
+            )),
             bootstrap,
             store,
             snapshot,

@@ -14,6 +14,7 @@ impl From<WallpaperError> for ApiError {
     fn from(error: WallpaperError) -> Self {
         match error {
             WallpaperError::NotFound(_) => ApiError::NotFound(error.to_string()),
+            WallpaperError::Conflict(_) => ApiError::Conflict(error.to_string()),
             WallpaperError::InvalidId(_)
             | WallpaperError::UnsupportedFormat
             | WallpaperError::TooLarge { .. } => ApiError::Validation(error.to_string()),

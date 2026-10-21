@@ -539,6 +539,100 @@ sudo systemctl restart getty@tty1
 systemctl --user restart suede
 ```
 
+## System Profiles
+
+System Profiles are named snapshots of selected parts of desired state. They
+are useful for saving a complete show setup or a reusable subset without
+changing the live configuration. Bootstrap settings such as the API token,
+bind address, and state directory are never included.
+
+`GET /api/v1/profiles` lists saved profiles as `{id, name, description,
+includes}`. Each profile's `includes` object has five independent switches:
+`displays` covers outputs and projection settings, `backgrounds` covers named
+backgrounds and their wallpaper images, `apps` covers the application
+catalog, `activeApp` covers the selected app, and `settings` covers daemon
+settings. Omitted switches default to `true`; an omitted description defaults
+to an empty string.
+
+In the web UI, open **System Profiles** and choose **Save new profile**. Pick
+the sections to capture, then save. Before activating a profile, use the
+header's **Save** or **Revert** controls to resolve any unsaved configuration
+edits. API clients can save the working copy with `PUT /api/v1/config` and
+`committed: true`, or discard it with `POST /api/v1/config/revert`.
+Profile creation and update capture the
+effective configuration only when explicitly requested; ordinary edits never
+change saved profiles.
+
+New profiles need a nonempty, unused name. Import and Duplicate ask for a name
+before saving anything. Names are compared without leading or trailing spaces
+and without case distinctions: `Demo` and ` demo ` are the same name. The API
+rejects a duplicate name with `409`, including on import or rename; updating
+a profile while keeping its own name is allowed. Blank names return `422`.
+
+Create a profile with `POST /api/v1/profiles` and `{id, name, description,
+includes}`. `PUT /api/v1/profiles/{id}` replaces the saved snapshot and its
+metadata from the current effective configuration.
+`DELETE /api/v1/profiles/{id}` removes one. Profiles are stored under
+`<state_dir>/system-profiles`; exported and imported profile documents are
+limited to 128 MiB of serialized data.
+
+`GET /api/v1/profiles/{id}` exports a portable document:
+
+```json
+{
+  "formatVersion": 1,
+  "name": "Opening show",
+  "description": "Main room setup",
+  "includes": {
+    "displays": true,
+    "backgrounds": true,
+    "apps": true,
+    "activeApp": true,
+    "settings": true
+  },
+  "config": {
+    "schemaVersion": 2,
+    "outputs": [],
+    "apps": [],
+    "backgrounds": [],
+    "settings": {
+      "hideCursor": true,
+      "outputPollIntervalSeconds": 5,
+      "measureCapabilitiesOnStart": true
+    }
+  },
+  "assets": {}
+}
+```
+
+The `config` object uses the regular desired-state schema. `assets` embeds
+wallpaper bytes by wallpaper ID; PNG and JPEG images are supported. Referenced
+wallpapers are included for the selected background presets and for inline
+wallpapers on selected displays, even when `backgrounds` is false. Import a
+document with `POST /api/v1/profiles/import` and `{id, profile}`. Import only
+stores it; it does not activate the profile or change the current
+configuration or wallpaper files. Existing wallpaper files with the same ID
+are preserved, and an activation that would require replacing a conflicting
+image is rejected before changing configuration or files.
+
+Activate with `POST /api/v1/profiles/{id}/activate`, optionally supplying
+`outputMappings` and `audioMappings` to adapt saved device names to this
+machine. Output mapping keys match the saved output match key and values name
+the destination connector; audio mapping keys are saved sink names and values
+are destination sink names. The selected sections are merged into the
+effective configuration and committed. Excluded sections remain untouched;
+an included empty section clears the corresponding current section. In
+particular, applications in the catalog and `activeApp` are separate, so a
+profile can preserve either independently. The merged configuration is
+validated before it is saved: structurally invalid state, such as an active
+app missing from the resulting catalog, returns `422`. Valid configuration
+that cannot currently be applied because a display or audio device is absent
+is saved and reported through the usual status divergences. Activation while
+a dirty working copy exists returns `409`. As with other desired-state
+writes, clients can send `If-Match`, `If-Config-Generation`, and
+`If-Config-Epoch` from `GET /api/v1/config` to protect activation against a
+concurrent change.
+
 ## Desired state
 
 One JSON document, written through `PUT /api/v1/config` or section by section. Here is a complete four-output appliance:

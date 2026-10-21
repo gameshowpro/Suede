@@ -1,6 +1,34 @@
 {
   "components": {
     "schemas": {
+      "ActivateProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "audioMappings": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Saved PipeWire sink name to the destination sink name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "outputMappings": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Saved output match key to the destination connector name.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "ActiveApp": {
         "description": "What `Status.activeApp` says about the one app the appliance is showing.",
         "properties": {
@@ -1264,6 +1292,28 @@
         ],
         "type": "object"
       },
+      "CaptureProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "includes": {
+            "$ref": "#/components/schemas/ProfileIncludes"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
       "Check": {
         "description": "An environment health check, as served by `GET /system/checks`.",
         "properties": {
@@ -2506,6 +2556,22 @@
         },
         "required": [
           "enabled"
+        ],
+        "type": "object"
+      },
+      "ImportProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/SystemProfile"
+          }
+        },
+        "required": [
+          "id",
+          "profile"
         ],
         "type": "object"
       },
@@ -3901,6 +3967,55 @@
         ],
         "type": "object"
       },
+      "ProfileIncludes": {
+        "additionalProperties": false,
+        "properties": {
+          "activeApp": {
+            "default": true,
+            "type": "boolean"
+          },
+          "apps": {
+            "default": true,
+            "type": "boolean"
+          },
+          "backgrounds": {
+            "default": true,
+            "type": "boolean"
+          },
+          "displays": {
+            "default": true,
+            "type": "boolean"
+          },
+          "settings": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "ProfileSummary": {
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "includes": {
+            "$ref": "#/components/schemas/ProfileIncludes"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "description",
+          "includes"
+        ],
+        "type": "object"
+      },
       "ProjectionBlackLiftStatus": {
         "description": "Adaptive lift telemetry. Capture IDs count measurements, while logical\ngenerations also advance for retained-capture repaints. Neither is a\npersisted configuration revision or a promise of simultaneous scanout.",
         "properties": {
@@ -5223,6 +5338,48 @@
         ],
         "type": "object"
       },
+      "SystemProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "assets": {
+            "additionalProperties": {
+              "items": {
+                "format": "int32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "config": {
+            "$ref": "#/components/schemas/DesiredState"
+          },
+          "description": {
+            "type": "string"
+          },
+          "formatVersion": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "includes": {
+            "$ref": "#/components/schemas/ProfileIncludes"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "formatVersion",
+          "name",
+          "config"
+        ],
+        "type": "object"
+      },
       "TemporarySettings": {
         "additionalProperties": false,
         "description": "Ephemeral, never-persisted settings: applied to the working copy exactly\nlike any other field, but reset to default wherever a document is about\nto reach disk.\n\nThat reset is structural, not a client convention: `commit_if` and\n`commit_literal_if` (`src/api/mod.rs`) reset this struct to its default,\nunconditionally, right before their `stage_replace_if` closures return —\nso it is categorically impossible for any caller, this UI or any future\nor API-direct one, to persist a non-default value here. The other reset\npoints fall out of that same guarantee for free: cancel\n(`clear_preview_if` discards the whole preview, the only place this\ncould be non-default), daemon startup/disk load (the persisted document\ncan never contain a non-default value, per the commit-time reset), and\nan explicit toggle back off (an ordinary write like any other).\n\nThis is the intended home for future ephemeral, render-affecting\ntoggles — debug overlays and the like — that only make sense on the live\nworking copy. `test_pattern` above predates this struct and stays where\nit is (moving it would be a breaking rename of an established field); it\nis only *conventionally* non-persistent today, relying on a well-behaved\nclient to strip it before every commit. New fields of this kind belong\nhere instead, where the guarantee is enforced rather than assumed.",
@@ -5306,6 +5463,24 @@
         "required": [
           "x",
           "y"
+        ],
+        "type": "object"
+      },
+      "UpdateProfile": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "includes": {
+            "$ref": "#/components/schemas/ProfileIncludes"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -7347,6 +7522,272 @@
         ]
       }
     },
+    "/api/v1/profiles": {
+      "get": {
+        "operationId": "list",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProfileSummary"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Saved system profiles"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      },
+      "post": {
+        "operationId": "create",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CaptureProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemProfile"
+                }
+              }
+            },
+            "description": "Captured the effective configuration"
+          },
+          "409": {
+            "description": "Profile identifier or name already exists"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/profiles/import": {
+      "post": {
+        "operationId": "import",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileSummary"
+                }
+              }
+            },
+            "description": "Stored without activation"
+          },
+          "409": {
+            "description": "Profile identifier or name already exists"
+          },
+          "422": {
+            "description": "Unsupported or invalid profile"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/profiles/{id}": {
+      "delete": {
+        "operationId": "delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted the saved profile; live configuration is unchanged"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      },
+      "get": {
+        "operationId": "download",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemProfile"
+                }
+              }
+            },
+            "description": "Portable profile with embedded wallpaper assets"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      },
+      "put": {
+        "operationId": "update",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemProfile"
+                }
+              }
+            },
+            "description": "Updated from the effective configuration"
+          },
+          "409": {
+            "description": "Another profile already uses this name"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
+    "/api/v1/profiles/{id}/activate": {
+      "post": {
+        "operationId": "activate",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Persisted revision",
+            "in": "header",
+            "name": "If-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Working-copy generation",
+            "in": "header",
+            "name": "If-Config-Generation",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Store instance identity",
+            "in": "header",
+            "name": "If-Config-Epoch",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ActivateProfile"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DesiredState"
+                }
+              }
+            },
+            "description": "Merged configuration accepted and saved; reconciliation is asynchronous"
+          },
+          "409": {
+            "description": "Unsaved configuration, stale precondition, or conflicting wallpaper"
+          },
+          "422": {
+            "description": "The combined configuration is invalid"
+          }
+        },
+        "tags": [
+          "profiles"
+        ]
+      }
+    },
     "/api/v1/projection/arrangement": {
       "get": {
         "operationId": "get_arrangement",
@@ -7905,6 +8346,10 @@
     }
   ],
   "tags": [
+    {
+      "description": "Named, portable system configuration snapshots",
+      "name": "profiles"
+    },
     {
       "description": "Live state reported by sway and PipeWire",
       "name": "observed"

@@ -62,6 +62,13 @@ impl Modify for SecurityAddon {
         ),
     ),
     paths(
+        super::profiles::list,
+        super::profiles::create,
+        super::profiles::update,
+        super::profiles::download,
+        super::profiles::import,
+        super::profiles::delete,
+        super::profiles::activate,
         super::observed::list_outputs,
         super::observed::list_ports,
         super::observed::get_output,
@@ -247,6 +254,7 @@ impl Modify for SecurityAddon {
     )),
     modifiers(&SecurityAddon),
     tags(
+        (name = "profiles", description = "Named, portable system configuration snapshots"),
         (name = "observed", description = "Live state reported by sway and PipeWire"),
         (name = "config", description = "Desired state, persisted and reconciled"),
         (name = "apps", description = "Managed application status and control"),

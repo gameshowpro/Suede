@@ -40,6 +40,21 @@ checks independently exercise real HTTP handlers, atomic preconditions, and
 validation. This suite does not measure the appliance's input-to-presentation
 latency or replace GPU/optical acceptance.
 
+## System Profiles browser check
+
+Run the profile workflow checks with the same external Playwright installation:
+
+```sh
+NODE_PATH=/tmp/suede-ui-tests/node_modules \
+PLAYWRIGHT_BROWSERS_PATH=/tmp/suede-ui-tests/browsers \
+node tests/ui/system-profiles.cjs
+```
+
+The fixture intercepts every API request and never connects to an appliance.
+It checks profile include flags, import without activation, the unsaved-edit
+guard, output and audio mappings, activation precondition headers, and visible
+recovery from a stale activation response.
+
 ## Manual appliance checklist
 
 Use isolated test state/processes as described in the Warp handoff. Record
@@ -155,7 +170,9 @@ node tests/ui/panel-layout.cjs
 
 It serves the embedded page at `suede.test` with fixture API responses and checks
 column widths and spacing at the responsive breakpoints, live resizing, focus,
-hidden and removed cards, replacement alerts, tabs, and closed dialogs. At wide
+hidden and removed cards, replacement alerts, tabs, and closed dialogs. It also
+checks that config events and resizes on a hidden Displays tab, or a container
+narrower than its padding, never produce a negative diagram scale. At wide
 widths it also checks the Displays left/right stacks, the selected output editor
 remaining below Layout, GPU/CPU placement and hiding behavior, and the Apps card
 spanning both columns. Below the breakpoint those groups return to one column.

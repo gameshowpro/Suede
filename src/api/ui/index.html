@@ -527,6 +527,7 @@ window.addEventListener("error", (event) => {
     <button role="tab" aria-selected="false" data-tab="wallpapers">Backgrounds</button>
     <button role="tab" aria-selected="false" data-tab="audio">AV I/O</button>
     <button role="tab" aria-selected="false" data-tab="system">System<span id="check-badge"></span></button>
+    <button role="tab" aria-selected="false" data-tab="profiles">System Profiles</button>
     <button role="tab" aria-selected="false" data-tab="config">Raw config</button>
   </nav>
 
@@ -1017,6 +1018,58 @@ window.addEventListener("error", (event) => {
     </dialog>
   </section>
 
+  <!-- System profiles -->
+  <section id="tab-profiles" class="panel-grid hidden">
+    <div class="panel">
+      <h2>System Profiles</h2>
+      <p class="hint">Save and activate reusable snapshots of this system configuration. Activating a profile merges only its selected sections.</p>
+      <div class="row" style="margin-bottom:12px">
+        <button class="action" id="profile-new">Save new profile</button>
+        <button class="action ghost" id="profile-import-button">Import</button>
+        <input id="profile-import-file" type="file" accept="application/json,.json" hidden>
+      </div>
+      <div id="profile-message" class="hint" role="status"></div>
+      <div class="table-scroll" role="region" aria-label="System profiles" tabindex="0">
+        <table id="profile-table"><thead><tr><th>Name</th><th>Description</th><th>Includes</th><th>Actions</th></tr></thead><tbody></tbody></table>
+      </div>
+      <p class="hint" id="profiles-empty" hidden>No saved profiles yet.</p>
+    </div>
+    <dialog id="profile-import-dialog" aria-labelledby="profile-import-heading">
+      <div class="dialog-body">
+        <h2 id="profile-import-heading">Import profile</h2>
+        <p class="hint" id="profile-import-source"></p>
+        <p class="hint">Choose an unused name for this profile. The source name is shown for reference and will not be used automatically.</p>
+        <label for="profile-import-name">Name</label>
+        <input id="profile-import-name" maxlength="120" required autocomplete="off" aria-describedby="profile-import-error">
+        <p class="hint" id="profile-import-error" role="alert" aria-live="polite"></p>
+      </div>
+      <div class="dialog-foot">
+        <button class="action ghost" type="button" id="profile-import-cancel" autofocus>Cancel</button>
+        <button class="action" type="button" id="profile-import-save">Import profile</button>
+      </div>
+    </dialog>
+    <div class="panel" id="profile-editor" hidden>
+      <h2 id="profile-editor-title">Save profile</h2>
+      <div class="fields">
+        <div><label for="profile-name">Name</label><input id="profile-name" maxlength="120"></div>
+        <div><label for="profile-description">Description</label><input id="profile-description" maxlength="500"></div>
+      </div>
+      <fieldset style="margin-top:12px"><legend>Configuration sections</legend>
+        <div class="row">
+          <label><input type="checkbox" data-profile-include="displays" checked> Displays</label>
+          <label><input type="checkbox" data-profile-include="backgrounds" checked> Backgrounds</label>
+          <label><input type="checkbox" data-profile-include="apps" checked> Apps</label>
+          <label><input type="checkbox" data-profile-include="activeApp" checked> Active app</label>
+          <label><input type="checkbox" data-profile-include="settings" checked> System settings</label>
+        </div>
+      </fieldset>
+      <div class="row" style="margin-top:12px">
+        <button class="action" id="profile-save">Save profile</button>
+        <button class="action ghost" id="profile-editor-cancel">Cancel</button>
+      </div>
+    </div>
+  </section>
+
   <!-- Raw config -->
   <section id="tab-config" class="panel-grid hidden">
     <div class="panel">
@@ -1317,7 +1370,7 @@ const bytes = (n) => n > 1048576 ? `${num(n / 1048576)} MB` : `${num(n / 1024, 0
 // rejected edit sitting in `config`.
 let configGeneration = null, configEpoch = null, observedConfigEpoch = null, acceptedConfig = null;
 let previewTimer = null, previewQueued = null;
-let previewFlight = null, writeTail = Promise.resolve(), lastPreviewAt = -Infinity;
+let previewFlight = null, writeTail = Promise.resolve(), lastPreviewAt = -Infinity, previewFailureVersion = 0;
 let editVersion = 0, configLoadSerial = 0, configBusy = false;
 let recommendation = null;
 let recommendationTimer = null, recommendationFlight = null, recommendationPending = null;
@@ -1416,6 +1469,7 @@ function sendPreview() {
     // Save, Revert or explicit Reload bumps editVersion to say so.
     if (version === editVersion) config = structuredClone(accepted);
   }).catch((error) => {
+    previewFailureVersion++;
     previewQueued = null;
     // Not a conflict (there is no other client's document to defer to here)
     // — a rejected edit (422) or a network failure just should not sit in
@@ -1835,6 +1889,10 @@ let layoutDrag = null;
 
 function renderLayout() {
   const container = $("layout");
+  const box = container.getBoundingClientRect();
+  // Live events still arrive on other tabs. A hidden (or very narrow)
+  // panel has no drawable width after padding; redraw when it is visible.
+  if (box.width <= 20) return;
   container.innerHTML = "";
   const entries = layoutEntries();
   const offline = entries.filter(({ known }) => !known.connected).length;
@@ -1849,8 +1907,6 @@ function renderLayout() {
   const canvas = canvasPixels();
   const spanX = canvas?.width ?? Math.max(...entries.map(({ r }) => r.x + r.width), 1920);
   const spanY = canvas?.height ?? Math.max(...entries.map(({ r }) => r.y + r.height), 1080);
-  const box = container.getBoundingClientRect();
-
   // The diagram's width is fixed by the panel, so that sets the scale and the
   // box grows downwards to suit. Fitting a fixed-height box instead meant a
   // second row halved every rectangle: a 2x2 wall gave each display about
@@ -4405,6 +4461,211 @@ function renderChecks() {
   }
 }
 
+// --- system profiles -----------------------------------------------------
+
+let systemProfiles = [], editingProfileId = null, pendingImportedProfile = null;
+const profileIncludes = ["displays", "backgrounds", "apps", "activeApp", "settings"];
+function selectedProfileIncludes() {
+  return Object.fromEntries(profileIncludes.map((key) => [key,
+    document.querySelector(`[data-profile-include="${key}"]`).checked]));
+}
+function profileMessage(message, error = false) {
+  const el = $("profile-message"); el.textContent = message || "";
+  el.style.color = error ? "var(--bad)" : "";
+}
+function newProfileId() {
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) crypto.getRandomValues(bytes);
+  else for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40; bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+async function profileTask(operation) {
+  try { return await operation(); }
+  catch (error) { toast(error.message, true); profileMessage(error.message, true); }
+}
+function renderProfiles() {
+  const body = $("profile-table").tBodies[0]; body.replaceChildren();
+  $("profiles-empty").hidden = systemProfiles.length > 0;
+  for (const profile of systemProfiles) {
+    const tr = document.createElement("tr");
+    const includes = profile.includes || {};
+    const labels = profileIncludes.filter((key) => includes[key]).map((key) =>
+      ({ displays: "Displays", backgrounds: "Backgrounds", apps: "Apps", activeApp: "Active app", settings: "System settings" })[key]);
+    tr.innerHTML = `<td>${escape(profile.name || profile.id)}</td><td>${escape(profile.description || "")}</td><td>${escape(labels.join(", ") || "None")}</td><td></td>`;
+    const actions = tr.cells[3];
+    const button = (label, handler, danger = false) => {
+      const b = document.createElement("button"); b.type = "button"; b.className = `action${danger ? " danger" : " ghost"}`;
+      b.textContent = label; b.onclick = () => profileTask(handler); actions.append(" ", b);
+    };
+    button("Activate", () => activateSystemProfile(profile));
+    button("Update snapshot", () => editSystemProfile(profile));
+    button("Duplicate", () => duplicateSystemProfile(profile));
+    button("Download", () => downloadSystemProfile(profile));
+    button("Delete", async () => {
+      if (!confirm(`Delete system profile “${profile.name || profile.id}”?`)) return;
+      await api(`/profiles/${encodeURIComponent(profile.id)}`, { method: "DELETE" });
+      await loadSystemProfiles(); profileMessage("Profile deleted.");
+    }, true);
+    body.append(tr);
+  }
+}
+async function loadSystemProfiles() {
+  systemProfiles = await api("/profiles"); renderProfiles();
+}
+function profileNameKey(name) { return String(name || "").trim().toLocaleLowerCase("en-US"); }
+function profileNameConflict(name, exceptId = null) {
+  const key = profileNameKey(name);
+  return systemProfiles.find((profile) => profile.id !== exceptId && profileNameKey(profile.name) === key);
+}
+function openProfileEditor(profile = null) {
+  editingProfileId = profile?.id ?? null;
+  $("profile-editor-title").textContent = profile ? "Update profile snapshot" : "Save new profile";
+  $("profile-name").value = profile?.name || "";
+  $("profile-description").value = profile?.description || "";
+  for (const key of profileIncludes) document.querySelector(`[data-profile-include="${key}"]`).checked =
+    profile ? Boolean(profile.includes?.[key]) : true;
+  $("profile-editor").hidden = false; $("profile-name").focus();
+}
+function editSystemProfile(profile) { openProfileEditor(profile); }
+$("profile-new").onclick = () => openProfileEditor();
+$("profile-editor-cancel").onclick = () => { $("profile-editor").hidden = true; };
+$("profile-save").onclick = () => profileTask(async () => {
+  if (!loaded()) return;
+  const name = $("profile-name").value.trim();
+  if (!name) throw new Error("Enter a profile name.");
+  await loadSystemProfiles();
+  if (profileNameConflict(name, editingProfileId)) throw new Error(`A profile named “${name}” already exists. Choose an unused name.`);
+  const body = { name, description: $("profile-description").value.trim(), includes: selectedProfileIncludes() };
+  const previewFailureBefore = previewFailureVersion;
+  await flushPreviews();
+  if (previewFailureVersion !== previewFailureBefore)
+    throw new Error("Pending configuration edits were rejected. Resolve the configuration error before saving this profile.");
+  if (editingProfileId) await api(`/profiles/${encodeURIComponent(editingProfileId)}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  else await api("/profiles", { method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ id: newProfileId(), ...body }) });
+  $("profile-editor").hidden = true; await loadSystemProfiles(); profileMessage(editingProfileId ? "Profile snapshot updated." : "Profile saved.");
+});
+async function downloadSystemProfile(profile) {
+  const exported = await api(`/profiles/${encodeURIComponent(profile.id)}`);
+  const blob = new Blob([JSON.stringify(exported, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob), link = document.createElement("a");
+  link.href = url; link.download = `${(profile.name || profile.id).replace(/[^a-z0-9_-]+/gi, "-")}.json`;
+  link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+async function duplicateSystemProfile(profile) {
+  const exported = await api(`/profiles/${encodeURIComponent(profile.id)}`);
+  await openProfileImport(exported, `Source profile: ${profile.name || profile.id}`, newProfileId(), "Duplicate profile");
+}
+$("profile-import-button").onclick = () => $("profile-import-file").click();
+$("profile-import-file").onchange = () => profileTask(async () => {
+  const file = $("profile-import-file").files[0]; if (!file) return;
+  const profile = JSON.parse(await file.text());
+  await openProfileImport(profile, `Source profile: ${profile.name || "Unnamed profile"}`, profile.id || newProfileId());
+});
+async function openProfileImport(profile, sourceHint, id, action = "Import profile") {
+  await loadSystemProfiles();
+  pendingImportedProfile = { profile: structuredClone(profile), id };
+  $("profile-import-heading").textContent = action;
+  $("profile-import-save").textContent = action;
+  $("profile-import-source").textContent = sourceHint;
+  $("profile-import-name").value = "";
+  $("profile-import-error").textContent = "";
+  $("profile-import-dialog").showModal();
+  $("profile-import-name").focus();
+}
+function closeProfileImport() {
+  $("profile-import-dialog").close(); pendingImportedProfile = null;
+  $("profile-import-file").value = "";
+}
+$("profile-import-cancel").onclick = closeProfileImport;
+$("profile-import-dialog").addEventListener("cancel", () => {
+  pendingImportedProfile = null; $("profile-import-file").value = "";
+});
+$("profile-import-save").onclick = () => profileTask(async () => {
+  if (!pendingImportedProfile) return;
+  const name = $("profile-import-name").value.trim();
+  if (!name) { $("profile-import-error").textContent = "Enter a new profile name to continue."; $("profile-import-name").focus(); return; }
+  try { await loadSystemProfiles(); }
+  catch (error) { $("profile-import-error").textContent = error.message; return; }
+  if (profileNameConflict(name)) {
+    $("profile-import-error").textContent = `A profile named “${name}” already exists. Enter a different name.`;
+    $("profile-import-name").focus(); return;
+  }
+  const { profile, id } = pendingImportedProfile;
+  profile.name = name;
+  try {
+    await api("/profiles/import", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ id, profile }) });
+  } catch (error) {
+    $("profile-import-error").textContent = error.message;
+    $("profile-import-name").focus(); return;
+  }
+  closeProfileImport(); await loadSystemProfiles(); profileMessage($("profile-import-heading").textContent === "Duplicate profile" ? `Created “${name}”.` : "Profile imported.");
+});
+function profileOutputMatchKey(match = {}) {
+  return match.name != null && match.make == null && match.model == null && match.serial == null ? match.name :
+    `edid:${match.name ?? ""}:${match.make ?? ""}:${match.model ?? ""}:${match.serial ?? ""}`;
+}
+function profileNames(profile, kind) {
+  const config = profile.config || profile;
+  if (kind === "display") return [...new Map((config.outputs || []).filter((o) => o.match &&
+    ["name", "make", "model", "serial"].some((key) => o.match[key] != null)).map((o) => [profileOutputMatchKey(o.match), {
+      key: profileOutputMatchKey(o.match), name: o.match.name || "",
+      label: [o.match.name, o.match.make, o.match.model, o.match.serial].filter(Boolean).join(" · ")
+    }])).values()];
+  return [...new Set((config.apps || []).map((a) => a.audio?.output).filter((v) => typeof v === "string" && v))];
+}
+async function activateSystemProfile(profile) {
+  if (isDirty() || previewQueued || previewFlight) {
+    toast("Save or Revert the unsaved configuration with the header controls before activating a profile.", true);
+    return;
+  }
+  const exported = await api(`/profiles/${encodeURIComponent(profile.id)}`);
+  const mappings = { outputMappings: {}, audioMappings: {} };
+  const pairs = [["Display names", profileNames(exported, "display"), profileNames(config || {}, "display"), mappings.outputMappings],
+    ["Audio sink names", profileNames(exported, "audio"), profileNames(config || {}, "audio"), mappings.audioMappings]];
+  const rows = pairs.flatMap(([title, names, current, target]) => names.map((name) => ({ title,
+    key: title === "Display names" ? name.key : name, label: title === "Display names" ? name.label : name,
+    current: title === "Display names" ? current.map((entry) => entry.key) : current,
+    target,
+    suggested: title === "Display names"
+      ? (current.some((entry) => entry.key === name.key) ? name.key
+        : current.some((entry) => entry.key === name.name) ? name.name : "")
+      : (current.includes(name) ? name : "") })));
+  const invoker = document.activeElement;
+  const dialog = document.createElement("dialog");
+  dialog.setAttribute("aria-labelledby", "profile-activate-heading");
+  dialog.innerHTML = `<div class="dialog-body"><h2 id="profile-activate-heading">Activate ${escape(profile.name || profile.id)}</h2>
+    <p class="hint">Map names from this profile to names on this system. Leave a value unchanged to keep the same name.</p>
+    ${rows.length ? rows.map((row, i) => `<div class="fields"><div><label for="profile-map-${i}">${escape(row.title)}: ${escape(row.label)}</label><input id="profile-map-${i}" value="${escape(row.suggested)}" placeholder="Leave blank to keep the profile value"></div></div>`).join("") : "<p class=\"hint\">No display or audio names need mapping.</p>"}
+    <p class="hint">Activation replaces only included sections. Save or Revert any unsaved edits first.</p></div>
+    <div class="dialog-foot"><button class="action ghost" type="button" data-profile-cancel autofocus>Cancel</button><button class="action" type="button" data-profile-activate>Activate profile</button></div>`;
+  document.body.append(dialog);
+  dialog.querySelector("[data-profile-cancel]").onclick = () => dialog.close();
+  dialog.querySelector("[data-profile-activate]").onclick = () => run(async () => {
+    if (isDirty() || previewQueued || previewFlight) throw new Error("The working configuration became unsaved. Save or Revert it, then retry activation.");
+    for (const key of Object.keys(mappings.outputMappings)) delete mappings.outputMappings[key];
+    for (const key of Object.keys(mappings.audioMappings)) delete mappings.audioMappings[key];
+    rows.forEach((row, i) => { const mapped = dialog.querySelector(`#profile-map-${i}`).value.trim();
+      if (mapped && mapped !== row.key) row.target[row.key] = mapped; });
+    const headers = { "content-type": "application/json" };
+    if (config?.revision != null) headers["if-match"] = String(config.revision);
+    if (configGeneration != null) headers["if-config-generation"] = String(configGeneration);
+    if (configEpoch != null) headers["if-config-epoch"] = String(configEpoch);
+    await api(`/profiles/${encodeURIComponent(profile.id)}/activate`, {
+      method: "POST", headers, body: JSON.stringify(mappings) });
+    dialog.close(); profileMessage(`Activated “${profile.name || profile.id}”.`);
+  }, "");
+  dialog.addEventListener("close", () => {
+    dialog.remove();
+    if (invoker?.isConnected) invoker.focus();
+  }, { once: true });
+  dialog.showModal();
+}
+
 // --- tabs, loading, live updates ----------------------------------------
 
 document.querySelectorAll("nav button").forEach((button) => {
@@ -4416,6 +4677,7 @@ document.querySelectorAll("nav button").forEach((button) => {
     // The layout is sized from the panel's measured width, which is zero while
     // the tab is hidden, so anything drawn during that time has to be redrawn.
     if (button.dataset.tab === "displays") renderLayout();
+    if (button.dataset.tab === "profiles") profileTask(loadSystemProfiles);
   };
 });
 

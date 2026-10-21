@@ -25,6 +25,7 @@ pub mod ports;
 pub mod presentation;
 pub mod probe;
 pub mod procs;
+pub mod profiles;
 #[cfg(feature = "projection")]
 pub mod projection;
 pub mod projection_policy;

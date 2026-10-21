@@ -5,7 +5,13 @@
 //! through `swaybg`, so the file has to exist on disk for the compositor to
 //! read; it cannot be held in memory.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -21,6 +27,8 @@ pub enum WallpaperError {
     NotFound(String),
     #[error("unrecognized image format; PNG and JPEG are supported")]
     UnsupportedFormat,
+    #[error("wallpaper {0:?} already exists with different bytes")]
+    Conflict(String),
     #[error("image is {size} bytes, over the {MAX_BYTES} byte limit")]
     TooLarge { size: usize },
     #[error("io error: {0}")]
@@ -80,11 +88,15 @@ pub struct Wallpaper {
 
 pub struct WallpaperStore {
     dir: PathBuf,
+    mutation_lock: Mutex<()>,
 }
 
 impl WallpaperStore {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            mutation_lock: Mutex::new(()),
+        }
     }
 
     pub fn directory(&self) -> &Path {
@@ -94,6 +106,7 @@ impl WallpaperStore {
     /// Ids share the app-id rules: they become file names.
     fn validate_id(id: &str) -> Result<(), WallpaperError> {
         let acceptable = !id.is_empty()
+            && id.len() <= 120
             && id != "."
             && !id.contains("..")
             && id
@@ -124,6 +137,7 @@ impl WallpaperStore {
 
     /// Store an image, replacing any existing wallpaper with the same id.
     pub fn store(&self, id: &str, bytes: &[u8]) -> Result<Wallpaper, WallpaperError> {
+        let _guard = self.mutation_lock.lock().unwrap();
         Self::validate_id(id)?;
         if bytes.len() > MAX_BYTES {
             return Err(WallpaperError::TooLarge { size: bytes.len() });
@@ -149,15 +163,107 @@ impl WallpaperStore {
     }
 
     pub fn read(&self, id: &str) -> Result<(Vec<u8>, Format), WallpaperError> {
+        let _guard = self.mutation_lock.lock().unwrap();
         let path = self.resolve(id)?;
-        let format =
-            detect_format(&std::fs::read(&path)?).ok_or(WallpaperError::UnsupportedFormat)?;
-        Ok((std::fs::read(&path)?, format))
+        let bytes = std::fs::read(&path)?;
+        let format = detect_format(&bytes).ok_or(WallpaperError::UnsupportedFormat)?;
+        Ok((bytes, format))
     }
 
     pub fn remove(&self, id: &str) -> Result<(), WallpaperError> {
+        let _guard = self.mutation_lock.lock().unwrap();
         let path = self.resolve(id)?;
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    /// Install self-contained profile images without replacing any existing
+    /// wallpaper. If a later file fails to install, earlier new files remain;
+    /// callers must apply the profile configuration only after this succeeds.
+    pub fn install_profile_assets(
+        &self,
+        assets: &BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), WallpaperError> {
+        if assets.is_empty() {
+            return Ok(());
+        }
+        // Validate every entry before touching the directory.
+        let mut validated = Vec::with_capacity(assets.len());
+        for (id, bytes) in assets {
+            Self::validate_id(id)?;
+            if bytes.len() > MAX_BYTES {
+                return Err(WallpaperError::TooLarge { size: bytes.len() });
+            }
+            let format = detect_format(bytes).ok_or(WallpaperError::UnsupportedFormat)?;
+            validated.push((id, bytes, format));
+        }
+
+        let _guard = self.mutation_lock.lock().unwrap();
+        // Check all conflicts before installing any entry.
+        for (id, bytes, _) in &validated {
+            for format in [Format::Png, Format::Jpeg] {
+                let path = self.path_for(id, format);
+                match fs::read(path) {
+                    Ok(existing) if existing != **bytes => {
+                        return Err(WallpaperError::Conflict((*id).clone()));
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        }
+
+        fs::create_dir_all(&self.dir)?;
+        for (id, bytes, format) in validated {
+            let destination = self.path_for(id, format);
+            if destination.exists() {
+                continue;
+            }
+            let mut random = [0u8; 16];
+            getrandom::fill(&mut random)
+                .map_err(|_| std::io::Error::other("could not obtain a temporary filename"))?;
+            let suffix = random
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            let temporary = self.dir.join(format!(".profile-{suffix}.tmp"));
+            let write_result = (|| {
+                let mut file = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temporary)?;
+                file.write_all(bytes)?;
+                file.sync_all()?;
+                // hard_link is an atomic no-replace install on the same filesystem.
+                match fs::hard_link(&temporary, &destination) {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        let existing = fs::read(&destination)?;
+                        if existing == *bytes {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::AlreadyExists,
+                                "wallpaper changed during profile asset installation",
+                            ))
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            })();
+            let _ = fs::remove_file(&temporary);
+            match write_result {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(WallpaperError::Conflict(id.clone()));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if let Ok(dir) = fs::File::open(&self.dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 
@@ -277,6 +383,39 @@ mod tests {
         assert_eq!(listed.len(), 1, "the PNG should have been removed");
         assert_eq!(listed[0].content_type, "image/jpeg");
         assert_eq!(store.read("wall").unwrap().1, Format::Jpeg);
+    }
+
+    #[test]
+    fn profile_assets_are_idempotent_and_never_replace_different_bytes() {
+        let (store, _dir) = store();
+        let assets = BTreeMap::from([("included".to_string(), PNG.to_vec())]);
+        store.install_profile_assets(&assets).unwrap();
+        store.install_profile_assets(&assets).unwrap();
+        assert_eq!(store.read("included").unwrap().0, PNG);
+
+        let conflicting = BTreeMap::from([("included".to_string(), JPEG.to_vec())]);
+        assert!(matches!(
+            store.install_profile_assets(&conflicting),
+            Err(WallpaperError::Conflict(_))
+        ));
+        assert_eq!(store.read("included").unwrap().0, PNG);
+    }
+
+    #[test]
+    fn invalid_profile_asset_set_installs_nothing() {
+        let (store, _dir) = store();
+        let assets = BTreeMap::from([
+            ("valid".to_string(), PNG.to_vec()),
+            ("invalid".to_string(), b"not an image".to_vec()),
+        ]);
+        assert!(matches!(
+            store.install_profile_assets(&assets),
+            Err(WallpaperError::UnsupportedFormat)
+        ));
+        assert!(matches!(
+            store.read("valid"),
+            Err(WallpaperError::NotFound(_))
+        ));
     }
 
     #[test]
