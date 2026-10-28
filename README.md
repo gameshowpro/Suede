@@ -14,7 +14,10 @@ Build a display appliance on Linux, manage it from anywhere.
 <!-- md-exclude-end -->
 
 ## Introduction
-Suede is a daemon with a name that is a hilarious pun on the word "Swayed". Media servers, video walls, scoreboard, and public information displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand though a system intended for personal desktop use. How many times have you seen the Windows login screen in an airport, a mouse pointer on a digital sign or an update popup on a billboard? 
+
+▶️ **Watch the short video overview: [Suede - the TLDR](https://www.youtube.com/watch?v=jirUHzoGhXs)** on YouTube.
+
+ Media servers, video walls, scoreboard, and public information displays in the AV and broadcast world are still too often driven by a full desktop OS being remote-controlled by hand though a system intended for personal desktop use. How many times have you seen the Windows login screen in an airport, a mouse pointer on a digital sign or an update popup on a billboard? 
 
 The [Sway](https://swaywm.org/) compositor already provides everything an unattended display appliance needs: precise output control and scriptable window management on minimal hardware. But it's tricky to configure and doesn't provide a friendly way to drive it from across the network or to keep its state across reboots. After developing multiple custom applications to harness Sway for game shows and arena displays, I created suede as a reusable, general-purpose solution.
 

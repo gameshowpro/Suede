@@ -96,6 +96,19 @@
   font-weight: 600;
 }
 
+/* The home page's introduction video scales with the content column. */
+.md-typeset .video-embed {
+  margin: 1.5em 0;
+}
+
+.md-typeset .video-embed iframe {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 0;
+  border-radius: 0.5rem;
+}
+
 /* Keep wide tables and diagrams inside their own scroll area. */
 .md-typeset table:not([class]) {
   display: block;

@@ -14,6 +14,10 @@ Suede is a daemon with a name that is a hilarious pun on the word "Swayed". It t
 
 You describe the state you want — which displays are on, at what mode and position, which browsers show which pages, where their audio goes — and Suede keeps reality matching it. Through reboots, display hotplugs, and application crashes, with no operator on site.
 
+<div class="video-embed">
+  <iframe src="https://www.youtube-nocookie.com/embed/jirUHzoGhXs" title="Suede - the TLDR" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
+</div>
+
 <div class="grid cards" markdown>
 
 -   :material-monitor-multiple:{ .lg .middle } **Full output control**
