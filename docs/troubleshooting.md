@@ -12,6 +12,10 @@ Then look at `GET /api/v1/status`, which lists every piece of desired state that
 
 Suede raises two kinds of complaint, and both are built so that they end somewhere you can act.
 
+[![Warning banners at the top of the Displays tab when no outputs are connected](assets/screenshots/details/warning-banners.avif){ width="820" height="384" loading=lazy }](screenshots.md#displays-disconnected)
+
+See the [Health checks](screenshots.md#health-checks) list and the [Displays tab with nothing connected](screenshots.md#displays-disconnected) for examples.
+
 A **check** is a fact about the machine — a missing package, a compositor setting that will silently break spanning. Each carries a `status` of `pass`, `warn` or `fail`, and:
 
 | Field | Meaning |
@@ -497,6 +501,12 @@ Every figure on them is sampled once per diagnostics interval, which
 from there. They answer "is this video decoded on the GPU?", "is the wall keeping up?"
 and "what is the browser doing?" without a terminal.
 
+[![Chromium panel on the System tab, showing GPU in Chromium, feature status and processes](assets/screenshots/details/chromium-panel.avif){ width="820" height="650" loading=lazy }](screenshots.md#system)
+
+[![GPU panel on the System tab, showing utilization over time and the processes using the GPU](assets/screenshots/details/gpu-panel.avif){ width="820" height="732" loading=lazy }](screenshots.md#system)
+
+See the [System tab](screenshots.md#system) for the panels.
+
 **GPU.** Shown only on a machine with an NVIDIA driver and `nvidia-smi`; it
 is hidden otherwise. Once per diagnostics interval Suede runs `nvidia-smi` (about 80 ms
 of wall time, negligible processor use) and shows, per GPU, utilization for
@@ -666,6 +676,10 @@ curl -s http://appliance:9088/api/v1/av | python3 -m json.tool
 wpctl status    # what PipeWire itself thinks
 ```
 
+[![Audio outputs card on the AV I/O tab, listing PipeWire sinks with their levels and the default marked](assets/screenshots/details/audio-outputs.avif){ width="820" height="300" loading=lazy }](screenshots.md#av-io)
+
+See the [AV I/O tab](screenshots.md#av-io).
+
 Use the `id` field (PipeWire's `node.name`) from `.audioOutputs` in the app's `audio.output`; it is stable across reboots. A configured sink that is absent is reported as an `audio_sink_not_present` divergence, and the app still launches on the default sink.
 
 If no sinks appear at all, `pw-dump` is failing — check that PipeWire is running. If sinks appear but browsers have no audio device, `pipewire-pulse` is missing; browsers reach PipeWire through its PulseAudio compatibility layer, which is what `PULSE_SINK` routing depends on.
@@ -738,6 +752,10 @@ wpctl status          # sinks in state "running" are being fed
 Three separate things have to be true, and all three fail the same way — a
 black rectangle, or `NotReadableError`, with no clue which one it was. The
 `capture-devices` health check covers the third.
+
+[![Video inputs card on the AV I/O tab, listing V4L2 capture devices](assets/screenshots/details/video-inputs.avif){ width="820" height="142" loading=lazy }](screenshots.md#av-io)
+
+The capture devices are listed on the [AV I/O tab](screenshots.md#av-io).
 
 | Requirement | Symptom when missing | Fix |
 |---|---|---|

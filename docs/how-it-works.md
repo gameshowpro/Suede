@@ -505,6 +505,10 @@ it against a photograph: a camera showing an output visibly behind while its
 presentation path; non-zero `one`/`two`/`more` counts on that output mean the
 presentation path itself is delivering it a stale frame.
 
+[![Slicer pipeline chart on the System tab, showing captured and presented frame rates and the output offset](assets/screenshots/details/slicer-pipeline.avif){ width="820" height="290" loading=lazy }](screenshots.md#system)
+
+The slicer pipeline chart is on the [System tab](screenshots.md#system).
+
 The `sync` pattern is built for that comparison on video as well as on a
 still. Besides the two big digits and the 16-bit strip, each output carries
 four large cells along its bottom edge — the counter's low four bits, most
@@ -601,6 +605,8 @@ To bypass the compositor presentation pass entirely and eliminate driver spin lo
 ## Warping and Display Modes {: #warping }
 
 Suede provides two distinct projection display modes: **Simple mode** and **Warp mode**. Both modes operate on a unified **shared virtual canvas** architecture, allowing operators to switch seamlessly between rectangular layouts and non-linear projection mapping without losing content alignment.
+
+See the [Displays tab](screenshots.md#displays) for both modes in the web UI.
 
 ### Simple vs. Warp Concept
 

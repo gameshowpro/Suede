@@ -137,3 +137,6 @@
 }
 
 .md-typeset img.osmf-wide { height: 56px; width: auto; margin: 0 0 1rem; }
+
+/* Detail crops from the screenshots page get rounded corners in both themes. */
+.md-typeset img[src*="screenshots/details/"] { border-radius: 0.5rem; }

@@ -18,6 +18,8 @@ You describe the state you want — which displays are on, at what mode and posi
   <iframe src="https://www.youtube-nocookie.com/embed/jirUHzoGhXs" title="Suede - the TLDR" loading="lazy" allow="accelerometer; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe>
 </div>
 
+See the [screenshots](screenshots.md) of the bundled web UI.
+
 <div class="grid cards" markdown>
 
 -   :material-monitor-multiple:{ .lg .middle } **Full output control**

@@ -151,6 +151,8 @@ Reboot when it finishes. The machine will log in, start Sway, and start Suede.
 
 Open `http://<machine>:9088/` from another computer on the network. If it times out rather than refusing, a host firewall is dropping the port — see [Network access](#network-access); on Ubuntu Server it usually is.
 
+See the [Displays](screenshots.md#displays) and [Health checks](screenshots.md#health-checks) tabs for what to expect.
+
 The web UI shows a banner for any health check that is not passing, with a **Fix this** button where Suede can safely remediate the problem itself. Work through those first — they cover the handful of things provisioning cannot do, such as enabling the user service before the first login has happened.
 
 Then:
@@ -164,6 +166,8 @@ That last step is the point of the whole exercise; do it once before you leave t
 ## Calibrate an overlapping or warped layout {: #calibration }
 
 Skip this section for a tiled installation with no overlapping projectors.
+
+See the [Displays tab](screenshots.md#displays) for what these controls look like.
 
 1. Re-run provisioning with overlap support: `sudo /usr/share/suede/provision.sh --allow-overlaps` (add `--no-direct-scanout` to have Sway composite the slices instead of flipping them). See [Overlapping layouts and direct scanout](configuration.md#direct-scanout).
 2. In **Displays → Layout**, position each output so its beam overlaps its neighbors by the amount the rigging actually overlaps — the layout *is* the projection configuration. See [Projection and edge blending](configuration.md#projection-edge-blending).

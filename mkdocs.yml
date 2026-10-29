@@ -54,6 +54,7 @@ not_in_nav: |
 nav:
   - Home: index.md
   - Getting started: getting-started.md
+  - Screenshots: screenshots.md
   - Configuration: configuration.md
   - How it works: how-it-works.md
   - Behind a reverse proxy: reverse-proxy.md

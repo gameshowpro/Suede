@@ -67,6 +67,10 @@ comma-separated override, e.g. `SUEDE_POWER=reboot,poweroff`). Empty is the
 default: a display appliance should not be able to turn itself off because
 somebody found the button.
 
+[![System card on the System tab, with the restart and shut down buttons](assets/screenshots/details/host-power.avif){ width="820" height="386" loading=lazy }](screenshots.md#system)
+
+The restart and shut down buttons are on the [System tab](screenshots.md#system).
+
 That list lives in the bootstrap file, not in desired state, and that is
 deliberate: desired state is writable through the very API the permission is
 meant to constrain, so a gate the caller can open by writing configuration is
@@ -736,6 +740,10 @@ The canvas stays the size the configuration describes, every blend ramp stays
 where it was, and the other displays carry on showing exactly the pixels they
 showed a moment earlier — the missing output's region is simply not shown.
 
+[![Displays tab with every output disconnected, showing the canvas preview as not connected and the outputs table as Disconnected](assets/screenshots/details/unplugged-outputs.avif){ width="820" height="824" loading=lazy }](screenshots.md#displays-disconnected)
+
+See the [Displays tab with nothing connected](screenshots.md#displays-disconnected).
+
 This is deliberate, and it is why the geometry is derived from the
 configuration rather than from what is currently plugged in. The alternative
 would mean one loose connector resizing the canvas mid-show, reflowing the
@@ -927,6 +935,8 @@ per display from the dropdown on the **Displays** tab.
 ### Applications
 
 An application is a *launch specification*, not a window. That is what makes it restorable after a reboot.
+
+See the [Apps tab](screenshots.md#apps) and its edit dialog.
 
 **One application is active at a time — `activeApp` — and it always covers
 the whole canvas.** The rest of the list is a library to switch between:
@@ -1268,6 +1278,10 @@ This is how page content learns where to post heartbeats without hard-coding hos
 
 #### Audio routing
 
+[![Audio outputs card on the AV I/O tab, listing PipeWire sinks with their levels and the default marked](assets/screenshots/details/audio-outputs.avif){ width="820" height="300" loading=lazy }](screenshots.md#av-io)
+
+See the [AV I/O tab](screenshots.md#av-io).
+
 The `audio` field distinguishes three cases, and the distinction is deliberate:
 
 | Value | Meaning |
@@ -1357,6 +1371,10 @@ space exactly as its beam lands on the surface — overlapping the neighbors by
 however much the rigging actually overlaps, each seam its own amount, rows
 and grids included. The canvas is the layout's bounding box, and the Displays
 tab reports it live.
+
+[![Edge blending card on the Displays tab, with blending, overlap highlight, projector gamma and black-level compensation settings](assets/screenshots/details/edge-blending.avif){ width="820" height="250" loading=lazy }](screenshots.md#displays)
+
+See the [Displays tab](screenshots.md#displays) for these controls.
 
 An overlapping layout is only accepted on an appliance provisioned for one:
 set [`allow_overlaps = true`](#direct-scanout) in `suede.toml`, or
@@ -1997,6 +2015,10 @@ shared content crop, and Warp correction use that one selection. Missing
 calibration is initialized with identity pins and neutral centers; switching
 modes preserves the shared composition and retained calibration.
 
+[![Warp and geometry pin editor on the Displays tab, with draggable corner and center handles](assets/screenshots/details/warp-editor.avif){ width="790" height="470" loading=lazy }](screenshots.md#displays)
+
+See the [Displays tab](screenshots.md#displays) for the Warp pin editor.
+
 Crop X/Y are canvas pixels. Content scale is enlargement from canvas pixels
 to output pixels: 200% maps a 960×540 crop to a 1920×1080 output. This differs
 from compositor **Output scale** and the read-only global **Rendering scale**.
@@ -2086,6 +2108,10 @@ because alignment comes first — and, being canvas-anchored rather than
 per-output, they are unaffected by the overlapping-output limitation above,
 which makes them the right tool for checking a rig before committing to a
 layout.
+
+[![Test pattern picker on the Displays tab](assets/screenshots/details/test-pattern.avif){ width="790" height="112" loading=lazy }](screenshots.md#displays)
+
+The pattern picker is on the [Displays tab](screenshots.md#displays).
 
 | Pattern | For |
 |---|---|
