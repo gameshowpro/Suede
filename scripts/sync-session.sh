@@ -208,8 +208,14 @@ switch_arm() {
 # --- menu -------------------------------------------------------------------
 
 finish() {
-  echo "Restoring the wall: pattern off, arena-fx active."
-  hide_pattern; set_app arena-fx
+  if [ -n "$ORIGINAL_APP" ]; then
+    echo "Restoring the wall: pattern off, $ORIGINAL_APP active."
+  else
+    echo "Restoring the wall: pattern off."
+  fi
+  hide_pattern
+  # Put back whichever app was running before the session started.
+  [ -n "$ORIGINAL_APP" ] && set_app "$ORIGINAL_APP"
   record session_end '{}'
   echo
   echo "${BOLD}Session complete.${OFF}"
@@ -224,6 +230,8 @@ trap 'echo; echo "Interrupted - the manifest is intact at $MANIFEST"; exit 1' IN
 
 record session_start "$(jq -c -n --arg h "$HOST" '{host:$h}')"
 record machine "$(remote "curl -s $API/system")"
+# The app that was active before the session, restored by finish().
+ORIGINAL_APP=$(remote "curl -s $API/config" | jq -r '.activeApp // empty')
 
 cat <<BANNER
 

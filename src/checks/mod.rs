@@ -3892,14 +3892,14 @@ mod tests {
         crashes: u32,
     ) -> crate::browser_gpu::AppGpuReport {
         crate::browser_gpu::AppGpuReport {
-            app: "arena-fx".into(),
+            app: "scoreboard".into(),
             pid: 10,
             rendering,
             crashes,
             software_since: Some(1_791_381_792),
             seen_hardware: false,
             restarts_this_hour: 0,
-            log_path: PathBuf::from("/var/lib/suede/logs/arena-fx.log"),
+            log_path: PathBuf::from("/var/lib/suede/logs/scoreboard.log"),
         }
     }
 
@@ -3908,7 +3908,7 @@ mod tests {
         use crate::browser_gpu::Rendering;
         let dir = tempfile::tempdir().unwrap();
         let runner = runner(dir.path().to_path_buf());
-        let running = vec![("arena-fx".to_string(), 10)];
+        let running = vec![("scoreboard".to_string(), 10)];
 
         let none = runner.browser_gpu_check(&[], &[]);
         assert_eq!(none.id, ids::BROWSER_GPU);
@@ -3939,7 +3939,7 @@ mod tests {
 
         // A report on an earlier process (the app restarted since) is stale.
         let stale = gpu_report(Some(Rendering::Software), 3);
-        let check = runner.browser_gpu_check(&[("arena-fx".to_string(), 11)], &[stale]);
+        let check = runner.browser_gpu_check(&[("scoreboard".to_string(), 11)], &[stale]);
         assert_eq!(check.status, CheckStatus::Pass, "{}", check.detail);
         assert!(!check.fix_available);
     }

@@ -1335,7 +1335,7 @@ mod tests {
         assert_eq!(state.revision, 1736);
         assert_eq!(state.outputs.len(), 4);
         assert_eq!(state.apps.len(), 5);
-        assert_eq!(state.active_app.as_deref(), Some("arena-fx"));
+        assert_eq!(state.active_app.as_deref(), Some("scoreboard"));
         assert_eq!(
             state.outputs[0].adopted.as_ref().unwrap().mode.unwrap(),
             Mode {

@@ -367,7 +367,7 @@ committed configuration, output modes, active app, and 17/17 health checks.
 `~/.bash_profile` ended byte-identical to its recorded baseline, SHA-256
 `552fa6f4ae6f7196b7d709e478e32b2c039c7bc9d60fa27ac83de9bd61fd9834`, and the
 live Sway's environment carries no `__GL_YIELD`. Final appliance status:
-synced, revision 1981, 17 pass / 0 warn / 0 fail, active app `arena-fx`
+synced, revision 1981, 17 pass / 0 warn / 0 fail, active app `scoreboard`
 running. All 16 analyzer results reported `performanceEligible: true`, five
 fresh stats intervals, and no errors or warnings.
 
@@ -560,7 +560,7 @@ Driver 550 prints no `GPU Firmware:` line in
 is older than the newest tested release 595.91.07; behavior on older
 drivers is not validated (per-present timing needs 595 or later)"). On the
 Wayland session the appliance reported 18 pass, 1 warn (that check), 0 fail,
-with `arena-fx` running and all three projectors at 1920×1200@59.95.
+with `scoreboard` running and all three projectors at 1920×1200@59.95.
 
 ### Fallback sequence
 
@@ -580,7 +580,7 @@ with `arena-fx` running and all three projectors at 1920×1200@59.95.
 | 03:32:07.66 | `display-reset` ran; headless Sway ended |
 | 03:32:07.93 | auto-login's DRM Sway up (`session = wayland`) |
 | 03:32:08.49 | systemd restarts the daemon (NRestarts 1); it resolves wayland from the marker |
-| 03:32:09.40 | `arena-fx` running; all three projectors active at 1920×1200@59.95 |
+| 03:32:09.40 | `scoreboard` running; all three projectors active at 1920×1200@59.95 |
 
 The dark gap was 16.9 s from the getty restart to the DRM Sway, of which
 15.2 s was the old daemon's stop timeout; from the new daemon's start to the
@@ -619,7 +619,7 @@ are addressed by the retest below.
 `suede.toml` was restored byte-identically (SHA-256 `fcd84f9d…`), the
 marker and attempt counter removed, and `getty@tty1` and `suede` restarted:
 DRM Sway, `/system` presentation wayland/wayland with no reason, 18 pass,
-1 warn, 0 fail, `arena-fx` running, revision 1771 committed, the three
+1 warn, 0 fail, `scoreboard` running, revision 1771 committed, the three
 projectors at 1920×1200@59.95, no marker. The test build and its profile
 (SHA-256 `d59ec094…`) stay installed for the driver upgrade that follows.
 
@@ -654,7 +654,7 @@ The headless Sway now received `WLR_RENDER_DRM_DEVICE=/dev/dri/renderD129`
 | 14:35:38.27 | auto-login's DRM Sway up |
 | 14:35:38.65 | systemd restarts the daemon; it resolves wayland from the marker |
 | 14:35:38.93 | Wayland slicer started |
-| 14:35:40.32 | `arena-fx` running; three projectors at 1920×1200@59.95 |
+| 14:35:40.32 | `scoreboard` running; three projectors at 1920×1200@59.95 |
 
 `/system.presentation.reason`:
 
@@ -682,7 +682,7 @@ message kinds already present before the test.
 Wayland was restored as before (original `suede.toml` byte-identical,
 marker and attempt counter removed, getty and `suede` restarted): DRM Sway
 in 0.7 s, presentation wayland/wayland with no reason, 18 pass, 1 warn,
-0 fail, `arena-fx` running, revision 1771 committed, no marker. The rebuilt
+0 fail, `scoreboard` running, revision 1771 committed, no marker. The rebuilt
 package and its profile (SHA-256 `81021f62…`) stay installed for the driver
 upgrade that follows.
 
@@ -698,7 +698,7 @@ the machine.
 ### Wayland
 
 The DRM Sway came up on DP-5, DP-7 and DP-8 at 1920×1200@59.95 with
-`arena-fx` running. `/system` reported:
+`scoreboard` running. `/system` reported:
 
 ```json
 {"version": "595.91.07", "kernelModule": "proprietary",

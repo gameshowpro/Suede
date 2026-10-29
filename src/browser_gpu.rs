@@ -904,7 +904,7 @@ mod tests {
     #[test]
     fn the_counter_reads_incrementally_and_starts_again_for_a_new_launch() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("arena-fx.log");
+        let path = dir.path().join("scoreboard.log");
         let mut counter = CrashCounter::default();
         assert_eq!(counter.read(&path, 10), 0, "no log yet");
 
@@ -949,7 +949,7 @@ mod tests {
             Observation {
                 now: self.start + Duration::from_secs(seconds),
                 now_unix: 1000 + seconds,
-                app: "arena-fx",
+                app: "scoreboard",
                 chromium: true,
                 running: true,
                 pid: Some(10),
@@ -977,7 +977,7 @@ mod tests {
                 crashes: 3
             }
         );
-        let report = policy.report("arena-fx", PathBuf::from("x.log")).unwrap();
+        let report = policy.report("scoreboard", PathBuf::from("x.log")).unwrap();
         assert_eq!(report.software_since, Some(1010), "when it was first seen");
         assert_eq!(report.restarts_this_hour, 1);
         // The same process, still software: confirmed afresh, not at once.
@@ -1008,11 +1008,11 @@ mod tests {
         let clock = Clock::new();
         let mut policy = Policy::new(true);
         policy.evaluate(&clock.at(0, None, 0));
-        let report = policy.report("arena-fx", PathBuf::new()).unwrap();
+        let report = policy.report("scoreboard", PathBuf::new()).unwrap();
         assert_eq!(report.rendering, None);
         policy.evaluate(&clock.at(5, SW, 3));
         policy.evaluate(&clock.at(10, None, 3));
-        let report = policy.report("arena-fx", PathBuf::new()).unwrap();
+        let report = policy.report("scoreboard", PathBuf::new()).unwrap();
         assert_eq!(report.rendering, Some(Rendering::Software));
         assert_eq!(report.software_since, Some(1005));
     }
@@ -1030,7 +1030,7 @@ mod tests {
         let mut observation = clock.at(10, SW, 3);
         observation.pid = Some(11);
         assert_eq!(policy.evaluate(&observation), Decision::Wait);
-        let report = policy.report("arena-fx", PathBuf::new()).unwrap();
+        let report = policy.report("scoreboard", PathBuf::new()).unwrap();
         assert_eq!(report.pid, 11);
         assert_eq!(report.software_since, Some(1010));
         assert_eq!(report.restarts_this_hour, 1, "the budget is the app's");
@@ -1077,7 +1077,7 @@ mod tests {
         assert_eq!(exhausted, 1, "reported once for the process it held");
         assert_eq!(
             policy
-                .report("arena-fx", PathBuf::new())
+                .report("scoreboard", PathBuf::new())
                 .unwrap()
                 .restarts_this_hour,
             3
@@ -1102,10 +1102,10 @@ mod tests {
         let mut policy = Policy::new(true);
         policy.evaluate(&clock.at(0, SW, 3));
         policy.evaluate(&clock.at(5, SW, 3));
-        policy.refund("arena-fx");
+        policy.refund("scoreboard");
         assert_eq!(
             policy
-                .report("arena-fx", PathBuf::new())
+                .report("scoreboard", PathBuf::new())
                 .unwrap()
                 .restarts_this_hour,
             0
@@ -1125,7 +1125,7 @@ mod tests {
             assert_eq!(policy.evaluate(&clock.at(t, SW, 3)), Decision::Wait);
         }
         // Still tracked, so the check can say what it sees.
-        let report = policy.report("arena-fx", PathBuf::new()).unwrap();
+        let report = policy.report("scoreboard", PathBuf::new()).unwrap();
         assert_eq!(report.rendering, Some(Rendering::Software));
         assert_eq!(report.restarts_this_hour, 0);
     }
@@ -1160,7 +1160,7 @@ mod tests {
             observation.chromium = false;
             assert_eq!(policy.evaluate(&observation), Decision::Wait);
         }
-        assert!(policy.report("arena-fx", PathBuf::new()).is_none());
+        assert!(policy.report("scoreboard", PathBuf::new()).is_none());
     }
 
     #[test]
@@ -1188,7 +1188,7 @@ mod tests {
 
     fn report(rendering: Option<Rendering>, crashes: u32, restarts: u32) -> AppGpuReport {
         AppGpuReport {
-            app: "arena-fx".into(),
+            app: "scoreboard".into(),
             pid: 10,
             rendering,
             crashes,
@@ -1196,7 +1196,7 @@ mod tests {
             software_since: (rendering == SW).then_some(1_791_381_792),
             seen_hardware: false,
             restarts_this_hour: restarts,
-            log_path: PathBuf::from("/var/lib/suede/logs/arena-fx.log"),
+            log_path: PathBuf::from("/var/lib/suede/logs/scoreboard.log"),
         }
     }
 
@@ -1210,13 +1210,13 @@ mod tests {
     #[test]
     fn hardware_without_crashes_passes() {
         let hardware = report(HW, 0, 0);
-        let (status, detail) = check_verdict(&[("arena-fx", Some(&hardware))], true);
+        let (status, detail) = check_verdict(&[("scoreboard", Some(&hardware))], true);
         assert_eq!(status, CheckStatus::Pass);
         assert_eq!(
             detail,
-            "arena-fx: rendering on the GPU, with no GPU process crash since launch"
+            "scoreboard: rendering on the GPU, with no GPU process crash since launch"
         );
-        let (status, detail) = check_verdict(&[("arena-fx", None)], true);
+        let (status, detail) = check_verdict(&[("scoreboard", None)], true);
         assert_eq!(status, CheckStatus::Pass);
         assert!(detail.contains("no GPU process seen yet"), "{detail}");
     }
@@ -1224,16 +1224,16 @@ mod tests {
     #[test]
     fn hardware_after_a_crash_warns_with_the_log() {
         let crashed = report(HW, 2, 0);
-        let (status, detail) = check_verdict(&[("arena-fx", Some(&crashed))], true);
+        let (status, detail) = check_verdict(&[("scoreboard", Some(&crashed))], true);
         assert_eq!(status, CheckStatus::Warn);
         assert!(detail.contains("crashed 2 times since launch"), "{detail}");
         assert!(detail.contains("after the third crash"), "{detail}");
         assert!(
-            detail.contains("/var/lib/suede/logs/arena-fx.log"),
+            detail.contains("/var/lib/suede/logs/scoreboard.log"),
             "{detail}"
         );
         let once = report(None, 1, 0);
-        let (status, detail) = check_verdict(&[("arena-fx", Some(&once))], true);
+        let (status, detail) = check_verdict(&[("scoreboard", Some(&once))], true);
         assert_eq!(status, CheckStatus::Warn);
         assert!(detail.contains("crashed once"), "{detail}");
         assert!(detail.contains("no GPU process seen yet"), "{detail}");
@@ -1242,7 +1242,7 @@ mod tests {
     #[test]
     fn software_fails_saying_since_when_and_what_happens_next() {
         let fallen = report(SW, 3, 1);
-        let (status, detail) = check_verdict(&[("arena-fx", Some(&fallen))], true);
+        let (status, detail) = check_verdict(&[("scoreboard", Some(&fallen))], true);
         assert_eq!(status, CheckStatus::Fail);
         assert!(detail.contains("since 2026-10-07 14:03:12 UTC"), "{detail}");
         assert!(detail.contains("crashed 3 times"), "{detail}");
@@ -1252,25 +1252,25 @@ mod tests {
         );
         assert!(detail.contains("restarts it automatically"), "{detail}");
 
-        let (_, detail) = check_verdict(&[("arena-fx", Some(&fallen))], false);
+        let (_, detail) = check_verdict(&[("scoreboard", Some(&fallen))], false);
         assert!(detail.contains("automatic restart is off"), "{detail}");
 
         let spent = report(SW, 3, 3);
-        let (_, detail) = check_verdict(&[("arena-fx", Some(&spent))], true);
+        let (_, detail) = check_verdict(&[("scoreboard", Some(&spent))], true);
         assert!(
             detail.contains("every automatic restart this hour is used"),
             "{detail}"
         );
 
         let from_launch = report(SW, 0, 0);
-        let (status, detail) = check_verdict(&[("arena-fx", Some(&from_launch))], true);
+        let (status, detail) = check_verdict(&[("scoreboard", Some(&from_launch))], true);
         assert_eq!(status, CheckStatus::Fail);
         assert!(detail.contains("started that way"), "{detail}");
         let after_hardware = AppGpuReport {
             seen_hardware: true,
             ..report(SW, 0, 0)
         };
-        let (status, detail) = check_verdict(&[("arena-fx", Some(&after_hardware))], true);
+        let (status, detail) = check_verdict(&[("scoreboard", Some(&after_hardware))], true);
         assert_eq!(status, CheckStatus::Fail);
         assert!(
             detail.contains("after rendering on the GPU earlier in this launch"),
@@ -1286,9 +1286,9 @@ mod tests {
             ..report(HW, 0, 0)
         };
         let (status, detail) =
-            check_verdict(&[("arena-fx", Some(&fallen)), ("clock", Some(&fine))], true);
+            check_verdict(&[("scoreboard", Some(&fallen)), ("clock", Some(&fine))], true);
         assert_eq!(status, CheckStatus::Fail);
-        assert!(detail.starts_with("arena-fx: "), "{detail}");
+        assert!(detail.starts_with("scoreboard: "), "{detail}");
         assert!(detail.contains("; clock: "), "{detail}");
     }
 
@@ -1322,7 +1322,7 @@ mod tests {
         ));
         let app = AppConfig {
             shared_input: None,
-            id: "arena-fx".into(),
+            id: "scoreboard".into(),
             enabled: true,
             launcher: Launcher::ChromiumKiosk {
                 uri: "http://127.0.0.1/".into(),
@@ -1342,13 +1342,13 @@ mod tests {
             persist_profile: false,
         };
         let target = crate::reconciler::plan::AppTarget {
-            id: "arena-fx".into(),
+            id: "scoreboard".into(),
             output: None,
             workspace: None,
             blocked: None,
         };
         supervisor.reconcile(&[app], &[target]).await;
-        let pid = supervisor.status("arena-fx").await.unwrap().pid.unwrap();
+        let pid = supervisor.status("scoreboard").await.unwrap().pid.unwrap();
         map_window(&supervisor, pid).await;
 
         let snapshot = Arc::new(Snapshot::new());
@@ -1416,10 +1416,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, checks, snapshot, pid) = chromium_app(dir.path(), true).await;
         assert_eq!(
-            supervisor.status("arena-fx").await.unwrap().state,
+            supervisor.status("scoreboard").await.unwrap().state,
             AppState::Running
         );
-        let log = supervisor.launch_context().log_path("arena-fx");
+        let log = supervisor.launch_context().log_path("scoreboard");
         std::fs::write(&log, CRASH.repeat(3)).unwrap();
         let proc = fallen_back(pid);
         let mut watchdog =
@@ -1428,7 +1428,7 @@ mod tests {
 
         assert_eq!(
             watchdog.step().await,
-            vec![("arena-fx".to_string(), Decision::Wait)]
+            vec![("scoreboard".to_string(), Decision::Wait)]
         );
         let check = browser_gpu_check(&checks);
         assert_eq!(check.status, CheckStatus::Fail, "{}", check.detail);
@@ -1437,7 +1437,7 @@ mod tests {
         assert_eq!(
             watchdog.step().await,
             vec![(
-                "arena-fx".to_string(),
+                "scoreboard".to_string(),
                 Decision::Restart {
                     pid,
                     attempt: 1,
@@ -1445,7 +1445,7 @@ mod tests {
                 }
             )]
         );
-        let status = supervisor.status("arena-fx").await.unwrap();
+        let status = supervisor.status("scoreboard").await.unwrap();
         assert_ne!(status.pid, Some(pid));
         assert_eq!(status.last_restart_reason, Some(RestartReason::GpuFallback));
         // The checks ran again at once, and a report on the old process no
@@ -1461,7 +1461,7 @@ mod tests {
     async fn with_the_key_off_the_check_fails_and_its_fix_restarts() {
         let dir = tempfile::tempdir().unwrap();
         let (supervisor, checks, snapshot, pid) = chromium_app(dir.path(), false).await;
-        let log = supervisor.launch_context().log_path("arena-fx");
+        let log = supervisor.launch_context().log_path("scoreboard");
         std::fs::write(&log, CRASH.repeat(3)).unwrap();
         let proc = fallen_back(pid);
         let mut watchdog =
@@ -1471,9 +1471,9 @@ mod tests {
         watchdog.step().await;
         assert_eq!(
             watchdog.step().await,
-            vec![("arena-fx".to_string(), Decision::Off { crashes: 3 })]
+            vec![("scoreboard".to_string(), Decision::Off { crashes: 3 })]
         );
-        assert_eq!(supervisor.status("arena-fx").await.unwrap().pid, Some(pid));
+        assert_eq!(supervisor.status("scoreboard").await.unwrap().pid, Some(pid));
         let check = browser_gpu_check(&checks);
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(
@@ -1484,8 +1484,8 @@ mod tests {
         assert!(check.fix_available);
 
         let outcome = checks.fix(crate::checks::ids::BROWSER_GPU).await.unwrap();
-        assert!(outcome.contains("arena-fx"), "{outcome}");
-        let status = supervisor.status("arena-fx").await.unwrap();
+        assert!(outcome.contains("scoreboard"), "{outcome}");
+        let status = supervisor.status("scoreboard").await.unwrap();
         assert_ne!(status.pid, Some(pid));
         assert_eq!(status.last_restart_reason, Some(RestartReason::GpuFallback));
         assert_eq!(browser_gpu_check(&checks).status, CheckStatus::Pass);

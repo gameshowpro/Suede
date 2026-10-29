@@ -1720,8 +1720,8 @@ scale would push a slice outside the canvas, any larger would cover less on
 both axes. `unusedCanvas` reports whatever fraction is left uncovered on
 each axis, centered on the canvas exactly as `overhang` is. Left `false`
 (the default), an overlap request never leaves a band — see above, it
-overhangs instead, so most callers (Zelus's slider-driven Arrange dialog
-included) never need to send this flag at all; it exists for a caller that
+overhangs instead, so most callers (a slider-driven Arrange dialog, for
+example) never need to send this flag at all; it exists for a caller that
 would rather see the wall's inner boundary sit inside the projected surfaces
 than see black slice pixels hanging off its edge. A content-scale solve that
 would leave a band on an unseamed axis at the asked-for scale (a single row

@@ -252,7 +252,7 @@ not scope):
   an idle black wall, a static pattern, or an app that draws nothing reports
   no intervals, so it stays unconfirmed (and presents correctly). Any slicer
   exit in that state falls back at once.
-- **Window placement chatter.** arena-fx's "Can't update Chrome" update
+- **Window placement chatter.** A kiosk app's "Can't update Chrome" update
   bubble and its main window share the single headless workspace
   (`HEADLESS-1`); only one can be fullscreen at a time, so the supervisor
   logs "placed window" roughly once a second and the applied-window
