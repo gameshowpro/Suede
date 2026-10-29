@@ -59,9 +59,10 @@ pub struct ScalePreset {
     pub available: bool,
 }
 
-/// Read-only resolution guidance. `approximate` is always true: the sampled
-/// Jacobian maximum plus an engineering margin is guidance, not a proof of the
-/// exact maximum density.
+/// Read-only resolution guidance. `approximate` is false only when every
+/// enabled output is an axis-aligned rectangle, whose density is computed
+/// exactly. Otherwise the sampled Jacobian maximum plus an engineering margin
+/// is guidance, not a proof of the exact maximum density.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RecommendationResponse {
@@ -468,10 +469,12 @@ pub fn recommend_for_state(
         })
         .collect::<Result<Vec<_>, String>>()?;
 
-    let mut density = 0.0_f64;
-    let mut warnings = vec![
-        "approximate density: sampled largest-singular Jacobian with an engineering margin; this is not an exact maximum proof".to_string(),
-    ];
+    // Sampled (isotropic) density for outputs that are not axis-aligned, and
+    // exact per-axis densities for those that are. `None` means no output took
+    // that path.
+    let mut sampled_density: Option<f64> = None;
+    let mut exact_density: Option<(f64, f64)> = None;
+    let mut warnings = Vec::new();
     for (output, geometry) in geometries {
         let mode = output.effective_mode().ok_or_else(|| {
             format!(
@@ -556,21 +559,45 @@ pub fn recommend_for_state(
                 output.r#match.key()
             ));
         }
-        density = density.max(sample_density(&warp, slice.width, slice.height)?);
+        if let Some((rw, rh)) = axis_aligned_extent(&geometry.corners) {
+            // The mapping is a per-axis scale (piecewise at the center
+            // remap), so the density is known exactly: output pixels per
+            // canvas-width unit along each axis, taking the steeper half.
+            let [cx, cy] = geometry.center;
+            let dx = f64::from(width) * rw * (2.0 * cx).max(2.0 * (1.0 - cx)) / slice.width;
+            let dy = f64::from(height) * rh * (2.0 * cy).max(2.0 * (1.0 - cy)) / slice.height;
+            let (max_dx, max_dy) = exact_density.unwrap_or((0.0, 0.0));
+            exact_density = Some((max_dx.max(dx), max_dy.max(dy)));
+        } else {
+            let density = sample_density(&warp, slice.width, slice.height)?;
+            sampled_density = Some(sampled_density.map_or(density, |best| best.max(density)));
+        }
     }
-    if !density.is_finite() || density <= 0.0 {
-        return Err("geometry has no finite positive sampling density".into());
+    let approximate = sampled_density.is_some();
+    if approximate {
+        warnings.push(
+            "approximate density: sampled largest-singular Jacobian with an engineering margin; this is not an exact maximum proof".to_string(),
+        );
     }
-
     // Five percent is an engineering margin for finite-difference truncation
     // and variation between the 33×33 grid points. It is not a mathematical
-    // bound on the unsampled maximum.
-    // The density estimator uses canonical isotropic canvas units. Account
-    // for the actual rounded integer height when choosing the width: for an
-    // odd aspect/height pair, `round(width / aspect)` can otherwise leave the
-    // y density just below the sampled target.
-    let target_density = (density * 1.05).ceil().max(1.0);
-    let ideal_width_f = width_for_density(target_density, requested_aspect)?;
+    // bound on the unsampled maximum, and it applies to the sampled outputs
+    // only; axis-aligned outputs carry no margin.
+    // The sampled estimator uses canonical isotropic canvas units, so it
+    // constrains both axes equally; exact outputs constrain each axis on its
+    // own. Account for the actual rounded integer height when choosing the
+    // width: for an odd aspect/height pair, `round(width / aspect)` can
+    // otherwise leave the y density just below the target.
+    let (mut x_density, mut y_density) = exact_density.unwrap_or((0.0, 0.0));
+    if let Some(density) = sampled_density {
+        let target_density = (density * 1.05).ceil().max(1.0);
+        x_density = x_density.max(target_density);
+        y_density = y_density.max(target_density);
+    }
+    if !x_density.is_finite() || !y_density.is_finite() || x_density <= 0.0 || y_density <= 0.0 {
+        return Err("geometry has no finite positive sampling density".into());
+    }
+    let ideal_width_f = width_for_density(x_density, y_density, requested_aspect)?;
     if !ideal_width_f.is_finite() || ideal_width_f >= u64::MAX as f64 {
         return Err("geometry density is too ill-conditioned to represent safely".into());
     }
@@ -628,7 +655,7 @@ pub fn recommend_for_state(
         known_limits: LIMITS,
         unknown_limits: vec!["device/compositor allocation limit".into()],
         warnings,
-        approximate: true,
+        approximate,
     })
 }
 
@@ -679,8 +706,33 @@ fn admissible_width(aspect: f64) -> Result<u32, String> {
     Ok(lo)
 }
 
-fn width_for_density(target_density: f64, aspect: f64) -> Result<f64, String> {
-    if !(target_density.is_finite() && target_density > 0.0) {
+/// The corners' rectangle extent `(width, height)` in normalized output
+/// fractions when they (TL, TR, BR, BL) form a positive axis-aligned
+/// rectangle, otherwise `None`.
+fn axis_aligned_extent(corners: &[[f64; 2]; 4]) -> Option<(f64, f64)> {
+    const TOLERANCE: f64 = 1e-12;
+    let [tl, tr, br, bl] = *corners;
+    let aligned = (tl[1] - tr[1]).abs() <= TOLERANCE
+        && (bl[1] - br[1]).abs() <= TOLERANCE
+        && (tl[0] - bl[0]).abs() <= TOLERANCE
+        && (tr[0] - br[0]).abs() <= TOLERANCE;
+    let (rw, rh) = (tr[0] - tl[0], bl[1] - tl[1]);
+    (aligned && rw.is_finite() && rh.is_finite() && rw > TOLERANCE && rh > TOLERANCE)
+        .then_some((rw, rh))
+}
+
+/// Round up while ignoring float noise (e.g. 3840.0000000004 stays 3840).
+/// The relative slack also absorbs an aspect stored to eight places:
+/// 3840 / 1.77777777 is 2160.0000036 rows, a few thousandths of a pixel.
+fn ceil_tol(value: f64) -> f64 {
+    (value - value.abs() * 1e-6).ceil()
+}
+
+/// Smallest integer canvas width that meets `x_density` horizontally and
+/// `y_density` vertically (both in output pixels per canvas-width unit; the
+/// canvas height in pixels is `round(width / aspect)`).
+fn width_for_density(x_density: f64, y_density: f64, aspect: f64) -> Result<f64, String> {
+    if !(x_density.is_finite() && x_density > 0.0 && y_density.is_finite() && y_density > 0.0) {
         return Err("geometry density is not finite and positive".into());
     }
     if !(aspect.is_finite() && aspect > 0.0) {
@@ -690,14 +742,14 @@ fn width_for_density(target_density: f64, aspect: f64) -> Result<f64, String> {
     // width >= aspect * (h - 0.5). Calculate the minimum required integer
     // height directly instead of incrementing width: at very large values an
     // f64 cannot represent width + 1, and an incremental loop could stall.
-    let required_height = (target_density / aspect).ceil().max(1.0);
+    let required_height = ceil_tol(y_density / aspect).max(1.0);
     // Canvas height is at least one even below the first rounding boundary.
     let y_width = if required_height == 1.0 {
         1.0
     } else {
         (aspect * (required_height - 0.5)).ceil().max(1.0)
     };
-    let width = target_density.ceil().max(y_width).max(1.0);
+    let width = ceil_tol(x_density).max(y_width).max(1.0);
     if !width.is_finite() || width >= u64::MAX as f64 {
         return Err("geometry density is too ill-conditioned to represent safely".into());
     }
@@ -892,9 +944,15 @@ mod tests {
         assert_eq!(canvas_height(100, 3.0).unwrap(), 33);
         assert_eq!(round_positive(100.4), 100.0);
         assert_eq!(round_positive(100.5), 101.0);
-        assert_eq!(width_for_density(105.84, 1.6).unwrap(), 107.0);
-        assert!(width_for_density(1.0e20, 1.6).is_err());
-        assert_eq!(width_for_density(100.0, 1.0e9).unwrap(), 100.0);
+        assert_eq!(width_for_density(105.84, 105.84, 1.6).unwrap(), 107.0);
+        assert!(width_for_density(1.0e20, 1.0e20, 1.6).is_err());
+        assert_eq!(width_for_density(100.0, 100.0, 1.0e9).unwrap(), 100.0);
+        // Per-axis requirements stay separate: 3840 px wide and 2160 rows
+        // at aspect 1.77777777 need exactly width 3840.
+        assert_eq!(
+            width_for_density(3840.0000000004, 3839.99998, 1.77777777).unwrap(),
+            3840.0
+        );
         assert!(canvas_height_unbounded(100, 1.0e-320).is_err());
     }
 
@@ -1002,6 +1060,482 @@ mod tests {
         state.projection.as_mut().unwrap().mode = ProjectionMode::Warp;
         let warp = recommend_for_state(&state, 0).unwrap();
         assert!(warp.ideal_width > simple.ideal_width);
+    }
+
+    /// Four 1920x1080 outputs in a 2x2 grid on a 3840-wide canvas, as on
+    /// System A, with the given pins and mode.
+    fn grid_state(mode: ProjectionMode, corners: [[f64; 2]; 4]) -> crate::model::DesiredState {
+        let slice_height = 0.281_250_001_230_468_8;
+        let mut state = crate::model::DesiredState::new();
+        state.outputs = [
+            (0.0, 0.0),
+            (0.5, 0.0),
+            (0.0, slice_height),
+            (0.5, slice_height),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (x, y))| {
+            let slice = CanvasRect {
+                x,
+                y,
+                width: 0.5,
+                height: slice_height,
+            };
+            let mut configured = output(&format!("grid-{index}"), 0, 0, 1920, 1080, true);
+            configured.geometry = Some(OutputGeometry {
+                slice,
+                corners,
+                center: [0.5, 0.5],
+                raster_footprint: slice,
+            });
+            configured
+        })
+        .collect();
+        state.projection = Some(crate::model::ProjectionConfig {
+            mode,
+            canvas: Some(CanvasConfig {
+                aspect: 1.777_777_77,
+                render_width: 3840,
+            }),
+            ..Default::default()
+        });
+        state
+    }
+
+    const IDENTITY_PINS: [[f64; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    const KEYSTONE_PINS: [[f64; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.1, 1.0]];
+
+    #[test]
+    fn axis_aligned_grid_recommendation_is_exact() {
+        for mode in [ProjectionMode::Simple, ProjectionMode::Warp] {
+            let rec = recommend_for_state(&grid_state(mode, IDENTITY_PINS), 0).unwrap();
+            assert_eq!(rec.ideal_width, 3840, "{mode:?}");
+            assert_eq!(rec.ideal_height, 2160, "{mode:?}");
+            assert!(!rec.approximate, "{mode:?}");
+            assert!(rec.warnings.iter().all(|w| !w.contains("approximate")));
+            assert_eq!(rec.presets[3].width, 3840);
+        }
+        // Simple ignores non-identity pins, so it stays exact and unchanged.
+        let rec =
+            recommend_for_state(&grid_state(ProjectionMode::Simple, KEYSTONE_PINS), 0).unwrap();
+        assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
+        assert!(!rec.approximate);
+    }
+
+    #[test]
+    fn rectangular_pins_scale_the_exact_density() {
+        // A half-width rectangle halves the density the 1920 raster needs.
+        let half = [[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [0.0, 1.0]];
+        let mut state = grid_state(ProjectionMode::Warp, half);
+        state.outputs.truncate(1);
+        state
+            .projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .aspect = 16.0 / 9.0;
+        state.outputs[0].geometry.as_mut().unwrap().slice = CanvasRect {
+            x: 0.0,
+            y: 0.0,
+            width: 0.5,
+            height: 0.28125,
+        };
+        let rec = recommend_for_state(&state, 0).unwrap();
+        assert!(!rec.approximate);
+        // dx = 1920 * 0.5 / 0.5; dy = 1080 / 0.28125 = 3840 rows * aspect.
+        assert_eq!(rec.ideal_width, 3840);
+
+        // Without the height requirement dominating, the width is the x density.
+        state.outputs[0].geometry.as_mut().unwrap().slice.height = 0.5625;
+        let rec = recommend_for_state(&state, 0).unwrap();
+        assert_eq!(rec.ideal_width, 1920);
+    }
+
+    #[test]
+    fn off_center_scales_the_exact_density() {
+        let mut state = grid_state(ProjectionMode::Warp, IDENTITY_PINS);
+        state.outputs.truncate(1);
+        state.outputs[0].geometry.as_mut().unwrap().center = [0.25, 0.5];
+        let rec = recommend_for_state(&state, 0).unwrap();
+        assert!(!rec.approximate);
+        // dx = 1920 * 1.5 / 0.5 = 5760; dy = 3840 is the lesser requirement.
+        assert_eq!(rec.ideal_width, 5760);
+    }
+
+    #[test]
+    fn keystoned_pins_keep_the_sampled_margin() {
+        let rec = recommend_for_state(&grid_state(ProjectionMode::Warp, KEYSTONE_PINS), 0).unwrap();
+        assert!(rec.approximate);
+        assert!(rec.warnings.iter().any(|w| w.contains("approximate")));
+        assert!(rec.ideal_width > 3840);
+    }
+
+    #[test]
+    fn mixed_layout_meets_both_requirements() {
+        let rectangular =
+            recommend_for_state(&grid_state(ProjectionMode::Warp, IDENTITY_PINS), 0).unwrap();
+        let mut mixed = grid_state(ProjectionMode::Warp, IDENTITY_PINS);
+        mixed.outputs[1].geometry.as_mut().unwrap().corners = KEYSTONE_PINS;
+        let rec = recommend_for_state(&mixed, 0).unwrap();
+        assert!(rec.approximate);
+        assert!(rec.ideal_width >= rectangular.ideal_width);
+        assert!(rec.ideal_width > 3840);
+    }
+
+    /// A `cols`x`rows` grid of `raster_w`x`raster_h` (logical) outputs, each
+    /// slice sized so the output samples `ratio_x` / `ratio_y` physical pixels
+    /// per canvas pixel at render width `canvas_w`.
+    struct RatioCase {
+        name: &'static str,
+        cols: u32,
+        rows: u32,
+        raster: (i32, i32),
+        transform: Transform,
+        canvas_w: f64,
+        ratio: (f64, f64),
+        aspect: f64,
+        pins: [[f64; 2]; 4],
+        center: [f64; 2],
+        /// Expected `(ideal_width, ideal_height)`.
+        expect: (u64, u64),
+    }
+
+    impl RatioCase {
+        fn new(
+            name: &'static str,
+            (cols, rows): (u32, u32),
+            raster: (i32, i32),
+            canvas_w: f64,
+            ratio: (f64, f64),
+            aspect: f64,
+            expect: (u64, u64),
+        ) -> Self {
+            Self {
+                name,
+                cols,
+                rows,
+                raster,
+                transform: Transform::Normal,
+                canvas_w,
+                ratio,
+                aspect,
+                pins: IDENTITY_PINS,
+                center: [0.5, 0.5],
+                expect,
+            }
+        }
+
+        fn state(&self) -> crate::model::DesiredState {
+            let (w, h) = self.raster;
+            let slice_w = f64::from(w) / (self.ratio.0 * self.canvas_w);
+            let slice_h = f64::from(h) / (self.ratio.1 * self.canvas_w);
+            let rotated = matches!(
+                self.transform,
+                Transform::Rotate90
+                    | Transform::Rotate270
+                    | Transform::Flipped90
+                    | Transform::Flipped270
+            );
+            let mode = if rotated { (h, w) } else { (w, h) };
+            let mut state = crate::model::DesiredState::new();
+            for row in 0..self.rows {
+                for col in 0..self.cols {
+                    let slice = CanvasRect {
+                        // Slices that would overhang (ratios below 1) are
+                        // pulled back onto the canvas; they may coincide.
+                        x: (f64::from(col) * slice_w).min(1.0 - slice_w),
+                        y: (f64::from(row) * slice_h).min(1.0 / self.aspect - slice_h),
+                        width: slice_w,
+                        height: slice_h,
+                    };
+                    let mut configured =
+                        output(&format!("o-{row}-{col}"), 0, 0, mode.0, mode.1, true);
+                    configured.transform = Some(self.transform);
+                    configured.geometry = Some(OutputGeometry {
+                        slice,
+                        corners: self.pins,
+                        center: self.center,
+                        raster_footprint: slice,
+                    });
+                    state.outputs.push(configured);
+                }
+            }
+            state.projection = Some(crate::model::ProjectionConfig {
+                mode: ProjectionMode::Warp,
+                canvas: Some(CanvasConfig {
+                    aspect: self.aspect,
+                    render_width: self.canvas_w as u32,
+                }),
+                ..Default::default()
+            });
+            state
+        }
+    }
+
+    #[test]
+    fn whole_ratio_layouts_hit_exact_dimensions() {
+        const A: f64 = 16.0 / 9.0;
+        let hd = (1920, 1080);
+        let mut cases = vec![
+            RatioCase::new("1:1 grid", (2, 2), hd, 3840.0, (1.0, 1.0), A, (3840, 2160)),
+            RatioCase::new("2:1 grid", (2, 2), hd, 3840.0, (2.0, 2.0), A, (7680, 4320)),
+            RatioCase::new("1:2 grid", (2, 2), hd, 3840.0, (0.5, 0.5), A, (1920, 1080)),
+            RatioCase::new(
+                "2:1 x, 1:1 y",
+                (2, 2),
+                hd,
+                3840.0,
+                (2.0, 1.0),
+                A,
+                (7680, 4320),
+            ),
+            RatioCase::new(
+                "1:1 x, 2:1 y",
+                (2, 2),
+                hd,
+                3840.0,
+                (1.0, 2.0),
+                A,
+                (7680, 4320),
+            ),
+            RatioCase::new(
+                "single full canvas",
+                (1, 1),
+                hd,
+                1920.0,
+                (1.0, 1.0),
+                A,
+                (1920, 1080),
+            ),
+            RatioCase::new(
+                "5:4",
+                (1, 1),
+                (1280, 1024),
+                1280.0,
+                (1.0, 1.0),
+                1.25,
+                (1280, 1024),
+            ),
+            RatioCase::new(
+                "1366x768",
+                (1, 1),
+                (1366, 768),
+                1366.0,
+                (1.0, 1.0),
+                1366.0 / 768.0,
+                (1366, 768),
+            ),
+            RatioCase::new(
+                "3x1",
+                (3, 1),
+                hd,
+                5760.0,
+                (1.0, 1.0),
+                5760.0 / 1080.0,
+                (5760, 1080),
+            ),
+            RatioCase::new(
+                "1x3",
+                (1, 3),
+                hd,
+                1920.0,
+                (1.0, 1.0),
+                1920.0 / 3240.0,
+                (1920, 3240),
+            ),
+            // 3x2 on a 2.5 canvas: W / aspect = 2304 is already whole.
+            RatioCase::new(
+                "3x2 aspect 2.5",
+                (3, 2),
+                hd,
+                5760.0,
+                (1.0, 1.0),
+                2.5,
+                (5760, 2304),
+            ),
+            // W / aspect = 2215.38: the 2216th row is genuinely required, and
+            // no further row may be added.
+            RatioCase::new(
+                "3x2 aspect 2.6",
+                (3, 2),
+                hd,
+                5760.0,
+                (1.0, 1.0),
+                2.6,
+                (5761, 2216),
+            ),
+        ];
+        let mut half_pins = RatioCase::new(
+            "half-raster pins",
+            (1, 1),
+            hd,
+            1920.0,
+            (1.0, 1.0),
+            A,
+            (960, 540),
+        );
+        half_pins.pins = [[0.0, 0.0], [0.5, 0.0], [0.5, 0.5], [0.0, 0.5]];
+        cases.push(half_pins);
+        let mut off_center = RatioCase::new(
+            "center 0.25",
+            (1, 1),
+            hd,
+            3840.0,
+            (1.0, 1.0),
+            A,
+            (5760, 3240),
+        );
+        off_center.center = [0.25, 0.5];
+        cases.push(off_center);
+        for (name, ratio, expect) in [
+            ("rotated 1:1", (1.0, 1.0), (1080, 1920)),
+            ("rotated 2:1", (2.0, 2.0), (2160, 3840)),
+        ] {
+            for transform in [Transform::Rotate90, Transform::Rotate270] {
+                // Logical raster is portrait; canvas is portrait too.
+                let mut rotated = RatioCase::new(
+                    name,
+                    (1, 1),
+                    (1080, 1920),
+                    1080.0,
+                    ratio,
+                    9.0 / 16.0,
+                    expect,
+                );
+                rotated.transform = transform;
+                cases.push(rotated);
+            }
+        }
+        for case in &cases {
+            let rec = recommend_for_state(&case.state(), 0).unwrap();
+            assert!(!rec.approximate, "{}", case.name);
+            assert_eq!(
+                (rec.ideal_width, rec.ideal_height),
+                case.expect,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn stored_aspect_and_slice_noise_do_not_add_pixels() {
+        // System A: aspect stored to eight places, slice height carrying the
+        // matching float dust.
+        let mut noisy = RatioCase::new(
+            "noisy",
+            (2, 2),
+            (1920, 1080),
+            3840.0,
+            (1.0, 1.0),
+            1.777_777_77,
+            (3840, 2160),
+        );
+        let mut state = noisy.state();
+        for configured in &mut state.outputs {
+            let geometry = configured.geometry.as_mut().unwrap();
+            geometry.slice.height = 0.281_250_001_230_468_8;
+            geometry.raster_footprint = geometry.slice;
+        }
+        let rec = recommend_for_state(&state, 0).unwrap();
+        assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
+        // Stored aspect with an exact slice height, as a typed 1080 px crop
+        // produces.
+        let rec = recommend_for_state(&noisy.state(), 0).unwrap();
+        assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
+        // Exact aspect with exact and with dusty slice heights.
+        noisy.aspect = 16.0 / 9.0;
+        let rec = recommend_for_state(&noisy.state(), 0).unwrap();
+        assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
+        let mut state = noisy.state();
+        for configured in &mut state.outputs {
+            let geometry = configured.geometry.as_mut().unwrap();
+            geometry.slice.height = 0.281_250_001_230_468_8;
+            geometry.raster_footprint = geometry.slice;
+        }
+        let rec = recommend_for_state(&state, 0).unwrap();
+        assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
+        let widths: Vec<u64> = rec.presets.iter().map(|preset| preset.width).collect();
+        assert_eq!(widths, [960, 1920, 2880, 3840]);
+    }
+
+    #[test]
+    fn arrangement_round_trip_hits_the_content_scale_exactly() {
+        let raster = |_: &OutputConfig| Some((1920u32, 1080u32));
+        for (columns, rows) in [(1, 1), (2, 1), (1, 2), (2, 2), (3, 2), (3, 3)] {
+            for scale in [0.5, 1.0, 2.0, 4.0] {
+                let mut document = arrangement_document((columns * rows) as usize);
+                // A canvas the grid fills exactly at this scale, so zero
+                // overlap and the requested scale agree.
+                let canvas_w = f64::from(columns) * 1920.0 / scale;
+                let canvas_h = f64::from(rows) * 1080.0 / scale;
+                if canvas_w * canvas_h > LIMITS.max_canvas_pixels as f64 {
+                    // 3x3 at 0.5 needs an 11520x6480 canvas, past the 64 MP
+                    // planning limit, so the solver rightly refuses it.
+                    continue;
+                }
+                document.projection.as_mut().unwrap().canvas = Some(CanvasConfig {
+                    aspect: canvas_w / canvas_h,
+                    render_width: canvas_w as u32,
+                });
+                let request = crate::model::ArrangementRequest {
+                    rows,
+                    columns,
+                    overlap_x: None,
+                    overlap_y: None,
+                    content_scale: Some(scale),
+                    allow_unused_canvas: false,
+                    committed: false,
+                };
+                let solution = crate::model::solve_document(&document, &request, raster)
+                    .unwrap_or_else(|error| panic!("{columns}x{rows} @ {scale}: {error}"));
+                crate::model::apply(&mut document, &solution);
+                let rec = recommend_for_state(&document, 0).unwrap();
+                let label = format!("{columns}x{rows} @ {scale}");
+                assert!(!rec.approximate, "{label}");
+                assert_eq!(rec.ideal_width, (canvas_w * scale) as u64, "{label}");
+                assert_eq!(rec.ideal_height, (canvas_h * scale) as u64, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn arrangement_round_trip_with_overlap_hits_the_content_scale_exactly() {
+        let raster = |_: &OutputConfig| Some((1920u32, 1080u32));
+        // (columns, rows, overlapX, overlapY): the covered extent is
+        // 2*1920 - 0.25*1920 = 3360 wide and 2*1080 - 0.5*1080 = 1620 tall.
+        for (columns, rows, overlap_x, overlap_y, covered) in [
+            (2, 1, 0.25, 0.0, (3360.0, 1080.0)),
+            (2, 2, 0.25, 0.5, (3360.0, 1620.0)),
+        ] {
+            for scale in [1.0, 2.0] {
+                let mut document = arrangement_document((columns * rows) as usize);
+                let canvas_w = covered.0 / scale;
+                document.projection.as_mut().unwrap().canvas = Some(CanvasConfig {
+                    aspect: covered.0 / covered.1,
+                    render_width: canvas_w as u32,
+                });
+                let request = crate::model::ArrangementRequest {
+                    rows,
+                    columns,
+                    overlap_x: Some(overlap_x),
+                    overlap_y: Some(overlap_y),
+                    content_scale: None,
+                    allow_unused_canvas: false,
+                    committed: false,
+                };
+                let solution = crate::model::solve_document(&document, &request, raster).unwrap();
+                let label = format!("{columns}x{rows} @ {scale}");
+                assert_eq!(solution.arrangement.content_scale, scale, "{label}");
+                crate::model::apply(&mut document, &solution);
+                let rec = recommend_for_state(&document, 0).unwrap();
+                assert!(!rec.approximate, "{label}");
+                assert_eq!(rec.ideal_width, (canvas_w * scale) as u64, "{label}");
+            }
+        }
     }
 
     #[test]

@@ -704,8 +704,8 @@ Dragging corner pins or adjusting center fractions is not all GPU work:
 Suede provides read-only planning endpoints to assist operators during design and setup:
 
 - **Resolution Recommendation (`GET /api/v1/projection/recommendation`)**:
-  Analyzes the effective working geometry across all outputs. It evaluates a dense grid of the largest-singular-value canvas-to-output Jacobian density (including both sides of center-remap breaks) and adds a 5% engineering margin. Rather than a single recommended value, the response reports the requested aspect, an ideal and an admissible render width, and `0.25`/`0.5`/`0.75`/`1.0` scale presets, each with an `available` flag against the admissible limit.
-  - The response includes `approximate: true` as guidance rather than an absolute mathematical proof.
+  Analyzes the effective working geometry across all outputs. Outputs whose corners form an axis-aligned rectangle (any center) get an exact per-axis density with no margin. Any other output is evaluated on a dense grid of the largest-singular-value canvas-to-output Jacobian density (including both sides of center-remap breaks) with a 5% engineering margin. Rather than a single recommended value, the response reports the requested aspect, an ideal and an admissible render width, and `0.25`/`0.5`/`0.75`/`1.0` scale presets, each with an `available` flag against the admissible limit.
+  - The response reports `approximate: false` when every output is axis-aligned, and `approximate: true` (guidance rather than an absolute mathematical proof) when any output needed the sampled path.
   - Suede never automatically resizes or adopts a recommended canvas resolution; the operator must deliberately apply a value.
 
 - **Live Status & Geometry Telemetry (`GET /api/v1/projection/stats`)**:

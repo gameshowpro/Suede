@@ -1597,10 +1597,13 @@ succeeds.
 `GET /api/v1/projection/recommendation` is read-only. It uses the
 effective working copy and reports its persisted `revision` and working-copy
 `generation`, a requested aspect, ideal and admissible dimensions, and
-`0.25`, `0.5`, `0.75`, and `1.0` scale presets. The ideal width samples the largest
-singular value of the canvas-to-output Jacobian on a dense grid for every
-output, evaluating both sides of center-remap breaks and applying a
-5% engineering margin. It is explicitly `approximate: true`; it is guidance,
+`0.25`, `0.5`, `0.75`, and `1.0` scale presets. An output whose corners form an
+axis-aligned rectangle (any center, in either projection mode) has an exactly
+known density, computed per axis with no margin. For any other output the ideal
+width samples the largest singular value of the canvas-to-output Jacobian on a
+dense grid, evaluating both sides of center-remap breaks and applying a 5%
+engineering margin. The response is `approximate: false` when every output is
+axis-aligned and `approximate: true` otherwise; the sampled result is guidance,
 not a proof of the exact maximum. Ill-conditioned or non-finite geometry is
 rejected. Preset widths round to the nearest positive integer (ties up), with
 no multiple-of-eight restriction. Percentages use the ideal width, while the

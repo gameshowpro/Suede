@@ -4874,7 +4874,7 @@
         "type": "object"
       },
       "RecommendationResponse": {
-        "description": "Read-only resolution guidance. `approximate` is always true: the sampled\nJacobian maximum plus an engineering margin is guidance, not a proof of the\nexact maximum density.",
+        "description": "Read-only resolution guidance. `approximate` is false only when every\nenabled output is an axis-aligned rectangle, whose density is computed\nexactly. Otherwise the sampled Jacobian maximum plus an engineering margin\nis guidance, not a proof of the exact maximum density.",
         "properties": {
           "admissibleHeight": {
             "format": "int32",
