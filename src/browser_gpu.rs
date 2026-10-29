@@ -1285,8 +1285,10 @@ mod tests {
             app: "clock".into(),
             ..report(HW, 0, 0)
         };
-        let (status, detail) =
-            check_verdict(&[("scoreboard", Some(&fallen)), ("clock", Some(&fine))], true);
+        let (status, detail) = check_verdict(
+            &[("scoreboard", Some(&fallen)), ("clock", Some(&fine))],
+            true,
+        );
         assert_eq!(status, CheckStatus::Fail);
         assert!(detail.starts_with("scoreboard: "), "{detail}");
         assert!(detail.contains("; clock: "), "{detail}");
@@ -1473,7 +1475,10 @@ mod tests {
             watchdog.step().await,
             vec![("scoreboard".to_string(), Decision::Off { crashes: 3 })]
         );
-        assert_eq!(supervisor.status("scoreboard").await.unwrap().pid, Some(pid));
+        assert_eq!(
+            supervisor.status("scoreboard").await.unwrap().pid,
+            Some(pid)
+        );
         let check = browser_gpu_check(&checks);
         assert_eq!(check.status, CheckStatus::Fail);
         assert!(
