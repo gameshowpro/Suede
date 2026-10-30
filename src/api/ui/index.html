@@ -2032,12 +2032,11 @@ function renderLayout() {
             height: r.height / pixels.yDensity,
           };
           output.geometry ??= identityGeometry(layoutDrag.initialSlice);
-          output.geometry.slice = {
-            x: layoutDrag.initialSlice.x + dx / (layoutDrag.scale * pixels.width),
-            y: layoutDrag.initialSlice.y + dy / (layoutDrag.scale * pixels.yDensity),
-            width: layoutDrag.initialSlice.width,
-            height: layoutDrag.initialSlice.height,
-          };
+          const initial = layoutDrag.initialSlice;
+          output.geometry.slice = snapSliceOrigin(initial,
+            initial.x * pixels.width + dx / layoutDrag.scale,
+            initial.y * pixels.yDensity + dy / layoutDrag.scale,
+            pixels);
         }
         // With a canvas present, geometry.slice above is the one layout
         // representation; legacy position is written only when there is no
@@ -2049,8 +2048,14 @@ function renderLayout() {
           };
         }
 
-        el.style.left = `${layoutDrag.initialLeft + dx}px`;
-        el.style.top = `${layoutDrag.initialTop + dy}px`;
+        // Draw the box where the snapped slice is, not under the pointer.
+        let shownDx = dx, shownDy = dy;
+        if (pixels && output.geometry?.slice) {
+          shownDx = (output.geometry.slice.x - layoutDrag.initialSlice.x) * pixels.width * layoutDrag.scale;
+          shownDy = (output.geometry.slice.y - layoutDrag.initialSlice.y) * pixels.yDensity * layoutDrag.scale;
+        }
+        el.style.left = `${layoutDrag.initialLeft + shownDx}px`;
+        el.style.top = `${layoutDrag.initialTop + shownDy}px`;
 
         renderSharedContent();
         renderLayoutSize();
@@ -2256,7 +2261,7 @@ window.addEventListener("keydown", (event) => {
 
   event.preventDefault();
 
-  const stepPx = event.shiftKey ? 10 : (event.altKey ? 0.1 : 1);
+  const stepPx = event.shiftKey ? 10 : 1;
   const dxPx = delta[0] * stepPx;
   const dyPx = delta[1] * stepPx;
 
@@ -2271,8 +2276,9 @@ window.addEventListener("keydown", (event) => {
       width: r.width / pixels.width,
       height: r.height / pixels.yDensity,
     });
-    output.geometry.slice.x += dxPx / pixels.width;
-    output.geometry.slice.y += dyPx / pixels.yDensity;
+    const slice = output.geometry.slice;
+    output.geometry.slice = snapSliceOrigin(slice,
+      slice.x * pixels.width + dxPx, slice.y * pixels.yDensity + dyPx, pixels);
   }
   // As the drag handler above: legacy position is written only when there
   // is no canvas, so geometry.slice stays the one representation once one
@@ -2609,6 +2615,20 @@ for (const id of ["o-enable", "o-mode", "o-scale", "o-transform", "o-bg"]) {
 $("o-mode").addEventListener("input", renderModeNote);
 $("o-mode").addEventListener("change", renderModeNote);
 
+// Manual moves (dragging and arrow keys) land on whole canvas pixels in
+// every mode: at 1:1 a fractional origin only resamples the picture, and
+// exact mode refuses one. Exact also keeps the slice inside the canvas.
+// `xPx`/`yPx` are the wanted origin in canvas pixels.
+function snapSliceOrigin(slice, xPx, yPx, pixels) {
+  let x = Math.round(xPx), y = Math.round(yPx);
+  if (isExact()) {
+    const maxX = Math.max(0, Math.round(pixels.width - slice.width * pixels.width));
+    const maxY = Math.max(0, Math.round(pixels.height - slice.height * pixels.yDensity));
+    x = Math.min(Math.max(x, 0), maxX);
+    y = Math.min(Math.max(y, 0), maxY);
+  }
+  return { ...slice, x: x / pixels.width, y: y / pixels.yDensity };
+}
 function canvasPixels(canvas = config?.projection?.canvas) {
   const width = canvas?.renderWidth, aspect = canvas?.aspect;
   if (!(Number.isFinite(width) && Number.isFinite(aspect) && width > 0 && aspect > 0)) return null;
@@ -2683,18 +2703,20 @@ function editSharedContent(change) {
 }
 // Exact places slices at whole canvas pixels; reject a fraction here rather
 // than send a document the daemon would refuse.
-function requireWholePixel(value, label) {
-  if (!Number.isInteger(value)) throw new Error(`${label} must be a whole number of pixels in Exact mode.`);
+// Exact accepts whole canvas pixels only, so a typed fraction is rounded on
+// entry, and the field shows what was sent, rather than refused.
+function cropPixels(event) {
+  const value = Number(event.target.value);
+  if (!isExact() || !Number.isFinite(value)) return value;
+  const rounded = Math.round(value);
+  event.target.value = String(rounded);
+  return rounded;
 }
 $("slice-x").onchange = event => editSharedContent((slice, pixels) => {
-  const value = Number(event.target.value);
-  if (isExact()) requireWholePixel(value, "Crop X");
-  slice.x = value / pixels.width;
+  slice.x = cropPixels(event) / pixels.width;
 });
 $("slice-y").onchange = event => editSharedContent((slice, pixels) => {
-  const value = Number(event.target.value);
-  if (isExact()) requireWholePixel(value, "Crop Y");
-  slice.y = value / pixels.yDensity;
+  slice.y = cropPixels(event) / pixels.yDensity;
 });
 $("content-scale").onchange = event => editSharedContent((slice, pixels, mode) => {
   const scale = Number(event.target.value) / 100;

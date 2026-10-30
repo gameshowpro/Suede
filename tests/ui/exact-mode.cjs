@@ -200,12 +200,19 @@ function resetDocument(from) {
     assert.match(await page.locator('#source-size').textContent(), /Crop 1920 × 1080 px/);
     assert.doesNotMatch(await page.locator('#canvas-current').textContent(), /one-to-one|1:1/, 'no claim without telemetry');
 
-    // A fractional crop is refused in the page; a daemon 422 rolls back verbatim.
+    // A fractional crop is rounded to whole pixels on entry; a daemon 422
+    // rolls back verbatim.
     await page.evaluate(() => selectOutput(config.outputs[1].match.name));
-    await page.locator('#slice-x').fill('1920.5');
+    const putsBeforeCrop = puts.length;
+    await page.locator('#slice-x').fill('1940.6');
     await page.locator('#slice-x').dispatchEvent('change');
-    assert.match(await page.locator('#warp-error').textContent(), /Crop X must be a whole number of pixels in Exact mode/);
-    assert.equal(puts.length, 1, 'nothing sent for a fractional crop');
+    await settle();
+    assert.equal(await page.locator('#slice-x').inputValue(), '1941', 'the field shows the rounded crop');
+    assert(puts.length > putsBeforeCrop, 'the rounded crop is sent');
+    assert.equal(Math.round(puts.at(-1).outputs[1].geometry.slice.x * 7680 * 1e6) / 1e6, 1941, 'whole pixels sent');
+    await page.locator('#slice-x').fill('1920');
+    await page.locator('#slice-x').dispatchEvent('change');
+    await settle();
     const reason = 'outputs[1].geometry.slice must be a whole-pixel rectangle of exactly 1920×1080 canvas pixels in exact mode';
     rejectNextPut = reason;
     await page.locator('#slice-x').fill('1930');
@@ -263,6 +270,39 @@ function resetDocument(from) {
     await page.waitForFunction(() => document.getElementById('arrange-dialog').open);
     await page.locator('#arrange-cancel').click();
 
+    // Dragging and arrow keys land on whole canvas pixels; Exact also keeps
+    // the slice inside the canvas.
+    const whole = v => Math.abs(v - Math.round(v)) < 1e-6;
+    const origin = index => page.evaluate(i => {
+      const s = config.outputs[i].geometry.slice, p = canvasPixels();
+      return [s.x * p.width, s.y * p.yDensity];
+    }, index);
+    const drag = async (index, dx, dy) => {
+      const name = await page.evaluate(i => config.outputs[i].match.name, index);
+      const box = await page.locator(`.display-box[data-name="${name}"]`).boundingBox();
+      const x = box.x + box.width / 2, y = box.y + box.height / 2;
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await page.mouse.move(x + dx, y + dy, { steps: 5 });
+      await page.mouse.up();
+      await settle();
+      return origin(index);
+    };
+    const [startX] = await origin(1);
+    const [draggedX, draggedY] = await drag(1, 13, 7);
+    assert(whole(draggedX) && whole(draggedY), `Exact drag lands on whole pixels: ${draggedX}, ${draggedY}`);
+    assert(draggedX > startX, 'the drag moved the slice');
+    assert.equal(Math.round(draggedY), 0, 'a full-height slice cannot leave the canvas vertically');
+    const [clampedX] = await drag(0, -400, 0);
+    assert.equal(Math.round(clampedX), 0, 'Exact keeps the slice inside the canvas');
+    assert(whole(clampedX));
+    await page.evaluate(i => selectOutput(config.outputs[i].match.name), 1);
+    await page.locator(`.display-box[data-name="${await page.evaluate(() => config.outputs[1].match.name)}"]`).focus();
+    await page.keyboard.press('Alt+ArrowRight');
+    await settle();
+    const [nudgedX] = await origin(1);
+    assert.equal(Math.round((nudgedX - draggedX) * 1e6) / 1e6, 1, 'Alt+arrow nudges a whole pixel');
+
     // Back to Simple: the controls return and only the mode is pushed.
     const putsBeforeLeave = puts.length;
     await page.locator('#mode-simple').click();
@@ -282,6 +322,10 @@ function resetDocument(from) {
     assert(!(await visible('arrange-scale-fixed')));
     assert.equal(await page.locator('label[for="arrange-overlap-x"]').textContent(), 'Overlap X (%)');
     await page.locator('#arrange-cancel').click();
+
+    // Outside Exact a drag still lands on whole canvas pixels.
+    const [simpleX, simpleY] = await drag(1, 13, 7);
+    assert(whole(simpleX) && whole(simpleY), `Simple drag lands on whole pixels: ${simpleX}, ${simpleY}`);
 
     // A conforming document needs no confirm.
     verdict = { action: 'keep', reasons: [], revision: 0, generation: 0 };
