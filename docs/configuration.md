@@ -1415,7 +1415,7 @@ to composite the slices instead.
 }
 ```
 
-Simple and Warp share one canvas and each output's `geometry.slice` crop.
+Exact, Simple and Warp share one canvas and each output's `geometry.slice` crop.
 Warp adds retained corner and center correction to the same content selection:
 
 ```json
@@ -1428,7 +1428,7 @@ Warp adds retained corner and center correction to the same content selection:
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `mode` | string | `simple` | `simple` crops and scales the shared canvas; `warp` adds retained geometric correction |
+| `mode` | string | `simple` | `exact`, `simple` or `warp`; see [Projection modes](#projection-modes). `exact` is strictly one-to-one at whole-pixel positions; `simple` crops and scales the shared canvas; `warp` adds retained geometric correction. A write that changes the mode and the geometry in one request is judged as one merged document |
 | `canvas` | object or null | `null` | Shared `aspect` and authoritative `renderWidth`. Required for Warp; when absent, Simple uses integer output positions. `scale` is deprecated metadata and has no rendering effect |
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
@@ -1534,6 +1534,11 @@ Things the filter does not change:
 - **1:1 outputs ignore it.** An output that maps exactly one canvas pixel to one
   output pixel, including a 1:1 output rotated or flipped by the GPU slicer, is
   a byte copy whatever the filter is.
+- **Exact mode ignores it.** In [Exact mode](#exact-mode) every output is a
+  one-to-one integer copy, so there is nothing to interpolate and the filter has
+  no effect on the picture. The setting is accepted and kept, and the reference
+  UI hides the **Resampling filter** control there; it applies again when you
+  leave Exact for Simple or Warp.
 - **Shrinking is always averaged.** When an output shrinks the canvas by more
   than 2x along an axis, the renderer averages a box of source pixels
   (reported as `area`), up to 8x8, whatever `filter` says.
@@ -1551,9 +1556,178 @@ chosen filter is a poor fit:
 - `the lanczos filter needs the GPU renderer; the renderer is set to cpu, so
   this filter is not used` (likewise for `easu`).
 
+#### Projection modes {: #projection-modes }
+
+| Mode | What each output shows | Scale and correction | Use it when |
+|---|---|---|---|
+| `exact` | Exactly its own raster's worth of canvas pixels, at whole-pixel canvas coordinates | Output scale 1, no corner or center correction, no resampling | Pixel-for-pixel fidelity matters: LED walls, tiled panels, content authored at the wall's resolution |
+| `simple` (default) | A rectangular crop of the canvas, scaled to the raster | Any scale; fractional crops allowed | Flat layouts that need scaling or a canvas that is not the outputs' pixel size |
+| `warp` | The same crop, geometrically fitted to the surface | Retained corner pins and center remap | Projectors on curved, tilted or angled surfaces |
+
+The three modes share one canvas and the same `geometry.slice` crops. The mode
+is chosen with `PUT /api/v1/config/projection {"mode": "exact"}` (or
+`"simple"`, `"warp"`), or with the **Exact | Simple | Warp** toggle on the
+Displays tab. [How it works](how-it-works.md#warping) compares them in
+more detail.
+
+#### Exact mode {: #exact-mode }
+
+Exact is strictly one-to-one. Every enabled output shows exactly its own
+raster's worth of canvas pixels (`transform.physical_size` of its mode, so a
+rotated output counts as its swapped raster), placed at whole-pixel canvas
+coordinates, at output scale 1, with no correction. The canvas may be larger
+than the union of the outputs. It needs the canvas slicer and `projection.canvas`.
+
+The daemon enforces these rules whenever `projection.mode` is `exact`, each as
+its own message in the `422`:
+
+- `projection.canvas` is required: `projection.canvas is required in exact
+  mode`.
+- Every enabled output has an effective scale of exactly 1.0 (or none):
+  `outputs[i].scale must be 1.0 in exact mode`.
+- Every enabled output's `geometry.slice` is a whole-pixel rectangle of
+  exactly its raster: `outputs[i].geometry.slice must be a whole-pixel
+  rectangle of exactly 1920×1080 canvas pixels in exact mode; got 1919.5×1080
+  at (0.5, 0)`. It must also lie inside the canvas: `outputs[i].geometry.slice
+  must lie inside the 3680×2000 canvas in exact mode; got 1920×1080 at (1900,
+  1000)` (the sizes are the output's own).
+- No corner or center correction: `outputs[i].geometry has corner or center
+  correction, which exact mode does not carry`. Exact does not retain
+  correction; the switch into it strips it (below), so a conforming document
+  never trips this, but a write that adds pins while in Exact is refused rather
+  than silently ignored.
+- `projection.arrangement`, if present, has `contentScale` 1 and a whole
+  number of pixels of overlap on every seam: `projection.arrangement implies a
+  0.5 px overlap; exact mode arranges in whole pixels`, and
+  `projection.arrangement.contentScale is 0.9; exact mode arranges at content
+  scale 1`.
+- `filter` is accepted and ignored; `testPattern`, `blend`, `gamma`,
+  `blackLift`, `freeRun`, `renderer` and `temporary` are unaffected.
+
+On an appliance that tiles (`allow_overlaps = false`) Exact is unavailable.
+There is no canvas, slice or slicer to constrain, and a tiled layout at output
+scale 1 and integer positions is already one texel per pixel. A write of
+`mode: exact` is refused with `exact mode needs the canvas slicer: this
+appliance tiles (allow_overlaps = false); tiled output is already one-to-one at
+output scale 1`. See [`allow_overlaps`](#direct-scanout).
+
+##### Switching into and out of Exact {: #exact-switching }
+
+Whenever a write changes `projection.mode`, the daemon applies the switch as
+one merged document:
+
+- **Into Exact** (from Simple or Warp). Corner pins and centers are stripped,
+  and the arrangement record is dropped unless it is valid in Exact. If the
+  result satisfies the Exact rules, it is kept: slices, canvas and everything
+  else stay as they were. Otherwise the layout is **reset** to the Exact
+  defaults. Non-geometry fields of the same write are honored either way.
+  An omitted layout is refilled from the previous working copy first, so a bare
+  `{"mode": "exact"}` is judged on the layout it would actually switch.
+- **The reset** derives the layout from the enabled outputs' integer
+  `position`s: the canvas is the whole-pixel bounding box of the positioned
+  rasters (render width its width, aspect width divided by height), each slice
+  is its output's positioned rectangle, pins are unit pins, centers are
+  `[0.5, 0.5]`, and any output whose effective scale is not 1 gets `scale: 1.0`.
+  The arrangement record and every `arrangeOffset` are dropped. Blend, gamma,
+  black lift, filter, patterns and the outputs' modes, transforms and
+  backgrounds are untouched. An enabled output with no mode or position makes
+  the reset fail with `outputs[i].mode is required for a shared canvas` or
+  `outputs[i].position is required for a shared canvas`.
+- **Out of Exact** (to Simple or Warp). Only `mode` changes: an Exact document
+  already carries identity pins, a centered remap, scale 1 and whole-pixel
+  slices, which Simple and Warp render pixel for pixel the same way.
+- **Round trip.** Exact to Simple to Exact, and Exact to Warp to Exact, with no
+  edits in between give a byte-identical document. Simple and Warp keep their
+  own [retained calibration](#retaining-calibration) behavior.
+
+`GET /api/v1/projection/exact-transition` tells a client what a switch would do
+without writing anything, so it can warn before a reset. It reads the effective
+document (the live preview when one is active, else the working copy) and runs
+the real switch on a clone, so the answer cannot drift from the write:
+
+```json
+{ "action": "reset",
+  "reasons": ["outputs[0].geometry.slice must be a whole-pixel rectangle of exactly 1920×1080 canvas pixels in exact mode; got 1919.5×1080 at (0.5, 0)"],
+  "revision": 41, "generation": 7 }
+```
+
+| `action` | Meaning | `reasons` |
+|---|---|---|
+| `keep` | The layout is kept, stripped of correction. Also reported when the document is already in Exact | Empty |
+| `reset` | The layout is replaced by the Exact defaults | The rules the current layout breaks |
+| `unavailable` | Exact cannot be used here; the switch would be refused | The single reason, the tiled-appliance message above |
+
+`revision` and `generation` identify the document the answer was computed on.
+The request is a `422`, `cannot reset to the exact-mode defaults: ...`, when
+the layout would be reset but the defaults cannot be derived (an enabled output
+has no mode or position).
+
+##### Status
+
+`GET /api/v1/projection/stats` reports Exact in its `geometry` block.
+`geometry.exactAvailable` is `false` on a tiled appliance (and on a build
+without projection machinery), with the reason in `geometry.exactReason`; it is
+`true` otherwise, when `exactReason` is absent. Exact needs no capability probe
+beyond Simple's, so while it is requested and available
+`geometry.effectiveMode` is `exact`, including on the CPU renderer; if it is
+requested but unavailable the effective mode is `simple`. The reference UI
+disables its **Exact** button with `exactReason` as its tooltip.
+
+##### Recommendation in Exact
+
+In Exact `GET /api/v1/projection/recommendation` has one answer: the canvas
+itself. `idealWidth` is the canvas width, `approximate` is `false`, `presets` is
+empty, and `warnings` holds the one warning `exact mode: the canvas is defined
+by the output placements`. There is nothing to recommend because the output
+placements define the canvas.
+
+##### Whole-pixel arrangement {: #exact-arrangement }
+
+The [grid arrangement](#grid-arrangement) endpoints work in Exact, with no free
+scale and no overhang:
+
+- `contentScale` is fixed at 1. A request with any other value is a `422`:
+  `projection.arrangement.contentScale is 0.9; exact mode arranges at content
+  scale 1`.
+- The requested overlaps are fractions per axis: `overlapX` is a fraction of the
+  seam's raster width (the smaller of the two adjacent outputs'), `overlapY` of
+  its height. Each is **rounded to the nearest whole pixel**, never below 0,
+  and the solution reports the rounded fractions as `overlapX`/`overlapY`
+  together with `overlapXPx` and `overlapYPx`. A worked example: a 160 px
+  overlap on a 1920×1080 seam is `1/12` across (`160 / 1920`) and `4/27` down
+  (`160 / 1080`). Asking for 8.3% on both axes gives 159 px across
+  (`0.083 × 1920 = 159.36`) and 90 px down (`0.083 × 1080 = 89.64`). An overlap
+  that rounds to the whole seam is a `422`: `overlapX of 0.99999 rounds to 1920
+  px, the whole 1920 px seam; overlap cannot reach 100%`.
+- The canvas is **derived**: it is the whole-pixel bounding box of the arranged
+  slices (a 2×2 of 1920×1080 outputs at 160 px overlaps is 3680×2000), reported
+  as `canvas` in the dry run and written to `projection.canvas` by the `PUT`.
+  The canvas you had is replaced.
+- `allowUnusedCanvas` has no meaning (no unused band, no overhang), and
+  `limits` is omitted: overlap limits are not computed in Exact.
+- `outputs[].arrangeOffset` is still added after placement; one that leaves a
+  slice off the whole-pixel grid or outside the canvas is refused when the
+  document is validated.
+
+##### In the reference UI
+
+On the Displays tab the toggle reads **Exact | Simple | Warp**. Switching to
+Exact first asks the daemon what would happen. If the layout would be reset, the
+page asks to confirm before changing anything: `Switching to Exact resets the
+layout: <reasons>. Continue?`. If the layout is kept, it switches directly.
+Leaving Exact changes only the mode. While in Exact the UI hides the Warp editor,
+pins and centers, the **Resampling filter**, the canvas presets, rendering scale
+and recommendation, and the content scale input. It disables the output scale
+("Fixed at 1.0 in Exact mode"), steps the crop position in whole pixels, shows
+the crop size as the raster read-only, and makes the canvas fields read-only
+beside a **Fit canvas to outputs** button, which sets the whole-pixel bounding
+box of the outputs (the daemon validates it). The arrangement dialog takes
+overlaps in px, shows content scale as a fixed 100%, and reads "Canvas derived
+from the arrangement".
+
 #### Canvas and warp geometry {: #projection-geometry }
 
-`mode` is `simple` (the default) or `warp`. Both use the shared canvas and crop
+`mode` is `exact`, `simple` (the default) or `warp`. All three use the shared canvas and crop
 when configured. The daemon retains saved correction and requested intent while
 temporarily forcing effective simple mode on a machine without the required
 warp capability; it reports that limitation as a health warning and restores
@@ -1687,6 +1861,9 @@ dialog, a show controller with sliders) gets the same answer.
 enabled output's `geometry.slice`; `GET /api/v1/projection/arrangement` runs
 the same solve without writing anything, so a client can preview before
 committing to a value.
+
+Everything below describes Simple and Warp. In [Exact mode](#exact-arrangement)
+the solve is in whole pixels with a fixed content scale and a derived canvas.
 
 ```json
 {
@@ -2064,8 +2241,8 @@ curl -X PUT http://appliance:9088/api/v1/config/settings \
 
 #### Editing geometry in the web UI {: #geometry-editor }
 
-In **Displays → Layout**, edit canvas aspect and render width, choose Simple
-or Warp, then select an output in the table or diagram. Hardware settings,
+In **Displays → Layout**, edit canvas aspect and render width, choose Exact,
+Simple or Warp (see [Exact mode](#exact-mode) for what Exact changes), then select an output in the table or diagram. Hardware settings,
 shared content crop, and Warp correction use that one selection. Missing
 calibration is initialized with identity pins and neutral centers; switching
 modes preserves the shared composition and retained calibration.

@@ -53,3 +53,13 @@ The list of health checks, here all passing. Each one links to its documentation
 [![The health checks list with every check passing](assets/screenshots/health-checks.avif){ width="823" height="1977" loading=lazy }](assets/screenshots/health-checks.avif)
 
 Read more: [How warnings reach you](troubleshooting.md#how-warnings-reach-you), [First run](getting-started.md#first-run).
+
+## Screenshots that need refreshing {: #refresh }
+
+The Displays tab gained the **Exact** mode button, first in the **Exact | Simple | Warp** toggle, and the Exact-only controls behind it. These captures predate that and show the old two-button toggle, so they need retaking:
+
+- `assets/screenshots/displays.avif`
+- `assets/screenshots/displays-disconnected.avif`
+- `assets/screenshots/details/unplugged-outputs.avif`
+
+`assets/screenshots/details/warp-editor.avif` was checked and does not need retaking: its crop is the Warp and geometry pin editor and does not include the mode toggle. The other captures are on other tabs. No procedure for retaking screenshots is documented in this repository, so this note does not give one.
