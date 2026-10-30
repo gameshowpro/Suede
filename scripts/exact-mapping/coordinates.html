@@ -1,0 +1,76 @@
+<!doctype html>
+<!--
+  The browser variant of Suede's `coordinates` test pattern, for
+  scripts/verify-exact-mapping.sh. Every viewport pixel (x, y) gets
+    R = x & 0xFF, G = y & 0xFF, B = ((x >> 8) & 0x0F) << 4 | ((y >> 8) & 0x0F)
+  drawn with putImageData into a canvas the size of the viewport, so on a
+  canvas-sized kiosk window viewport pixels are canvas pixels.
+
+  After every draw the page requests /report?... from the server that served
+  it. The request is expected to 404; it exists so the server's access log
+  records the viewport size, devicePixelRatio and draw count the harness
+  checks before capturing. No text is drawn: it would break the encoding.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>coordinates</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #000; overflow: hidden; }
+  canvas { display: block; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+  "use strict";
+  const canvas = document.getElementById("c");
+  let draws = 0;
+
+  function draw() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    // One canvas pixel per CSS pixel; at devicePixelRatio 1 that is one per
+    // device pixel. A different ratio is reported, not compensated, so the
+    // harness can refuse the run rather than measure a resampled page.
+    canvas.width = w;
+    canvas.height = h;
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    const ctx = canvas.getContext("2d", { alpha: false, colorSpace: "srgb" });
+    const image = ctx.createImageData(w, h);
+    const data = image.data;
+    let i = 0;
+    for (let y = 0; y < h; y++) {
+      const g = y & 0xff;
+      const yHigh = (y >> 8) & 0x0f;
+      for (let x = 0; x < w; x++) {
+        data[i] = x & 0xff;
+        data[i + 1] = g;
+        data[i + 2] = (((x >> 8) & 0x0f) << 4) | yHigh;
+        data[i + 3] = 255;
+        i += 4;
+      }
+    }
+    ctx.putImageData(image, 0, 0);
+    draws += 1;
+    const query = new URLSearchParams({
+      w: String(w),
+      h: String(h),
+      dpr: String(window.devicePixelRatio),
+      sw: String(window.screen.width),
+      sh: String(window.screen.height),
+      draws: String(draws),
+    });
+    fetch("report?" + query.toString(), { cache: "no-store" }).catch(() => {});
+  }
+
+  let pending = 0;
+  window.addEventListener("resize", () => {
+    clearTimeout(pending);
+    pending = setTimeout(draw, 100);
+  });
+  draw();
+</script>
+</body>
+</html>
