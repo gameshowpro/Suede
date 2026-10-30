@@ -36,6 +36,10 @@
 //! - [`warp_update`] builds that per-pixel mapping incrementally, one output
 //!   at a time and bounded per pass, so an edit to one output's pins does
 //!   not stall every other output's frame.
+//! - [`resample`] picks the GPU shader's resampling kernel for each output
+//!   that does not map 1:1 (the configured `projection.filter`, or the
+//!   automatic area filter past 2x minification) and defines what each
+//!   kernel computes.
 //! - [`control`] is the versioned, bounded protocol the manager and a
 //!   running slicer child speak over its stdin/stdout: the initial spec, then
 //!   incremental updates the child may discard if a newer one supersedes it
@@ -78,6 +82,8 @@ pub mod manager;
 #[cfg(unix)]
 pub mod overlay;
 pub mod pattern;
+#[cfg(unix)]
+pub mod resample;
 #[cfg(unix)]
 pub mod shared_texture;
 #[cfg(unix)]

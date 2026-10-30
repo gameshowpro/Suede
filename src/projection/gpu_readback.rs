@@ -848,6 +848,558 @@ fn exact_copy_is_byte_exact_under_every_transform() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The canvas the filter readback and benchmark sample: a pixel-varied
+/// pattern with hard wraps (`x * 10` passes 255 every 26 columns), so
+/// misplaced taps, wrong weights and missing overshoot clamps all show.
+fn filter_fixture(size: [u32; 2]) -> Vec<[u8; 4]> {
+    (0..size[1])
+        .flat_map(|y| {
+            (0..size[0]).map(move |x| {
+                [
+                    (x * 10 + 1) as u8,
+                    (y * 16 + 3) as u8,
+                    (x * 5 + y * 7) as u8,
+                    255,
+                ]
+            })
+        })
+        .collect()
+}
+
+/// Every resampling kernel against the CPU reference in `resample`
+/// (`reference_sample`, written from the kernel definitions in that
+/// module's doc, in `f64`): 2x and 3x whole-number upscales, a 2x upscale
+/// on an output rotated by 90 (the kernels run on canvas axes), a
+/// keystoned 2x upscale (the kernels follow the warped source position),
+/// and 2.5x and 2.5x-by-1x minifications, which take the area filter
+/// whatever is configured. Both source and target formats, capture y
+/// inversion off and on, a neutral transfer table.
+///
+/// Tolerances, per kernel actually taken:
+/// - `nearest` 0: one `texelFetch`, and every case's source positions sit
+///   at least 1/6 texel from a texel boundary, far beyond the `f32`
+///   position error. The keystone is skipped for nearest: a warped
+///   position can land arbitrarily close to a boundary, where `f32` and
+///   `f64` may legitimately pick different texels.
+/// - `area` 0: integer sums and an integer rounded division of `texelFetch`
+///   bytes, with box starts at least 1/4 texel from a boundary.
+/// - `bilinear` 1: the hardware's LINEAR filter quantizes its weights to a
+///   few sub-texel bits, the existing warped tolerance in
+///   `shipped_shader_matches_reference_pixels`.
+/// - `bicubic` 1: `f32` weights and positions against `f64`, well under a
+///   hundredth of a byte, can still straddle a rounding boundary.
+/// - `lanczos` 2: as bicubic, plus the GPU's approximate `sin` across 36
+///   taps and their normalization.
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+fn filters_match_cpu_reference() -> anyhow::Result<()> {
+    use crate::model::ResampleFilter;
+    use crate::projection::resample::{self, Kernel};
+    let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM];
+    let canvas_size = [48u32, 28];
+    let rgba = filter_fixture(canvas_size);
+    let fixture = [3.0, 2.0, 17.0, 9.0];
+    let pins = |w: f64, h: f64| [[0.0, 0.0], [w, 0.0], [w, h], [0.0, h]];
+    // (name, warp, warped): `warped` positions are not tie-free.
+    let cases: Vec<(&str, Warp, bool)> = vec![
+        (
+            "2x",
+            Warp::identity(34, 18).with_source_rect(fixture).unwrap(),
+            false,
+        ),
+        (
+            "3x",
+            Warp::identity(51, 27).with_source_rect(fixture).unwrap(),
+            false,
+        ),
+        (
+            "2x rotated 90",
+            Warp::for_output(
+                pins(34.0, 18.0),
+                [0.5, 0.5],
+                34,
+                18,
+                crate::model::Transform::Rotate90,
+            )
+            .unwrap()
+            .with_source_rect(fixture)
+            .unwrap(),
+            false,
+        ),
+        (
+            "2x keystone",
+            Warp::new(
+                [[1.5, 0.75], [33.0, 0.0], [34.0, 18.0], [0.0, 17.25]],
+                [0.5, 0.5],
+                34,
+                18,
+            )
+            .unwrap()
+            .with_source_rect(fixture)
+            .unwrap(),
+            true,
+        ),
+        (
+            "2.5x minification",
+            Warp::identity(17, 9)
+                .with_source_rect([2.0, 2.0, 42.5, 22.5])
+                .unwrap(),
+            false,
+        ),
+        (
+            "2.5x by 1x minification",
+            Warp::identity(17, 9)
+                .with_source_rect([2.0, 2.0, 42.5, 9.0])
+                .unwrap(),
+            false,
+        ),
+    ];
+    let filters = [
+        ResampleFilter::Bilinear,
+        ResampleFilter::Nearest,
+        ResampleFilter::Bicubic,
+        ResampleFilter::Lanczos,
+    ];
+    let mut cases_run = 0;
+    let mut worst: BTreeMap<&str, u8> = BTreeMap::new();
+    for target_format in formats {
+        let mut gpu = Gpu::new(None)?;
+        println!("GPU readback: {}", gpu.describe());
+        for source_format in formats {
+            let pixels: Vec<u8> = rgba
+                .iter()
+                .flat_map(|p| encode(*p, source_format))
+                .collect();
+            for invert in [false, true] {
+                for (name, warp, warped) in &cases {
+                    for filter in filters {
+                        let kernel = Kernel::select(filter, resample::minification(warp));
+                        if name.contains("minification") {
+                            assert!(
+                                matches!(kernel, Kernel::Area(_)),
+                                "{name} {filter:?}: {kernel:?}"
+                            );
+                        }
+                        if *warped && kernel == Kernel::Nearest {
+                            continue;
+                        }
+                        let (label, tolerance) = match kernel {
+                            Kernel::Nearest => ("nearest", 0),
+                            Kernel::Area(_) => ("area", 0),
+                            Kernel::Bilinear => ("bilinear", 1),
+                            Kernel::Bicubic => ("bicubic", 1),
+                            Kernel::Lanczos => ("lanczos", 2),
+                        };
+                        let size = warp.output_size();
+                        let table = vec![(256u16, 0u8); (size[0] * size[1]) as usize];
+                        let constants =
+                            PushConstants::canvas([3, 2], size, canvas_size[1], invert, Some(warp))
+                                .with_kernel(kernel);
+                        let canvas = Image::new(&gpu, canvas_size, source_format)?;
+                        let target = Image::new(&gpu, size, target_format)?;
+                        let got = draw(
+                            &mut gpu,
+                            &canvas,
+                            &target,
+                            &pixels,
+                            constants,
+                            &table,
+                            target_format,
+                        )?;
+                        let bounds =
+                            resample::texel_bounds(warp.source_rect().unwrap(), canvas_size);
+                        let texel = |[x, y]: [i64; 2]| {
+                            let row = if invert {
+                                i64::from(canvas_size[1]) - 1 - y
+                            } else {
+                                y
+                            };
+                            let p = rgba[(row * i64::from(canvas_size[0]) + x) as usize];
+                            [p[0], p[1], p[2]]
+                        };
+                        let worst = worst.entry(label).or_default();
+                        for (i, got) in got.chunks_exact(4).enumerate() {
+                            let p = [i as u32 % size[0], i as u32 / size[0]];
+                            let s = warp
+                                .clamped_canvas_at(
+                                    f64::from(p[0]) + 0.5,
+                                    f64::from(p[1]) + 0.5,
+                                    [0.0, 0.0],
+                                )
+                                .unwrap();
+                            let flipped_y = if invert {
+                                f64::from(canvas_size[1]) - s[1]
+                            } else {
+                                s[1]
+                            };
+                            let inside = s[0] >= 0.5
+                                && s[0] <= f64::from(canvas_size[0]) - 0.5
+                                && flipped_y >= 0.5
+                                && flipped_y <= f64::from(canvas_size[1]) - 0.5;
+                            let [r, g, b] = if inside {
+                                resample::reference_sample(kernel, &texel, s, bounds)
+                            } else {
+                                [0, 0, 0]
+                            };
+                            let want = encode([r, g, b, 255], target_format);
+                            assert_eq!(got[3], 255, "alpha {name} {filter:?} pixel {p:?}");
+                            for channel in 0..3 {
+                                let error = got[channel].abs_diff(want[channel]);
+                                *worst = (*worst).max(error);
+                                assert!(
+                                    error <= tolerance,
+                                    "{name} filter={filter:?} kernel={kernel:?} source={source_format:?} target={target_format:?} invert={invert} pixel={p:?} channel={channel}: got {} want {}",
+                                    got[channel],
+                                    want[channel]
+                                );
+                            }
+                        }
+                        cases_run += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "GPU filter readback passed: {cases_run} cases, worst channel error per kernel {worst:?}; tolerance nearest 0, area 0, bilinear 1, bicubic 1, lanczos 2"
+    );
+    Ok(())
+}
+
+/// Record `repeats` draws of the production pipeline from `canvas` into
+/// `target` between two device timestamps and return the mean device time
+/// per draw, in milliseconds. No readback, so only the shader's cost (and a
+/// barrier between draws, which serializes them the way successive outputs
+/// serialize in a frame) is timed.
+fn draw_timed(
+    gpu: &mut Gpu,
+    canvas: &StaticCanvas,
+    target: &Image,
+    constants: PushConstants,
+    format: vk::Format,
+    repeats: u32,
+) -> anyhow::Result<f64> {
+    let output = 2; // the same sparse slot `draw_installed` uses
+    gpu.ensure_pipeline(format)?;
+    let state = &gpu.device;
+    let device = &state.device;
+    // Safety: read-only properties of the live physical device.
+    let period_ns = f64::from(
+        unsafe {
+            state
+                .instance
+                .get_physical_device_properties(state.physical_device)
+        }
+        .limits
+        .timestamp_period,
+    );
+    let valid_bits = unsafe {
+        state
+            .instance
+            .get_physical_device_queue_family_properties(state.physical_device)
+    }[state.queue_family as usize]
+        .timestamp_valid_bits;
+    anyhow::ensure!(valid_bits > 0 && period_ns > 0.0, "queue has no timestamps");
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    let cb = gpu.command_buffer;
+    let set = gpu.outputs[output].as_ref().unwrap().descriptor_set;
+    let canvas_info = [vk::DescriptorImageInfo::default()
+        .image_view(canvas.view)
+        .image_layout(vk::ImageLayout::GENERAL)];
+    let write = [vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(0)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(&canvas_info)];
+    let area = vk::Rect2D {
+        offset: vk::Offset2D { x: 0, y: 0 },
+        extent: vk::Extent2D {
+            width: target.size[0],
+            height: target.size[1],
+        },
+    };
+    let attachments = [vk::RenderingAttachmentInfo::default()
+        .image_view(target.view)
+        .image_layout(vk::ImageLayout::GENERAL)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)];
+    // Safety: all handles belong to this device; the pool is created,
+    // used by one submission that is waited on, read, and destroyed here.
+    unsafe {
+        let pool = device.create_query_pool(
+            &vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(2),
+            None,
+        )?;
+        device.update_descriptor_sets(&write, &[]);
+        device.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
+        device.begin_command_buffer(
+            cb,
+            &vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+        )?;
+        device.cmd_reset_query_pool(cb, pool, 0, 2);
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[image_barrier(
+                canvas.image,
+                vk::ImageLayout::GENERAL,
+                vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ,
+                vk::AccessFlags::SHADER_READ,
+            )],
+        );
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::TOP_OF_PIPE | vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[image_barrier(
+                target.image,
+                if target.initialized.get() {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                },
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            )],
+        );
+        device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, pool, 0);
+        for _ in 0..repeats {
+            device.cmd_begin_rendering(
+                cb,
+                &vk::RenderingInfo::default()
+                    .render_area(area)
+                    .layer_count(1)
+                    .color_attachments(&attachments),
+            );
+            device.cmd_bind_pipeline(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                gpu.pipeline.as_ref().unwrap().pipeline,
+            );
+            device.cmd_set_viewport(
+                cb,
+                0,
+                &[vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: target.size[0] as f32,
+                    height: target.size[1] as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                }],
+            );
+            device.cmd_set_scissor(cb, 0, &[area]);
+            device.cmd_bind_descriptor_sets(
+                cb,
+                vk::PipelineBindPoint::GRAPHICS,
+                gpu.pipeline_layout,
+                0,
+                &[set],
+                &[],
+            );
+            device.cmd_push_constants(
+                cb,
+                gpu.pipeline_layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                constants.as_bytes(),
+            );
+            device.cmd_draw(cb, 3, 1, 0, 0);
+            device.cmd_end_rendering(cb);
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[image_barrier(
+                    target.image,
+                    vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                )],
+            );
+        }
+        device.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
+        device.end_command_buffer(cb)?;
+        device.reset_fences(&[gpu.fence])?;
+        let buffers = [cb];
+        device.queue_submit(
+            state.queue,
+            &[vk::SubmitInfo::default().command_buffers(&buffers)],
+            gpu.fence,
+        )?;
+        device.wait_for_fences(&[gpu.fence], true, 10_000_000_000)?;
+        target.initialized.set(true);
+        let mut values = [0u64; 2];
+        let result = device.get_query_pool_results(
+            pool,
+            0,
+            &mut values,
+            vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+        );
+        device.destroy_query_pool(pool, None);
+        result?;
+        let ticks = values[1].wrapping_sub(values[0]) & mask;
+        Ok(ticks as f64 * period_ns / 1.0e6 / f64::from(repeats))
+    }
+}
+
+/// Device time per output draw for each kernel, for the GPU cost table in
+/// `docs/developer/gpu-timing.md`: a 4x upscale (960x540 canvas to a
+/// 1920x1080 output, 2x per axis) for every configurable filter, the
+/// automatic area filter at 2.5x (3x3 box) and 8x (8x8, the cap)
+/// minification, and the exact 1:1 copy and 1:1 bilinear as controls. An
+/// offscreen microbenchmark of the production pipeline and shader, timed
+/// with device timestamps; it does not include capture, presentation or the
+/// compositor, which `GET /projection/stats` (`gpuSpanMs`) covers on a
+/// running appliance.
+#[test]
+#[ignore = "benchmark only; run explicitly on the target GPU outside timing campaigns"]
+fn benchmark_filters_at_4x_upscale() -> anyhow::Result<()> {
+    use crate::projection::resample::{self, Kernel};
+    const REPEATS: u32 = 20;
+    const SAMPLES: usize = 10;
+    let format = vk::Format::R8G8B8A8_UNORM;
+    let mut gpu = Gpu::new(None)?;
+    println!("filter benchmark on {}", gpu.describe());
+    let upload = |gpu: &mut Gpu, size: [u32; 2]| {
+        let pixels: Vec<u8> = filter_fixture(size).into_iter().flatten().collect();
+        gpu.upload_static_canvas_rgba(size[0], size[1], &pixels)
+    };
+    let full = [1920u32, 1080];
+    let quarter = [960u32, 540];
+    let large = [3840u32, 2160];
+    let canvases = [
+        (full, upload(&mut gpu, full)?),
+        (quarter, upload(&mut gpu, quarter)?),
+        (large, upload(&mut gpu, large)?),
+    ];
+    let canvas_for = |size: [u32; 2]| {
+        &canvases
+            .iter()
+            .find(|(s, _)| *s == size)
+            .expect("uploaded")
+            .1
+    };
+    let rect = |size: [u32; 2]| [0.0, 0.0, f64::from(size[0]), f64::from(size[1])];
+    struct Run {
+        name: String,
+        canvas: [u32; 2],
+        target: [u32; 2],
+        /// `None` (with `kernel` `None`) is the exact copy.
+        warp: Option<Warp>,
+        kernel: Option<Kernel>,
+    }
+    let mut runs = vec![
+        Run {
+            name: "exact 1:1 (control)".into(),
+            canvas: full,
+            target: full,
+            warp: None,
+            kernel: None,
+        },
+        Run {
+            name: "bilinear 1:1 through a warp (control)".into(),
+            canvas: full,
+            target: full,
+            warp: Some(
+                Warp::identity(1920, 1080)
+                    .with_source_rect([0.5, 0.0, 1920.0, 1080.0])
+                    .map_err(anyhow::Error::msg)?,
+            ),
+            kernel: Some(Kernel::Bilinear),
+        },
+    ];
+    for kernel in [
+        Kernel::Bilinear,
+        Kernel::Nearest,
+        Kernel::Bicubic,
+        Kernel::Lanczos,
+    ] {
+        runs.push(Run {
+            name: format!("{} 4x upscale", format!("{kernel:?}").to_lowercase()),
+            canvas: quarter,
+            target: full,
+            warp: Some(
+                Warp::identity(1920, 1080)
+                    .with_source_rect(rect(quarter))
+                    .map_err(anyhow::Error::msg)?,
+            ),
+            kernel: Some(kernel),
+        });
+    }
+    for (target, label) in [([1536u32, 864], "2.5x"), ([480, 270], "8x")] {
+        let warp = Warp::identity(target[0], target[1])
+            .with_source_rect(rect(large))
+            .map_err(anyhow::Error::msg)?;
+        let kernel = Kernel::select(
+            crate::model::ResampleFilter::Bilinear,
+            resample::minification(&warp),
+        );
+        assert!(matches!(kernel, Kernel::Area(_)), "{label}: {kernel:?}");
+        runs.push(Run {
+            name: format!("area {label} minification ({kernel:?})"),
+            canvas: large,
+            target,
+            warp: Some(warp),
+            kernel: Some(kernel),
+        });
+    }
+    for Run {
+        name,
+        canvas: canvas_size,
+        target: target_size,
+        warp,
+        kernel,
+    } in &runs
+    {
+        let canvas = canvas_for(*canvas_size);
+        let target = Image::new(&gpu, *target_size, format)?;
+        let pixels = (target_size[0] * target_size[1]) as usize;
+        gpu.set_transfer(2, target_size[0], target_size[1], &vec![(256, 0); pixels])?;
+        let mut constants =
+            PushConstants::canvas([0, 0], *target_size, canvas_size[1], false, warp.as_ref());
+        if let Some(kernel) = kernel {
+            constants = constants.with_kernel(*kernel);
+        }
+        // Warm the pipeline and the target before timing.
+        draw_timed(&mut gpu, canvas, &target, constants, format, 1)?;
+        let mut samples: Vec<f64> = (0..SAMPLES)
+            .map(|_| draw_timed(&mut gpu, canvas, &target, constants, format, REPEATS))
+            .collect::<anyhow::Result<_>>()?;
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        println!(
+            "filter benchmark {name}: {}x{} canvas -> {}x{} output, mean {mean:.4} ms/draw, \
+             min {:.4}, max {:.4}, {:.3} ns/output px ({SAMPLES} samples of {REPEATS} draws)",
+            canvas_size[0],
+            canvas_size[1],
+            target_size[0],
+            target_size[1],
+            samples[0],
+            samples[samples.len() - 1],
+            mean * 1.0e6 / pixels as f64,
+        );
+    }
+    Ok(())
+}
+
 /// The `sync` pattern (mode 1) on an exact output that owns a transform
 /// hit-tests the logical index: shapes are laid out on the logical raster.
 #[test]
@@ -1007,7 +1559,7 @@ fn source_measurement_reuses_its_target_without_stale_samples_or_padding() -> an
 }
 
 #[test]
-#[ignore = "benchmark only; run explicitly on the target GPU"]
+#[ignore = "benchmark only; run explicitly on brain"]
 fn benchmark_source_measurement_grid_readback_25_frames() -> anyhow::Result<()> {
     // This is an offscreen draw+measurement microbenchmark, not a playback
     // claim. It retains source, target, transfer, and measurement resources.
@@ -1441,6 +1993,7 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         source_y: 0,
         warp: Some(&warp),
         transform: crate::model::Transform::Normal,
+        kernel: crate::projection::resample::Kernel::Bilinear,
     };
     assert!(gpu
         .blend(&capture, false, &[job])
@@ -1455,6 +2008,7 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         source_y: 0,
         warp: Some(&wrong_size),
         transform: crate::model::Transform::Normal,
+        kernel: crate::projection::resample::Kernel::Bilinear,
     };
     assert!(gpu
         .blend(&capture, false, &[job])
@@ -1469,6 +2023,7 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         source_y: 0,
         warp: None,
         transform: crate::model::Transform::Normal,
+        kernel: crate::projection::resample::Kernel::Bilinear,
     };
     assert!(gpu
         .blend(&capture, false, &[job])

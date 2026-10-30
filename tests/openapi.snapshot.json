@@ -4360,6 +4360,13 @@
               }
             ]
           },
+          "samplingNote": {
+            "description": "What qualifies `samplingMode`, when something does: the automatic\narea filter capped its box at 8x8 texels, or the configured filter\nis not implemented by the shader and the output sampled bilinear\ninstead. Absent otherwise.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "submittedGeneration": {
             "format": "int64",
             "minimum": 0,

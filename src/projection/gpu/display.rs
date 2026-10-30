@@ -48,6 +48,8 @@ pub struct DirectBlendJob<'a> {
     pub warp: Option<&'a crate::projection::warp::Warp>,
     /// See [`super::BlendJob::transform`].
     pub transform: crate::model::Transform,
+    /// See [`super::BlendJob::kernel`].
+    pub kernel: crate::projection::resample::Kernel,
 }
 
 /// A rendered set of images awaiting one batched present call.

@@ -43,6 +43,17 @@ struct Key {
     /// whose size changes fails the install check and restarts the slicer.
     /// The source rectangle they scale from is in `slice` and `layout`.
     markers: bool,
+    /// How the shader samples this output ([`sampling_path`]). Everything
+    /// it is derived from is already in this key except the configured
+    /// filter, which is the one input it exists for: a filter change
+    /// reinstalls, and reports the new `samplingMode` of, exactly the
+    /// outputs whose kernel it changes, live, and leaves every exact copy
+    /// alone. The table built alongside is unchanged by it.
+    sampling: SamplingPath,
+    /// [`SamplingPath::note`] for `sampling`, so the one filter change that
+    /// keeps the kernel (`easu`, sampled bilinear, to `bilinear`) still
+    /// reinstalls and clears the note it no longer earns.
+    sampling_note: Option<String>,
 }
 
 pub struct Output {
@@ -439,6 +450,12 @@ impl Controller {
 /// `highlight_overlaps` is deliberately absent: it changes only the contents
 /// of the per-pixel tables, which is exactly what a live update rebuilds, so
 /// toggling the lineup aid must never restart the slicer.
+///
+/// So is `filter`: the shader takes the kernel from push constants on every
+/// draw, and the controller's per-output key carries the sampling path it
+/// selects, so a filter change reinstalls (and re-reports) only the outputs
+/// whose kernel it changes. `slicer_topology_fingerprint` in manager.rs
+/// leaves it out for the same reason.
 pub fn same_topology(a: &SlicerSpec, b: &SlicerSpec) -> bool {
     a.source == b.source
         && a.canvas_width == b.canvas_width
@@ -555,7 +572,8 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
             {
                 return Err("configured output raster differs from presenter dimensions".into());
             }
-            sampling_warp(spec, &slice, (w, h), slice.transform)?;
+            let warp = sampling_warp(spec, &slice, (w, h), slice.transform)?;
+            let sampling = sampling_path_with(spec, &slice, (w, h), slice.transform, warp.as_ref());
             Ok(Key {
                 layout: layout
                     .as_ref()
@@ -579,6 +597,8 @@ fn validate(spec: &SlicerSpec, sizes: &[(u32, u32)]) -> Result<Vec<Key>, String>
                 },
                 dynamic: dynamic_mode(spec),
                 markers: spec.highlight_overlaps,
+                sampling_note: sampling.note(spec.filter),
+                sampling,
             })
         })
         .collect()
@@ -671,31 +691,77 @@ pub(crate) fn sampling_warp(
 
 /// How the GPU shader samples one output: the integer copy, which permutes
 /// texels by the output transform the presenter owns (`Normal` when it owns
-/// none), or bilinear sampling through the output's warp.
+/// none), or resampling through the output's warp with a
+/// [`Kernel`](super::resample::Kernel).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SamplingPath {
     Exact(crate::model::Transform),
-    Bilinear,
+    Sampled(super::resample::Kernel),
 }
 
 impl SamplingPath {
-    /// What the control status reports for this path.
+    /// What the control status reports for this path: `exact`, or the
+    /// kernel actually taken (the configured filter, or `area`).
     pub fn mode(self) -> crate::model::SamplingMode {
         match self {
             Self::Exact(_) => crate::model::SamplingMode::Exact,
-            Self::Bilinear => crate::model::SamplingMode::Bilinear,
+            Self::Sampled(kernel) => kernel.mode(),
+        }
+    }
+
+    /// Whether the shader samples through the warp at all. Every such path
+    /// still needs a linearly filterable capture: bilinear does, and the
+    /// warp capability (`validate_filtering`) is not split by kernel.
+    pub fn is_sampled(self) -> bool {
+        matches!(self, Self::Sampled(_))
+    }
+
+    /// What the sampling report adds to [`SamplingPath::mode`], if
+    /// anything; see [`super::resample::note`].
+    pub fn note(self, filter: crate::model::ResampleFilter) -> Option<String> {
+        match self {
+            Self::Exact(_) => None,
+            Self::Sampled(kernel) => super::resample::note(filter, kernel),
         }
     }
 }
 
-/// [`exact_copy`] as a [`SamplingPath`].
+/// [`exact_copy`] as a [`SamplingPath`]: otherwise the configured
+/// `spec.filter`, or the area filter when the output's warp minifies an
+/// axis by more than 2x ([`super::resample::Kernel::select`]). Builds the
+/// table's warp ([`sampling_warp`]) to measure that; a caller that already
+/// has it uses [`sampling_path_with`].
 pub(crate) fn sampling_path(
     spec: &SlicerSpec,
     slice: &SliceSpec,
     size: (u32, u32),
     transform: crate::model::Transform,
 ) -> SamplingPath {
-    exact_copy(spec, slice, size, transform).map_or(SamplingPath::Bilinear, SamplingPath::Exact)
+    let warp = if exact_copy(spec, slice, size, transform).is_some() {
+        None
+    } else {
+        sampling_warp(spec, slice, size, transform).ok().flatten()
+    };
+    sampling_path_with(spec, slice, size, transform, warp.as_ref())
+}
+
+/// [`sampling_path`] given the table's warp for the same arguments. A
+/// sampled output without one (only a hand-built spec can get here) is
+/// measured as unit density.
+pub(crate) fn sampling_path_with(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    size: (u32, u32),
+    transform: crate::model::Transform,
+    warp: Option<&Warp>,
+) -> SamplingPath {
+    match exact_copy(spec, slice, size, transform) {
+        Some(transform) => SamplingPath::Exact(transform),
+        None => SamplingPath::Sampled(super::resample::Kernel::select(
+            spec.filter,
+            warp.map_or([1.0, 1.0], super::resample::minification),
+        )),
+    }
 }
 
 /// Whether the shader may draw `slice` as an integer copy on a presenter
@@ -1001,7 +1067,7 @@ fn build(
         let slice = &request.keys[index].slice;
         let logical = sizes[index];
         let warp = sampling_warp(spec, slice, logical, slice.transform)?;
-        let sampling = sampling_path(spec, slice, logical, slice.transform);
+        let sampling = request.keys[index].sampling;
         // Tables are built on the raster the presenter attaches: physical
         // when it owns an axis-swapping transform.
         let (width, height) = slice.transform.physical_size(logical);
@@ -1094,8 +1160,11 @@ fn build(
 mod tests {
     use super::*;
     use crate::{
-        model::{AdaptiveBlackLift, Rect, Renderer},
-        projection::warp::Geometry,
+        model::{AdaptiveBlackLift, Rect, Renderer, ResampleFilter, SamplingMode},
+        projection::{
+            resample::{AreaBox, Kernel},
+            warp::Geometry,
+        },
     };
     use std::time::Duration;
 
@@ -1441,7 +1510,7 @@ mod tests {
                 );
                 assert_eq!(
                     sampling_path(&spec, slice, size, transform),
-                    SamplingPath::Bilinear,
+                    SamplingPath::Sampled(Kernel::Bilinear),
                     "{transform:?}: {name}"
                 );
             }
@@ -1571,7 +1640,7 @@ mod tests {
         assert_eq!(exact.sampling.mode(), crate::model::SamplingMode::Exact);
         let crop = &prepared.outputs[1];
         assert!(crop.warp.is_some());
-        assert_eq!(crop.sampling, SamplingPath::Bilinear);
+        assert_eq!(crop.sampling, SamplingPath::Sampled(Kernel::Bilinear));
         assert_eq!(crop.sampling.mode(), crate::model::SamplingMode::Bilinear);
     }
 
@@ -2140,6 +2209,137 @@ mod tests {
             .outputs
             .iter()
             .all(|output| output.dynamic_table.is_none() && !output.table.is_empty()));
+    }
+
+    /// A filter change is a live update that reinstalls exactly the outputs
+    /// whose kernel (or sampling note) it changes, reporting their new path;
+    /// an exact output is never rebuilt for it, and resending the same
+    /// filter rebuilds nothing.
+    #[test]
+    fn a_filter_change_reinstalls_only_the_outputs_it_resamples() {
+        let mut base = fixture();
+        // B upscales 2x from a 4x4 source; A stays the exact copy.
+        base.slices[1].source_rect = Some([4.0, 0.0, 4.0, 4.0]);
+        let mut c = Controller::new(&base, vec![(8, 8); 2], 1).unwrap();
+        let initial = complete(&mut c);
+        assert_eq!(
+            initial
+                .outputs
+                .iter()
+                .map(|o| o.sampling)
+                .collect::<Vec<_>>(),
+            [
+                SamplingPath::Exact(crate::model::Transform::Normal),
+                SamplingPath::Sampled(Kernel::Bilinear)
+            ]
+        );
+        c.installed(&initial);
+        let with = |filter| {
+            let mut spec = base.clone();
+            spec.filter = filter;
+            assert!(same_topology(&base, &spec), "a filter is never topology");
+            spec
+        };
+        for (generation, filter, rebuilt) in [
+            (1, ResampleFilter::Nearest, Some(Kernel::Nearest)),
+            (2, ResampleFilter::Nearest, None),
+            (3, ResampleFilter::Easu, Some(Kernel::Bilinear)),
+            // Same kernel, but the easu note goes away: still reinstalled.
+            (4, ResampleFilter::Bilinear, Some(Kernel::Bilinear)),
+            (5, ResampleFilter::Bicubic, Some(Kernel::Bicubic)),
+        ] {
+            send(&mut c, generation, with(filter));
+            let prepared = complete(&mut c);
+            assert_eq!(prepared.generation, generation);
+            match rebuilt {
+                Some(kernel) => {
+                    assert_eq!(prepared.outputs.len(), 1, "{filter:?}");
+                    assert_eq!(prepared.outputs[0].name, "B");
+                    assert_eq!(prepared.outputs[0].sampling, SamplingPath::Sampled(kernel));
+                    assert_eq!(
+                        prepared.outputs[0].sampling.note(filter).is_some(),
+                        filter == ResampleFilter::Easu
+                    );
+                }
+                None => assert!(prepared.outputs.is_empty(), "{filter:?}"),
+            }
+            c.installed(&prepared);
+        }
+    }
+
+    /// The area filter takes over per output, at more than 2x on either
+    /// axis, whatever the configured filter; an exact copy ignores it.
+    #[test]
+    fn sampling_path_takes_area_past_two_times_minification_per_axis() {
+        let mut spec = fixture();
+        spec.canvas_width = 64;
+        spec.canvas_height = 64;
+        let slice = spec.slices[0].clone();
+        let at = |filter, rect: Option<[f64; 4]>| {
+            let mut spec = spec.clone();
+            spec.filter = filter;
+            let mut slice = slice.clone();
+            slice.source_rect = rect;
+            sampling_path(&spec, &slice, (8, 8), slice.transform)
+        };
+        let area = |width, height| {
+            SamplingPath::Sampled(Kernel::Area(AreaBox {
+                width,
+                height,
+                capped: false,
+            }))
+        };
+        for filter in [
+            ResampleFilter::Bilinear,
+            ResampleFilter::Nearest,
+            ResampleFilter::Bicubic,
+            ResampleFilter::Lanczos,
+            ResampleFilter::Easu,
+        ] {
+            assert_eq!(
+                at(filter, None),
+                SamplingPath::Exact(crate::model::Transform::Normal)
+            );
+            assert_eq!(
+                at(filter, Some([0.0, 0.0, 20.0, 8.0])),
+                area(3, 1),
+                "{filter:?}"
+            );
+            assert_eq!(
+                at(filter, Some([0.0, 0.0, 8.0, 20.0])),
+                area(1, 3),
+                "{filter:?}"
+            );
+            assert_eq!(
+                at(filter, Some([0.0, 0.0, 20.0, 20.0])),
+                area(3, 3),
+                "{filter:?}"
+            );
+            assert_eq!(
+                at(filter, Some([0.0, 0.0, 16.0, 16.0])).mode(),
+                match filter {
+                    ResampleFilter::Bilinear | ResampleFilter::Easu => SamplingMode::Bilinear,
+                    ResampleFilter::Nearest => SamplingMode::Nearest,
+                    ResampleFilter::Bicubic => SamplingMode::Bicubic,
+                    ResampleFilter::Lanczos => SamplingMode::Lanczos,
+                },
+                "exactly 2x is not area: {filter:?}"
+            );
+        }
+        // Past 8x the box is capped, and the note says so.
+        let capped = at(ResampleFilter::Bilinear, Some([0.0, 0.0, 72.0, 8.0]));
+        assert_eq!(
+            capped,
+            SamplingPath::Sampled(Kernel::Area(AreaBox {
+                width: 8,
+                height: 1,
+                capped: true,
+            }))
+        );
+        assert!(capped
+            .note(ResampleFilter::Bilinear)
+            .unwrap()
+            .contains("capped"));
     }
 
     #[test]

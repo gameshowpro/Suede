@@ -345,6 +345,9 @@ pub struct BlendJob<'a> {
     /// logical slice at `source_x`/`source_y`. Must be `Normal` with a warp,
     /// which composes its own transform.
     pub transform: crate::model::Transform,
+    /// The kernel the shader resamples through `warp` with; ignored by the
+    /// integer copy (`warp` is `None`) and by the sync pattern.
+    pub kernel: super::resample::Kernel,
 }
 
 #[derive(Clone, Copy)]
@@ -419,6 +422,8 @@ struct RenderJob<'a> {
     warp: Option<&'a super::warp::Warp>,
     /// See [`BlendJob::transform`].
     transform: crate::model::Transform,
+    /// See [`BlendJob::kernel`].
+    kernel: super::resample::Kernel,
 }
 
 /// One output-local transfer table in an atomic [`Gpu::replace_transfers`]
@@ -565,9 +570,11 @@ struct PushConstants {
     center: [f32; 2],
     warp_enabled: u32,
     /// Bits 0..3: the output transform the exact copy (`warp_enabled == 0`)
-    /// permutes texels by, as [`transform_flags`] encodes it. Bits 4..7 are
-    /// reserved for a filter selector; every other bit is zero. Ignored on
-    /// the warp path, whose inverse rows already compose the transform.
+    /// permutes texels by, as [`transform_flags`] encodes it; ignored on the
+    /// warp path, whose inverse rows already compose the transform. Bits
+    /// 4..15: the warp path's resampling kernel, as
+    /// [`super::resample::Kernel::flags`] encodes it; ignored by the exact
+    /// copy. Every other bit is zero.
     flags: u32,
     source_rect: [f32; 4],
     dynamic_lift: f32,
@@ -626,6 +633,14 @@ impl PushConstants {
         self.flags = (self.flags & !TRANSFORM_FLAGS_MASK) | transform_flags(transform);
         (self.logical_width, self.logical_height) =
             transform.physical_size((self.width, self.height));
+        self
+    }
+
+    /// Make a warp block (`warp` was `Some`) resample with `kernel`.
+    /// Bilinear leaves the block as it was.
+    fn with_kernel(mut self, kernel: super::resample::Kernel) -> Self {
+        debug_assert_ne!(self.warp_enabled, 0, "the exact copy never resamples");
+        self.flags = (self.flags & !super::resample::KERNEL_FLAGS_MASK) | kernel.flags();
         self
     }
 
@@ -3231,6 +3246,7 @@ impl Gpu {
                 source_y: job.source_y,
                 warp: job.warp,
                 transform: job.transform,
+                kernel: job.kernel,
             })
             .collect();
         match self.render_targets(source, &render_jobs, &acquired.waits, &acquired.signals) {
@@ -3841,6 +3857,7 @@ impl Gpu {
                 source_y: job.source_y,
                 warp: job.warp,
                 transform: job.transform,
+                kernel: job.kernel,
             })
             .collect();
         self.render_targets(source, &jobs, &[], &[])
@@ -4113,9 +4130,11 @@ impl Gpu {
                 y_invert != 0,
                 job.warp,
             );
-            if job.warp.is_none() {
-                push_constants = push_constants.with_exact_transform(job.transform);
-            }
+            push_constants = if job.warp.is_none() {
+                push_constants.with_exact_transform(job.transform)
+            } else {
+                push_constants.with_kernel(job.kernel)
+            };
             push_constants.mode = mode;
             push_constants.groups = output.sync_groups;
             push_constants.dynamic_lift = self.dynamic_lift;
@@ -5397,6 +5416,40 @@ mod tests {
             .with_exact_transform(Transform::Flipped180);
         assert_eq!(flipped.flags, 6);
         assert_eq!((flipped.logical_width, flipped.logical_height), (640, 480));
+    }
+
+    #[test]
+    fn kernel_sets_only_flag_bits_four_to_fifteen_and_bilinear_is_a_no_op() {
+        use crate::projection::resample::{AreaBox, Kernel};
+        let warp = crate::projection::warp::Warp::identity(640, 480)
+            .with_source_rect([0.0, 0.0, 320.0, 240.0])
+            .unwrap();
+        let plain = PushConstants::canvas([0, 0], [640, 480], 480, true, Some(&warp));
+        assert_eq!(
+            plain.with_kernel(Kernel::Bilinear).as_bytes(),
+            plain.as_bytes()
+        );
+        let area = Kernel::Area(AreaBox {
+            width: 3,
+            height: 2,
+            capped: false,
+        });
+        for kernel in [Kernel::Nearest, Kernel::Bicubic, Kernel::Lanczos, area] {
+            let constants = plain.with_kernel(kernel);
+            assert_eq!(constants.flags, kernel.flags(), "{kernel:?}");
+            let bytes = constants.as_bytes();
+            let word =
+                |offset: usize| u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            assert_eq!(word(92), kernel.flags(), "flags at byte 92");
+            // Nothing else in the block moves.
+            assert_eq!(&bytes[..92], &plain.as_bytes()[..92]);
+            assert_eq!(&bytes[96..], &plain.as_bytes()[96..]);
+            // A second kernel replaces the first rather than OR-ing into it.
+            assert_eq!(
+                constants.with_kernel(Kernel::Nearest).flags,
+                Kernel::Nearest.flags()
+            );
+        }
     }
 
     #[test]

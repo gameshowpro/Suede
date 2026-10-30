@@ -58,9 +58,12 @@ layout(push_constant) uniform PushConstants {
     vec2 center;
     uint warp_enabled;
     // Bits 0..3: the output transform the exact copy (`warp_enabled == 0`)
-    // permutes texels by, coded as `transform_flags` in gpu.rs does. Bits
-    // 4..7 are reserved for a filter selector; every other bit is zero. The
-    // warp path ignores it: its inverse rows already compose the transform.
+    // permutes texels by, coded as `transform_flags` in gpu.rs does; the
+    // warp path ignores them, its inverse rows already compose the
+    // transform. Bits 4..7: the warp path's resampling kernel (`FILTER_*`
+    // below), and bits 8..11 / 12..15 the area kernel's box width / height
+    // minus one, as `Kernel::flags` in resample.rs codes them; the exact
+    // copy ignores those. Every other bit is zero.
     uint flags;
     // Absolute canvas pixel-boundary x, y, width, height, at byte 96.
     vec4 source_rect;
@@ -104,6 +107,101 @@ uvec2 exact_logical_index(uvec2 p) {
         q.y = pc.logical_height - 1u - q.y;
     }
     return q;
+}
+
+// The warp path's resampling kernels, coded in `pc.flags` bits 4..7 as
+// `Kernel::flags` in resample.rs does (its module doc defines each one, and
+// `shader_filter_codes_match_the_kernel_flags` holds these lines to it).
+// Bilinear is code 0, so a block without a kernel samples as it always has.
+const uint FILTER_BILINEAR = 0u;
+const uint FILTER_NEAREST = 1u;
+const uint FILTER_BICUBIC = 2u;
+const uint FILTER_LANCZOS = 3u;
+const uint FILTER_AREA = 4u;
+
+const float PI = 3.14159265358979;
+
+// The byte value of the canvas texel at unflipped canvas index `i`, with `i`
+// first clamped to `lo..hi`: the texels the source rectangle touches, so no
+// kernel tap reads past the slice's edge (bilinear, through the LINEAR
+// sampler, is the one kernel that does not come through here). Capture y
+// inversion happens here, per tap, so the kernels themselves work in canvas
+// orientation and never depend on it.
+uvec3 filter_texel(ivec2 i, ivec2 lo, ivec2 hi) {
+    ivec2 last = ivec2(textureSize(canvas, 0)) - ivec2(1);
+    i = clamp(i, lo, hi);
+    if (pc.y_invert != 0u) {
+        i.y = int(pc.canvas_height) - 1 - i.y;
+    }
+    i = clamp(i, ivec2(0), last);
+    return uvec3(round(texelFetch(sampler2D(canvas, canvasSampler), i, 0).rgb * 255.0));
+}
+
+// The separable kernels' weight at distance `x` from a texel center:
+// Catmull-Rom (a = -0.5) for bicubic, Lanczos-3 otherwise.
+float filter_weight(uint resample, float x) {
+    x = abs(x);
+    if (resample == FILTER_BICUBIC) {
+        if (x < 1.0) {
+            return (1.5 * x - 2.5) * x * x + 1.0;
+        } else if (x < 2.0) {
+            return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+        }
+        return 0.0;
+    }
+    if (x < 1.0e-5) {
+        return 1.0;
+    } else if (x >= 3.0) {
+        return 0.0;
+    }
+    float px = PI * x;
+    return 3.0 * sin(px) * sin(px / 3.0) / (px * px);
+}
+
+// Bicubic (4x4 taps) or Lanczos-3 (6x6) at unflipped canvas position `s`,
+// weights normalized to sum to one and the result clamped to a byte.
+uvec3 filter_separable(uint resample, vec2 s, ivec2 lo, ivec2 hi) {
+    int first = resample == FILTER_BICUBIC ? -1 : -2;
+    int taps = resample == FILTER_BICUBIC ? 4 : 6;
+    vec2 f = s - vec2(0.5);
+    vec2 b = floor(f);
+    vec2 t = f - b;
+    ivec2 base = ivec2(b);
+    float wx[6];
+    float wy[6];
+    float sx = 0.0;
+    float sy = 0.0;
+    for (int k = 0; k < taps; ++k) {
+        wx[k] = filter_weight(resample, float(first + k) - t.x);
+        wy[k] = filter_weight(resample, float(first + k) - t.y);
+        sx += wx[k];
+        sy += wy[k];
+    }
+    vec3 acc = vec3(0.0);
+    for (int j = 0; j < taps; ++j) {
+        vec3 row = vec3(0.0);
+        for (int i = 0; i < taps; ++i) {
+            row += wx[i] * vec3(filter_texel(base + ivec2(first + i, first + j), lo, hi));
+        }
+        acc += wy[j] * row;
+    }
+    return uvec3(floor(clamp(acc / (sx * sy), vec3(0.0), vec3(255.0)) + vec3(0.5)));
+}
+
+// The area kernel: the rounded integer mean of an nx-by-ny box of texels
+// centered on unflipped canvas position `s`.
+uvec3 filter_area(vec2 s, ivec2 lo, ivec2 hi) {
+    uint nx = ((pc.flags >> 8u) & 0xfu) + 1u;
+    uint ny = ((pc.flags >> 12u) & 0xfu) + 1u;
+    ivec2 start = ivec2(floor(s - vec2(float(nx), float(ny)) * 0.5 + vec2(0.5)));
+    uvec3 sum = uvec3(0u);
+    for (uint j = 0u; j < ny; ++j) {
+        for (uint i = 0u; i < nx; ++i) {
+            sum += filter_texel(start + ivec2(int(i), int(j)), lo, hi);
+        }
+    }
+    uint n = nx * ny;
+    return (sum + uvec3(n / 2u)) / uvec3(n);
 }
 
 void main() {
@@ -232,6 +330,9 @@ void main() {
         vec2 inset = min(vec2(0.5), pc.source_rect.zw * 0.5);
         source = clamp(source, pc.source_rect.xy + inset,
                        pc.source_rect.xy + max(inset, pc.source_rect.zw - inset));
+        // Every kernel but bilinear works on this unflipped position and
+        // inverts each tap instead (`filter_texel`).
+        vec2 unflipped = source;
         if (pc.y_invert != 0u) {
             source.y = float(pc.canvas_height) - source.y;
         }
@@ -242,9 +343,24 @@ void main() {
             outColor = vec4(0.0, 0.0, 0.0, 1.0);
             return;
         } else {
-            vec4 t = textureLod(sampler2D(canvas, canvasSampler),
-                                source / canvas_size, 0.0);
-            c = uvec3(round(t.rgb * 255.0));
+            uint resample = (pc.flags >> 4u) & 0xfu;
+            // The texels the source rectangle touches, unflipped: the
+            // range every tap below is clamped to.
+            ivec2 last = ivec2(canvas_size) - ivec2(1);
+            ivec2 lo = clamp(ivec2(floor(pc.source_rect.xy)), ivec2(0), last);
+            ivec2 hi = clamp(ivec2(ceil(pc.source_rect.xy + pc.source_rect.zw)) - ivec2(1),
+                             lo, last);
+            if (resample == FILTER_NEAREST) {
+                c = filter_texel(ivec2(floor(unflipped)), lo, hi);
+            } else if (resample == FILTER_BICUBIC || resample == FILTER_LANCZOS) {
+                c = filter_separable(resample, unflipped, lo, hi);
+            } else if (resample == FILTER_AREA) {
+                c = filter_area(unflipped, lo, hi);
+            } else {
+                vec4 t = textureLod(sampler2D(canvas, canvasSampler),
+                                    source / canvas_size, 0.0);
+                c = uvec3(round(t.rgb * 255.0));
+            }
         }
     } else {
         // The integer copy: physical pixel `p` shows logical pixel `q` of

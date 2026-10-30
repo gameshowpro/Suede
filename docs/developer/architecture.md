@@ -156,7 +156,7 @@ CI has no compositor, so the architecture is built around that constraint rather
 | Persistence | Temp directories; corruption and migration paths included |
 | OpenAPI | Snapshot test, so every endpoint change is a reviewable diff |
 | Documentation links | `tests/docs_links.rs` resolves every `"page/#anchor"` string literal named in `src/checks/mod.rs` and `src/model/observed.rs` against the actual docs tree |
-| GPU-gated | `#[ignore]`d by default; `SUEDE_GPU_TEST=1 cargo test -- --ignored` runs them against whatever Vulkan device the machine actually has |
+| GPU-gated | `#[ignore]`d by default; `SUEDE_GPU_TEST=1 cargo test -- --ignored --test-threads=1` runs them against whatever Vulkan device the machine actually has (one at a time: concurrent device teardown has hung the NVIDIA driver) |
 | Web UI (Warp editor) | `tests/ui/*.cjs`, driven by Playwright against a real browser — not run by CI; a manual step documented in `tests/ui/README.md` |
 | End to end | `scripts/smoke-test.sh` drives a running daemon over HTTP |
 | Spelling | `scripts/check-en-us.sh` fails on en-GB spelling in a tracked text file; runs in CI and in `scripts/dev-check.sh` |

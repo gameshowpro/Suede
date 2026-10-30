@@ -489,8 +489,8 @@ struct Presenter {
     /// through it whenever it is `Some`.
     warp: Option<super::warp::Warp>,
     /// How the GPU shader samples this output: the exact copy, permuted by
-    /// the owned transform, or bilinear through `warp`. Installed together
-    /// with `warp`; see [`Presenter::gpu_sampling`].
+    /// the owned transform, or resampled through `warp` with a kernel.
+    /// Installed together with `warp`; see [`Presenter::gpu_sampling`].
     sampling: super::warp_update::SamplingPath,
     /// [`AxisSamples`] for `warp`, rebuilt only when `warp_revision` moves
     /// past `sample_revision` — see `present_frame_cpu`. `None` whenever
@@ -1518,12 +1518,23 @@ impl Presenter {
 
     /// What a GPU blend or sync job passes the shader: no warp and the
     /// transform to permute by on the exact path, even when `warp` holds the
-    /// transform-only warp the table was built through; `warp` and `Normal`
-    /// otherwise (a warp composes its own transform).
-    fn gpu_sampling(&self) -> (Option<&super::warp::Warp>, Transform) {
+    /// transform-only warp the table was built through; `warp`, `Normal` (a
+    /// warp composes its own transform) and the kernel to resample with
+    /// otherwise. The exact path's kernel is bilinear, which it ignores.
+    fn gpu_sampling(
+        &self,
+    ) -> (
+        Option<&super::warp::Warp>,
+        Transform,
+        super::resample::Kernel,
+    ) {
         match self.sampling {
-            super::warp_update::SamplingPath::Exact(transform) => (None, transform),
-            super::warp_update::SamplingPath::Bilinear => (self.warp.as_ref(), Transform::Normal),
+            super::warp_update::SamplingPath::Exact(transform) => {
+                (None, transform, super::resample::Kernel::Bilinear)
+            }
+            super::warp_update::SamplingPath::Sampled(kernel) => {
+                (self.warp.as_ref(), Transform::Normal, kernel)
+            }
         }
     }
 
@@ -3298,10 +3309,16 @@ fn requires_linear_sampling(spec: &SlicerSpec) -> Result<bool, String> {
         let size = (slice.slice.width as u32, slice.slice.height as u32);
         // Still built, so a malformed mapping is rejected here as before;
         // whether the shader samples through it is `sampling_path`'s call.
-        super::warp_update::sampling_warp(spec, slice, size, slice.transform)?;
+        let warp = super::warp_update::sampling_warp(spec, slice, size, slice.transform)?;
         Ok(required
-            || super::warp_update::sampling_path(spec, slice, size, slice.transform)
-                == super::warp_update::SamplingPath::Bilinear)
+            || super::warp_update::sampling_path_with(
+                spec,
+                slice,
+                size,
+                slice.transform,
+                warp.as_ref(),
+            )
+            .is_sampled())
     })
 }
 
@@ -3701,7 +3718,8 @@ fn static_pattern_rgba(
 /// The `samplingMode` each output of `prepared` reports: the shader's path
 /// ([`super::warp_update::SamplingPath`]), not whether the table has a warp.
 /// A presenter that owns a 180 transform at 1:1 has a table warp and still
-/// reports `exact`.
+/// reports `exact`; a sampled output reports the kernel it actually takes,
+/// which is `area` rather than the configured filter past 2x minification.
 fn sampling_modes(
     prepared: &super::warp_update::Prepared,
 ) -> BTreeMap<String, crate::model::SamplingMode> {
@@ -3709,6 +3727,21 @@ fn sampling_modes(
         .outputs
         .iter()
         .map(|o| (o.name.clone(), o.sampling.mode()))
+        .collect()
+}
+
+/// The `samplingNote` of each output of `prepared` that has one (a capped
+/// area box, or `easu` sampled as bilinear); see
+/// [`super::warp_update::SamplingPath::note`].
+fn sampling_notes(prepared: &super::warp_update::Prepared) -> BTreeMap<String, String> {
+    prepared
+        .outputs
+        .iter()
+        .filter_map(|o| {
+            o.sampling
+                .note(prepared.spec.filter)
+                .map(|note| (o.name.clone(), note))
+        })
         .collect()
 }
 
@@ -3748,7 +3781,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     let filtering_restart = prepared
         .outputs
         .iter()
-        .any(|output| output.sampling == super::warp_update::SamplingPath::Bilinear)
+        .any(|output| output.sampling.is_sampled())
         && state
             .capture
             .gpu_images
@@ -3832,6 +3865,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     }
     let mut changed: Vec<_> = prepared.outputs.iter().map(|o| o.name.clone()).collect();
     let sampling_modes = sampling_modes(&prepared);
+    let sampling_notes = sampling_notes(&prepared);
     for output in &mut prepared.outputs {
         let presenter = &mut state.presenters[output.index];
         presenter.transfer = std::mem::take(&mut output.table);
@@ -3863,6 +3897,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
         super::control::ControlEventKind::Applied {
             outputs: changed,
             sampling_modes,
+            sampling_notes,
             build_ms: Some(prepared.build_ms),
             upload_ms: Some(upload_ms),
         },
@@ -5184,7 +5219,7 @@ fn present_frame_direct_source(
         .iter()
         .map(|&index| {
             let p = &state.presenters[index];
-            let (warp, transform) = p.gpu_sampling();
+            let (warp, transform, kernel) = p.gpu_sampling();
             gpu::display::DirectBlendJob {
                 display: index,
                 output: index,
@@ -5192,6 +5227,7 @@ fn present_frame_direct_source(
                 source_y: p.slice.y.max(0) as u32,
                 warp,
                 transform,
+                kernel,
             }
         })
         .collect();
@@ -5501,7 +5537,7 @@ fn gpu_blend_due_source(
         .map(|d| {
             let presenter = &presenters[d.index];
             let (_, image) = &presenter.gpu_buffers[d.slot];
-            let (warp, transform) = presenter.gpu_sampling();
+            let (warp, transform, kernel) = presenter.gpu_sampling();
             gpu::BlendJob {
                 target: image,
                 output: d.index,
@@ -5509,6 +5545,7 @@ fn gpu_blend_due_source(
                 source_y: presenter.slice.y.max(0) as u32,
                 warp,
                 transform,
+                kernel,
             }
         })
         .collect();
@@ -6327,7 +6364,7 @@ fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
         .iter()
         .map(|&index| {
             let p = &state.presenters[index];
-            let (warp, transform) = p.gpu_sampling();
+            let (warp, transform, kernel) = p.gpu_sampling();
             gpu::display::DirectBlendJob {
                 display: index,
                 output: index,
@@ -6335,6 +6372,7 @@ fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
                 source_y: p.slice.y.max(0) as u32,
                 warp,
                 transform,
+                kernel,
             }
         })
         .collect();
@@ -6733,7 +6771,7 @@ fn present_sync_gpu(
         .filter_map(|d| {
             let presenter = &presenters[d.index];
             let (_, image) = presenter.gpu_buffers.get(d.slot)?;
-            let (warp, transform) = presenter.gpu_sampling();
+            let (warp, transform, kernel) = presenter.gpu_sampling();
             Some(gpu::BlendJob {
                 target: image,
                 output: d.index,
@@ -6744,6 +6782,7 @@ fn present_sync_gpu(
                 source_y: presenter.slice.y.max(0) as u32,
                 warp,
                 transform,
+                kernel,
             })
         })
         .collect();
@@ -9241,7 +9280,8 @@ mod tests {
                 "the table is built through a warp"
             );
             assert_eq!(presenter.sampling.mode(), expected);
-            let (warp, transform) = presenter.gpu_sampling();
+            let (warp, transform, kernel) = presenter.gpu_sampling();
+            assert_eq!(kernel, super::super::resample::Kernel::Bilinear);
             if expected == crate::model::SamplingMode::Exact {
                 assert!(warp.is_none());
                 assert_eq!(transform, Transform::Rotate180);
@@ -9271,6 +9311,109 @@ mod tests {
             );
             // The bootstrap table and the control build agree pixel for pixel.
             assert_eq!(prepared.outputs[0].table, presenter.transfer);
+        }
+    }
+
+    /// A control build reports the kernel each sampled output actually
+    /// takes: the configured filter, `area` instead of it past 2x
+    /// minification (per axis), and `bilinear` with a note for `easu`; the
+    /// presenter then hands that kernel to the shader. An exact output
+    /// ignores the filter.
+    #[test]
+    fn control_builds_report_the_kernel_actually_taken_and_hand_it_to_the_shader() {
+        use super::super::resample::{AreaBox, Kernel};
+        use crate::model::{ResampleFilter, SamplingMode};
+        let area = |width, height| {
+            Kernel::Area(AreaBox {
+                width,
+                height,
+                capped: false,
+            })
+        };
+        let upscale = Some([30.0, 20.0, 120.0, 90.0]);
+        let minify = Some([0.0, 0.0, 600.0, 450.0]);
+        let minify_x = Some([0.0, 0.0, 600.0, 180.0]);
+        let exactly_2x = Some([0.0, 0.0, 480.0, 360.0]);
+        let cases = [
+            (ResampleFilter::Bilinear, upscale, Kernel::Bilinear, None),
+            (ResampleFilter::Nearest, upscale, Kernel::Nearest, None),
+            (ResampleFilter::Bicubic, upscale, Kernel::Bicubic, None),
+            (ResampleFilter::Lanczos, upscale, Kernel::Lanczos, None),
+            (
+                ResampleFilter::Easu,
+                upscale,
+                Kernel::Bilinear,
+                Some("easu is not implemented yet; this output samples bilinear"),
+            ),
+            (ResampleFilter::Nearest, minify, area(3, 3), None),
+            (ResampleFilter::Lanczos, minify_x, area(3, 1), None),
+            (ResampleFilter::Easu, minify, area(3, 3), None),
+            (ResampleFilter::Bicubic, exactly_2x, Kernel::Bicubic, None),
+        ];
+        for (filter, source_rect, kernel, note) in cases {
+            let mut spec = pattern_spec();
+            spec.canvas_width = 640;
+            spec.canvas_height = 480;
+            spec.filter = filter;
+            spec.slices[0].source_rect = source_rect;
+            let size = (240, 180);
+            let mut controller = super::super::warp_update::Controller::new(&spec, vec![size], 1)
+                .expect("controller");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut prepared = loop {
+                if let Some(prepared) = controller.poll() {
+                    break prepared;
+                }
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            let label = format!("{filter:?} {source_rect:?}");
+            assert_eq!(
+                prepared.outputs[0].sampling,
+                super::super::warp_update::SamplingPath::Sampled(kernel),
+                "{label}"
+            );
+            assert_eq!(
+                sampling_modes(&prepared),
+                BTreeMap::from([("DP-1".to_string(), kernel.mode())]),
+                "{label}"
+            );
+            assert_eq!(
+                sampling_notes(&prepared),
+                note.map(|note| BTreeMap::from([("DP-1".to_string(), note.to_string())]))
+                    .unwrap_or_default(),
+                "{label}"
+            );
+            let mut presenter = bare_presenter("DP-1", size, spec.slices[0].slice);
+            presenter.warp = prepared.outputs[0].warp.take();
+            presenter.sampling = prepared.outputs[0].sampling;
+            let (warp, transform, handed) = presenter.gpu_sampling();
+            assert!(warp.is_some(), "{label}");
+            assert_eq!(transform, Transform::Normal);
+            assert_eq!(handed, kernel, "{label}");
+            assert!(requires_linear_sampling(&spec).unwrap());
+        }
+        // The exact copy ignores every filter.
+        for filter in [ResampleFilter::Nearest, ResampleFilter::Lanczos] {
+            let mut spec = pattern_spec();
+            spec.filter = filter;
+            let size = (240, 180);
+            let mut controller = super::super::warp_update::Controller::new(&spec, vec![size], 1)
+                .expect("controller");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let prepared = loop {
+                if let Some(prepared) = controller.poll() {
+                    break prepared;
+                }
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(
+                sampling_modes(&prepared),
+                BTreeMap::from([("DP-1".to_string(), SamplingMode::Exact)])
+            );
+            assert!(sampling_notes(&prepared).is_empty());
+            assert!(!requires_linear_sampling(&spec).unwrap());
         }
     }
 

@@ -93,6 +93,12 @@ pub enum ControlEventKind {
         /// Effective sampler selected for each affected output.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         sampling_modes: BTreeMap<String, SamplingMode>,
+        /// What qualifies an affected output's sampling mode, for the
+        /// outputs that have something to say (a capped area box, a filter
+        /// the shader does not implement). An output in `sampling_modes`
+        /// but not here has no note.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        sampling_notes: BTreeMap<String, String>,
     },
     Submitted {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

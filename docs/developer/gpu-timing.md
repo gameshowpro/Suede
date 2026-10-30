@@ -583,3 +583,41 @@ restored and verified afterward. The original 15 passing checks and two warnings
 (direct scanout and output phase) remained, with no failed checks. The temporary
 fixture server was stopped. Raw campaign, qualification, and restoration evidence
 is retained under `/var/tmp/suede-pi-tables-20261009` on the test appliance.
+
+## Resampling filter cost (2026-10-30)
+
+`benchmark_filters_at_4x_upscale` in `src/projection/gpu_readback.rs` times one
+output draw per filter with device timestamps. It is an offscreen
+microbenchmark of the production pipeline and shader: it excludes capture,
+presentation and the compositor, which `gpuSpanMs` in
+`GET /projection/stats` covers on a running appliance. The "4x upscale" cases
+are 4x by area (a 960x540 canvas drawn to a 1920x1080 output, 2x per axis).
+
+[System A](test-systems.md#system-a), Quadro RTX 8000, NVIDIA 615.71.09,
+release build, RGBA8 source and target, 10 samples of 20 draws each, with the
+daemon running and no other GPU work. Run it on its own, with
+`--test-threads=1`; see the note below.
+
+| Case | Canvas | Output | Mean (ms/draw) | Min | Max |
+| --- | --- | --- | --- | --- | --- |
+| Exact 1:1 copy (control) | 1920x1080 | 1920x1080 | 0.082 | 0.063 | 0.117 |
+| Bilinear 1:1 through a warp (control) | 1920x1080 | 1920x1080 | 0.085 | 0.071 | 0.107 |
+| Bilinear, 4x upscale | 960x540 | 1920x1080 | 0.085 | 0.068 | 0.107 |
+| Nearest, 4x upscale | 960x540 | 1920x1080 | 0.077 | 0.059 | 0.102 |
+| Bicubic (Catmull-Rom, 16 taps), 4x upscale | 960x540 | 1920x1080 | 0.364 | 0.313 | 0.386 |
+| Lanczos-3, 4x upscale | 960x540 | 1920x1080 | 0.650 | 0.593 | 0.695 |
+| Area, 2.5x minification (3x3 box) | 3840x2160 | 1536x864 | 0.152 | 0.117 | 0.189 |
+| Area, 8x minification (8x8 box, the cap) | 3840x2160 | 480x270 | 0.911 | 0.839 | 0.961 |
+
+On this GPU the exact copy, nearest and bilinear filters cost the same within
+noise. Bicubic costs about 4.3 times as much as bilinear and Lanczos-3 about
+7.6 times, so four Lanczos outputs add roughly 2.3 ms per presented cycle. That
+matters next to a 16.7 ms frame budget only on a GPU already near its limit. Area
+cost scales with the number of source texels read rather than with output size.
+
+**Concurrent runs can hang the driver.** Running several of the `#[ignore]`d GPU
+readback tests in parallel (the test harness's default) deadlocked this driver
+when three tests destroyed their Vulkan devices at the same moment: one thread
+spun in `libnvidia-eglcore` thread-exit cleanup while the others blocked in
+`vkDestroyDevice`. The same tests pass in under a second each when run one at a
+time, so pass `--test-threads=1`.

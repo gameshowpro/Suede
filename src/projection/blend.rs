@@ -145,7 +145,11 @@ pub struct SlicerSpec {
     #[serde(default)]
     pub renderer: Renderer,
     /// Resampling filter for outputs that do not map 1:1; see
-    /// [`crate::model::ResampleFilter`]. Not yet consumed by either renderer.
+    /// [`crate::model::ResampleFilter`]. The GPU renderer's shader applies
+    /// it (`projection::resample`), live: it is deliberately not part of
+    /// the slicer's topology (`warp_update::same_topology`), so changing it
+    /// reinstalls only the affected outputs. The CPU renderer still samples
+    /// bilinear whatever it says.
     #[serde(default, skip_serializing_if = "ResampleFilter::is_default")]
     pub filter: ResampleFilter,
     /// Full configured roster, independently of which outputs can present —

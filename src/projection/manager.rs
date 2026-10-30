@@ -908,6 +908,7 @@ fn update_control_status_for_config(
                 build_ms,
                 upload_ms,
                 sampling_modes,
+                sampling_notes,
             } => {
                 let advances_applied = status
                     .child_generation
@@ -927,7 +928,7 @@ fn update_control_status_for_config(
                     event.generation,
                     OutputStage::Applied,
                 );
-                set_output_sampling(&mut status.outputs, sampling_modes);
+                set_output_sampling(&mut status.outputs, sampling_modes, sampling_notes);
                 status.build_ms = build_ms.or(status.build_ms);
                 status.upload_ms = upload_ms.or(status.upload_ms);
                 clear_failure_through(&mut status.last_failure, event.generation);
@@ -1040,6 +1041,7 @@ fn set_output_generation(
                     submitted_generation: None,
                     presented_generation: None,
                     sampling_mode: None,
+                    sampling_note: None,
                 });
                 statuses.len() - 1
             }
@@ -1054,11 +1056,16 @@ fn set_output_generation(
     }
 }
 
+/// Record each reported output's sampling mode and replace its note with
+/// the one reported alongside (an output reported without one loses any it
+/// had: notes describe the mode they arrived with).
 fn set_output_sampling(
     statuses: &mut Vec<ProjectionControlOutputStatus>,
     sampling_modes: std::collections::BTreeMap<String, crate::model::SamplingMode>,
+    mut sampling_notes: std::collections::BTreeMap<String, String>,
 ) {
     for (name, sampling_mode) in sampling_modes {
+        let note = sampling_notes.remove(&name);
         let index = match statuses.iter().position(|status| status.name == name) {
             Some(index) => index,
             None => {
@@ -1069,11 +1076,13 @@ fn set_output_sampling(
                     submitted_generation: None,
                     presented_generation: None,
                     sampling_mode: None,
+                    sampling_note: None,
                 });
                 statuses.len() - 1
             }
         };
         statuses[index].sampling_mode = Some(sampling_mode);
+        statuses[index].sampling_note = note;
     }
 }
 
@@ -1938,6 +1947,25 @@ mod tests {
         assert_ne!(slicer_fingerprint(&cpu, false), cpu_fingerprint);
     }
 
+    /// The resampling filter is a live update on the GPU path (the shader
+    /// takes it from push constants and the child reinstalls only the
+    /// outputs whose kernel changes), never a restart; the CPU path, whose
+    /// fingerprint is the whole spec, still restarts on it.
+    #[test]
+    fn a_filter_change_is_live_on_gpu_but_restarts_the_cpu_path() {
+        let gpu = minimal_slicer_spec();
+        let mut changed = gpu.clone();
+        changed.filter = crate::model::ResampleFilter::Lanczos;
+        assert_eq!(
+            slicer_fingerprint(&gpu, true),
+            slicer_fingerprint(&changed, true)
+        );
+        assert_ne!(
+            slicer_fingerprint(&gpu, false),
+            slicer_fingerprint(&changed, false)
+        );
+    }
+
     /// With a layout set (the arrangement endpoint's shared-canvas path) and
     /// no pattern, `slicer_topology_fingerprint` hashes only each slice's
     /// raster width/height, not its `source_rect` or `source.x`/`source.y`.
@@ -2098,6 +2126,7 @@ mod tests {
                     build_ms: Some(2.0),
                     upload_ms: Some(1.0),
                     sampling_modes: std::collections::BTreeMap::new(),
+                    sampling_notes: std::collections::BTreeMap::new(),
                 },
             ),
         );
@@ -2131,6 +2160,7 @@ mod tests {
                     build_ms: None,
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::new(),
+                    sampling_notes: std::collections::BTreeMap::new(),
                 },
             ),
             Some(41),
@@ -2168,6 +2198,7 @@ mod tests {
                 build_ms: None,
                 upload_ms: None,
                 sampling_modes: std::collections::BTreeMap::new(),
+                sampling_notes: std::collections::BTreeMap::new(),
             },
         );
         if event_belongs_to_session(&old, "current") {
@@ -2192,6 +2223,7 @@ mod tests {
                     build_ms: None,
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::new(),
+                    sampling_notes: std::collections::BTreeMap::new(),
                 },
             ),
             Some(80),
@@ -2208,6 +2240,7 @@ mod tests {
                     build_ms: None,
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::new(),
+                    sampling_notes: std::collections::BTreeMap::new(),
                 },
             ),
             Some(70),
@@ -2315,6 +2348,7 @@ mod tests {
                         "DP-1".into(),
                         crate::model::SamplingMode::Bilinear,
                     )]),
+                    sampling_notes: std::collections::BTreeMap::new(),
                 },
             ),
         );
@@ -2402,6 +2436,7 @@ mod tests {
                         "DP-1".into(),
                         crate::model::SamplingMode::Exact,
                     )]),
+                    sampling_notes: std::collections::BTreeMap::new(),
                 },
             ),
         );
@@ -2503,6 +2538,7 @@ mod tests {
                     "DP-1".to_string(),
                     crate::model::SamplingMode::Exact,
                 )]),
+                sampling_notes: std::collections::BTreeMap::new(),
             },
             ControlEventKind::Submitted {
                 outputs: vec!["DP-1".to_string()],

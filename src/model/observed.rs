@@ -1176,6 +1176,12 @@ pub struct ProjectionControlOutputStatus {
     /// Filled when the slicer reports its effective sampling path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_mode: Option<crate::model::SamplingMode>,
+    /// What qualifies `samplingMode`, when something does: the automatic
+    /// area filter capped its box at 8x8 texels, or the configured filter
+    /// is not implemented by the shader and the output sampled bilinear
+    /// instead. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sampling_note: Option<String>,
 }
 
 impl ProjectionControlStatus {
