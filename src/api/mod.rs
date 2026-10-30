@@ -532,6 +532,10 @@ pub fn router(state: ApiState) -> Router {
             get(projection::recommend_resolution),
         )
         .route("/projection/arrangement", get(projection::get_arrangement))
+        .route(
+            "/projection/exact-transition",
+            get(projection::get_exact_transition),
+        )
         .route("/system", get(observed::get_system))
         .route("/system/gpu", get(observed::get_gpu))
         .route("/system/pipeline", get(observed::get_pipeline))

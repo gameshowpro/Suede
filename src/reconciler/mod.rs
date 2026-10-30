@@ -1635,7 +1635,7 @@ impl Reconciler {
                     format!(
                         "{output} settled on a value the saved configuration cannot hold \
                          ({detail}), so it was not pinned. Set the value explicitly, or leave \
-                         warp mode, or the display will pick it again at the next restart."
+                         warp or exact mode, or the display will pick it again at the next restart."
                     ),
                 )
             })

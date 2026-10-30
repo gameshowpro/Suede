@@ -1010,6 +1010,13 @@ pub struct ProjectionGeometryStatus {
     pub warp_available: Option<bool>,
     pub reason: Option<String>,
     pub retained_warp: bool,
+    /// Whether Exact mode can be used on this appliance. The policy always
+    /// reports it; `None` only in a default (never computed) status.
+    #[serde(default)]
+    pub exact_available: Option<bool>,
+    /// Why Exact is unavailable, when it is.
+    #[serde(default)]
+    pub exact_reason: Option<String>,
 }
 
 impl ProjectionGeometryStatus {

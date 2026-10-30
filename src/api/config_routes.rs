@@ -3086,6 +3086,100 @@ mod tests {
         }
     }
 
+    /// The dry run's answer for the harness's working copy.
+    async fn dry_run(harness: &Harness) -> serde_json::Value {
+        let (status, body) =
+            call(harness, "GET", "/api/v1/projection/exact-transition", None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body
+    }
+
+    /// The dry run predicts the real bare `PUT {"mode":"exact"}`: keep for a
+    /// conforming layout, reset for a fractional one, and it writes nothing.
+    #[tokio::test]
+    async fn the_exact_dry_run_matches_the_real_switch_and_writes_nothing() {
+        for (stored, expected) in [
+            (conforming_simple_grid(), "keep"),
+            (fractional_simple_grid(), "reset"),
+        ] {
+            let harness = harness_with(true, stored.clone());
+            let revision = harness.state.store.revision();
+            let generation = harness.state.store.generation();
+            let before = harness.state.store.effective();
+            let body = dry_run(&harness).await;
+            assert_eq!(body["action"], expected, "{body}");
+            assert_eq!(body["revision"], revision);
+            assert_eq!(body["generation"], generation);
+            let reasons = body["reasons"].as_array().unwrap();
+            assert_eq!(reasons.is_empty(), expected == "keep", "{body}");
+            assert!(body.get("projection").is_none() && body.get("outputs").is_none());
+            assert_eq!(harness.state.store.revision(), revision);
+            assert_eq!(harness.state.store.generation(), generation);
+            assert_eq!(harness.state.store.effective(), before);
+
+            // The real write: the same keep/reset, judged by the outcome.
+            let (status, put) = call(
+                &harness,
+                "PUT",
+                "/api/v1/config/projection",
+                Some(r#"{"mode":"exact"}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{put}");
+            let written = harness.state.store.effective();
+            assert_eq!(
+                written.outputs == stored.outputs,
+                expected == "keep",
+                "dry run said {expected}"
+            );
+            // Already in Exact: a further switch changes nothing.
+            assert_eq!(dry_run(&harness).await["action"], "keep");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_exact_dry_run_reports_the_preview_basis() {
+        let harness = harness_with(true, conforming_simple_grid());
+        harness
+            .state
+            .store
+            .set_preview(Some(fractional_simple_grid()));
+        let body = dry_run(&harness).await;
+        assert_eq!(body["action"], "reset", "{body}");
+        let (_, generation) = harness.state.store.effective_with_generation();
+        assert_eq!(body["generation"], generation);
+        assert!(harness.state.store.get().projection.is_some());
+    }
+
+    #[tokio::test]
+    async fn the_exact_dry_run_on_a_tiled_appliance_is_unavailable() {
+        let mut document = DesiredState::new();
+        document.outputs.push(serde_json::from_str(OUTPUT).unwrap());
+        let harness = harness_with(false, document);
+        let body = dry_run(&harness).await;
+        assert_eq!(body["action"], "unavailable", "{body}");
+        assert_eq!(body["reasons"][0], crate::model::exact::TILED_REASON);
+    }
+
+    #[tokio::test]
+    async fn the_exact_dry_run_fails_like_the_write_when_no_reset_exists() {
+        let mut document = fractional_simple_grid();
+        document.outputs[1].position = None;
+        let harness = harness_with(true, document);
+        let (status, body) =
+            call(&harness, "GET", "/api/v1/projection/exact-transition", None).await;
+        let (put_status, put_body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"mode":"exact"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(put_status, status, "{put_body}");
+        assert_eq!(body["detail"], put_body["detail"]);
+    }
+
     #[tokio::test]
     async fn exact_on_a_tiled_appliance_is_refused_with_the_tiled_reason() {
         let mut document = DesiredState::new();

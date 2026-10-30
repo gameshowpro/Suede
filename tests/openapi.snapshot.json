@@ -1933,6 +1933,48 @@
         ],
         "type": "object"
       },
+      "ExactTransitionAction": {
+        "description": "What switching to Exact would do to the layout.",
+        "enum": [
+          "keep",
+          "reset",
+          "unavailable"
+        ],
+        "type": "string"
+      },
+      "ExactTransitionResponse": {
+        "description": "The answer to `GET /api/v1/projection/exact-transition`: what a switch to\nExact mode would do, with the document identity it was computed against.\nNo document is returned.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ExactTransitionAction"
+          },
+          "generation": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reasons": {
+            "description": "For `reset`, the Exact rules the current layout breaks; for\n`unavailable`, the single reason; empty for `keep`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "revision": {
+            "description": "Revision and generation of the effective document (the preview when\none is active, else the working copy) the prediction was made on,\nlike the recommendation and arrangement dry runs.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "action",
+          "reasons",
+          "revision",
+          "generation"
+        ],
+        "type": "object"
+      },
       "FixOutcome": {
         "description": "What a remediation did.",
         "properties": {
@@ -4504,6 +4546,20 @@
         "properties": {
           "effectiveMode": {
             "$ref": "#/components/schemas/ProjectionMode"
+          },
+          "exactAvailable": {
+            "description": "Whether Exact mode can be used on this appliance. The policy always\nreports it; `None` only in a default (never computed) status.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "exactReason": {
+            "description": "Why Exact is unavailable, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "reason": {
             "type": [
@@ -7899,6 +7955,30 @@
           }
         },
         "summary": "`GET /api/v1/projection/arrangement` — solve a grid arrangement without\nwriting it, exactly like [`recommend_resolution`]: reads the effective\ndocument and changes nothing. Pure arithmetic over a handful of outputs,\nso unlike the recommendation endpoint this needs no `spawn_blocking` —\nthe limits scan included, which re-runs the same placement a few hundred\ntimes at most.",
+        "tags": [
+          "projection"
+        ]
+      }
+    },
+    "/api/v1/projection/exact-transition": {
+      "get": {
+        "operationId": "get_exact_transition",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExactTransitionResponse"
+                }
+              }
+            },
+            "description": "What switching to exact mode would do; nothing is written"
+          },
+          "422": {
+            "description": "The layout would be reset but the Exact defaults cannot be derived (an enabled output has no mode or position)"
+          }
+        },
+        "summary": "`GET /api/v1/projection/exact-transition` — predict what `PUT\n/config/projection {\"mode\":\"exact\"}` would do to the layout, without\nwriting: keep it or reset it to the Exact defaults. Runs the real switch\n([`crate::projection_policy::transition`]) on a clone of the effective\ndocument, so the answer cannot drift from the write.",
         "tags": [
           "projection"
         ]

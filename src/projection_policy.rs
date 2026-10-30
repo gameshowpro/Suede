@@ -40,6 +40,17 @@ pub fn status(
     } else {
         (None, Some("warp capability is not verified; run content or a calibration pattern to probe the selected pipeline".into()))
     };
+    // Exact is the canvas slicer's contract; `exact::unavailable_reason` is
+    // the one statement of when an appliance cannot have it.
+    let exact_reason = if !cfg!(feature = "projection") {
+        Some(
+            "this build has no projection machinery; install a projection-enabled build"
+                .to_string(),
+        )
+    } else {
+        exact::unavailable_reason(allow_overlaps).map(str::to_string)
+    };
+    let exact_available = exact_reason.is_none();
     ProjectionGeometryStatus {
         requested_renderer: projection.renderer,
         requested_mode: projection.mode,
@@ -58,16 +69,17 @@ pub fn status(
                 ProjectionMode::Warp
             }
             ProjectionMode::Warp | ProjectionMode::Simple => ProjectionMode::Simple,
-            // Exact renders through the same uncorrected canvas plan as
-            // Simple, so reporting Simple here keeps every consumer's
-            // `== Warp` test right. Reporting `exact` itself (and the
-            // `exactAvailable` capability beside `warpAvailable`) is the
-            // status slice's work; see `exact::unavailable_reason`.
+            // Exact needs no capability probe beyond what Simple needs, so
+            // it is in effect whenever it is requested and available. A
+            // build or appliance that cannot run it renders Simple.
+            ProjectionMode::Exact if exact_available => ProjectionMode::Exact,
             ProjectionMode::Exact => ProjectionMode::Simple,
         },
         warp_available: available,
         reason,
         retained_warp: retained,
+        exact_available: Some(exact_available),
+        exact_reason,
     }
 }
 
@@ -91,7 +103,10 @@ pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
 /// Fill an omitted `projection.canvas` and each output's omitted `geometry`
 /// from `previous`, matching outputs by their `match` rule. Present values
 /// are never touched, and an output `next` no longer lists stays gone.
-fn refill_omitted(next: &mut DesiredState, previous: &DesiredState) {
+///
+/// Shared by [`preserve_retained`] and [`transition`], and through the
+/// latter by [`exact_dry_run`].
+pub(crate) fn refill_omitted(next: &mut DesiredState, previous: &DesiredState) {
     if let Some(old) = &previous.projection {
         if old.canvas.is_some() {
             let projection = next.projection.get_or_insert_with(Default::default);
@@ -177,6 +192,51 @@ pub fn transition(
             Ok(None)
         }
     }
+}
+
+/// What switching to Exact would do to a document, without doing it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactDryRun {
+    /// The document is already in Exact; a write changes nothing here.
+    AlreadyExact,
+    /// The layout conforms (once its correction is stripped) and is kept.
+    Keep,
+    /// The layout does not conform and is reset to the Exact defaults;
+    /// `reasons` are the rules it breaks.
+    Reset { reasons: Vec<String> },
+    /// Exact cannot be used here; the write would be refused with this
+    /// reason.
+    Unavailable { reason: String },
+}
+
+/// Predict a switch of `document`'s projection to Exact by making it: the
+/// mode is set on a clone, and [`transition`] (with its refill of omitted
+/// canvas and geometry, its strip and its tiled skip) runs on that clone
+/// against `document` as the previous working copy, exactly as a write does
+/// through `api::validate_configuration_against`. Fails with the reasons the
+/// write would be refused with when the reset itself cannot be derived.
+pub fn exact_dry_run(
+    document: &DesiredState,
+    allow_overlaps: bool,
+) -> Result<ExactDryRun, Vec<String>> {
+    if document
+        .projection
+        .as_ref()
+        .is_some_and(|projection| projection.mode == ProjectionMode::Exact)
+    {
+        return Ok(ExactDryRun::AlreadyExact);
+    }
+    if let Some(reason) = exact::unavailable_reason(allow_overlaps) {
+        return Ok(ExactDryRun::Unavailable {
+            reason: reason.to_string(),
+        });
+    }
+    let mut next = document.clone();
+    next.projection.get_or_insert_with(Default::default).mode = ProjectionMode::Exact;
+    Ok(match transition(&mut next, document, allow_overlaps)? {
+        Some(exact::Transition::Reset { reasons }) => ExactDryRun::Reset { reasons },
+        Some(exact::Transition::Kept) | None => ExactDryRun::Keep,
+    })
 }
 
 pub fn validate_activation(
@@ -813,7 +873,63 @@ mod tests {
         assert!(validate_activation(&exact, &simple, &Default::default(), false, true).is_ok());
         let status = status(&exact, &Default::default(), false, true, None);
         assert_eq!(status.requested_mode, ProjectionMode::Exact);
-        assert_eq!(status.effective_mode, ProjectionMode::Simple);
+        assert_eq!(status.effective_mode, ProjectionMode::Exact);
+    }
+
+    #[cfg(feature = "projection")]
+    #[test]
+    fn exact_availability_follows_the_tiled_policy() {
+        let exact = exact_saved();
+        let slicer = status(&exact, &Default::default(), false, true, None);
+        assert_eq!(slicer.exact_available, Some(true));
+        assert_eq!(slicer.exact_reason, None);
+        assert_eq!(slicer.effective_mode, ProjectionMode::Exact);
+
+        let tiled = status(&exact, &Default::default(), false, false, None);
+        assert_eq!(tiled.exact_available, Some(false));
+        assert_eq!(tiled.exact_reason.as_deref(), Some(exact::TILED_REASON));
+        assert_eq!(tiled.effective_mode, ProjectionMode::Simple);
+        assert_eq!(tiled.requested_mode, ProjectionMode::Exact);
+
+        // Reported whatever the requested mode is, so a client can disable
+        // the toggle before anyone asks for Exact.
+        let simple = with_mode(&exact, ProjectionMode::Simple);
+        assert_eq!(
+            status(&simple, &Default::default(), false, false, None).exact_available,
+            Some(false)
+        );
+    }
+
+    #[cfg(feature = "projection")]
+    #[test]
+    fn exact_with_the_cpu_renderer_is_effective_exact() {
+        let mut exact = exact_saved();
+        exact.projection.as_mut().unwrap().renderer = Renderer::Cpu;
+        let status = status(&exact, &Default::default(), true, true, None);
+        assert_eq!(status.effective_mode, ProjectionMode::Exact);
+        assert_eq!(status.exact_available, Some(true));
+    }
+
+    #[test]
+    fn the_dry_run_predicts_each_outcome_of_the_real_transition() {
+        let exact = exact_saved();
+        let simple = with_mode(&exact, ProjectionMode::Simple);
+        assert_eq!(exact_dry_run(&simple, true), Ok(ExactDryRun::Keep));
+        assert_eq!(exact_dry_run(&exact, true), Ok(ExactDryRun::AlreadyExact));
+        assert!(matches!(
+            exact_dry_run(&simple, false),
+            Ok(ExactDryRun::Unavailable { .. })
+        ));
+        let mut fractional = simple.clone();
+        fractional.outputs[0].geometry.as_mut().unwrap().slice.x += 0.0005;
+        let Ok(ExactDryRun::Reset { reasons }) = exact_dry_run(&fractional, true) else {
+            panic!("a fractional slice must reset");
+        };
+        assert!(!reasons.is_empty());
+        // The prediction is the real transition's own outcome.
+        let mut next = with_mode(&fractional, ProjectionMode::Exact);
+        let real = transition(&mut next, &fractional, true).unwrap();
+        assert_eq!(real, Some(exact::Transition::Reset { reasons }));
     }
 
     #[cfg(feature = "projection")]

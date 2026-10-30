@@ -387,6 +387,79 @@ pub async fn get_arrangement(
     }))
 }
 
+/// What switching to Exact would do to the layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum ExactTransitionAction {
+    /// The layout is kept (stripped of correction); also reported when the
+    /// document is already in Exact and a switch would change nothing.
+    Keep,
+    /// The layout is replaced by the Exact defaults.
+    Reset,
+    /// Exact cannot be used on this appliance; the switch would be refused
+    /// with `reasons[0]`.
+    Unavailable,
+}
+
+/// The answer to `GET /api/v1/projection/exact-transition`: what a switch to
+/// Exact mode would do, with the document identity it was computed against.
+/// No document is returned.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExactTransitionResponse {
+    pub action: ExactTransitionAction,
+    /// For `reset`, the Exact rules the current layout breaks; for
+    /// `unavailable`, the single reason; empty for `keep`.
+    pub reasons: Vec<String>,
+    /// Revision and generation of the effective document (the preview when
+    /// one is active, else the working copy) the prediction was made on,
+    /// like the recommendation and arrangement dry runs.
+    pub revision: u64,
+    pub generation: u64,
+}
+
+/// `GET /api/v1/projection/exact-transition` — predict what `PUT
+/// /config/projection {"mode":"exact"}` would do to the layout, without
+/// writing: keep it or reset it to the Exact defaults. Runs the real switch
+/// ([`crate::projection_policy::transition`]) on a clone of the effective
+/// document, so the answer cannot drift from the write.
+#[utoipa::path(
+    get,
+    path = "/api/v1/projection/exact-transition",
+    tag = "projection",
+    responses(
+        (status = 200, description = "What switching to exact mode would do; nothing is written", body = ExactTransitionResponse),
+        (status = 422, description = "The layout would be reset but the Exact defaults cannot be derived (an enabled output has no mode or position)"),
+    )
+)]
+pub async fn get_exact_transition(
+    State(state): State<crate::api::ApiState>,
+) -> ApiResult<Json<ExactTransitionResponse>> {
+    use crate::projection_policy::{exact_dry_run, ExactDryRun};
+    let (document, generation) = state.store.effective_with_generation();
+    let (action, reasons) = match exact_dry_run(&document, state.bootstrap.allow_overlaps) {
+        Ok(ExactDryRun::AlreadyExact | ExactDryRun::Keep) => {
+            (ExactTransitionAction::Keep, Vec::new())
+        }
+        Ok(ExactDryRun::Reset { reasons }) => (ExactTransitionAction::Reset, reasons),
+        Ok(ExactDryRun::Unavailable { reason }) => {
+            (ExactTransitionAction::Unavailable, vec![reason])
+        }
+        Err(errors) => {
+            return Err(ApiError::Validation(format!(
+                "cannot reset to the exact-mode defaults: {}",
+                errors.join("; ")
+            )))
+        }
+    };
+    Ok(Json(ExactTransitionResponse {
+        action,
+        reasons,
+        revision: document.revision,
+        generation,
+    }))
+}
+
 /// Pure recommendation implementation, kept separate so tests can call it
 /// synchronously without going through the executor or an `ApiState`.
 pub fn recommend_for_state(
@@ -438,6 +511,10 @@ pub fn recommend_for_state(
         .ok_or_else(|| "projection canvas aspect is unknown".to_string())?;
     if !(requested_aspect.is_finite() && requested_aspect > 0.0) {
         return Err("projection canvas aspect must be finite and positive".into());
+    }
+
+    if requested_mode == ProjectionMode::Exact {
+        return exact_recommendation(document, &converted, requested_aspect, generation);
     }
 
     let geometries: Vec<(&OutputConfig, OutputGeometry)> = outputs
@@ -702,6 +779,40 @@ pub fn recommend_for_state(
         unknown_limits: vec!["device/compositor allocation limit".into()],
         warnings,
         approximate,
+    })
+}
+
+/// The recommendation in Exact mode: there is nothing to recommend, because
+/// the canvas is whatever the output placements make it. The ideal width is
+/// the canvas's own, never approximate, with no presets.
+fn exact_recommendation(
+    document: &crate::model::DesiredState,
+    converted: &Option<ConvertLayoutResponse>,
+    requested_aspect: f64,
+    generation: u64,
+) -> Result<RecommendationResponse, String> {
+    let canvas = document
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.canvas)
+        .or_else(|| converted.as_ref().map(|candidate| candidate.canvas))
+        .ok_or_else(|| "projection canvas is unknown".to_string())?;
+    let (ideal_width, ideal_height) = canvas.dimensions()?;
+    let admissible_width = admissible_width(requested_aspect)?;
+    let admissible_height = canvas_height(admissible_width, requested_aspect)?;
+    Ok(RecommendationResponse {
+        revision: document.revision,
+        generation,
+        requested_aspect,
+        ideal_width: u64::from(ideal_width),
+        ideal_height: u64::from(ideal_height),
+        admissible_width,
+        admissible_height,
+        presets: Vec::new(),
+        known_limits: LIMITS,
+        unknown_limits: vec!["device/compositor allocation limit".into()],
+        warnings: vec!["exact mode: the canvas is defined by the output placements".into()],
+        approximate: false,
     })
 }
 
@@ -1176,6 +1287,26 @@ mod tests {
             recommend_for_state(&grid_state(ProjectionMode::Simple, KEYSTONE_PINS), 0).unwrap();
         assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
         assert!(!rec.approximate);
+    }
+
+    #[test]
+    fn exact_recommendation_is_the_canvas_with_no_presets() {
+        // Pins are irrelevant: Exact carries none, and nothing is sampled.
+        for pins in [IDENTITY_PINS, KEYSTONE_PINS] {
+            let state = grid_state(ProjectionMode::Exact, pins);
+            let canvas = state.projection.as_ref().unwrap().canvas.unwrap();
+            let rec = recommend_for_state(&state, 7).unwrap();
+            let (width, height) = canvas.dimensions().unwrap();
+            assert_eq!(rec.ideal_width, u64::from(width));
+            assert_eq!(rec.ideal_height, u64::from(height));
+            assert!(!rec.approximate);
+            assert!(rec.presets.is_empty());
+            assert_eq!(
+                rec.warnings,
+                ["exact mode: the canvas is defined by the output placements"]
+            );
+            assert_eq!(rec.generation, 7);
+        }
     }
 
     #[test]
