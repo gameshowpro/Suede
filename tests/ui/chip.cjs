@@ -20,8 +20,9 @@ function document() {
   }
   fixture.projection.mode = 'simple';
   fixture.projection.canvas = { aspect: 8000 / 1080, renderWidth: 8000 };
+  fixture.projection.sliceUnits = 'pixels';
   fixture.outputs.forEach((output, i) => {
-    output.geometry.slice = { x: i * 1920 / 8000, y: 0, width: 1920 / 8000, height: 1080 / 8000 };
+    output.geometry.slice = { x: i * 1920, y: 0, width: 1920, height: 1080 };
     output.geometry.rasterFootprint = structuredClone(output.geometry.slice);
   });
   return fixture;

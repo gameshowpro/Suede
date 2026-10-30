@@ -26,14 +26,16 @@ function simpleDocument() {
   });
   return fixture;
 }
-// What the daemon's reset produces: the 7680x1080 bounding box, scale 1.
+// What the daemon's reset produces: the 7680x1080 bounding box, scale 1, in
+// whole pixels (Exact is always pixels).
 function resetDocument(from) {
   const next = structuredClone(from);
   next.projection.mode = 'exact';
   next.projection.canvas = { aspect: 7680 / 1080, renderWidth: 7680 };
+  next.projection.sliceUnits = 'pixels';
   next.outputs.forEach((output, i) => {
     output.scale = 1;
-    output.geometry.slice = { x: i * 1920 / 7680, y: 0, width: 1920 / 7680, height: 1080 / 7680 };
+    output.geometry.slice = { x: i * 1920, y: 0, width: 1920, height: 1080 };
     output.geometry.rasterFootprint = structuredClone(output.geometry.slice);
   });
   return next;
@@ -179,7 +181,8 @@ function resetDocument(from) {
     assert.equal(puts.length, 1);
     assert.equal(puts[0].projection.mode, 'exact');
     assert.equal(puts[0].committed, false);
-    assert.deepEqual({ ...puts[0].projection, mode: 'simple' }, before.projection, 'only the mode differs');
+    assert.equal(puts[0].projection.sliceUnits, 'percent', 'the unit is always sent');
+    assert.deepEqual({ ...puts[0].projection, mode: 'simple', sliceUnits: undefined }, { ...before.projection, sliceUnits: undefined }, 'only the mode differs');
     assert.deepEqual(puts[0].outputs, before.outputs, 'no local geometry edit');
     assert.equal(await page.evaluate(() => config.outputs[1].scale), 1, 'the reset document was adopted');
     assert.equal(await page.locator('#mode-exact').getAttribute('aria-pressed'), 'true');
@@ -197,6 +200,7 @@ function resetDocument(from) {
     assert.match(await page.locator('#o-scale-hint').textContent(), /Fixed at 1\.0 in Exact mode/);
     assert.equal(await page.locator('#slice-x').getAttribute('step'), '1');
     assert(!(await visible('content-scale')), 'content scale hidden');
+    assert(!(await visible('slice-units-row')), 'no unit to choose in Exact');
     assert.match(await page.locator('#source-size').textContent(), /Crop 1920 × 1080 px/);
     assert.doesNotMatch(await page.locator('#canvas-current').textContent(), /one-to-one|1:1/, 'no claim without telemetry');
 
@@ -209,7 +213,8 @@ function resetDocument(from) {
     await settle();
     assert.equal(await page.locator('#slice-x').inputValue(), '1941', 'the field shows the rounded crop');
     assert(puts.length > putsBeforeCrop, 'the rounded crop is sent');
-    assert.equal(Math.round(puts.at(-1).outputs[1].geometry.slice.x * 7680 * 1e6) / 1e6, 1941, 'whole pixels sent');
+    assert.equal(puts.at(-1).outputs[1].geometry.slice.x, 1941, 'whole pixels sent');
+    assert.equal(puts.at(-1).projection.sliceUnits, 'pixels');
     await page.locator('#slice-x').fill('1920');
     await page.locator('#slice-x').dispatchEvent('change');
     await settle();
@@ -219,16 +224,15 @@ function resetDocument(from) {
     await page.locator('#slice-x').dispatchEvent('change');
     await settle();
     assert.equal(await page.locator('#warp-error').textContent(), reason);
-    assert.equal(await page.evaluate(() => Math.round(config.outputs[1].geometry.slice.x * 7680)), 1920, 'rolled back');
+    assert.equal(await page.evaluate(() => config.outputs[1].geometry.slice.x), 1920, 'rolled back');
     await page.locator('#slice-x').fill('1920');
     await page.locator('#slice-x').blur();
     await settle();
 
     // Fit canvas to outputs: shifts the slices so the box starts at the origin.
     await page.evaluate(() => {
-      config.outputs.forEach(o => { o.geometry.slice.x += 100 / 7680; });
+      config.outputs.forEach(o => { o.geometry.slice.x += 100; });
       config.projection.canvas = { aspect: 8000 / 1080, renderWidth: 8000 };
-      for (const o of config.outputs) { const s = o.geometry.slice; s.x = s.x * 7680 / 8000; s.width = 1920 / 8000; s.height = 1080 / 8000; }
     });
     const putsBeforeFit = puts.length;
     await page.locator('#canvas-fit').click();
@@ -236,7 +240,7 @@ function resetDocument(from) {
     const fit = puts.at(putsBeforeFit);
     assert.equal(fit.projection.canvas.renderWidth, 7680);
     assert(Math.abs(fit.projection.canvas.aspect - 7680 / 1080) < 1e-12);
-    assert.deepEqual(fit.outputs.map(o => Math.round(o.geometry.slice.x * 7680)), [0, 1920, 3840, 5760]);
+    assert.deepEqual(fit.outputs.map(o => o.geometry.slice.x), [0, 1920, 3840, 5760]);
 
     // Arrangement: px in, normalized per-axis fractions out, px back.
     await page.locator('#arrange-outputs').click();
@@ -274,8 +278,8 @@ function resetDocument(from) {
     // the slice inside the canvas.
     const whole = v => Math.abs(v - Math.round(v)) < 1e-6;
     const origin = index => page.evaluate(i => {
-      const s = config.outputs[i].geometry.slice, p = canvasPixels();
-      return [s.x * p.width, s.y * p.yDensity];
+      const s = sliceToPx(config.outputs[i].geometry.slice);
+      return [s.x, s.y];
     }, index);
     const drag = async (index, dx, dy) => {
       const name = await page.evaluate(i => config.outputs[i].match.name, index);
@@ -314,7 +318,8 @@ function resetDocument(from) {
     assert(await page.locator('#o-scale').isEnabled());
     assert(!(await page.locator('#canvas-width').evaluate(e => e.readOnly)));
     assert(!(await visible('canvas-fit')));
-    assert.equal(await page.locator('#slice-x').getAttribute('step'), 'any');
+    assert.equal(await page.locator('#slice-x').getAttribute('step'), '1', 'leaving Exact keeps pixels');
+    assert(await visible('slice-units-row'));
     assert(await visible('arrange-outputs'));
     await page.locator('#arrange-outputs').click();
     assert(await visible('arrange-mode-row'));

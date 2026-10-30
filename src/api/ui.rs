@@ -562,12 +562,6 @@ mod tests {
                 "locked at {0, 0}: a per-output nudge for a client driving the grid \
                  arrangement solve directly, not a manual geometry control",
             ),
-            (
-                "sliceUnits",
-                "not offered yet: the \"Slice from canvas\" panel's Percent/Pixels \
-                 radio will write it; until then the page keeps whatever unit the \
-                 document holds, since an omitted unit is kept",
-            ),
         ];
 
         let document: serde_json::Value =

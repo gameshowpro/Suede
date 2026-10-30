@@ -339,6 +339,9 @@ legend { font-size: 12px; color: var(--muted); font-weight: 600; padding: 0 6px;
   align-items: center; justify-content: center; font-size: 12px; cursor: grab; overflow: hidden;
   padding: 4px; text-align: center; user-select: none; touch-action: none;
   transition: box-shadow .15s ease, outline-color .15s ease; }
+.display-box .overhang { position: absolute; pointer-events: none; z-index: 1;
+  background: repeating-linear-gradient(45deg, color-mix(in srgb, var(--warn) 55%, transparent) 0 4px, transparent 4px 8px); }
+.display-box > :not(.overhang) { position: relative; z-index: 2; }
 .display-box:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 .display-box.inactive { border-color: var(--muted); border-style: dashed; background: transparent; color: var(--muted); }
 .display-box.offline { border-color: var(--warn); border-style: dashed;
@@ -436,7 +439,7 @@ button.pin-toggle[aria-pressed="false"]:hover:not(:disabled) { opacity: 1; color
 button.pin-toggle:disabled { opacity: 0.3; cursor: not-allowed; }
 #output-table tr { cursor: pointer; }
 #output-table tr.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
-#canvas-presets[hidden], #canvas-fit[hidden], #arrange-mode-row[hidden] { display: none; }
+#canvas-presets[hidden], #canvas-fit[hidden], #arrange-mode-row[hidden], #slice-units-row[hidden] { display: none; }
 dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; max-width: min(34em, calc(100vw - 32px)); }
 #arrange-dialog { max-width: min(42em, calc(100vw - 32px)); border-radius: 12px; }
 #arrange-dialog form { padding: 24px 28px; }
@@ -639,13 +642,21 @@ window.addEventListener("error", (event) => {
       </div>
 
       <fieldset id="shared-content">
-        <legend>Shared content selection</legend>
-        <p class="hint">Simple and Warp share this crop and content scale (100% = 1:1 pixels); destination pins are Warp calibration. <a data-docs-path="configuration/#projection-geometry" target="_blank" rel="noopener noreferrer">Learn about projection geometry</a>.</p>
-        <div class="fields">
-          <div><label for="slice-x">Crop X (canvas px)</label><input id="slice-x" type="number" step="any" data-config-field="slice"></div>
-          <div><label for="slice-y">Crop Y (canvas px)</label><input id="slice-y" type="number" step="any" data-config-field="slice"></div>
-          <div><label for="content-scale" id="content-scale-label">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="slice"><span class="hint" id="source-size"></span></div>
+        <legend>Slice from canvas</legend>
+        <p class="hint" id="slice-explain"></p>
+        <p class="hint"><a data-docs-path="configuration/#projection-geometry" target="_blank" rel="noopener noreferrer">Learn about projection geometry</a>.</p>
+        <div class="row" id="slice-units-row" role="radiogroup" aria-label="Slice units">
+          <label><input type="radio" name="slice-units" id="slice-units-percent" value="percent"> Percent</label>
+          <label><input type="radio" name="slice-units" id="slice-units-pixels" value="pixels"> Pixels</label>
         </div>
+        <div class="fields">
+          <div><label for="slice-x" id="slice-x-label">X</label><input id="slice-x" type="number" step="any" data-config-field="slice"></div>
+          <div><label for="slice-y" id="slice-y-label">Y</label><input id="slice-y" type="number" step="any" data-config-field="slice"></div>
+          <div><label for="slice-width" id="slice-width-label">Width</label><input id="slice-width" type="number" step="any" min="0" data-config-field="slice"></div>
+          <div><label for="slice-height" id="slice-height-label">Height</label><input id="slice-height" type="number" step="any" min="0" data-config-field="slice"></div>
+          <div><label for="content-scale" id="content-scale-label">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="slice"></div>
+        </div>
+        <p class="hint" id="source-size"></p>
       </fieldset>
 
       <fieldset id="output-warp" hidden>
@@ -1413,6 +1424,12 @@ async function writeConfig(path, options) {
   if (result?.revision != null && config) config.revision = result.revision;
   return result;
 }
+// Every write the page makes states its slice unit, so the daemon never has
+// to guess what the slices it receives are stored in.
+function withSliceUnits(doc) {
+  if (doc?.projection) doc.projection.sliceUnits = sliceUnits(doc);
+  return doc;
+}
 function pushPreview(material = false) {
   if (configBusy) return;
   editVersion++;
@@ -1463,6 +1480,7 @@ async function requestRecommendation(input) {
 function recommendationSignature() {
   const canvas = config?.projection?.canvas;
   return JSON.stringify({ canvas: canvas && { aspect: canvas.aspect, renderWidth: canvas.renderWidth }, mode: config?.projection?.mode,
+    sliceUnits: sliceUnits(),
     outputs: (config?.outputs ?? []).filter(o => o.enable !== false).map(o => ({ key: outputKey(o), mode: o.mode, transform: o.transform,
       slice: o.geometry?.slice, corners: o.geometry?.corners, center: o.geometry?.center })) });
 }
@@ -1479,7 +1497,7 @@ function sendPreview() {
   previewFlight = exclusiveWrite(async () => {
     lastPreviewAt = performance.now();
     const accepted = await writeConfig("/config", { method: "PUT",
-      headers: { "content-type": "application/json" }, body: JSON.stringify({ ...next, committed: false }) });
+      headers: { "content-type": "application/json" }, body: JSON.stringify(withSliceUnits({ ...next, committed: false })) });
     acceptedConfig = structuredClone(accepted);
     // Keep newer local pointer feedback while this response is in flight; a
     // Save, Revert or explicit Reload bumps editVersion to say so.
@@ -1564,7 +1582,7 @@ function saveCommitted() {
   // (see TemporarySettings in src/model/desired.rs) — this is a courtesy
   // that keeps the client's own view consistent with that guarantee.
   if (next.projection) delete next.projection.temporary;
-  return save("/config", { ...next, committed: true });
+  return save("/config", withSliceUnits({ ...next, committed: true }));
 }
 
 async function run(operation, successMessage) {
@@ -1792,20 +1810,13 @@ function configEntry(name) {
 // an output that is both attached and unpinned falls back to what it runs.
 // A slice's size in canvas pixels, at the precision that matters for it.
 function sizeLabel(r) {
-  const digits = r.configured?.geometry?.slice ? cropDigits(r.configured, r.configured.geometry.slice) : 0;
-  return `${editNumber(r.width, digits)}×${editNumber(r.height, digits)}`;
+  return `${editNumber(r.width, 0)}×${editNumber(r.height, 0)}`;
 }
 function canvasRect(known) {
   const configured = configEntry(known.name);
   const rect = known.output?.rect;
   const slice = configured?.geometry?.slice, canvas = canvasPixels();
-  if (slice && canvas) return {
-    x: slice.x * canvas.width,
-    y: slice.y * canvas.yDensity,
-    width: slice.width * canvas.width,
-    height: slice.height * canvas.yDensity,
-    configured,
-  };
+  if (slice && canvas) return { ...sliceToPx(slice, canvas), configured };
   return {
     x: configured?.position?.x ?? rect?.x ?? 0,
     y: configured?.position?.y ?? rect?.y ?? 0,
@@ -1835,7 +1846,7 @@ function addToLayout(name) {
   const mode = known?.output?.currentMode ?? COMMON_MODES[0];
   const raster = rasterDimensions({ match: { name }, mode, transform: "normal" });
   const canvas = canvasPixels();
-  const slice = canvas ? { x: 0, y: 0, width: raster.width / canvas.width, height: raster.height / canvas.yDensity } :
+  const slice = canvas ? pxToSlice({ x: 0, y: 0, width: raster.width, height: raster.height }, canvas) :
     { x: 0, y: 0, width: 1, height: 1 };
   (config.outputs ??= []).push({
     match: { name },
@@ -1903,6 +1914,32 @@ const OFFLINE_TOOLTIP =
 
 let layoutDrag = null;
 
+// Hatches the part of a display's slice that lies outside the canvas, which
+// renders black. Computed here from the held document (so a drag shows it as
+// it happens), in either unit and every mode. `px` is the slice in canvas
+// pixels; the strips are positioned as fractions of the box.
+function paintOverhang(el, px, pixels) {
+  el.querySelectorAll(":scope > .overhang").forEach(strip => strip.remove());
+  delete el.dataset.overhang;
+  if (!(px.width > 0 && px.height > 0)) return;
+  const past = sliceOverhang(px, pixels), parts = [];
+  const strip = (edge, style) => {
+    const node = document.createElement("div");
+    node.className = `overhang overhang-${edge}`;
+    node.setAttribute("aria-hidden", "true");
+    Object.assign(node.style, style);
+    el.appendChild(node);
+    parts.push(`${edge}:${past[edge]}`);
+  };
+  const fx = value => `${Math.min(100, value / px.width * 100)}%`, fy = value => `${Math.min(100, value / px.height * 100)}%`;
+  // The horizontal strips span the box; the vertical ones sit between them.
+  if (past.left > 0) strip("left", { left: 0, top: fy(past.top), bottom: fy(past.bottom), width: fx(past.left) });
+  if (past.right > 0) strip("right", { right: 0, top: fy(past.top), bottom: fy(past.bottom), width: fx(past.right) });
+  if (past.top > 0) strip("top", { left: 0, right: 0, top: 0, height: fy(past.top) });
+  if (past.bottom > 0) strip("bottom", { left: 0, right: 0, bottom: 0, height: fy(past.bottom) });
+  if (parts.length) el.dataset.overhang = parts.join(" ");
+}
+
 function renderLayout() {
   const container = $("layout");
   const box = container.getBoundingClientRect();
@@ -1921,8 +1958,15 @@ function renderLayout() {
         : "No outputs detected.");
 
   const canvas = canvasPixels();
-  const spanX = canvas?.width ?? Math.max(...entries.map(({ r }) => r.x + r.width), 1920);
-  const spanY = canvas?.height ?? Math.max(...entries.map(({ r }) => r.y + r.height), 1080);
+  // A slice may extend past the canvas (it renders black there), so the
+  // diagram covers the canvas and every slice; `originX`/`originY` is the
+  // canvas pixel at its top left corner.
+  const configured = canvas ? entries.filter(({ r }) => r.width > 0) : [];
+  const originX = Math.min(0, ...configured.map(({ r }) => r.x)), originY = Math.min(0, ...configured.map(({ r }) => r.y));
+  const spanX = canvas ? Math.max(canvas.width, ...configured.map(({ r }) => r.x + r.width)) - originX
+    : Math.max(...entries.map(({ r }) => r.x + r.width), 1920);
+  const spanY = canvas ? Math.max(canvas.height, ...configured.map(({ r }) => r.y + r.height)) - originY
+    : Math.max(...entries.map(({ r }) => r.y + r.height), 1080);
   // The diagram's width is fixed by the panel, so that sets the scale and the
   // box grows downwards to suit. Fitting a fixed-height box instead meant a
   // second row halved every rectangle: a 2x2 wall gave each display about
@@ -1949,8 +1993,8 @@ function renderLayout() {
   if (canvas) {
     const frame = document.createElement("div");
     frame.className = "canvas-frame";
-    frame.style.left = "10px"; frame.style.top = "10px";
-    frame.style.width = `${spanX * scale}px`; frame.style.height = `${spanY * scale}px`;
+    frame.style.left = `${10 - originX * scale}px`; frame.style.top = `${10 - originY * scale}px`;
+    frame.style.width = `${canvas.width * scale}px`; frame.style.height = `${canvas.height * scale}px`;
     frame.title = `Shared canvas ${canvas.width} × ${canvas.height}`;
     container.appendChild(frame);
   }
@@ -1966,8 +2010,8 @@ function renderLayout() {
     el.setAttribute("role", "button");
     el.setAttribute("aria-label", `Display ${known.name}`);
     if (r.width > 0) {
-      el.style.left = `${10 + r.x * scale}px`;
-      el.style.top = `${10 + r.y * scale}px`;
+      el.style.left = `${10 + (r.x - originX) * scale}px`;
+      el.style.top = `${10 + (r.y - originY) * scale}px`;
       el.style.width = `${r.width * scale}px`;
       el.style.height = `${r.height * scale}px`;
     } else {
@@ -1983,6 +2027,7 @@ function renderLayout() {
       (r.configured?.background
         ? `<span class="muted">bg: ${escape(backgroundLabel(r.configured.background))}</span>` : "");
 
+    if (r.width > 0 && canvas) paintOverhang(el, r, canvas);
     if (r.width > 0) {
       el.addEventListener("pointerdown", (event) => {
         if (event.button !== 0) return;
@@ -2025,17 +2070,12 @@ function renderLayout() {
 
         const pixels = canvasPixels();
         if (pixels) {
-          layoutDrag.initialSlice ??= {
-            x: r.x / pixels.width,
-            y: r.y / pixels.yDensity,
-            width: r.width / pixels.width,
-            height: r.height / pixels.yDensity,
-          };
+          layoutDrag.initialSlice ??= pxToSlice(r, pixels);
           output.geometry ??= identityGeometry(layoutDrag.initialSlice);
-          const initial = layoutDrag.initialSlice;
+          const initial = layoutDrag.initialSlice, start = sliceToPx(initial, pixels);
           output.geometry.slice = snapSliceOrigin(initial,
-            initial.x * pixels.width + dx / layoutDrag.scale,
-            initial.y * pixels.yDensity + dy / layoutDrag.scale,
+            start.x + dx / layoutDrag.scale,
+            start.y + dy / layoutDrag.scale,
             pixels);
         }
         // With a canvas present, geometry.slice above is the one layout
@@ -2051,11 +2091,14 @@ function renderLayout() {
         // Draw the box where the snapped slice is, not under the pointer.
         let shownDx = dx, shownDy = dy;
         if (pixels && output.geometry?.slice) {
-          shownDx = (output.geometry.slice.x - layoutDrag.initialSlice.x) * pixels.width * layoutDrag.scale;
-          shownDy = (output.geometry.slice.y - layoutDrag.initialSlice.y) * pixels.yDensity * layoutDrag.scale;
+          const start = sliceToPx(layoutDrag.initialSlice, pixels), now = sliceToPx(output.geometry.slice, pixels);
+          shownDx = (now.x - start.x) * layoutDrag.scale;
+          shownDy = (now.y - start.y) * layoutDrag.scale;
         }
         el.style.left = `${layoutDrag.initialLeft + shownDx}px`;
         el.style.top = `${layoutDrag.initialTop + shownDy}px`;
+        // The hatching follows the drag, from the held document.
+        if (pixels && output.geometry?.slice) paintOverhang(el, sliceToPx(output.geometry.slice, pixels), pixels);
 
         renderSharedContent();
         renderLayoutSize();
@@ -2270,15 +2313,9 @@ window.addEventListener("keydown", (event) => {
   const r = canvasRect(known);
 
   if (pixels) {
-    output.geometry ??= identityGeometry({
-      x: r.x / pixels.width,
-      y: r.y / pixels.yDensity,
-      width: r.width / pixels.width,
-      height: r.height / pixels.yDensity,
-    });
-    const slice = output.geometry.slice;
-    output.geometry.slice = snapSliceOrigin(slice,
-      slice.x * pixels.width + dxPx, slice.y * pixels.yDensity + dyPx, pixels);
+    output.geometry ??= identityGeometry(pxToSlice(r, pixels));
+    const slice = output.geometry.slice, start = sliceToPx(slice, pixels);
+    output.geometry.slice = snapSliceOrigin(slice, start.x + dxPx, start.y + dyPx, pixels);
   }
   // As the drag handler above: legacy position is written only when there
   // is no canvas, so geometry.slice stays the one representation once one
@@ -2540,14 +2577,11 @@ function outputEdited(field = document.activeElement?.id) {
     const pixels = canvasPixels(), slice = previous.geometry.slice;
     const oldRaster = rasterDimensions(previous), newRaster = rasterDimensions(entry);
     if (pixels && oldRaster && newRaster) {
-      const scale = oldRaster.width / (slice.width * pixels.width);
+      const units = sliceUnits(), old = sliceToPx(slice, pixels, units);
+      const scale = oldRaster.width / old.width;
       entry.geometry = structuredClone(previous.geometry);
-      entry.geometry.slice = {
-        x: slice.x,
-        y: slice.y,
-        width: newRaster.width / (scale * pixels.width),
-        height: newRaster.height / (scale * pixels.yDensity),
-      };
+      const size = pxToSlice({ x: 0, y: 0, width: newRaster.width / scale, height: newRaster.height / scale }, pixels, units);
+      entry.geometry.slice = { x: slice.x, y: slice.y, width: size.width, height: size.height };
     }
   }
   const index = (config.outputs ?? []).findIndex((o) => o.match?.name === selected);
@@ -2615,19 +2649,53 @@ for (const id of ["o-enable", "o-mode", "o-scale", "o-transform", "o-bg"]) {
 $("o-mode").addEventListener("input", renderModeNote);
 $("o-mode").addEventListener("change", renderModeNote);
 
+// --- slice units ------------------------------------------------------------
+//
+// `projection.sliceUnits` says what `geometry.slice` (and `rasterFootprint`
+// and `arrangeOffset`) are stored in: "percent" (fractions of the canvas;
+// also what a missing field means) or "pixels" (whole canvas pixels). This
+// pair of helpers is the only place the page converts between a stored slice
+// and canvas pixels, and mirrors the daemon (`effective_slice_px`):
+// x and width scale by the canvas width W, y and height by aspect * H
+// (`yDensity`), and edges round half up, floor(v + 0.5), so a width is the
+// difference of two rounded edges.
+function sliceUnits(doc = config) { return doc?.projection?.sliceUnits === "pixels" ? "pixels" : "percent"; }
+const roundEdge = value => Math.floor(value + 0.5);
+// The whole canvas pixels a stored slice stands for: {x, y, width, height}.
+function sliceToPx(slice, pixels = canvasPixels(), units = sliceUnits()) {
+  const kx = units === "pixels" ? 1 : pixels.width, ky = units === "pixels" ? 1 : pixels.yDensity;
+  const left = roundEdge(slice.x * kx), top = roundEdge(slice.y * ky);
+  const right = roundEdge((slice.x + slice.width) * kx), bottom = roundEdge((slice.y + slice.height) * ky);
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+// A canvas-pixel rectangle as it is stored: whole pixels as they are, or
+// fractions px / density. The inverse of sliceToPx up to the edge rounding.
+function pxToSlice(rect, pixels = canvasPixels(), units = sliceUnits()) {
+  if (units === "pixels") return { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) };
+  return { x: rect.x / pixels.width, y: rect.y / pixels.yDensity, width: rect.width / pixels.width, height: rect.height / pixels.yDensity };
+}
+// The canvas pixels of a slice that lie outside the canvas, per edge.
+function sliceOverhang(px, pixels = canvasPixels()) {
+  return {
+    left: Math.max(0, -px.x), top: Math.max(0, -px.y),
+    right: Math.max(0, px.x + px.width - pixels.width), bottom: Math.max(0, px.y + px.height - pixels.height),
+  };
+}
 // Manual moves (dragging and arrow keys) land on whole canvas pixels in
 // every mode: at 1:1 a fractional origin only resamples the picture, and
 // exact mode refuses one. Exact also keeps the slice inside the canvas.
-// `xPx`/`yPx` are the wanted origin in canvas pixels.
+// `xPx`/`yPx` are the wanted origin in canvas pixels; only the origin
+// changes, so a percent size is never rounded into the document.
 function snapSliceOrigin(slice, xPx, yPx, pixels) {
+  const units = sliceUnits();
   let x = Math.round(xPx), y = Math.round(yPx);
   if (isExact()) {
-    const maxX = Math.max(0, Math.round(pixels.width - slice.width * pixels.width));
-    const maxY = Math.max(0, Math.round(pixels.height - slice.height * pixels.yDensity));
-    x = Math.min(Math.max(x, 0), maxX);
-    y = Math.min(Math.max(y, 0), maxY);
+    const size = sliceToPx(slice, pixels, units);
+    x = Math.min(Math.max(x, 0), Math.max(0, pixels.width - size.width));
+    y = Math.min(Math.max(y, 0), Math.max(0, pixels.height - size.height));
   }
-  return { ...slice, x: x / pixels.width, y: y / pixels.yDensity };
+  const origin = pxToSlice({ x, y, width: 0, height: 0 }, pixels, units);
+  return { ...slice, x: origin.x, y: origin.y };
 }
 function canvasPixels(canvas = config?.projection?.canvas) {
   const width = canvas?.renderWidth, aspect = canvas?.aspect;
@@ -2663,67 +2731,114 @@ function rasterDimensions(output) {
     ? { width: mode.height, height: mode.width } : { width: mode.width, height: mode.height };
 }
 function selectedGeometry() { return configEntry(selected)?.geometry ?? null; }
+// "100% · 1:1": the scale as a percentage and as a ratio of canvas pixels to
+// output pixels.
+function scaleText(scale) {
+  const ratio = scale >= 1 ? `${displayNumber(scale, 2)}:1` : `1:${displayNumber(1 / scale, 2)}`;
+  return `${displayNumber(scale * 100, 2)}% · ${ratio}`;
+}
+const SLICE_EXPLANATION = {
+  exact: "Exact copies this rectangle of the canvas to the output one-to-one, in whole pixels.",
+  simple: "Simple stretches this rectangle of the canvas over the output without geometric correction.",
+  warp: "Warp stretches this rectangle of the canvas over the output, then the destination pins below correct the picture.",
+};
 function renderSharedContent() {
   const geometry = selectedGeometry(), mode = rasterDimensions(configEntry(selected)), pixels = canvasPixels();
   const container = $("shared-content");
   container.hidden = !geometry || !mode || !pixels;
-  // Exact has no content scale (it is 1 by definition), and the crop origin
-  // moves in whole pixels.
-  const exact = isExact();
+  // Exact has no content scale (it is 1 by definition), no size to edit, and
+  // is always whole pixels, so there is no unit to choose.
+  const exact = isExact(), units = sliceUnits(), inPixels = units === "pixels";
   $("content-scale-label").hidden = exact;
   $("content-scale").hidden = exact;
-  for (const id of ["slice-x", "slice-y"]) $(id).step = exact ? "1" : "any";
-  if (container.hidden || container.contains(document.activeElement)) return;
-  const slice = geometry.slice;
-  const scale = mode.width / (slice.width * pixels.width);
-  const digits = cropDigits(configEntry(selected), slice, pixels);
+  $("slice-units-row").hidden = exact;
+  $("slice-units-percent").checked = !inPixels;
+  $("slice-units-pixels").checked = inPixels;
+  const requested = config?.projection?.mode;
+  $("slice-explain").textContent = SLICE_EXPLANATION[requested] ?? SLICE_EXPLANATION.simple;
+  for (const id of ["slice-x", "slice-y", "slice-width", "slice-height"]) {
+    $(id).step = inPixels ? "1" : "any";
+    $(id).min = id.endsWith("width") || id.endsWith("height") ? (inPixels ? "1" : "0") : "";
+  }
+  for (const id of ["slice-width", "slice-height"]) $(id).readOnly = exact;
+  for (const id of ["slice-x", "slice-y", "slice-width", "slice-height"])
+    $(id).title = inPixels ? "Canvas pixels" : "Percent of the canvas";
+  if (container.hidden) return;
+  // Leave a number being typed alone; a radio or button may keep focus.
+  const active = document.activeElement;
+  if (container.contains(active) && active.matches?.("input[type=number]")) return;
+  const slice = geometry.slice, px = sliceToPx(slice, pixels, units);
+  const scale = mode.width / px.width, heightScale = mode.height / px.height;
   // One percent of content scale moves the far edge by raster/100 pixels.
   const scaleDigits = detectableDigits(mode.width / 100);
-  $("slice-x").value = editNumber(slice.x * pixels.width, digits);
-  $("slice-y").value = editNumber(slice.y * pixels.yDensity, digits);
+  const show = value => inPixels ? String(value) : editNumber(value * 100, 4);
+  $("slice-x").value = show(inPixels ? px.x : slice.x);
+  $("slice-y").value = show(inPixels ? px.y : slice.y);
+  $("slice-width").value = show(inPixels ? px.width : slice.width);
+  $("slice-height").value = show(inPixels ? px.height : slice.height);
   $("content-scale").value = editNumber(scale * 100, scaleDigits);
-  const heightScale = mode.height / (slice.height * pixels.yDensity);
   $("source-size").textContent = exact
-    ? `Crop ${mode.width} × ${mode.height} px (the output raster, fixed in Exact mode)`
-    : `Crop ${editNumber(slice.width * pixels.width, digits)} × ${editNumber(slice.height * pixels.yDensity, digits)} px; ` +
-      (Math.abs(scale - heightScale) < 1e-8 ? "uniform" : `vertical density ${displayNumber(heightScale * 100, 2)}%`);
+    ? `Crop ${mode.width} × ${mode.height} px (the output raster, fixed in Exact mode); scale ${scaleText(1)}`
+    : `Crop ${px.width} × ${px.height} px; scale ${scaleText(scale)}` +
+      (Math.abs(scale - heightScale) < 1e-3 ? "" : `; vertical ${scaleText(heightScale)}`);
 }
+// `change(slice, context)` edits a copy of the stored slice; `context.px` is
+// its whole canvas pixels, and `context.store(valuePx, axis)` turns a size in
+// canvas pixels into what the document stores.
 function editSharedContent(change) {
   const output = configEntry(selected), pixels = canvasPixels();
   if (!output?.geometry || !pixels) return;
-  const slice = structuredClone(output.geometry.slice);
+  const units = sliceUnits(), slice = structuredClone(output.geometry.slice);
   try {
-    change(slice, pixels, rasterDimensions(output));
+    change(slice, {
+      pixels, units, mode: rasterDimensions(output), px: sliceToPx(slice, pixels, units),
+      store: (valuePx, axis) => units === "pixels" ? Math.round(valuePx) : valuePx / (axis === "x" ? pixels.width : pixels.yDensity),
+    });
     if (![slice.x, slice.y, slice.width, slice.height].every(Number.isFinite) || slice.width <= 0 || slice.height <= 0)
       throw new Error("Crop values must be finite and the crop size must be positive.");
+    if (units === "pixels" && (slice.width < 1 || slice.height < 1))
+      throw new Error("The crop must be at least one pixel wide and tall.");
     output.geometry.slice = slice;
     setDisplayError("");
     pushPreview(true); renderSharedContent(); renderCanvas(); renderLayout(); renderLayoutSize();
   } catch (error) { setDisplayError(error.message); }
 }
-// Exact places slices at whole canvas pixels; reject a fraction here rather
-// than send a document the daemon would refuse.
-// Exact accepts whole canvas pixels only, so a typed fraction is rounded on
-// entry, and the field shows what was sent, rather than refused.
-function cropPixels(event) {
+// A typed value in the field's own unit, as the stored number: percent
+// fields hold percentages of the canvas, pixel fields whole pixels (a typed
+// fraction is rounded on entry, and the field shows what was sent, rather
+// than refused).
+function sliceFieldValue(event) {
   const value = Number(event.target.value);
-  if (!isExact() || !Number.isFinite(value)) return value;
+  if (!Number.isFinite(value)) return value;
+  if (sliceUnits() !== "pixels") return value / 100;
   const rounded = Math.round(value);
   event.target.value = String(rounded);
   return rounded;
 }
-$("slice-x").onchange = event => editSharedContent((slice, pixels) => {
-  slice.x = cropPixels(event) / pixels.width;
-});
-$("slice-y").onchange = event => editSharedContent((slice, pixels) => {
-  slice.y = cropPixels(event) / pixels.yDensity;
-});
-$("content-scale").onchange = event => editSharedContent((slice, pixels, mode) => {
+for (const [id, key] of [["slice-x", "x"], ["slice-y", "y"], ["slice-width", "width"], ["slice-height", "height"]])
+  $(id).onchange = event => editSharedContent(slice => { slice[key] = sliceFieldValue(event); });
+$("content-scale").onchange = event => editSharedContent((slice, { mode, store }) => {
   const scale = Number(event.target.value) / 100;
   if (!(scale > 0)) throw new Error("Content scale must be positive.");
-  slice.width = mode.width / (scale * pixels.width);
-  slice.height = mode.height / (scale * pixels.yDensity);
+  slice.width = store(mode.width / scale, "x");
+  slice.height = store(mode.height / scale, "y");
 });
+// The radio is the stored setting, not a display preference: write the held
+// document with the unit flipped and every slice as it is, and adopt the
+// converted document the daemon answers with.
+async function setSliceUnits(to) {
+  if (!config?.projection || configBusy || isExact() || sliceUnits() === to) { renderSharedContent(); return; }
+  editVersion++;
+  invalidateRecommendation();
+  previewQueued = structuredClone(config);
+  previewQueued.projection.sliceUnits = to;
+  schedulePreview();
+  renderWarpStatus();
+  await settleModeSwitch();
+  renderSharedContent(); renderCanvas();
+}
+for (const id of ["slice-units-percent", "slice-units-pixels"])
+  $(id).onchange = event => { if (event.target.checked) setSliceUnits(event.target.value); };
 
 const unitPins = [[0,0],[1,0],[1,1],[0,1]];
 function identityGeometry(slice) {
@@ -2751,12 +2866,7 @@ function ensureWarpGeometries() {
     const scale = entry.scale ?? entry.adopted?.scale ?? known?.output?.scale ?? 1;
     const x = entry.position ? entry.position.x * scale : 0;
     const y = entry.position ? entry.position.y * scale : 0;
-    entry.geometry = identityGeometry({
-      x: x / pixels.width,
-      y: y / pixels.yDensity,
-      width: raster.width / pixels.width,
-      height: raster.height / pixels.yDensity,
-    });
+    entry.geometry = identityGeometry(pxToSlice({ x, y, width: raster.width, height: raster.height }, pixels));
   }
 }
 
@@ -3713,13 +3823,6 @@ function detectableDigits(effect) {
   if (!(effect > 0) || !Number.isFinite(effect)) return 0;
   return Math.max(0, Math.floor(Math.log10(effect)));
 }
-// Crop position and size are in canvas pixels; one canvas pixel moves the
-// output by (raster / crop) pixels, so at 100% content scale integers suffice.
-function cropDigits(output, slice = output?.geometry?.slice, pixels = canvasPixels()) {
-  const raster = rasterDimensions(output);
-  if (!raster || !slice || !pixels) return 1;
-  return detectableDigits(raster.width / (slice.width * pixels.width));
-}
 function warpPinPrecision(axis) {
   const raster = rasterDimensions(warpOutput());
   const d = axis === 0 ? raster?.width : raster?.height;
@@ -3814,6 +3917,9 @@ function renderWarpStatus() {
   if (c?.session && output?.presentedGeneration != null) message +=
     ` Selected output: presentation receipt for control generation ${output.presentedGeneration} (not optical visibility).`;
   if (c?.lastFailure) message += ` ${c.lastFailure.reason ?? c.lastFailure.message ?? "Projection update failed."}`;
+  // Slices left past the canvas edge are accepted, not fixed: the daemon
+  // names each output and its overhang.
+  for (const overhang of g?.outOfCanvas ?? []) if (overhang.message) message += ` ${overhang.message}.`;
   $("warp-status").textContent = message;
   // Keeps the scale lock and pin-button disabled state honest
   // across a mode toggle or a capability change, without touching any
@@ -3923,19 +4029,19 @@ function fitCanvasToOutputs() {
   const pixels = canvasPixels();
   if (!pixels || !isExact()) return;
   const rects = (config.outputs ?? []).filter(o => o.enable !== false && o.geometry?.slice).map(o => {
-    const s = o.geometry.slice;
-    return { o, x: Math.round(s.x * pixels.width), y: Math.round(s.y * pixels.yDensity),
-      w: Math.round(s.width * pixels.width), h: Math.round(s.height * pixels.yDensity) };
+    const s = sliceToPx(o.geometry.slice, pixels);
+    return { o, x: s.x, y: s.y, w: s.width, h: s.height };
   });
   if (!rects.length) return;
   const left = Math.min(...rects.map(r => r.x)), top = Math.min(...rects.map(r => r.y));
   const width = Math.max(...rects.map(r => r.x + r.w)) - left, height = Math.max(...rects.map(r => r.y + r.h)) - top;
+  const fitted = { aspect: width / height, renderWidth: width }, fittedPixels = canvasPixels(fitted);
   for (const r of rects) {
-    const slice = { x: (r.x - left) / width, y: (r.y - top) / width, width: r.w / width, height: r.h / width };
+    const slice = pxToSlice({ x: r.x - left, y: r.y - top, width: r.w, height: r.h }, fittedPixels);
     r.o.geometry.slice = slice;
     r.o.geometry.rasterFootprint = structuredClone(slice);
   }
-  config.projection.canvas = { ...config.projection.canvas, aspect: width / height, renderWidth: width };
+  config.projection.canvas = { ...config.projection.canvas, ...fitted };
   pushPreview(true); renderCanvas(); renderSharedContent(); renderLayout(); renderLayoutSize();
 }
 $("canvas-fit").onclick = fitCanvasToOutputs;
@@ -3947,6 +4053,7 @@ function setProjectionMode(mode) {
     // The daemon fills every omitted projection field from its own defaults.
     config.projection ??= {};
     if (!config.projection.canvas) {
+      if (!config.projection.sliceUnits && !(config.outputs ?? []).some(o => o.geometry)) config.projection.sliceUnits = "pixels";
       config.projection.canvas = {
         aspect: defaultCanvasAspect(),
         renderWidth: defaultCanvasWidth(),
@@ -3963,7 +4070,7 @@ $("mode-simple").onclick = () => setProjectionMode("simple");
 $("mode-warp").onclick = () => setProjectionMode("warp");
 $("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
 $("warp-reset-pins").onclick = () => editGeometry(g=>g.corners=structuredClone(unitPins));
-function adoptCanvas(aspect, width, preserveAspectPixels = false) {
+function adoptCanvas(aspect, width) {
   if (!config) return;
   // A shared canvas edit is valid regardless of mode (section 1 of the
   // rework plan) and must not fabricate `mode` any more than an unrelated
@@ -3977,20 +4084,20 @@ function adoptCanvas(aspect, width, preserveAspectPixels = false) {
   const height = Math.max(1, Math.round(width / aspect));
   if (![aspect, width].every(v => Number.isFinite(v) && v > 0) || !Number.isInteger(width) || width > 32768 || height > 32768 || width * height > 64000000)
     throw new Error("Choose positive dimensions within 32768 pixels per axis and 64MP.");
-  const old = canvasPixels(config.projection.canvas);
-  if (preserveAspectPixels && old) for (const output of config.outputs ?? []) {
-    const slice = output.geometry?.slice;
-    if (!slice) continue;
-    slice.y = slice.y * old.yDensity / (aspect * height);
-    slice.height = slice.height * old.yDensity / (aspect * height);
-  }
+  // The slices are not touched here: the stored unit decides what a change of
+  // canvas does to them (percent fractions rescale with the canvas, pixels
+  // stay where they are), and the daemon reports a slice left past the edge.
+  // A canvas created where there was none starts in pixels, as the daemon's
+  // fresh documents do, unless slices are already stored.
+  if (!config.projection.canvas && !config.projection.sliceUnits &&
+      !(config.outputs ?? []).some(o => o.geometry)) config.projection.sliceUnits = "pixels";
   config.projection.canvas = { ...(config.projection.canvas ?? {}), aspect, renderWidth: width };
   ensureWarpGeometries();
   pushPreview(true); renderCanvas(); renderSharedContent();
 }
 function setCanvasWidth(width) { adoptCanvas(undefined, Number(width)); }
 $("canvas-width").onchange = () => { try { setCanvasWidth(Number($("canvas-width").value)); } catch (error) { setDisplayError(error.message); } };
-$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), undefined, true); } catch (error) { setDisplayError(error.message); } };
+$("canvas-aspect").onchange = () => { try { adoptCanvas(Number($("canvas-aspect").value), undefined); } catch (error) { setDisplayError(error.message); } };
 for (const event of ["focusin", "focusout"]) $("warp-canvas").addEventListener(event, () => setTimeout(renderCanvas));
 const warpSvg = $("warp-editor");
 function pointerPoint(event) {
