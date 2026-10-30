@@ -55,6 +55,24 @@ It checks profile include flags, import without activation, the unsaved-edit
 guard, output and audio mappings, activation precondition headers, and visible
 recovery from a stale activation response.
 
+## Exact mode browser check
+
+```sh
+NODE_PATH=/tmp/suede-ui-tests/node_modules \
+PLAYWRIGHT_BROWSERS_PATH=/tmp/suede-ui-tests/browsers \
+node tests/ui/exact-mode.cjs
+```
+
+The fixture intercepts every API request and never connects to an appliance.
+It checks the Exact | Simple | Warp toggle order and the disabled state with the
+daemon's reason, the transition dry run (keep, reset with a confirm, and the
+unavailable and 422 outcomes that block the switch), that the preview carries
+only `mode` and the returned document is adopted, the controls Exact hides or
+locks, a fractional crop refused in the page, a daemon 422 rolled back with its
+reason shown verbatim, Fit canvas to outputs, the arrangement dialog's pixel
+inputs sent as per-axis fractions of the seam extent, and the controls
+returning when the mode goes back to Simple.
+
 ## Manual appliance checklist
 
 Use isolated test state/processes as described in the Warp handoff. Record

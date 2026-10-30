@@ -436,7 +436,7 @@ button.pin-toggle[aria-pressed="false"]:hover:not(:disabled) { opacity: 1; color
 button.pin-toggle:disabled { opacity: 0.3; cursor: not-allowed; }
 #output-table tr { cursor: pointer; }
 #output-table tr.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
-#canvas-presets[hidden] { display: none; }
+#canvas-presets[hidden], #canvas-fit[hidden], #arrange-mode-row[hidden] { display: none; }
 dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; max-width: min(34em, calc(100vw - 32px)); }
 #arrange-dialog { max-width: min(42em, calc(100vw - 32px)); border-radius: 12px; }
 #arrange-dialog form { padding: 24px 28px; }
@@ -546,9 +546,10 @@ window.addEventListener("error", (event) => {
           <div><label for="canvas-aspect">Aspect (width / height)</label><input id="canvas-aspect" type="number" min="0.001" step="any" data-config-field="aspect"></div>
           <div><label for="canvas-width">Render width</label><input id="canvas-width" type="number" min="1" max="32768" step="1" data-config-field="renderWidth"></div>
           <div><label>Derived height</label><output id="canvas-height">—</output></div>
-          <div><label>Recommended width</label><output id="canvas-recommendation">Calculating…</output></div>
-          <div><label>Rendering scale</label><output id="canvas-rendering-scale">—</output></div>
+          <div id="canvas-recommendation-field"><label>Recommended width</label><output id="canvas-recommendation">Calculating…</output></div>
+          <div id="canvas-scale-field"><label>Rendering scale</label><output id="canvas-rendering-scale">—</output></div>
         </div>
+        <div class="row"><button class="action ghost" type="button" id="canvas-fit" hidden>Fit canvas to outputs</button></div>
         <div class="row" id="canvas-presets" hidden aria-label="Recommended render width presets"></div>
         <p id="canvas-current" class="hint"></p>
       </fieldset>
@@ -558,6 +559,7 @@ window.addEventListener("error", (event) => {
       <div class="row" style="margin-top:10px">
         <button class="action ghost" id="arrange-outputs">Arrange automatically…</button>
         <div class="mode-toggle" role="group" aria-label="Projection mode">
+          <button type="button" id="mode-exact" aria-pressed="false">Exact</button>
           <button type="button" id="mode-simple" aria-pressed="false">Simple</button>
           <button type="button" id="mode-warp" aria-pressed="false">Warp</button>
         </div>
@@ -640,7 +642,7 @@ window.addEventListener("error", (event) => {
         <div class="fields">
           <div><label for="slice-x">Crop X (canvas px)</label><input id="slice-x" type="number" step="any" data-config-field="slice"></div>
           <div><label for="slice-y">Crop Y (canvas px)</label><input id="slice-y" type="number" step="any" data-config-field="slice"></div>
-          <div><label for="content-scale">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="slice"><span class="hint" id="source-size"></span></div>
+          <div><label for="content-scale" id="content-scale-label">Content scale (%)</label><input id="content-scale" type="number" min="0.000001" step="any" data-config-field="slice"><span class="hint" id="source-size"></span></div>
         </div>
       </fieldset>
 
@@ -761,7 +763,7 @@ window.addEventListener("error", (event) => {
       <form method="dialog">
         <h2 id="arrange-title">Arrange outputs</h2>
         <p class="hint">Outputs fill rows in the listed order. Choose overlap or scale to keep fixed. Using all pixels may add black overhang; keeping slices inside may leave canvas unused. <a data-docs-path="configuration/#grid-arrangement" target="_blank" rel="noopener noreferrer">Learn about grid arrangement</a>.</p>
-        <div class="row arrange-mode-row">
+        <div class="row arrange-mode-row" id="arrange-mode-row">
           <div class="mode-toggle" role="group" aria-label="Arrange by">
             <button type="button" id="arrange-mode-overlap" aria-pressed="true">Overlap</button>
             <button type="button" id="arrange-mode-scale" aria-pressed="false">Scale</button>
@@ -774,11 +776,13 @@ window.addEventListener("error", (event) => {
         <div class="fields">
           <div><label for="arrange-rows">Rows</label><input id="arrange-rows" type="number" min="1" step="1" value="1"></div>
           <div><label for="arrange-columns">Columns</label><input id="arrange-columns" type="number" min="1" step="1" value="1"></div>
-          <div><label for="arrange-scale">Content scale (%)</label><input id="arrange-scale" type="number" min="0.01" step="any"></div>
-          <div><label for="arrange-overlap-x">Overlap X (%)</label><input id="arrange-overlap-x" type="number" min="0" max="99" step="any" value="0"></div>
-          <div><label for="arrange-overlap-y">Overlap Y (%)</label><input id="arrange-overlap-y" type="number" min="0" max="99" step="any" value="0"></div>
+          <div id="arrange-scale-field"><label for="arrange-scale">Content scale (%)</label><input id="arrange-scale" type="number" min="0.01" step="any"></div>
+          <div id="arrange-scale-fixed" hidden><label>Content scale</label><output>100%</output></div>
+          <div><label for="arrange-overlap-x" id="arrange-overlap-x-label">Overlap X (%)</label><input id="arrange-overlap-x" type="number" min="0" max="99" step="any" value="0"></div>
+          <div><label for="arrange-overlap-y" id="arrange-overlap-y-label">Overlap Y (%)</label><input id="arrange-overlap-y" type="number" min="0" max="99" step="any" value="0"></div>
         </div>
         <ol id="arrange-order" class="arrange-order" aria-label="Output order"></ol>
+        <p class="hint" id="arrange-exact-note" hidden>Canvas derived from the arrangement. Exact mode places every output at whole pixels, one-to-one.</p>
         <p class="hint" id="arrange-preview"></p>
         <div class="row"><button class="action" type="button" id="arrange-apply">Apply arrangement</button><button class="action ghost" id="arrange-cancel" value="cancel">Cancel</button></div>
       </form>
@@ -2404,10 +2408,12 @@ function refreshFieldHints(name) {
   // normalized to the as-viewed raster); the backend rejects any other scale
   // on a warp output. Lock the control rather than let an edit round-trip
   // into a rejected write, and say why.
-  const warpLocked = config?.projection?.mode === "warp";
-  $("o-scale").disabled = warpLocked;
-  $("o-scale").title = warpLocked ? "Warp requires scale 1×; locked while Warp mode is active." : "";
-  if (warpLocked) $("o-scale-hint").textContent += " Locked: Warp requires scale 1×.";
+  const warpLocked = config?.projection?.mode === "warp", exactLocked = isExact();
+  $("o-scale").disabled = warpLocked || exactLocked;
+  $("o-scale").title = exactLocked ? "Fixed at 1.0 in Exact mode."
+    : warpLocked ? "Warp requires scale 1×; locked while Warp mode is active." : "";
+  if (exactLocked) $("o-scale-hint").textContent += " Fixed at 1.0 in Exact mode.";
+  else if (warpLocked) $("o-scale-hint").textContent += " Locked: Warp requires scale 1×.";
 
   for (const [id, key] of [["pin-mode", "mode"], ["pin-output-scale", "scale"], ["pin-transform", "transform"]]) {
     const button = $(id), pinned = existing?.[key] != null;
@@ -2582,6 +2588,12 @@ function renderSharedContent() {
   const geometry = selectedGeometry(), mode = rasterDimensions(configEntry(selected)), pixels = canvasPixels();
   const container = $("shared-content");
   container.hidden = !geometry || !mode || !pixels;
+  // Exact has no content scale (it is 1 by definition), and the crop origin
+  // moves in whole pixels.
+  const exact = isExact();
+  $("content-scale-label").hidden = exact;
+  $("content-scale").hidden = exact;
+  for (const id of ["slice-x", "slice-y"]) $(id).step = exact ? "1" : "any";
   if (container.hidden || container.contains(document.activeElement)) return;
   const slice = geometry.slice;
   const scale = mode.width / (slice.width * pixels.width);
@@ -2592,8 +2604,10 @@ function renderSharedContent() {
   $("slice-y").value = editNumber(slice.y * pixels.yDensity, digits);
   $("content-scale").value = editNumber(scale * 100, scaleDigits);
   const heightScale = mode.height / (slice.height * pixels.yDensity);
-  $("source-size").textContent = `Crop ${editNumber(slice.width * pixels.width, digits)} × ${editNumber(slice.height * pixels.yDensity, digits)} px; ` +
-    (Math.abs(scale - heightScale) < 1e-8 ? "uniform" : `vertical density ${displayNumber(heightScale * 100, 2)}%`);
+  $("source-size").textContent = exact
+    ? `Crop ${mode.width} × ${mode.height} px (the output raster, fixed in Exact mode)`
+    : `Crop ${editNumber(slice.width * pixels.width, digits)} × ${editNumber(slice.height * pixels.yDensity, digits)} px; ` +
+      (Math.abs(scale - heightScale) < 1e-8 ? "uniform" : `vertical density ${displayNumber(heightScale * 100, 2)}%`);
 }
 function editSharedContent(change) {
   const output = configEntry(selected), pixels = canvasPixels();
@@ -2608,8 +2622,21 @@ function editSharedContent(change) {
     pushPreview(true); renderSharedContent(); renderCanvas(); renderLayout(); renderLayoutSize();
   } catch (error) { setDisplayError(error.message); }
 }
-$("slice-x").onchange = event => editSharedContent((slice, pixels) => { slice.x = Number(event.target.value) / pixels.width; });
-$("slice-y").onchange = event => editSharedContent((slice, pixels) => { slice.y = Number(event.target.value) / pixels.yDensity; });
+// Exact places slices at whole canvas pixels; reject a fraction here rather
+// than send a document the daemon would refuse.
+function requireWholePixel(value, label) {
+  if (!Number.isInteger(value)) throw new Error(`${label} must be a whole number of pixels in Exact mode.`);
+}
+$("slice-x").onchange = event => editSharedContent((slice, pixels) => {
+  const value = Number(event.target.value);
+  if (isExact()) requireWholePixel(value, "Crop X");
+  slice.x = value / pixels.width;
+});
+$("slice-y").onchange = event => editSharedContent((slice, pixels) => {
+  const value = Number(event.target.value);
+  if (isExact()) requireWholePixel(value, "Crop Y");
+  slice.y = value / pixels.yDensity;
+});
 $("content-scale").onchange = event => editSharedContent((slice, pixels, mode) => {
   const scale = Number(event.target.value) / 100;
   if (!(scale > 0)) throw new Error("Content scale must be positive.");
@@ -2690,9 +2717,43 @@ function saveArrangeAllowUnused(value) {
   try { localStorage.setItem("suede.arrangeAllowUnused", String(value)); } catch {}
 }
 
+// Exact arranges in whole pixels at content scale 1, so the dialog is always
+// in overlap mode there and shows px instead of percent. The stored
+// preference is left alone for when the operator leaves Exact.
+const arrangeEffectiveMode = () => isExact() ? "overlap" : arrangeMode;
+function renderArrangeVariant() {
+  const exact = isExact();
+  $("arrange-mode-row").hidden = exact;
+  $("arrange-scale-field").hidden = exact;
+  $("arrange-scale-fixed").hidden = !exact;
+  $("arrange-exact-note").hidden = !exact;
+  $("arrange-overlap-x-label").textContent = exact ? "Overlap X (px)" : "Overlap X (%)";
+  $("arrange-overlap-y-label").textContent = exact ? "Overlap Y (px)" : "Overlap Y (%)";
+  for (const id of ["arrange-overlap-x", "arrange-overlap-y"]) {
+    $(id).step = exact ? "1" : "any";
+    if (exact) $(id).removeAttribute("max"); else $(id).max = "99";
+  }
+}
+// The raster extent an overlap fraction applies to on each axis, as the
+// solver computes it: the smaller of the two rasters a seam joins, where a
+// column is as wide as its widest output and a row as tall as its tallest.
+// The first seam with a positive extent is the reference; an axis with no
+// seam has none (0).
+function arrangeSeamExtents(rows, columns) {
+  const colWidth = Array(columns).fill(0), rowHeight = Array(rows).fill(0);
+  (config?.outputs ?? []).filter(o => o.enable !== false).forEach((output, index) => {
+    const raster = rasterDimensions(output), row = Math.floor(index / columns), column = index % columns;
+    if (!raster || row >= rows) return;
+    colWidth[column] = Math.max(colWidth[column], raster.width);
+    rowHeight[row] = Math.max(rowHeight[row], raster.height);
+  });
+  const seam = extents => extents.slice(1).map((e, i) => Math.min(e, extents[i])).find(e => e > 0) ?? 0;
+  return { x: seam(colWidth), y: seam(rowHeight) };
+}
 function setArrangeMode(mode) {
   arrangeMode = mode;
   saveArrangeMode(mode);
+  mode = arrangeEffectiveMode();
   $("arrange-mode-overlap").setAttribute("aria-pressed", String(mode === "overlap"));
   $("arrange-mode-scale").setAttribute("aria-pressed", String(mode === "scale"));
   // The family not being sent is read-only here: renderArrangement() is its
@@ -2740,6 +2801,19 @@ function arrangeRequest() {
   // fills both axes) but the daemon's default is false either way, so the
   // dry run must say so explicitly rather than relying on that default.
   const allowUnusedCanvas = arrangeAllowUnused;
+  if (isExact()) {
+    // Whole pixels typed, fractions of the seam's raster extent sent; the
+    // daemon rounds back to the same pixel count. No contentScale: it is 1.
+    const extents = arrangeSeamExtents(rows, columns);
+    const overlap = (id, extent, label) => {
+      const text = $(id).value.trim(), px = text === "" ? 0 : Number(text);
+      if (!(Number.isInteger(px) && px >= 0)) throw new Error(`${label} overlap must be a whole number of pixels.`);
+      if (extent > 0 && px >= extent) throw new Error(`${label} overlap must be less than the ${extent} px seam.`);
+      return extent > 0 ? px / extent : 0;
+    };
+    return { rows, columns, overlapX: overlap("arrange-overlap-x", extents.x, "Horizontal"),
+      overlapY: overlap("arrange-overlap-y", extents.y, "Vertical"), allowUnusedCanvas };
+  }
   if (arrangeMode === "scale") {
     const contentScale = Number($("arrange-scale").value) / 100;
     if (!(contentScale > 0 && Number.isFinite(contentScale))) throw new Error("Content scale must be positive.");
@@ -2793,6 +2867,20 @@ function arrangeUnavailable(message) {
 
 function renderArrangement(solution) {
   const resolved = solution.arrangement;
+  if (isExact()) {
+    arrangeField("arrange-overlap-x", String(solution.overlapXPx ?? 0));
+    arrangeField("arrange-overlap-y", String(solution.overlapYPx ?? 0));
+    let text = resolved.rows > 1 || resolved.columns > 1
+      ? `Overlap: ${solution.overlapXPx ?? 0} px H, ${solution.overlapYPx ?? 0} px V` : "Single output";
+    if (solution.canvas) {
+      const c = solution.canvas, h = Math.max(1, Math.round(c.renderWidth / c.aspect));
+      text += ` · Canvas derived from the arrangement: ${c.renderWidth} × ${h} px`;
+    }
+    for (const warning of solution.warnings ?? []) text += ` · ⚠ ${warning}`;
+    $("arrange-preview").textContent = text;
+    $("arrange-apply").disabled = false;
+    return;
+  }
   if (arrangeMode === "scale") {
     arrangeField("arrange-overlap-x", editNumber(resolved.overlapX * 100, 1));
     arrangeField("arrange-overlap-y", editNumber(resolved.overlapY * 100, 1));
@@ -2841,10 +2929,17 @@ $("arrange-outputs").onclick = () => {
   }
   $("arrange-rows").value = rows;
   $("arrange-columns").value = cols;
-  if (record) {
+  renderArrangeVariant();
+  if (record && isExact()) {
+    const extents = arrangeSeamExtents(rows, cols);
+    $("arrange-overlap-x").value = String(Math.round(record.overlapX * extents.x));
+    $("arrange-overlap-y").value = String(Math.round(record.overlapY * extents.y));
+  } else if (record) {
     $("arrange-overlap-x").value = editNumber(record.overlapX * 100, 1);
     $("arrange-overlap-y").value = editNumber(record.overlapY * 100, 1);
     $("arrange-scale").value = editNumber(record.contentScale * 100, 2);
+  } else if (isExact()) {
+    for (const id of ["arrange-overlap-x", "arrange-overlap-y"]) $(id).value = "0";
   } else {
     for (const id of ["arrange-overlap-x", "arrange-overlap-y"]) {
       const value = Number($(id).value);
@@ -3428,6 +3523,9 @@ const outputKey = o => {
     `edid:${m.name ?? ""}:${m.make ?? ""}:${m.model ?? ""}:${m.serial ?? ""}`;
 };
 const warpOutput = () => configEntry(selected);
+function isExact() { return config?.projection?.mode === "exact"; }
+// Older daemons report no `exactAvailable`; only an explicit false disables.
+function exactAvailable() { return projectionStats?.geometry?.exactAvailable !== false; }
 const warpAvailable = () => projectionStats?.geometry?.warpAvailable === true && config?.projection?.renderer !== "cpu";
 const warpEditable = () => warpAvailable() && config?.projection?.mode === "warp" && !configBusy;
 let warpDrag = null, rejectedHandle = null;
@@ -3611,9 +3709,14 @@ function renderWarpEditor() {
 function renderWarpStatus() {
   const g = projectionStats?.geometry, c = projectionStats?.control;
   const requested = config?.projection?.mode ?? "simple", forcedSimple = requested === "warp" && !warpAvailable();
-  $("warp-capability").textContent = forcedSimple
+  $("warp-capability").textContent = requested === "exact"
+    ? "Exact: every output shows its canvas pixels one-to-one. Scaling controls are unavailable."
+    : forcedSimple
     ? "Simple is selected while Warp intent and calibration are retained."
     : requested === "warp" ? "Warp capability verified. Shared crop edits keep the calibration." : "Simple uses the shared canvas and crop without geometric correction.";
+  $("mode-exact").setAttribute("aria-pressed", String(requested === "exact"));
+  $("mode-exact").disabled = !exactAvailable() || configBusy;
+  $("mode-exact").title = !exactAvailable() ? (g?.exactReason ?? "Exact mode is unavailable.") : "";
   $("mode-simple").setAttribute("aria-pressed", String(forcedSimple || requested === "simple"));
   $("mode-warp").setAttribute("aria-pressed", String(!forcedSimple && requested === "warp"));
   $("mode-simple").disabled = configBusy;
@@ -3638,6 +3741,7 @@ function renderWarpStatus() {
   renderDirtyStatus();
 }
 function oneToOneStatus() {
+  if (isExact()) return "Exact mode: every output is one-to-one.";
   const g = warpOutput()?.geometry, mode = rasterDimensions(warpOutput()), c = config?.projection?.canvas;
   if (!g || !mode || !c) return "One-to-one status unavailable.";
   const h = Math.max(1, Math.round(c.renderWidth / c.aspect));
@@ -3664,6 +3768,16 @@ function renderCanvas() {
     $("canvas-width").value = c?.renderWidth ?? width;
   }
   $("canvas-height").textContent = pixels ? `${pixels.height} (${mp} MP)` : `${derivedHeight} (${derivedMp} MP)`;
+  // In Exact the canvas follows the output placements: no recommendation, no
+  // rendering scale, and the size fields only display (use "Fit canvas to
+  // outputs" or the arrangement to change it).
+  const exact = isExact();
+  $("canvas-width").readOnly = exact;
+  $("canvas-aspect").readOnly = exact;
+  $("canvas-fit").hidden = !exact;
+  $("canvas-recommendation-field").hidden = exact;
+  $("canvas-scale-field").hidden = exact;
+  if (exact) { $("canvas-presets").hidden = true; return; }
   if (!recommendation) return;
   $("canvas-recommendation").textContent = `${recommendation.idealWidth} px`;
   const ratio = width / recommendation.idealWidth;
@@ -3691,8 +3805,68 @@ function renderCanvas() {
   }
   $("canvas-presets").dataset.key = presetKey;
 }
+// The only place Exact asks the operator anything. Returns true to go ahead.
+// Remove the call in `enterExact` (and this function) to switch silently.
+function confirmExactReset(reasons) {
+  const why = (reasons ?? []).join("; ");
+  return confirm(`Switching to Exact resets the layout${why ? `: ${why}` : ""}. Continue?`);
+}
+// Asks the daemon what entering Exact would do to the current working copy
+// (`GET /projection/exact-transition`), confirms a reset, then previews
+// `mode: "exact"` and nothing else. The daemon's switching rules decide the
+// geometry; the document the preview returns is adopted as for any edit.
+async function enterExact() {
+  if (!exactAvailable()) { toast(projectionStats?.geometry?.exactReason ?? "Exact mode is unavailable.", true); return; }
+  let verdict;
+  try {
+    await flushPreviews();
+    verdict = await api("/projection/exact-transition");
+  } catch (error) {
+    setDisplayError(error.message); toast(error.message, true); return;
+  }
+  if (verdict.action === "unavailable") {
+    const message = (verdict.reasons ?? []).join("; ") || "Exact mode is unavailable.";
+    setDisplayError(message); toast(message, true); return;
+  }
+  if (verdict.action === "reset" && !confirmExactReset(verdict.reasons)) return;
+  setDisplayError("");
+  config.projection = { ...config.projection, mode: "exact" };
+  pushPreview(true); renderWarpEditor(); renderLayoutSize();
+  await settleModeSwitch();
+}
+// After a switch into or out of Exact the preview response replaces `config`
+// (slices, canvas and scales may all have changed), so redraw from it.
+async function settleModeSwitch() {
+  await flushPreviews();
+  renderProjection(true); renderLayout(); renderLayoutSize();
+  if (selected) refreshFieldHints(selected);
+}
+// Pushes the whole-pixel bounding box of the enabled outputs' slices as the
+// canvas, shifting every slice so the box starts at 0,0. The daemon validates.
+function fitCanvasToOutputs() {
+  const pixels = canvasPixels();
+  if (!pixels || !isExact()) return;
+  const rects = (config.outputs ?? []).filter(o => o.enable !== false && o.geometry?.slice).map(o => {
+    const s = o.geometry.slice;
+    return { o, x: Math.round(s.x * pixels.width), y: Math.round(s.y * pixels.yDensity),
+      w: Math.round(s.width * pixels.width), h: Math.round(s.height * pixels.yDensity) };
+  });
+  if (!rects.length) return;
+  const left = Math.min(...rects.map(r => r.x)), top = Math.min(...rects.map(r => r.y));
+  const width = Math.max(...rects.map(r => r.x + r.w)) - left, height = Math.max(...rects.map(r => r.y + r.h)) - top;
+  for (const r of rects) {
+    const slice = { x: (r.x - left) / width, y: (r.y - top) / width, width: r.w / width, height: r.h / width };
+    r.o.geometry.slice = slice;
+    r.o.geometry.rasterFootprint = structuredClone(slice);
+  }
+  config.projection.canvas = { ...config.projection.canvas, aspect: width / height, renderWidth: width };
+  pushPreview(true); renderCanvas(); renderSharedContent(); renderLayout(); renderLayoutSize();
+}
+$("canvas-fit").onclick = fitCanvasToOutputs;
 function setProjectionMode(mode) {
   if (!config || (mode === "warp" && !warpAvailable())) return;
+  if (mode === "exact") { if (!isExact()) enterExact(); return; }
+  const leavingExact = isExact();
   if (mode === "warp") {
     // The daemon fills every omitted projection field from its own defaults.
     config.projection ??= {};
@@ -3706,7 +3880,9 @@ function setProjectionMode(mode) {
   }
   config.projection = { ...config.projection, mode };
   pushPreview(true); renderWarpEditor(); renderLayoutSize();
+  if (leavingExact) settleModeSwitch();
 }
+$("mode-exact").onclick = () => setProjectionMode("exact");
 $("mode-simple").onclick = () => setProjectionMode("simple");
 $("mode-warp").onclick = () => setProjectionMode("warp");
 $("warp-reset-centers").onclick = () => editGeometry(g=>g.center=[.5,.5]);
