@@ -5759,8 +5759,18 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 wayland,
                 sample,
                 slice,
+                sampling,
                 ..
             } = presenter;
+            // The kernel this output was classified with, cut down to what
+            // the CPU implements. An exact output has no `sample` table, so
+            // the choice is moot for it.
+            let kernel = match *sampling {
+                super::warp_update::SamplingPath::Sampled(kernel) => {
+                    super::resample::cpu_kernel(kernel)
+                }
+                super::warp_update::SamplingPath::Exact(_) => super::resample::Kernel::Bilinear,
+            };
             let (_, map) = &mut wayland.as_mut().unwrap().buffers[slot];
             let blend = Blend {
                 canvas,
@@ -5774,6 +5784,7 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
                 source_y: slice.y.max(0) as u32,
                 width,
                 sample: sample.as_ref(),
+                kernel,
             };
 
             let row_bytes = width as usize * 4;
@@ -5858,6 +5869,13 @@ fn present_frame_cpu(state: &mut State, handle: &QueueHandle<State>) {
 struct AxisSamples {
     x: Vec<Option<f64>>,
     y: Vec<Option<f64>>,
+    /// The inclusive range of unflipped canvas texels per axis the
+    /// non-bilinear kernels may read: the texels that intersect the warp's
+    /// source rectangle, as the GPU shader clamps its taps to. Unbounded
+    /// (to be intersected with the captured canvas) when the warp has no
+    /// source rectangle.
+    texels_x: (i64, i64),
+    texels_y: (i64, i64),
 }
 
 impl AxisSamples {
@@ -5890,7 +5908,19 @@ impl AxisSamples {
                     .map(|p| p[1])
             })
             .collect();
-        Self { x, y }
+        let texels = |axis: usize| match warp.source_rect() {
+            Some(rect) => (
+                rect[axis].floor() as i64,
+                (rect[axis] + rect[axis + 2]).ceil() as i64 - 1,
+            ),
+            None => (0, i64::MAX),
+        };
+        Self {
+            x,
+            y,
+            texels_x: texels(0),
+            texels_y: texels(1),
+        }
     }
 }
 
@@ -5914,6 +5944,10 @@ struct Blend<'a> {
     /// `Some` is the common fractional crop/scale path. `None` is the
     /// exact integer-copy proof and deliberately retains its old sampling.
     sample: Option<&'a AxisSamples>,
+    /// How the fractional branch of [`Blend::sample`] interpolates; only
+    /// `nearest`, `bilinear` and `bicubic` are implemented here (see
+    /// [`super::resample::cpu_kernel`]). Ignored when `sample` is `None`.
+    kernel: super::resample::Kernel,
 }
 
 impl Blend<'_> {
@@ -5984,29 +6018,99 @@ impl Blend<'_> {
             source_y
         };
         // The exact path remains a byte-for-byte texel copy.  Fractional
-        // source rectangles use bilinear texel-center sampling, matching the
-        // GPU's linearly filtered source mapping.
-        let x0 = (source_x - 0.5).floor() as u32;
-        let y0 = (source_y - 0.5).floor() as u32;
-        let x1 = (x0 + 1).min(self.usable_width - 1);
-        let y1 = (y0 + 1).min(self.usable_height - 1);
-        let tx = source_x - (f64::from(x0) + 0.5);
-        let ty = source_y - (f64::from(y0) + 0.5);
+        // source rectangles use the configured kernel at texel-center
+        // positions, matching the GPU's.
         let channel = |pixel_x: u32, pixel_y: u32, index: usize| {
             self.canvas[pixel_y as usize * self.stride as usize
                 + pixel_x as usize * self.format.bytes
                 + index] as f64
         };
-        let interpolate = |index| {
-            ((1.0 - ty) * ((1.0 - tx) * channel(x0, y0, index) + tx * channel(x1, y0, index))
-                + ty * ((1.0 - tx) * channel(x0, y1, index) + tx * channel(x1, y1, index)))
-            .round() as u8
+        let (blue, green, red) = (self.format.blue, self.format.green, self.format.red);
+        let (bounds_x, bounds_y) = match self.kernel {
+            super::resample::Kernel::Nearest | super::resample::Kernel::Bicubic => {
+                let (width, height) = (
+                    i64::from(self.usable_width) - 1,
+                    i64::from(self.usable_height) - 1,
+                );
+                let clip = |(lo, hi): (i64, i64), last: i64| (lo.max(0), hi.min(last));
+                let x = clip(axes.texels_x, width);
+                let y = clip(axes.texels_y, height);
+                // `axes` is in unflipped canvas rows; the position above is
+                // in captured rows.
+                let y = if self.y_invert {
+                    (height - y.1, height - y.0)
+                } else {
+                    y
+                };
+                (x, y)
+            }
+            _ => ((0, 0), (0, 0)),
         };
-        Some([
-            interpolate(self.format.blue),
-            interpolate(self.format.green),
-            interpolate(self.format.red),
-        ])
+        // Reads a texel, an out-of-range index clamped to the nearest edge
+        // texel of the source rectangle like the shader's taps are.
+        let fetch = |tap_x: i64, tap_y: i64, index: usize| {
+            channel(
+                tap_x.clamp(bounds_x.0, bounds_x.1.max(bounds_x.0)) as u32,
+                tap_y.clamp(bounds_y.0, bounds_y.1.max(bounds_y.0)) as u32,
+                index,
+            )
+        };
+        match self.kernel {
+            super::resample::Kernel::Nearest => {
+                let (tap_x, tap_y) = (source_x.floor() as i64, source_y.floor() as i64);
+                Some([
+                    fetch(tap_x, tap_y, blue) as u8,
+                    fetch(tap_x, tap_y, green) as u8,
+                    fetch(tap_x, tap_y, red) as u8,
+                ])
+            }
+            super::resample::Kernel::Bicubic => {
+                // Separable Catmull-Rom over the 4x4 texels around the
+                // position, the weights normalized to sum to one and the
+                // result clamped before rounding (the kernel overshoots at
+                // hard edges), as `resample::reference_sample` defines it.
+                let f = [source_x - 0.5, source_y - 0.5];
+                let base = [f[0].floor(), f[1].floor()];
+                let t = [f[0] - base[0], f[1] - base[1]];
+                let base = [base[0] as i64, base[1] as i64];
+                let weights = |axis: usize| {
+                    let mut w = [0.0; 4];
+                    for (k, w) in w.iter_mut().enumerate() {
+                        *w = super::resample::catmull_rom(k as f64 - 1.0 - t[axis]);
+                    }
+                    let sum: f64 = w.iter().sum();
+                    w.map(|w| w / sum)
+                };
+                let (wx, wy) = (weights(0), weights(1));
+                let interpolate = |index| {
+                    let mut acc = 0.0;
+                    for (j, wy) in wy.iter().enumerate() {
+                        for (i, wx) in wx.iter().enumerate() {
+                            acc += wx
+                                * wy
+                                * fetch(base[0] + i as i64 - 1, base[1] + j as i64 - 1, index);
+                        }
+                    }
+                    (acc.clamp(0.0, 255.0) + 0.5).floor() as u8
+                };
+                Some([interpolate(blue), interpolate(green), interpolate(red)])
+            }
+            _ => {
+                let x0 = (source_x - 0.5).floor() as u32;
+                let y0 = (source_y - 0.5).floor() as u32;
+                let x1 = (x0 + 1).min(self.usable_width - 1);
+                let y1 = (y0 + 1).min(self.usable_height - 1);
+                let tx = source_x - (f64::from(x0) + 0.5);
+                let ty = source_y - (f64::from(y0) + 0.5);
+                let interpolate = |index| {
+                    ((1.0 - ty)
+                        * ((1.0 - tx) * channel(x0, y0, index) + tx * channel(x1, y0, index))
+                        + ty * ((1.0 - tx) * channel(x0, y1, index) + tx * channel(x1, y1, index)))
+                    .round() as u8
+                };
+                Some([interpolate(blue), interpolate(green), interpolate(red)])
+            }
+        }
     }
 
     /// Shade `count` destination rows, `dst` starting at row `first`.
@@ -6164,6 +6268,10 @@ fn present_pattern(
             source_y: slice.slice.y.max(0) as u32,
             width,
             sample: Some(&sample),
+            kernel: super::resample::cpu_kernel(super::resample::Kernel::select(
+                spec.filter,
+                super::resample::minification(&warp),
+            )),
         };
         let (_, map) = &mut presenter.wayland.as_mut().unwrap().buffers[0];
         let row_bytes = width as usize * 4;
@@ -7402,6 +7510,7 @@ mod tests {
             source_y: 1,
             width: 6,
             sample: None,
+            kernel: super::super::resample::Kernel::Bilinear,
         }
     }
 
@@ -7554,6 +7663,7 @@ mod tests {
             source_y: 0,
             width,
             sample: Some(sample),
+            kernel: super::super::resample::Kernel::Bilinear,
         }
     }
 
@@ -7601,6 +7711,7 @@ mod tests {
             source_y: 0,
             width: 4,
             sample: Some(&sample),
+            kernel: super::super::resample::Kernel::Bilinear,
         };
         let mut output = vec![0u8; 16];
         blend.rows(&mut output, 0, 1);
@@ -7613,6 +7724,139 @@ mod tests {
             vec![0, 50, 150, 200]
         );
         assert!(output.chunks_exact(4).all(|pixel| pixel[3] == 255));
+    }
+
+    /// A grayscale BGRA canvas of `width` x `height` from row-major `values`.
+    fn gray_canvas(values: &[u8]) -> Vec<u8> {
+        values.iter().flat_map(|&v| [v, v, v, 255]).collect()
+    }
+
+    /// Renders the whole of a `canvas_size` canvas, scaled to `output`,
+    /// through [`Blend::rows`] with `kernel`, and returns the blue channel
+    /// row-major.
+    fn render_scaled(
+        canvas: &[u8],
+        canvas_size: (u32, u32),
+        output: (u32, u32),
+        kernel: super::super::resample::Kernel,
+        y_invert: bool,
+    ) -> Vec<u8> {
+        let transfer = vec![(256, 0); (output.0 * output.1) as usize];
+        let warp = super::super::warp::Warp::identity(output.0, output.1)
+            .with_source_rect([0.0, 0.0, canvas_size.0 as f64, canvas_size.1 as f64])
+            .unwrap();
+        let sample = AxisSamples::build(&warp, [0.0, 0.0]);
+        let blend = Blend {
+            canvas,
+            transfer: &transfer,
+            format: PixelFormat {
+                bytes: 4,
+                red: 2,
+                green: 1,
+                blue: 0,
+            },
+            stride: canvas_size.0 * 4,
+            y_invert,
+            usable_width: canvas_size.0,
+            usable_height: canvas_size.1,
+            source_x: 0,
+            source_y: 0,
+            width: output.0,
+            sample: Some(&sample),
+            kernel,
+        };
+        let mut pixels = vec![0u8; (output.0 * output.1) as usize * 4];
+        blend.rows(&mut pixels, 0, output.1);
+        pixels.chunks_exact(4).map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn cpu_simple_upscale_nearest_replicates_pixels() {
+        let canvas = vec![0, 0, 0, 255, 200, 200, 200, 255];
+        let output = render_scaled(
+            &canvas,
+            (2, 1),
+            (4, 1),
+            super::super::resample::Kernel::Nearest,
+            false,
+        );
+        assert_eq!(output, vec![0, 0, 200, 200]);
+        // A non-whole ratio still returns only source values.
+        let output = render_scaled(
+            &canvas,
+            (2, 1),
+            (3, 1),
+            super::super::resample::Kernel::Nearest,
+            false,
+        );
+        assert_eq!(output, vec![0, 200, 200]);
+    }
+
+    /// The reference is the Catmull-Rom spline in its textbook polynomial
+    /// (matrix) form over the four neighbors, clamped at the image edges,
+    /// written here without the production weight function.
+    #[test]
+    fn cpu_simple_upscale_bicubic_matches_reference() {
+        let (cw, ch) = (4usize, 3usize);
+        // Hard edges so the spline overshoots and clamping matters.
+        let values: Vec<u8> = vec![0, 0, 255, 255, 0, 255, 255, 0, 10, 250, 0, 255];
+        let canvas = gray_canvas(&values);
+        let spline = |p: [f64; 4], t: f64| {
+            0.5 * ((2.0 * p[1])
+                + (-p[0] + p[2]) * t
+                + (2.0 * p[0] - 5.0 * p[1] + 4.0 * p[2] - p[3]) * t * t
+                + (-p[0] + 3.0 * p[1] - 3.0 * p[2] + p[3]) * t * t * t)
+        };
+        let mut overshot = false;
+        for y_invert in [false, true] {
+            // The captured rows, top to bottom, as the sampler sees them.
+            let rows: Vec<Vec<f64>> = (0..ch)
+                .map(|row| {
+                    let row = if y_invert { ch - 1 - row } else { row };
+                    values[row * cw..(row + 1) * cw]
+                        .iter()
+                        .map(|&v| f64::from(v))
+                        .collect()
+                })
+                .collect();
+            let (ow, oh) = (10usize, 7usize);
+            let output = render_scaled(
+                &canvas,
+                (cw as u32, ch as u32),
+                (ow as u32, oh as u32),
+                super::super::resample::Kernel::Bicubic,
+                y_invert,
+            );
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let px =
+                        ((ox as f64 + 0.5) * cw as f64 / ow as f64).clamp(0.5, cw as f64 - 0.5);
+                    let py =
+                        ((oy as f64 + 0.5) * ch as f64 / oh as f64).clamp(0.5, ch as f64 - 0.5);
+                    let (fx, fy) = (px - 0.5, py - 0.5);
+                    let (ix, iy) = (fx.floor() as i64, fy.floor() as i64);
+                    let (tx, ty) = (fx - ix as f64, fy - iy as f64);
+                    let at = |x: i64, y: i64| {
+                        rows[y.clamp(0, ch as i64 - 1) as usize][x.clamp(0, cw as i64 - 1) as usize]
+                    };
+                    let column: Vec<f64> = (-1..=2)
+                        .map(|dy| {
+                            let row: Vec<f64> = (-1..=2).map(|dx| at(ix + dx, iy + dy)).collect();
+                            spline([row[0], row[1], row[2], row[3]], tx)
+                        })
+                        .collect();
+                    let value = spline([column[0], column[1], column[2], column[3]], ty);
+                    overshot |= !(0.0..=255.0).contains(&value);
+                    let expected = (value.clamp(0.0, 255.0) + 0.5).floor() as u8;
+                    let got = output[oy * ow + ox];
+                    assert!(
+                        got == expected,
+                        "invert {y_invert} pixel ({ox}, {oy}): got {got}, reference {expected}"
+                    );
+                }
+            }
+        }
+        assert!(overshot, "the data must make the spline leave 0..=255");
     }
 
     #[test]
@@ -7645,6 +7889,7 @@ mod tests {
             source_y: 0,
             width: 2,
             sample: Some(&sample),
+            kernel: super::super::resample::Kernel::Bilinear,
         };
         let mut output = vec![0u8; 16];
         blend.rows(&mut output, 0, 2);
@@ -9807,6 +10052,7 @@ mod tests {
             source_y: 10,
             width: 480,
             sample: Some(&sample),
+            kernel: super::super::resample::Kernel::Bilinear,
         };
         let mut expected = vec![0u8; 480 * 360 * 4];
         expected_blend.rows(&mut expected, 0, 360);
@@ -10570,6 +10816,7 @@ mod reconstruction {
                     source_y: slice.slice.y.max(0) as u32,
                     width,
                     sample: None,
+                    kernel: super::super::resample::Kernel::Bilinear,
                 };
                 let mut output = vec![0u8; (width * height * 4) as usize];
                 blend.rows(&mut output, 0, height);

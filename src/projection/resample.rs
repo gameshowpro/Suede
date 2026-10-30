@@ -251,6 +251,41 @@ pub fn note(filter: ResampleFilter, kernel: Kernel) -> Option<String> {
     }
 }
 
+/// The kernel the CPU renderer actually runs for `kernel`: `nearest`,
+/// `bilinear` and `bicubic` are implemented there; `lanczos` and the
+/// automatic `area` filter are GPU-only and fall back to bilinear.
+pub fn cpu_kernel(kernel: Kernel) -> Kernel {
+    match kernel {
+        Kernel::Lanczos | Kernel::Area(_) => Kernel::Bilinear,
+        other => other,
+    }
+}
+
+/// What the CPU renderer reports for an output the GPU would resample with
+/// `kernel` (configured as `filter`): the kernel it actually runs
+/// ([`cpu_kernel`]) and, when that is not the one asked for, a note in the
+/// same register as [`note`]'s `easu` fallback, so the daemon does not
+/// pretend parity it does not have.
+pub fn cpu_sampling(filter: ResampleFilter, kernel: Kernel) -> (SamplingMode, Option<String>) {
+    let mode = cpu_kernel(kernel).mode();
+    let note = match kernel {
+        Kernel::Area(_) => Some(
+            "area filtering (automatic past 2x minification) is GPU-only; \
+             this output samples bilinear on the CPU renderer"
+                .to_string(),
+        ),
+        _ => match filter {
+            ResampleFilter::Lanczos => Some("lanczos"),
+            ResampleFilter::Easu => Some("easu"),
+            _ => None,
+        }
+        .map(|name| {
+            format!("{name} is GPU-only; this output samples bilinear on the CPU renderer")
+        }),
+    };
+    (mode, note)
+}
+
 /// The inclusive texel index range, `[[x0, y0], [x1, y1]]`, every kernel
 /// but bilinear clamps its taps to: the texels that intersect the source
 /// rectangle `rect` (canvas pixel-boundary x, y, width, height), inside a
@@ -339,9 +374,10 @@ pub(crate) fn reference_sample(
     }
 }
 
-/// Catmull-Rom (`a = -0.5`) at distance `x` from a texel center.
-#[cfg(test)]
-fn catmull_rom(x: f64) -> f64 {
+/// Catmull-Rom (`a = -0.5`) at distance `x` from a texel center. The one
+/// copy of the weights: the CPU renderer's bicubic and the test reference
+/// both use it.
+pub(crate) fn catmull_rom(x: f64) -> f64 {
     let x = x.abs();
     if x < 1.0 {
         (1.5 * x - 2.5) * x * x + 1.0
@@ -446,6 +482,50 @@ mod tests {
             .contains("capped at 8x8"));
         let uncapped = Kernel::select(ResampleFilter::Easu, [3.0, 1.0]);
         assert_eq!(note(ResampleFilter::Easu, uncapped), None);
+    }
+
+    /// The CPU renderer implements `nearest` and `bicubic`; the GPU-only
+    /// filters report `bilinear` with a note.
+    #[test]
+    fn cpu_gpu_only_filters_report_bilinear_with_note() {
+        let report = |filter, minification| {
+            let kernel = Kernel::select(filter, minification);
+            assert_eq!(
+                cpu_kernel(kernel).mode(),
+                cpu_sampling(filter, kernel).0,
+                "{filter:?}"
+            );
+            cpu_sampling(filter, kernel)
+        };
+        let unity = [1.0, 1.0];
+        assert_eq!(
+            report(ResampleFilter::Bilinear, unity),
+            (SamplingMode::Bilinear, None)
+        );
+        assert_eq!(
+            report(ResampleFilter::Nearest, unity),
+            (SamplingMode::Nearest, None)
+        );
+        assert_eq!(
+            report(ResampleFilter::Bicubic, unity),
+            (SamplingMode::Bicubic, None)
+        );
+        for (filter, name) in [
+            (ResampleFilter::Lanczos, "lanczos"),
+            (ResampleFilter::Easu, "easu"),
+        ] {
+            let (mode, note) = report(filter, unity);
+            assert_eq!(mode, SamplingMode::Bilinear);
+            let note = note.expect("a GPU-only filter carries a note");
+            assert!(note.starts_with(&format!("{name} is GPU-only")), "{note}");
+            assert!(note.contains("bilinear"), "{note}");
+        }
+        // The automatic box is GPU-only too, whatever filter is configured.
+        for filter in [ResampleFilter::Nearest, ResampleFilter::Bicubic] {
+            let (mode, note) = report(filter, [3.0, 3.0]);
+            assert_eq!(mode, SamplingMode::Bilinear, "{filter:?}");
+            assert!(note.unwrap().contains("area filtering"), "{filter:?}");
+        }
     }
 
     #[test]
