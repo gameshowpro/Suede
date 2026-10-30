@@ -715,7 +715,11 @@ pub async fn get_projection(
                        already conforms. Writes that stay in Exact are \
                        literal. PUT is otherwise literal. To actually clear \
                        the shared canvas, use DELETE \
-                       /config/projection/canvas.",
+                       /config/projection/canvas. An omitted `sliceUnits` \
+                       keeps the previous unit (a body that creates the \
+                       canvas stores `pixels`), and a body naming the other \
+                       unit converts the outputs' slices, which this route \
+                       leaves unchanged; see `ProjectionConfig.sliceUnits`.",
         body = DesiredState),
         (status = 422, description = "Validation failed"),
     )
@@ -3051,6 +3055,18 @@ mod tests {
         harness
     }
 
+    /// `document` with its slices converted to whole pixels, as entering
+    /// Exact stores them.
+    fn in_pixels(document: &DesiredState) -> DesiredState {
+        let mut converted = document.clone();
+        crate::model::slice_units::convert_document(
+            &mut converted,
+            crate::model::SliceUnits::Pixels,
+        )
+        .unwrap();
+        converted
+    }
+
     fn exact_grid() -> DesiredState {
         let mut document = fractional_simple_grid();
         document.projection.as_mut().unwrap().mode = crate::model::ProjectionMode::Exact;
@@ -3101,12 +3117,17 @@ mod tests {
         let projection = effective.projection.as_ref().unwrap();
         assert_eq!(projection.mode, crate::model::ProjectionMode::Exact);
         // Kept: the omitted canvas is the stored 4000x2000 one, not the
-        // 3680x2000 a reset would derive, and no slice moved.
+        // 3680x2000 a reset would derive, and no slice moved: the percent
+        // slices are now stored as the whole pixels they stood for.
         assert_eq!(
             projection.canvas,
             stored.projection.as_ref().unwrap().canvas
         );
-        assert_eq!(effective.outputs, stored.outputs);
+        assert_eq!(
+            projection.slice_units,
+            Some(crate::model::SliceUnits::Pixels)
+        );
+        assert_eq!(effective.outputs, in_pixels(&stored).outputs);
         assert!(effective.validate(true).is_ok());
     }
 
@@ -3175,13 +3196,101 @@ mod tests {
             assert_eq!(status, StatusCode::OK, "{put}");
             let written = harness.state.store.effective();
             assert_eq!(
-                written.outputs == stored.outputs,
+                written.outputs == in_pixels(&stored).outputs,
                 expected == "keep",
                 "dry run said {expected}"
             );
             // Already in Exact: a further switch changes nothing.
             assert_eq!(dry_run(&harness).await["action"], "keep");
         }
+    }
+
+    // --- slice units --------------------------------------------------------
+
+    /// The unit switch is an ordinary write: the projection section with
+    /// `sliceUnits` changed and nothing else converts the working copy's
+    /// slices, and naming percent again converts them back.
+    #[tokio::test]
+    async fn writing_the_other_unit_converts_the_slices() {
+        let stored = conforming_simple_grid();
+        let harness = harness_with(true, stored.clone());
+        let (_, projection) = call(&harness, "GET", "/api/v1/config/projection", None).await;
+        assert!(projection.get("sliceUnits").is_none(), "{projection}");
+        let mut body = projection.clone();
+        body["sliceUnits"] = "pixels".into();
+        let (status, document) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(&body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        assert_eq!(document["projection"]["sliceUnits"], "pixels");
+        assert_eq!(
+            document["outputs"][3]["geometry"]["slice"],
+            serde_json::json!({"x": 1760.0, "y": 920.0, "width": 1920.0, "height": 1080.0})
+        );
+        assert_eq!(
+            harness.state.store.effective().outputs,
+            in_pixels(&stored).outputs
+        );
+
+        let mut body = document["projection"].clone();
+        body["sliceUnits"] = "percent".into();
+        let (status, document) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(&body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{document}");
+        assert!(document["projection"].get("sliceUnits").is_none());
+        assert_eq!(harness.state.store.effective().outputs, stored.outputs);
+    }
+
+    #[tokio::test]
+    async fn a_fractional_pixels_write_is_refused_with_a_clear_message() {
+        let harness = harness_with(true, in_pixels(&conforming_simple_grid()));
+        let mut document = harness.state.store.effective();
+        document.outputs[1].geometry.as_mut().unwrap().slice.x = 2000.5;
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&document).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.to_string().contains(
+                "outputs[1].geometry geometry.slice must be whole canvas pixels while \
+                 projection.sliceUnits is \\\"pixels\\\"; x is 2000.5"
+            ),
+            "{body}"
+        );
+    }
+
+    /// A fresh document has no canvas; the write that creates one stores
+    /// pixels, converting the fractions a client without the field sends.
+    #[tokio::test]
+    async fn a_canvas_created_on_a_fresh_document_is_stored_in_pixels() {
+        let harness = harness_with(true, DesiredState::new());
+        let written = conforming_simple_grid();
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config",
+            Some(&serde_json::to_string(&written).unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["sliceUnits"], "pixels");
+        assert_eq!(
+            harness.state.store.effective().outputs,
+            in_pixels(&written).outputs
+        );
     }
 
     #[tokio::test]

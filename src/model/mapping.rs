@@ -349,6 +349,9 @@ pub fn slicer_mapping(
             ratio_text(x, y)
         ));
     }
+    // Unreachable from a valid document since slice units: the planner
+    // always hands the slicer whole-pixel crops (`effective_slice_px`).
+    // Kept so a slicer that ever reports otherwise is not called verified.
     if !facts.whole_pixel_origin {
         unverified.push("fractional crop origin".to_string());
     }

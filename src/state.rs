@@ -1317,6 +1317,28 @@ mod tests {
         );
     }
 
+    /// System A's revision 2373, saved before slice units existed, loads
+    /// untouched: no repair, nothing written in, the same bytes out.
+    #[test]
+    fn system_a_revision_2373_loads_verbatim_as_percent() {
+        let text = include_str!("../tests/fixtures/system-a-revision-2373.json");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(FILE_NAME), text).unwrap();
+        let store = StateStore::load(dir.path().to_path_buf()).unwrap();
+        assert!(
+            store.load_repairs().is_empty(),
+            "{:?}",
+            store.load_repairs()
+        );
+        let state = store.get();
+        assert_eq!(state.revision, 2373);
+        assert_eq!(state.slice_units(), crate::model::SliceUnits::Percent);
+        assert_eq!(
+            String::from_utf8(serde_json::to_vec_pretty(&state).unwrap()).unwrap(),
+            text
+        );
+    }
+
     /// The document in `tests/fixtures/pre-warp-v1-state.json` was captured
     /// from a four-projector appliance before the warp merge: schema 1,
     /// revision 1736, no canvas and no per-output geometry. A2 in the

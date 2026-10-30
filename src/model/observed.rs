@@ -1017,6 +1017,12 @@ pub struct ProjectionGeometryStatus {
     /// Why Exact is unavailable, when it is.
     #[serde(default)]
     pub exact_reason: Option<String>,
+    /// Every enabled output whose whole-pixel slice extends past the canvas,
+    /// with the overhang in canvas pixels per edge and a sentence naming
+    /// it. A report, not an error: the slice still renders, its part off the
+    /// canvas black. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_of_canvas: Vec<crate::model::SliceOverhang>,
 }
 
 impl ProjectionGeometryStatus {

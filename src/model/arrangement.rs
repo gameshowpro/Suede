@@ -72,7 +72,9 @@ use utoipa::ToSchema;
 
 use super::desired::{DesiredState, OutputConfig, Transform};
 use super::exact;
-use super::geometry::{CanvasConfig, CanvasRect, OutputGeometry, ProjectionMode};
+use super::geometry::{
+    effective_slice_px, CanvasConfig, CanvasRect, OutputGeometry, ProjectionMode, SliceUnits,
+};
 
 /// Two slice rectangles are the same arrangement when every edge agrees to
 /// within this many normalized canvas units.
@@ -163,7 +165,9 @@ pub struct ArrangementRequest {
 pub struct ArrangedOutput {
     /// [`super::desired::OutputMatch::key`] of the output this places.
     pub key: String,
-    /// The normalized canvas rectangle this output samples.
+    /// The canvas rectangle this output samples, in the solution's
+    /// [`ArrangementSolution::slice_units`]: the solver's exact fractions in
+    /// `percent`, its rounded edges in `pixels`.
     pub slice: CanvasRect,
 }
 
@@ -241,6 +245,11 @@ pub struct ArrangementSolution {
     /// Exact mode only: the vertical overlap in whole pixels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlap_y_px: Option<u32>,
+    /// The unit `outputs[].slice` is in: the document's
+    /// `projection.sliceUnits` (always `pixels` in Exact mode). [`apply`]
+    /// writes the slices in it.
+    #[serde(default)]
+    pub slice_units: SliceUnits,
 }
 
 /// The overlaps one axis can take, holding the other axis at its requested
@@ -603,6 +612,21 @@ pub fn solve(
     request: &ArrangementRequest,
     raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
 ) -> Result<ArrangementSolution, String> {
+    solve_in_units(outputs, canvas, SliceUnits::Percent, request, raster)
+}
+
+/// [`solve`], with the slices reported in `units`: the solver's exact
+/// fractions in `percent`, and in `pixels` their edges rounded to whole
+/// canvas pixels ([`effective_slice_px`]), so neighbors that share or
+/// overlap an edge stay consistent. Each output's `arrangeOffset` is in
+/// `units` too, and is added after the rounding.
+pub fn solve_in_units(
+    outputs: &[OutputConfig],
+    canvas: &CanvasConfig,
+    units: SliceUnits,
+    request: &ArrangementRequest,
+    raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
+) -> Result<ArrangementSolution, String> {
     let enabled: Vec<&OutputConfig> = outputs.iter().filter(|output| output.enable).collect();
     let metrics = grid(&enabled, canvas, request.rows, request.columns, &raster)?;
 
@@ -697,24 +721,51 @@ pub fn solve(
         unused_canvas: placement.unused,
         overhang: placement.overhang,
         implied_aspect,
-        outputs: enabled
-            .iter()
-            .zip(placement.rects)
-            .map(|(output, mut slice)| {
-                if let Some(offset) = output.arrange_offset {
-                    slice.x += offset.x;
-                    slice.y += offset.y;
-                }
-                ArrangedOutput {
-                    key: output.r#match.key(),
-                    slice,
-                }
-            })
-            .collect(),
+        outputs: arranged(&enabled, placement.rects, canvas, units)?,
         warnings,
         canvas: None,
         overlap_x_px: None,
         overlap_y_px: None,
+        slice_units: units,
+    })
+}
+
+/// The placed rectangles (normalized canvas units, before any offset) as
+/// each output's slice in `units`, with its `arrangeOffset` (in `units`)
+/// added: rounded edges first in `pixels`, so the offset moves a whole-pixel
+/// slice by whole pixels.
+fn arranged(
+    enabled: &[&OutputConfig],
+    rects: Vec<CanvasRect>,
+    canvas: &CanvasConfig,
+    units: SliceUnits,
+) -> Result<Vec<ArrangedOutput>, String> {
+    enabled
+        .iter()
+        .zip(rects)
+        .map(|(output, rect)| {
+            let mut slice = expected_slice(rect, canvas, units)?;
+            if let Some(offset) = output.arrange_offset {
+                slice.x += offset.x;
+                slice.y += offset.y;
+            }
+            Ok(ArrangedOutput {
+                key: output.r#match.key(),
+                slice,
+            })
+        })
+        .collect()
+}
+
+/// One placed rectangle (normalized canvas units) as stored in `units`.
+fn expected_slice(
+    rect: CanvasRect,
+    canvas: &CanvasConfig,
+    units: SliceUnits,
+) -> Result<CanvasRect, String> {
+    Ok(match units {
+        SliceUnits::Percent => rect,
+        SliceUnits::Pixels => effective_slice_px(rect, SliceUnits::Percent, canvas)?.stored(),
     })
 }
 
@@ -758,8 +809,10 @@ fn whole_overlap(label: &str, requested: f64, seams: &[f64]) -> Result<(u32, f64
 /// `allowUnusedCanvas` has no meaning here: the derived canvas has no
 /// unused band and no overhang. Overlap-fraction limits are not computed.
 ///
-/// An [`OutputConfig::arrange_offset`] is still added after placement, as in
-/// the other modes; one that leaves a slice off the whole-pixel grid or
+/// The slices are whole canvas pixels (`sliceUnits: "pixels"`, as Exact
+/// always stores them), each the rounded edges of its placement on the
+/// derived canvas. An [`OutputConfig::arrange_offset`], in pixels, is still
+/// added after placement, as in the other modes; one that leaves a slice
 /// outside the canvas is refused when the document is validated.
 pub fn solve_exact(
     outputs: &[OutputConfig],
@@ -855,24 +908,12 @@ pub fn solve_exact(
         unused_canvas: UnusedCanvas::default(),
         overhang: Overhang::default(),
         implied_aspect: canvas.aspect,
-        outputs: enabled
-            .iter()
-            .zip(placement.rects)
-            .map(|(output, mut slice)| {
-                if let Some(offset) = output.arrange_offset {
-                    slice.x += offset.x;
-                    slice.y += offset.y;
-                }
-                ArrangedOutput {
-                    key: output.r#match.key(),
-                    slice,
-                }
-            })
-            .collect(),
+        outputs: arranged(&enabled, placement.rects, &canvas, SliceUnits::Pixels)?,
         warnings,
         canvas: Some(canvas),
         overlap_x_px: Some(px_x),
         overlap_y_px: Some(px_y),
+        slice_units: SliceUnits::Pixels,
     })
 }
 
@@ -930,6 +971,13 @@ pub fn solve_document(
     raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
 ) -> Result<ArrangementSolution, String> {
     if is_exact(document) {
+        // Exact stores pixels; an Exact document saved before slice units
+        // is percent, so its offsets are measured in pixels first.
+        if document.slice_units() != SliceUnits::Pixels {
+            let mut converted = document.clone();
+            super::slice_units::convert_document(&mut converted, SliceUnits::Pixels)?;
+            return solve_exact(&converted.outputs, request, raster);
+        }
         return solve_exact(&document.outputs, request, raster);
     }
     let canvas = document
@@ -937,7 +985,13 @@ pub fn solve_document(
         .as_ref()
         .and_then(|projection| projection.canvas.as_ref())
         .ok_or_else(|| "projection.canvas is required to arrange outputs".to_string())?;
-    solve(&document.outputs, canvas, request, raster)
+    solve_in_units(
+        &document.outputs,
+        canvas,
+        document.slice_units(),
+        request,
+        raster,
+    )
 }
 
 /// The raster extent, in raster pixels, that each seam's overlap fraction
@@ -1170,10 +1224,20 @@ fn is_exact(document: &DesiredState) -> bool {
 /// mode) also replaces `projection.canvas`, and each arranged output's
 /// `rasterFootprint` follows its slice, as the Exact defaults have it.
 ///
+/// The slices are written in the solution's
+/// [`ArrangementSolution::slice_units`]; a document in the other unit (only
+/// an Exact document saved before slice units) is converted to it first, so
+/// the outputs the solution does not name stay consistent.
+///
 /// The caller validates the result; a solution can be arithmetically fine
 /// and still produce a document validation rejects (a gap between slices,
 /// for instance).
 pub fn apply(document: &mut DesiredState, solution: &ArrangementSolution) {
+    if document.slice_units() != solution.slice_units {
+        if let Err(error) = super::slice_units::convert_document(document, solution.slice_units) {
+            tracing::warn!(%error, "could not convert the document to the solution's slice units");
+        }
+    }
     for arranged in &solution.outputs {
         let Some(output) = document
             .outputs
@@ -1243,10 +1307,14 @@ pub fn in_effect(
         return false;
     };
     let placement = place(&metrics, &arrangement);
+    let units = projection.slice_units();
     enabled
         .iter()
         .zip(placement.rects)
-        .all(|(output, mut expected)| {
+        .all(|(output, expected)| {
+            let Ok(mut expected) = expected_slice(expected, canvas, units) else {
+                return false;
+            };
             // Apply the document's *current* offset before comparing, the
             // same way `solve` applies it after placement — an offset edited
             // since the arrangement was applied is exactly the manual
@@ -2902,5 +2970,134 @@ mod tests {
             let value = serde_json::to_value(&solution).unwrap();
             assert!(value.get("canvas").is_none() && value.get("overlapXPx").is_none());
         }
+    }
+
+    // --- slice units --------------------------------------------------------
+
+    /// A 2x2 grid at content scale 0.9 on the 3840x2160 canvas, in each
+    /// unit. Percent stores the solver's exact fractions; pixels stores their
+    /// rounded edges: columns at 0..2133.33 and 1706.67..3840 px become
+    /// 0..2133 and 1707..3840, rows 0..1200 and 960..2160 are whole already.
+    /// Either way the pixels the slicer crops are the same, and the record
+    /// is in effect.
+    #[test]
+    fn content_scale_arrangement_in_each_unit() {
+        let asked = request(2, 2, None, None, Some(0.9));
+        let mut percent = document(4);
+        let solution = solve_document(&percent, &asked, mode_raster).unwrap();
+        assert_eq!(solution.slice_units, SliceUnits::Percent);
+        close_rect(
+            solution.outputs[1].slice,
+            [4.0 / 9.0, 0.0, 5.0 / 9.0, 0.3125],
+        );
+        apply(&mut percent, &solution);
+        percent.validate(true).unwrap();
+        assert!(in_effect(&percent, mode_raster));
+        assert_eq!(percent.projection.as_ref().unwrap().slice_units, None);
+
+        let mut pixels = document(4);
+        pixels
+            .projection
+            .as_mut()
+            .unwrap()
+            .set_slice_units(SliceUnits::Pixels);
+        let solution = solve_document(&pixels, &asked, mode_raster).unwrap();
+        assert_eq!(solution.slice_units, SliceUnits::Pixels);
+        let rects: Vec<[f64; 4]> = solution
+            .outputs
+            .iter()
+            .map(|o| [o.slice.x, o.slice.y, o.slice.width, o.slice.height])
+            .collect();
+        assert_eq!(
+            rects,
+            [
+                [0.0, 0.0, 2133.0, 1200.0],
+                [1707.0, 0.0, 2133.0, 1200.0],
+                [0.0, 960.0, 2133.0, 1200.0],
+                [1707.0, 960.0, 2133.0, 1200.0],
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&solution).unwrap()["sliceUnits"],
+            "pixels"
+        );
+        apply(&mut pixels, &solution);
+        pixels.validate(true).unwrap();
+        assert!(in_effect(&pixels, mode_raster));
+        assert_eq!(
+            pixels.projection.as_ref().unwrap().slice_units,
+            Some(SliceUnits::Pixels)
+        );
+        // The same crops from both documents.
+        let canvas = canvas_16_9();
+        for (a, b) in percent.outputs.iter().zip(&pixels.outputs) {
+            let a = effective_slice_px(
+                a.geometry.as_ref().unwrap().slice,
+                SliceUnits::Percent,
+                &canvas,
+            )
+            .unwrap();
+            let b = effective_slice_px(
+                b.geometry.as_ref().unwrap().slice,
+                SliceUnits::Pixels,
+                &canvas,
+            )
+            .unwrap();
+            assert_eq!(a, b);
+        }
+        // A manual one-pixel edit is noticed in pixels too.
+        pixels.outputs[0].geometry.as_mut().unwrap().slice.x = 1.0;
+        assert!(!in_effect(&pixels, mode_raster));
+    }
+
+    /// In pixels an `arrangeOffset` is whole pixels, added after the edges
+    /// are rounded.
+    #[test]
+    fn a_pixel_offset_moves_a_pixel_slice_by_whole_pixels() {
+        let mut pixels = document(4);
+        pixels
+            .projection
+            .as_mut()
+            .unwrap()
+            .set_slice_units(SliceUnits::Pixels);
+        pixels.outputs[1].arrange_offset = Some(ArrangeOffset { x: -3.0, y: 2.0 });
+        let solution =
+            solve_document(&pixels, &request(2, 2, None, None, Some(0.9)), mode_raster).unwrap();
+        assert_eq!(
+            solution.outputs[1].slice,
+            CanvasRect {
+                x: 1704.0,
+                y: 2.0,
+                width: 2133.0,
+                height: 1200.0
+            }
+        );
+        apply(&mut pixels, &solution);
+        pixels.validate(true).unwrap();
+        assert!(in_effect(&pixels, mode_raster));
+    }
+
+    /// Exact arranges in pixels whatever the document held: a legacy
+    /// percent Exact document is converted when the arrangement is applied.
+    #[test]
+    fn exact_arrangements_are_written_in_pixels() {
+        let mut document = exact_document(4);
+        assert_eq!(document.slice_units(), SliceUnits::Percent);
+        let asked = exact_overlap_request(2, 2, Some(160.0 / 1920.0), Some(160.0 / 1080.0));
+        let solution = solve_document(&document, &asked, mode_raster).unwrap();
+        assert_eq!(solution.slice_units, SliceUnits::Pixels);
+        assert_eq!(
+            solution.outputs[3].slice,
+            CanvasRect {
+                x: 1760.0,
+                y: 920.0,
+                width: 1920.0,
+                height: 1080.0
+            }
+        );
+        apply(&mut document, &solution);
+        assert_eq!(document.slice_units(), SliceUnits::Pixels);
+        crate::model::exact::conforms(&document).unwrap();
+        assert!(in_effect(&document, mode_raster));
     }
 }

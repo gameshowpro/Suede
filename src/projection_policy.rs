@@ -1,7 +1,11 @@
 //! Public geometry capability policy. Saved parameters are never the fallback.
 
 use crate::model::observed::ProjectionGeometryStatus;
-use crate::model::{exact, DesiredState, ProjectionControlStatus, ProjectionMode, Renderer};
+use crate::model::slice_units::{convert_arrange_offset, convert_geometry};
+use crate::model::{
+    exact, CanvasConfig, DesiredState, ProjectionControlStatus, ProjectionMode, Renderer,
+    SliceUnits,
+};
 
 pub fn status(
     desired: &DesiredState,
@@ -80,6 +84,87 @@ pub fn status(
         retained_warp: retained,
         exact_available: Some(exact_available),
         exact_reason,
+        out_of_canvas: crate::model::slice_units::out_of_canvas(desired),
+    }
+}
+
+/// Settle `projection.sliceUnits` for a working-copy replacement, before
+/// [`preserve_retained`] and [`transition`], so every later step sees one
+/// unit for the whole document.
+///
+/// * **The unit.** An explicit `sliceUnits` in the write wins. An omitted
+///   one keeps `previous`'s unit, so a client that does not know the field
+///   (a bare `{"mode":"exact"}`, a projection section built from scratch)
+///   never changes it. Except: a write that creates the canvas where
+///   `previous` had none (a fresh document has none) stores `pixels`, the
+///   default for a new layout.
+/// * **The slices.** Each output's geometry and `arrangeOffset` is in one
+///   of two units: one the write left exactly as `previous` had it is in
+///   `previous`'s unit; one the write changed is in the unit the write
+///   names, or `previous`'s when it names none. Whatever is not already in
+///   the settled unit is converted to it on the document's canvas (the
+///   write's, else `previous`'s): percent to pixels rounds the edges, pixels
+///   to percent divides exactly. So naming the other unit and changing
+///   nothing else converts the layout, a whole document written in its own
+///   unit is taken literally, and a new canvas's fractional slices become
+///   pixels.
+/// * **Without a canvas** there is nothing to measure a conversion against,
+///   so slices that would need one keep their numbers (a corner case: a
+///   retained geometry whose canvas was deleted).
+///
+/// Geometry the write omits is left for the refill, which converts it
+/// (see [`refill_omitted`]). Exact's own rule, pixels only, is applied by
+/// [`transition`].
+pub fn settle_slice_units(next: &mut DesiredState, previous: &DesiredState) {
+    let before = previous.slice_units();
+    let had_canvas = previous
+        .projection
+        .as_ref()
+        .is_some_and(|projection| projection.canvas.is_some());
+    let (written, created, target) = match next.projection.as_ref() {
+        // No projection section: the document is percent by definition.
+        None => (Some(SliceUnits::Percent), false, SliceUnits::Percent),
+        Some(projection) => {
+            let created = !had_canvas && projection.canvas.is_some();
+            let written = projection.slice_units;
+            let target = written.unwrap_or(if created { SliceUnits::Pixels } else { before });
+            (written, created, target)
+        }
+    };
+    // The unit a changed geometry is written in. A write that creates the
+    // canvas without naming a unit has no layout to keep a unit from: its
+    // slices are what any client without the field writes, fractions.
+    let changed_unit = written.unwrap_or(if created { SliceUnits::Percent } else { before });
+    let canvas: Option<CanvasConfig> = next
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.canvas)
+        .or_else(|| previous.projection.as_ref().and_then(|p| p.canvas))
+        .filter(|canvas| canvas.dimensions().is_ok());
+    if let Some(canvas) = canvas {
+        for output in &mut next.outputs {
+            let old = previous
+                .outputs
+                .iter()
+                .find(|o| o.r#match == output.r#match);
+            if let Some(geometry) = output.geometry.as_mut() {
+                let unchanged = old.is_some_and(|o| o.geometry.as_ref() == Some(&*geometry));
+                let from = if unchanged { before } else { changed_unit };
+                if let Err(error) = convert_geometry(geometry, from, target, &canvas) {
+                    tracing::warn!(%error, "could not convert a slice between units");
+                }
+            }
+            if let Some(offset) = output.arrange_offset.as_mut() {
+                let unchanged = old.is_some_and(|o| o.arrange_offset.as_ref() == Some(&*offset));
+                let from = if unchanged { before } else { changed_unit };
+                if let Err(error) = convert_arrange_offset(offset, from, target, &canvas) {
+                    tracing::warn!(%error, "could not convert an arrangement offset between units");
+                }
+            }
+        }
+    }
+    if let Some(projection) = next.projection.as_mut() {
+        projection.set_slice_units(target);
     }
 }
 
@@ -104,17 +189,31 @@ pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
 /// from `previous`, matching outputs by their `match` rule. Present values
 /// are never touched, and an output `next` no longer lists stays gone.
 ///
+/// A refilled geometry is in `previous`'s slice unit; when `next` settled on
+/// the other one ([`settle_slice_units`]) it is converted on `next`'s
+/// canvas (else `previous`'s), so the refill never mixes units.
+///
 /// Shared by [`preserve_retained`] and [`transition`], and through the
 /// latter by [`exact_dry_run`].
 pub(crate) fn refill_omitted(next: &mut DesiredState, previous: &DesiredState) {
     if let Some(old) = &previous.projection {
         if old.canvas.is_some() {
+            // A section the refill creates is percent: with no section,
+            // `settle_slice_units` has already put the write's slices in
+            // percent, and the refill below converts what it copies.
             let projection = next.projection.get_or_insert_with(Default::default);
             if projection.canvas.is_none() {
                 projection.canvas = old.canvas;
             }
         }
     }
+    let (from, to) = (previous.slice_units(), next.slice_units());
+    let canvas = next
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.canvas)
+        .or_else(|| previous.projection.as_ref().and_then(|p| p.canvas))
+        .filter(|canvas| canvas.dimensions().is_ok());
     for output in &mut next.outputs {
         if let Some(old) = previous
             .outputs
@@ -123,6 +222,11 @@ pub(crate) fn refill_omitted(next: &mut DesiredState, previous: &DesiredState) {
         {
             if output.geometry.is_none() {
                 output.geometry = old.geometry.clone();
+                if let (Some(geometry), Some(canvas)) = (output.geometry.as_mut(), canvas) {
+                    if let Err(error) = convert_geometry(geometry, from, to, &canvas) {
+                        tracing::warn!(%error, "could not convert a refilled slice between units");
+                    }
+                }
             }
         }
     }
@@ -167,8 +271,22 @@ pub fn transition(
     };
     let (from, to) = (mode(previous), mode(next));
     match (from, to) {
-        (ProjectionMode::Exact, ProjectionMode::Exact)
-        | (ProjectionMode::Simple, ProjectionMode::Simple)
+        // Exact stores pixels. A write that stays in Exact is literal, but
+        // one that leaves it in percent (an Exact document saved before
+        // slice units, or a write naming percent) is converted; its slices
+        // are whole pixels within `PIXEL_EPS` if it conforms at all, so
+        // nothing moves.
+        (ProjectionMode::Exact, ProjectionMode::Exact) => {
+            if next.slice_units() == SliceUnits::Percent {
+                if let Err(error) =
+                    crate::model::slice_units::convert_document(next, SliceUnits::Pixels)
+                {
+                    tracing::warn!(%error, "could not convert an exact document to pixels");
+                }
+            }
+            Ok(None)
+        }
+        (ProjectionMode::Simple, ProjectionMode::Simple)
         | (ProjectionMode::Warp, ProjectionMode::Warp)
         | (ProjectionMode::Simple, ProjectionMode::Warp)
         | (ProjectionMode::Warp, ProjectionMode::Simple) => Ok(None),
@@ -723,6 +841,7 @@ mod tests {
     /// What `api::validate_configuration_against` does to a replacement
     /// before validating it, on a slicer appliance.
     fn replace(mut next: DesiredState, previous: &DesiredState) -> DesiredState {
+        settle_slice_units(&mut next, previous);
         preserve_retained(&mut next, previous);
         transition(&mut next, previous, true).unwrap();
         assert!(next.validate(true).is_ok(), "{:?}", next.validate(true));
@@ -1000,5 +1119,254 @@ mod tests {
             );
             assert!(!h.state.store.has_unsaved_edits(), "{to:?}");
         }
+    }
+
+    // --- slice units --------------------------------------------------------
+
+    /// Two 100x100 outputs side by side on a 200x100 canvas, in percent,
+    /// with A's slice deliberately off whole pixels (x at 0.3 px).
+    fn percent_pair() -> DesiredState {
+        let mut d = DesiredState::new();
+        for (name, x) in [("A", 0.003 / 2.0), ("B", 0.5)] {
+            let mut output = OutputConfig::new(OutputMatch::by_name(name));
+            output.mode = Some(crate::model::Mode {
+                width: 100,
+                height: 100,
+                refresh_hz: 60.0,
+            });
+            let slice = CanvasRect {
+                x,
+                y: 0.0,
+                width: 0.5,
+                height: 0.5,
+            };
+            output.geometry = Some(OutputGeometry {
+                slice,
+                raster_footprint: slice,
+                corners: exact::UNIT_CORNERS,
+                center: exact::NEUTRAL_CENTER,
+            });
+            d.outputs.push(output);
+        }
+        d.projection = Some(ProjectionConfig {
+            canvas: Some(CanvasConfig {
+                aspect: 2.0,
+                render_width: 200,
+            }),
+            ..Default::default()
+        });
+        d
+    }
+
+    fn slices(document: &DesiredState) -> Vec<CanvasRect> {
+        document
+            .outputs
+            .iter()
+            .map(|output| output.geometry.as_ref().unwrap().slice)
+            .collect()
+    }
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> CanvasRect {
+        CanvasRect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn naming_the_other_unit_converts_the_unchanged_slices() {
+        let previous = percent_pair();
+        let mut next = previous.clone();
+        next.projection.as_mut().unwrap().slice_units = Some(SliceUnits::Pixels);
+        let next = replace(next, &previous);
+        assert_eq!(next.slice_units(), SliceUnits::Pixels);
+        // A's edges at 0.3 and 100.3 px round to 0 and 100.
+        assert_eq!(
+            slices(&next),
+            [rect(0.0, 0.0, 100.0, 100.0), rect(100.0, 0.0, 100.0, 100.0)]
+        );
+
+        // And back: exact division, the stored unit absent again.
+        let mut back = next.clone();
+        back.projection.as_mut().unwrap().slice_units = Some(SliceUnits::Percent);
+        let back = replace(back, &next);
+        assert_eq!(back.projection.as_ref().unwrap().slice_units, None);
+        assert_eq!(
+            slices(&back),
+            [rect(0.0, 0.0, 0.5, 0.5), rect(0.5, 0.0, 0.5, 0.5)]
+        );
+    }
+
+    #[test]
+    fn a_write_in_the_other_unit_is_taken_literally_where_it_changes_a_slice() {
+        let previous = percent_pair();
+        let mut next = previous.clone();
+        next.projection.as_mut().unwrap().slice_units = Some(SliceUnits::Pixels);
+        // B rewritten in pixels; A left as it was, so it is converted.
+        next.outputs[1].geometry.as_mut().unwrap().slice = rect(90.0, 0.0, 100.0, 100.0);
+        next.outputs[1].geometry.as_mut().unwrap().raster_footprint = rect(90.0, 0.0, 100.0, 100.0);
+        let next = replace(next, &previous);
+        assert_eq!(
+            slices(&next),
+            [rect(0.0, 0.0, 100.0, 100.0), rect(90.0, 0.0, 100.0, 100.0)]
+        );
+    }
+
+    #[test]
+    fn an_omitted_unit_keeps_the_previous_one() {
+        let mut previous = percent_pair();
+        crate::model::slice_units::convert_document(&mut previous, SliceUnits::Pixels).unwrap();
+        // A client that does not know the field: a projection section built
+        // from scratch, and a bare switch to Exact.
+        let mut next = previous.clone();
+        next.projection.as_mut().unwrap().slice_units = None;
+        next.projection.as_mut().unwrap().gamma = 2.4;
+        let next = replace(next, &previous);
+        assert_eq!(next.slice_units(), SliceUnits::Pixels);
+        assert_eq!(slices(&next), slices(&previous));
+
+        let mut bare = previous.clone();
+        bare.projection = Some(ProjectionConfig {
+            mode: ProjectionMode::Exact,
+            ..Default::default()
+        });
+        let entered = replace(bare, &previous);
+        assert_eq!(
+            entered.projection.as_ref().unwrap().mode,
+            ProjectionMode::Exact
+        );
+        assert_eq!(entered.slice_units(), SliceUnits::Pixels);
+        assert_eq!(slices(&entered), slices(&previous));
+    }
+
+    #[test]
+    fn a_canvas_created_where_there_was_none_stores_pixels() {
+        // A fresh document, then a write that brings a canvas and the
+        // fractional slices any client without the field sends.
+        let previous = DesiredState::new();
+        let next = replace(percent_pair(), &previous);
+        assert_eq!(
+            next.projection.as_ref().unwrap().slice_units,
+            Some(SliceUnits::Pixels)
+        );
+        assert_eq!(
+            slices(&next),
+            [rect(0.0, 0.0, 100.0, 100.0), rect(100.0, 0.0, 100.0, 100.0)]
+        );
+        // Naming percent keeps percent.
+        let mut explicit = percent_pair();
+        explicit.projection.as_mut().unwrap().slice_units = Some(SliceUnits::Percent);
+        let kept = replace(explicit, &previous);
+        assert_eq!(kept.projection.as_ref().unwrap().slice_units, None);
+        assert_eq!(slices(&kept), slices(&percent_pair()));
+        // A loaded document without the field is percent, and an ordinary
+        // write to it stays percent.
+        let loaded = percent_pair();
+        let mut edit = loaded.clone();
+        edit.projection.as_mut().unwrap().gamma = 2.4;
+        let edited = replace(edit, &loaded);
+        assert_eq!(edited.slice_units(), SliceUnits::Percent);
+        assert_eq!(slices(&edited), slices(&loaded));
+    }
+
+    /// A write with no projection section is percent by definition; the
+    /// Simple refill that brings the canvas back keeps the picture.
+    #[test]
+    fn dropping_the_projection_section_keeps_the_picture() {
+        let mut previous = percent_pair();
+        crate::model::slice_units::convert_document(&mut previous, SliceUnits::Pixels).unwrap();
+        let mut next = previous.clone();
+        next.projection = None;
+        let next = replace(next, &previous);
+        assert_eq!(next.slice_units(), SliceUnits::Percent);
+        assert_eq!(
+            next.projection.as_ref().unwrap().canvas,
+            previous.projection.as_ref().unwrap().canvas
+        );
+        assert_eq!(
+            slices(&next),
+            [rect(0.0, 0.0, 0.5, 0.5), rect(0.5, 0.0, 0.5, 0.5)]
+        );
+    }
+
+    #[test]
+    fn a_refilled_slice_follows_the_settled_unit() {
+        let previous = percent_pair();
+        let mut next = previous.clone();
+        next.projection.as_mut().unwrap().slice_units = Some(SliceUnits::Pixels);
+        next.outputs[0].geometry = None;
+        let next = replace(next, &previous);
+        assert_eq!(
+            slices(&next),
+            [rect(0.0, 0.0, 100.0, 100.0), rect(100.0, 0.0, 100.0, 100.0)]
+        );
+    }
+
+    /// An Exact document saved before slice units is percent; the first
+    /// write that stays in Exact stores it in pixels, moving nothing.
+    #[test]
+    fn a_write_that_stays_in_an_exact_percent_document_converts_it() {
+        let mut legacy = exact_saved();
+        crate::model::slice_units::convert_document(&mut legacy, SliceUnits::Percent).unwrap();
+        assert_eq!(legacy.slice_units(), SliceUnits::Percent);
+        assert!(legacy.validate(true).is_ok());
+        let mut next = legacy.clone();
+        next.projection.as_mut().unwrap().gamma = 2.2;
+        let next = replace(next, &legacy);
+        assert_eq!(next.slice_units(), SliceUnits::Pixels);
+        assert_eq!(slices(&next), slices(&exact_saved()));
+    }
+
+    #[test]
+    fn status_reports_slices_past_the_canvas() {
+        let mut document = percent_pair();
+        crate::model::slice_units::convert_document(&mut document, SliceUnits::Pixels).unwrap();
+        document
+            .projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 150;
+        let reported = status(
+            &document,
+            &ProjectionControlStatus::default(),
+            false,
+            true,
+            None,
+        );
+        // The canvas is 150x75 now: A hangs 25 px below it, B also 50 px
+        // past its right edge.
+        assert_eq!(reported.out_of_canvas.len(), 2);
+        assert_eq!(
+            reported.out_of_canvas[0].message,
+            "A extends 25 px past the canvas's bottom edge"
+        );
+        let overhang = &reported.out_of_canvas[1];
+        assert_eq!(
+            (overhang.output.as_str(), overhang.right, overhang.bottom),
+            ("B", 50, 25)
+        );
+        assert_eq!(
+            overhang.message,
+            "B extends 50 px past the canvas's right edge and 25 px past its bottom edge"
+        );
+        let json = serde_json::to_value(&reported).unwrap();
+        assert_eq!(json["outOfCanvas"][1]["right"], 50);
+        // Nothing past the canvas: the field is omitted.
+        let clear = status(
+            &percent_pair(),
+            &ProjectionControlStatus::default(),
+            false,
+            true,
+            None,
+        );
+        assert!(serde_json::to_value(&clear)
+            .unwrap()
+            .get("outOfCanvas")
+            .is_none());
     }
 }

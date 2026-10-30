@@ -9,8 +9,9 @@ use crate::model::{CanvasConfig, CanvasRect};
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LayoutParticipant {
     pub output: String,
-    /// This output's slice: the canvas region it samples, in normalized
-    /// canvas units — the same value as `geometry.slice`.
+    /// This output's slice: the whole-pixel canvas region it samples
+    /// ([`crate::model::effective_slice_px`]), in normalized canvas units,
+    /// so the blend ramps end exactly where the crop does.
     pub slice: CanvasRect,
     pub raster_footprint: CanvasRect,
 }
@@ -882,6 +883,7 @@ pub fn canvas_plan_with_correction(
         .ok_or("projection configuration missing")?;
     let canvas = projection.canvas.as_ref().ok_or("warp canvas missing")?;
     let (width, height) = canvas.dimensions()?;
+    let units = projection.slice_units();
     // Exact carries no correction and presents a unit-scale raster whatever
     // the caller's effective mode, the same as Simple.
     let apply_correction = match projection.mode {
@@ -909,7 +911,12 @@ pub fn canvas_plan_with_correction(
         let transform = config.effective_transform().unwrap_or_default();
         let (logical_width, logical_height) =
             transform.physical_size((mode.width as u32, mode.height as u32));
-        geometry.validate_for_output(canvas, logical_width, logical_height)?;
+        geometry.validate_for_output(canvas, units, logical_width, logical_height)?;
+        // The crop is always whole canvas pixels, in every mode and unit:
+        // the stored pixels, or a percent slice's rounded edges. Sub-pixel
+        // crops never make sense, and whole ones are what the integer copy
+        // needs.
+        let pixels = crate::model::effective_slice_px(geometry.slice, units, canvas)?;
         let slice_transform = config.slicer_transform();
         let attached = observed.iter().find(|o| config.r#match.matches(o));
         let output = attached
@@ -917,39 +924,25 @@ pub fn canvas_plan_with_correction(
             .unwrap_or_else(|| config.r#match.key());
         layout.participants.push(LayoutParticipant {
             output: output.clone(),
-            slice: geometry.slice,
-            raster_footprint: geometry.raster_footprint,
+            slice: pixels.to_canvas_units(canvas)?,
+            raster_footprint: crate::model::to_canvas_units(
+                geometry.raster_footprint,
+                units,
+                canvas,
+            )?,
         });
         if attached.is_none() {
             continue;
         }
-        let source = canonical_slice(desired, canvas, config).unwrap_or_else(|| {
-            geometry
-                .slice
-                .pixel_rect(canvas)
-                .expect("canvas already validated above")
-        });
-        // A normalized slice comes back from `pixel_rect` a few ulps off the
-        // whole pixels it was written as, which would cost it the integer
-        // copy. Wherever no correction is applied (Simple, Exact, and Warp
-        // with identity pins and a centered remap), a source within
-        // `PIXEL_EPS` of whole pixels on every component plans as those
-        // integers, in every mode alike: leaving Exact for Simple or Warp
-        // must not change the sampling path of a slice Exact accepted.
-        // Corrected outputs are resampled anyway and keep their exact value.
-        let uncorrected = !apply_correction
-            || (geometry.corners == crate::model::exact::UNIT_CORNERS
-                && geometry.center == crate::model::exact::NEUTRAL_CENTER);
-        let source = if uncorrected {
-            crate::model::exact::whole_pixel_source(source)
-        } else {
-            source
+        let source = pixels.source();
+        let origin = |value: i64| {
+            i32::try_from(value).map_err(|_| "slice origin is outside the i32 range".to_string())
         };
         slices.push(super::blend::SliceSpec {
             output: output.clone(),
             slice: crate::model::Rect {
-                x: source[0].floor() as i32,
-                y: source[1].floor() as i32,
+                x: origin(pixels.x)?,
+                y: origin(pixels.y)?,
                 width: destination_width,
                 height: destination_height,
             },
@@ -985,61 +978,6 @@ pub fn canvas_plan_with_correction(
         slices,
         sway_positions,
     })
-}
-
-/// Recover exact integer metadata only when the floating slice equals the
-/// canonical simple-layout conversion, with its original canvas dimensions.
-/// This is an equality proof, not tolerance-based snapping of a user edit;
-/// the only tolerance the planner applies is the `PIXEL_EPS` whole-pixel
-/// recovery for uncorrected outputs in [`canvas_plan_with_correction`],
-/// which is far below any edit a person or a solver means.
-fn canonical_slice(
-    desired: &crate::model::DesiredState,
-    canvas: &CanvasConfig,
-    selected: &crate::model::OutputConfig,
-) -> Option<[f64; 4]> {
-    let rects: Option<Vec<_>> = desired
-        .outputs
-        .iter()
-        .filter(|o| o.enable)
-        .map(|o| {
-            let m = o.effective_mode()?;
-            let p = o.position?;
-            Some((
-                i64::from(p.x),
-                i64::from(p.y),
-                i64::from(m.width),
-                i64::from(m.height),
-            ))
-        })
-        .collect();
-    let rects = rects?;
-    let x = rects.iter().map(|r| r.0).min()?;
-    let y = rects.iter().map(|r| r.1).min()?;
-    let w = rects.iter().map(|r| r.0 + r.2).max()? - x;
-    let h = rects.iter().map(|r| r.1 + r.3).max()? - y;
-    if w <= 0
-        || h <= 0
-        || canvas.dimensions().ok()? != (w as u32, h as u32)
-        || canvas.aspect != w as f64 / h as f64
-    {
-        return None;
-    }
-    let p = selected.position?;
-    let m = selected.effective_mode()?;
-    let px = [
-        (i64::from(p.x) - x) as f64,
-        (i64::from(p.y) - y) as f64,
-        f64::from(m.width),
-        f64::from(m.height),
-    ];
-    let canonical = CanvasRect {
-        x: px[0] / w as f64,
-        y: px[1] / w as f64,
-        width: px[2] / w as f64,
-        height: px[3] / w as f64,
-    };
-    (selected.geometry.as_ref()?.slice == canonical).then_some(px)
 }
 
 #[cfg(test)]
@@ -2322,12 +2260,11 @@ mod tests {
     #[test]
     fn a_near_integer_slice_plans_the_same_integer_copy_in_every_uncorrected_mode() {
         use crate::model::ProjectionMode;
-        // A conforming Exact slice a few ulps off whole pixels, as a
-        // normalized slice comes back from `pixel_rect`. Exact recovers the
-        // integers for the integer copy and applies no correction even when
-        // the caller asks for it; after `leave`, Simple and identity-pinned
-        // Warp plan the very same integer source, so the sampling path
-        // cannot change on the way out of Exact.
+        // A percent slice a few ulps off whole pixels. Its rounded edges
+        // are the integers, in every mode: Exact applies no correction even
+        // when the caller asks for it, and Simple and identity-pinned Warp
+        // plan the very same integer source, so the sampling path cannot
+        // change on the way out of Exact.
         let nearly = rect(0.0, 0.0, 1.0 + 1.0e-14, 1920.0 / 1080.0);
         let exact = plan_with(
             ProjectionMode::Exact,
@@ -2374,8 +2311,11 @@ mod tests {
         }
     }
 
+    /// Slice 12 kept a corrected Warp slice's floating source; now every
+    /// crop is whole pixels, corrected or not. The correction still reaches
+    /// the slicer as the geometry it resamples with.
     #[test]
-    fn a_corrected_warp_slice_keeps_its_exact_floating_source() {
+    fn a_corrected_warp_slice_also_crops_whole_pixels() {
         let nearly = rect(0.0, 0.0, 1.0 + 1.0e-14, 1920.0 / 1080.0);
         let mut plan = plan_with_pins(
             crate::model::ProjectionMode::Warp,
@@ -2383,8 +2323,98 @@ mod tests {
             [[0.01, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
         );
         let slice = plan.slices.remove(0);
-        assert_ne!(slice.source_rect, Some([0.0, 0.0, 1080.0, 1920.0]));
+        assert_eq!(slice.source_rect, Some([0.0, 0.0, 1080.0, 1920.0]));
         assert!(slice.geometry.is_some());
+
+        // A slice a third of a pixel in from each edge rounds to the whole
+        // pixels nearest its edges, not to a sub-pixel crop.
+        let third = 1.0 / 3.0 / 1080.0;
+        let inset = rect(
+            third,
+            third,
+            1.0 - 2.0 * third,
+            1920.0 / 1080.0 - 2.0 * third,
+        );
+        let mut plan = plan_with_pins(
+            crate::model::ProjectionMode::Warp,
+            inset,
+            [[0.01, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        );
+        assert_eq!(
+            plan.slices.remove(0).source_rect,
+            Some([0.0, 0.0, 1080.0, 1920.0])
+        );
+    }
+
+    /// System A's revision 2373 (percent, aspect 1.77777777, slice height
+    /// 0.2812500012304688) plans four exact 1920x1080 crops, and a pixels
+    /// document plans its integers directly, unchanged by a smaller canvas.
+    #[test]
+    fn system_a_revision_2373_plans_whole_1920_by_1080_crops() {
+        let mut desired: crate::model::DesiredState = serde_json::from_str(include_str!(
+            "../../tests/fixtures/system-a-revision-2373.json"
+        ))
+        .unwrap();
+        let mode = crate::model::Mode {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60.0,
+        };
+        let observed: Vec<_> = ["DP-1", "DP-2", "DP-3", "DP-4"]
+            .into_iter()
+            .map(|name| crate::model::Output {
+                name: name.into(),
+                active: true,
+                make: None,
+                model: None,
+                serial: None,
+                current_mode: Some(mode),
+                modes: vec![mode],
+                rect: crate::model::Rect {
+                    x: 0,
+                    y: 0,
+                    width: 1920,
+                    height: 1080,
+                },
+                scale: None,
+                transform: None,
+                adaptive_sync_status: None,
+            })
+            .collect();
+        let quadrants = [
+            [0.0, 0.0, 1920.0, 1080.0],
+            [1920.0, 0.0, 1920.0, 1080.0],
+            [0.0, 1080.0, 1920.0, 1080.0],
+            [1920.0, 1080.0, 1920.0, 1080.0],
+        ];
+        let sources = |plan: &super::super::blend::CanvasPlan| -> Vec<[f64; 4]> {
+            plan.slices
+                .iter()
+                .map(|slice| slice.source_rect.unwrap())
+                .collect()
+        };
+        for apply_correction in [false, true] {
+            let plan = canvas_plan_with_correction(&desired, &observed, apply_correction).unwrap();
+            assert_eq!((plan.canvas_width, plan.canvas_height), (3840, 2160));
+            assert_eq!(sources(&plan), quadrants);
+            for slice in &plan.slices {
+                assert_eq!((slice.slice.width, slice.slice.height), (1920, 1080));
+            }
+        }
+
+        crate::model::slice_units::convert_document(&mut desired, crate::model::SliceUnits::Pixels)
+            .unwrap();
+        desired
+            .projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 2880;
+        let plan = canvas_plan_with_correction(&desired, &observed, false).unwrap();
+        assert_eq!((plan.canvas_width, plan.canvas_height), (2880, 1620));
+        assert_eq!(sources(&plan), quadrants);
     }
 
     #[test]

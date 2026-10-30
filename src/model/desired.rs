@@ -5,7 +5,9 @@ use utoipa::ToSchema;
 
 use super::arrangement::Arrangement;
 use super::black_lift::BlackLift;
-use super::geometry::{validate_slices, CanvasConfig, OutputGeometry, ProjectionMode};
+use super::geometry::{
+    to_canvas_units, validate_slices, CanvasConfig, OutputGeometry, ProjectionMode, SliceUnits,
+};
 use super::observed::{Mode, Output, Position};
 
 /// Current persisted-document schema. Alpha upgrades require this exact
@@ -88,6 +90,23 @@ pub struct ProjectionConfig {
     /// Shared canvas dimensions for Simple, Warp, and capability fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canvas: Option<CanvasConfig>,
+    /// The unit every output's `geometry.slice`, `geometry.rasterFootprint`
+    /// and `arrangeOffset` is stored in; see [`SliceUnits`]. Absent means
+    /// `percent`, and `percent` is never written out, so a document without
+    /// it is read exactly as it always was. `pixels` documents fail to parse
+    /// on a build that predates this field rather than being misread.
+    ///
+    /// On a write, an omitted `sliceUnits` keeps the previous working copy's
+    /// unit, except that a write which creates the canvas where there was
+    /// none (a fresh document has none) stores `pixels`, converting the
+    /// slices it carries from fractions. A write that names a different unit
+    /// converts every output geometry and offset it leaves unchanged from
+    /// the previous working copy (percent to pixels rounds the edges; pixels
+    /// to percent divides exactly) and takes the ones it changes literally,
+    /// in the unit it names. Exact mode always stores `pixels`: a write that
+    /// lands in Exact in `percent` is converted.
+    #[serde(default, skip_serializing_if = "SliceUnits::omitted")]
+    pub slice_units: Option<SliceUnits>,
     /// Master switch for seam ramps. `false` retains required slicing and warp
     /// processing but disables the transfer fades.
     pub blend: bool,
@@ -158,6 +177,7 @@ impl Default for ProjectionConfig {
         Self {
             mode: ProjectionMode::Simple,
             canvas: None,
+            slice_units: None,
             blend: true,
             gamma: 2.2,
             black_lift: BlackLift::default(),
@@ -168,6 +188,22 @@ impl Default for ProjectionConfig {
             arrangement: None,
             temporary: TemporarySettings::default(),
         }
+    }
+}
+
+impl ProjectionConfig {
+    /// The unit the slices are stored in: `percent` when `sliceUnits` is
+    /// absent.
+    pub fn slice_units(&self) -> SliceUnits {
+        self.slice_units.unwrap_or_default()
+    }
+
+    /// Store `units`, in the field's canonical form: `percent` is absent.
+    pub fn set_slice_units(&mut self, units: SliceUnits) {
+        self.slice_units = match units {
+            SliceUnits::Percent => None,
+            SliceUnits::Pixels => Some(SliceUnits::Pixels),
+        };
     }
 }
 
@@ -314,6 +350,15 @@ impl DesiredState {
             schema_version: SCHEMA_VERSION,
             ..Default::default()
         }
+    }
+
+    /// The unit this document's slices are stored in: `percent` without a
+    /// projection section or without `sliceUnits`.
+    pub fn slice_units(&self) -> SliceUnits {
+        self.projection
+            .as_ref()
+            .map(ProjectionConfig::slice_units)
+            .unwrap_or_default()
     }
 
     /// Semantic validation beyond what serde enforces. Returns all problems found.
@@ -516,6 +561,7 @@ impl DesiredState {
     fn validate_output_geometry_once(
         geometry: &OutputGeometry,
         canvas: Option<&CanvasConfig>,
+        units: SliceUnits,
         mode: Option<Mode>,
         transform: Option<Transform>,
         prefix: &str,
@@ -529,9 +575,9 @@ impl DesiredState {
                 } else {
                     (mode.width, mode.height)
                 };
-                geometry.validate_for_output(canvas, width as u32, height as u32)
+                geometry.validate_for_output(canvas, units, width as u32, height as u32)
             }
-            _ => geometry.validate_numbers(canvas),
+            _ => geometry.validate_numbers(canvas, units),
         };
         if let Err(error) = result {
             errors.push(format!("{prefix}.geometry {error}"));
@@ -551,6 +597,7 @@ impl DesiredState {
                     Self::validate_output_geometry_once(
                         geometry,
                         None,
+                        SliceUnits::Percent,
                         None,
                         None,
                         &format!("outputs[{index}]"),
@@ -607,15 +654,36 @@ impl DesiredState {
         // matches the `±16` canvas-span bound `geometry.slice` is held to
         // (`MAX_SLICE_SPAN` in `geometry.rs`) — an offset need never be
         // larger than a slice rectangle is allowed to stray from the canvas.
+        // In pixels the offset is whole canvas pixels, and the bound is the
+        // same sixteen canvas spans measured in pixels (in the largest canvas
+        // there can be, when there is none yet).
+        let units = projection.slice_units();
+        let offset_bound = match units {
+            SliceUnits::Percent => 16.0,
+            SliceUnits::Pixels => {
+                16.0 * projection
+                    .canvas
+                    .as_ref()
+                    .and_then(|canvas| canvas.dimensions().ok())
+                    .map_or(f64::from(super::limits::MAX_DIMENSION), |(w, h)| {
+                        f64::from(w.max(h))
+                    })
+            }
+        };
         for (index, output) in self.outputs.iter().enumerate() {
             let Some(offset) = output.arrange_offset else {
                 continue;
             };
             for (axis, value) in [("x", offset.x), ("y", offset.y)] {
-                if !(value.is_finite() && value.abs() <= 16.0) {
+                if !(value.is_finite() && value.abs() <= offset_bound) {
                     errors.push(format!(
-                        "outputs[{index}].arrangeOffset.{axis} must be finite and at most 16 in \
-                         magnitude, not {value}"
+                        "outputs[{index}].arrangeOffset.{axis} must be finite and at most \
+                         {offset_bound} in magnitude, not {value}"
+                    ));
+                } else if units == SliceUnits::Pixels && value.fract() != 0.0 {
+                    errors.push(format!(
+                        "outputs[{index}].arrangeOffset.{axis} must be whole canvas pixels while \
+                         projection.sliceUnits is \"pixels\"; it is {value}"
                     ));
                 }
             }
@@ -656,6 +724,7 @@ impl DesiredState {
                 Self::validate_output_geometry_once(
                     geometry,
                     projection.canvas.as_ref(),
+                    units,
                     output.effective_mode(),
                     output.effective_transform(),
                     &prefix,
@@ -701,8 +770,18 @@ impl DesiredState {
             }
             match &output.geometry {
                 // Already validated once above (against this same canvas
-                // and mode); only the slice needs collecting here.
-                Some(geometry) => warp_slices.push(geometry.slice),
+                // and mode); only the slice needs collecting here, in canvas
+                // units whatever it is stored in. A canvas that cannot
+                // convert it has been reported above.
+                Some(geometry) => {
+                    if let Some(slice) = projection
+                        .canvas
+                        .as_ref()
+                        .and_then(|canvas| to_canvas_units(geometry.slice, units, canvas).ok())
+                    {
+                        warp_slices.push(slice);
+                    }
+                }
                 None => errors.push(format!("{prefix}.geometry is required for a shared canvas")),
             }
         }

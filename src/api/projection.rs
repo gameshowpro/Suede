@@ -78,6 +78,11 @@ pub struct RecommendationResponse {
     pub unknown_limits: Vec<String>,
     pub warnings: Vec<String>,
     pub approximate: bool,
+    /// Every enabled output whose whole-pixel slice extends past the
+    /// document's current canvas, as in the projection status; each
+    /// `message` is also among `warnings`. Omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out_of_canvas: Vec<crate::model::SliceOverhang>,
 }
 
 const LIMITS: ResolutionLimits = ResolutionLimits {
@@ -93,6 +98,10 @@ const LIMITS: ResolutionLimits = ResolutionLimits {
 /// at zero.  The slice and raster-footprint rectangles are intentionally both
 /// explicit in the result, even though the initial candidate uses the same
 /// rectangle for each; later calibration may change the footprint alone.
+///
+/// The candidate's rectangles are fractions of the canvas
+/// (`sliceUnits: "percent"`). Written as they are onto a document with no
+/// canvas, they are stored in pixels (see `projection.sliceUnits`).
 pub fn convert_layout_candidate(outputs: &[OutputConfig]) -> Result<ConvertLayoutResponse, String> {
     let mut keys = HashSet::new();
     for output in outputs {
@@ -344,6 +353,11 @@ pub struct ArrangementDryRun {
     /// Exact mode only: as `overlapXPx`, vertically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlap_y_px: Option<u32>,
+    /// The unit `outputs[].slice` is in: the document's
+    /// `projection.sliceUnits` (`pixels` in Exact mode), which applying the
+    /// arrangement writes them in.
+    #[serde(default)]
+    pub slice_units: crate::model::SliceUnits,
     pub revision: u64,
     pub generation: u64,
 }
@@ -397,6 +411,7 @@ pub async fn get_arrangement(
         canvas: solution.canvas,
         overlap_x_px: solution.overlap_x_px,
         overlap_y_px: solution.overlap_y_px,
+        slice_units: solution.slice_units,
         revision: document.revision,
         generation,
     }))
@@ -532,12 +547,40 @@ pub fn recommend_for_state(
         return exact_recommendation(document, &converted, requested_aspect, generation);
     }
 
+    // The slices as the slicer will crop them: whole canvas pixels on the
+    // document's canvas ([`crate::model::effective_slice_px`]), expressed in
+    // canvas units for the density arithmetic below. Without a valid canvas
+    // a percent slice is taken as stored; a pixels slice has nothing to be
+    // a fraction of, so the converted candidate stands in for it.
+    let canvas = document
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.canvas)
+        .filter(|canvas| canvas.dimensions().is_ok());
+    let units = document.slice_units();
+    let in_canvas_units = |geometry: &OutputGeometry| -> Option<OutputGeometry> {
+        let Some(canvas) = canvas else {
+            return (units == crate::model::SliceUnits::Percent).then(|| geometry.clone());
+        };
+        let pixels = crate::model::effective_slice_px(geometry.slice, units, &canvas).ok()?;
+        Some(OutputGeometry {
+            slice: pixels.to_canvas_units(&canvas).ok()?,
+            raster_footprint: crate::model::to_canvas_units(
+                geometry.raster_footprint,
+                units,
+                &canvas,
+            )
+            .ok()?,
+            ..geometry.clone()
+        })
+    };
     let geometries: Vec<(&OutputConfig, OutputGeometry)> = outputs
         .iter()
         .map(|output| {
             let mut geometry = output
                 .geometry
-                .clone()
+                .as_ref()
+                .and_then(in_canvas_units)
                 .or_else(|| {
                     converted.as_ref().and_then(|candidate| {
                         candidate
@@ -647,13 +690,20 @@ pub fn recommend_for_state(
         )?;
         // Validate slice bounds against the requested aspect while keeping
         // an invalid/stale persisted render width from preventing a useful
-        // read-only recommendation that can explain its clamp.
+        // read-only recommendation that can explain its clamp. The geometry
+        // is in canvas units by now, and is checked on the largest canvas
+        // the aspect admits, so no slice is too small to hold a whole pixel.
         let validation_canvas = CanvasConfig {
             aspect: requested_aspect,
-            render_width: 1,
+            render_width: admissible_width(requested_aspect)?,
         };
         geometry
-            .validate_for_output(&validation_canvas, width, height)
+            .validate_for_output(
+                &validation_canvas,
+                crate::model::SliceUnits::Percent,
+                width,
+                height,
+            )
             .map_err(|error| {
                 format!(
                     "output {} has invalid geometry: {error}",
@@ -762,6 +812,12 @@ pub fn recommend_for_state(
     warnings.push(
         "device and compositor maximum dimensions are unknown; no live probe was performed".into(),
     );
+    let out_of_canvas = crate::model::slice_units::out_of_canvas(document);
+    warnings.extend(
+        out_of_canvas
+            .iter()
+            .map(|overhang| overhang.message.clone()),
+    );
 
     let presets = [0.25, 0.5, 0.75, 1.0]
         .into_iter()
@@ -794,6 +850,7 @@ pub fn recommend_for_state(
         unknown_limits: vec!["device/compositor allocation limit".into()],
         warnings,
         approximate,
+        out_of_canvas,
     })
 }
 
@@ -815,6 +872,13 @@ fn exact_recommendation(
     let (ideal_width, ideal_height) = canvas.dimensions()?;
     let admissible_width = admissible_width(requested_aspect)?;
     let admissible_height = canvas_height(admissible_width, requested_aspect)?;
+    let out_of_canvas = crate::model::slice_units::out_of_canvas(document);
+    let mut warnings = vec!["exact mode: the canvas is defined by the output placements".into()];
+    warnings.extend(
+        out_of_canvas
+            .iter()
+            .map(|overhang| overhang.message.clone()),
+    );
     Ok(RecommendationResponse {
         revision: document.revision,
         generation,
@@ -826,8 +890,9 @@ fn exact_recommendation(
         presets: Vec::new(),
         known_limits: LIMITS,
         unknown_limits: vec!["device/compositor allocation limit".into()],
-        warnings: vec!["exact mode: the canvas is defined by the output placements".into()],
+        warnings,
         approximate: false,
+        out_of_canvas,
     })
 }
 
@@ -1615,8 +1680,12 @@ mod tests {
                 2.5,
                 (5760, 2304),
             ),
-            // W / aspect = 2215.38: the 2216th row is genuinely required, and
-            // no further row may be added.
+            // W / aspect = 2215.38, so the canvas is 5760x2215 and its
+            // vertical density 5759 px per unit. The stored fractions alone
+            // would ask for a 2216th row, but the recommendation reads the
+            // whole-pixel slices the slicer crops, which on this canvas are
+            // exactly 1080 rows each (edges at 1079.8 and 2159.6 round to
+            // 1080 and 2160), so no row is added.
             RatioCase::new(
                 "3x2 aspect 2.6",
                 (3, 2),
@@ -1624,7 +1693,7 @@ mod tests {
                 5760.0,
                 (1.0, 1.0),
                 2.6,
-                (5761, 2216),
+                (5760, 2215),
             ),
         ];
         let mut half_pins = RatioCase::new(

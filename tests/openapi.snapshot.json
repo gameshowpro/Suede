@@ -303,7 +303,7 @@
           },
           "slice": {
             "$ref": "#/components/schemas/CanvasRect",
-            "description": "The normalized canvas rectangle this output samples."
+            "description": "The canvas rectangle this output samples, in the solution's\n[`ArrangementSolution::slice_units`]: the solver's exact fractions in\n`percent`, its rounded edges in `pixels`."
           }
         },
         "required": [
@@ -422,6 +422,10 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "sliceUnits": {
+            "$ref": "#/components/schemas/SliceUnits",
+            "description": "The unit `outputs[].slice` is in: the document's\n`projection.sliceUnits` (`pixels` in Exact mode), which applying the\narrangement writes them in."
           },
           "unusedCanvas": {
             "$ref": "#/components/schemas/UnusedCanvas"
@@ -560,6 +564,10 @@
               "integer",
               "null"
             ]
+          },
+          "sliceUnits": {
+            "$ref": "#/components/schemas/SliceUnits",
+            "description": "The unit `outputs[].slice` is in: the document's\n`projection.sliceUnits` (always `pixels` in Exact mode). [`apply`]\nwrites the slices in it."
           },
           "unusedCanvas": {
             "$ref": "#/components/schemas/UnusedCanvas",
@@ -3529,11 +3537,11 @@
           },
           "rasterFootprint": {
             "$ref": "#/components/schemas/CanvasRect",
-            "description": "Physical light-field coverage, independent of the slice and\ndestination pins. Until a calibrated footprint is supplied, conversion\ncopies the slice rectangle into this field."
+            "description": "Physical light-field coverage, independent of the slice and\ndestination pins, in the same `projection.sliceUnits` as the slice\n(it need not be whole pixels: it is a measurement, not a crop). Until\na calibrated footprint is supplied, conversion copies the slice\nrectangle into this field."
           },
           "slice": {
             "$ref": "#/components/schemas/CanvasRect",
-            "description": "The slice: the canonical normalized canvas region this output\nsamples, used by both Simple and Warp. Pixel crop origins and content\nenlargement are derived from this rectangle, never stored as a second\neditable representation.\n\nSerialized as `slice`; `source` is still accepted on input (an alpha\nrename) so saved documents and older clients' writes keep parsing,\nbut every response and every re-serialization emits `slice`."
+            "description": "The slice: the canvas region this output samples, used by every\nmode, in the installation's `projection.sliceUnits` (fractions of the\ncanvas in `percent`, whole canvas pixels in `pixels`). The whole-pixel\ncrop the slicer uses is derived from this rectangle\n([`effective_slice_px`]), never stored as a second editable\nrepresentation.\n\nSerialized as `slice`; `source` is still accepted on input (an alpha\nrename) so saved documents and older clients' writes keep parsing,\nbut every response and every re-serialization emits `slice`."
           }
         },
         "required": [
@@ -4472,6 +4480,18 @@
               }
             ]
           },
+          "sliceUnits": {
+            "default": null,
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SliceUnits",
+                "description": "The unit every output's `geometry.slice`, `geometry.rasterFootprint`\nand `arrangeOffset` is stored in; see [`SliceUnits`]. Absent means\n`percent`, and `percent` is never written out, so a document without\nit is read exactly as it always was. `pixels` documents fail to parse\non a build that predates this field rather than being misread.\n\nOn a write, an omitted `sliceUnits` keeps the previous working copy's\nunit, except that a write which creates the canvas where there was\nnone (a fresh document has none) stores `pixels`, converting the\nslices it carries from fractions. A write that names a different unit\nconverts every output geometry and offset it leaves unchanged from\nthe previous working copy (percent to pixels rounds the edges; pixels\nto percent divides exactly) and takes the ones it changes literally,\nin the unit it names. Exact mode always stores `pixels`: a write that\nlands in Exact in `percent` is converted."
+              }
+            ]
+          },
           "temporary": {
             "default": {
               "highlightOverlaps": false
@@ -4763,6 +4783,13 @@
               "string",
               "null"
             ]
+          },
+          "outOfCanvas": {
+            "description": "Every enabled output whose whole-pixel slice extends past the canvas,\nwith the overhang in canvas pixels per edge and a sentence naming\nit. A report, not an error: the slice still renders, its part off the\ncanvas black. Omitted when empty.",
+            "items": {
+              "$ref": "#/components/schemas/SliceOverhang"
+            },
+            "type": "array"
           },
           "reason": {
             "type": [
@@ -5183,6 +5210,13 @@
           "knownLimits": {
             "$ref": "#/components/schemas/ResolutionLimits"
           },
+          "outOfCanvas": {
+            "description": "Every enabled output whose whole-pixel slice extends past the\ndocument's current canvas, as in the projection status; each\n`message` is also among `warnings`. Omitted when empty.",
+            "items": {
+              "$ref": "#/components/schemas/SliceOverhang"
+            },
+            "type": "array"
+          },
           "presets": {
             "items": {
               "$ref": "#/components/schemas/ScalePreset"
@@ -5447,6 +5481,60 @@
           "socket"
         ],
         "type": "object"
+      },
+      "SliceOverhang": {
+        "description": "One enabled output whose whole-pixel slice extends past the canvas.\n\nThe slice is still rendered (its part off the canvas shows black); this\nis a report, not an error. It arises in `pixels` when the canvas shrinks\nunder fixed slices, and in either unit when a slice is placed or\narranged past an edge. A slice with no area on the canvas at all is\nrefused by validation instead, and Exact mode refuses any overhang.",
+        "properties": {
+          "bottom": {
+            "description": "Whole canvas pixels past the canvas's bottom edge.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "left": {
+            "description": "Whole canvas pixels of the slice past the canvas's left edge; 0 when\nit does not extend past it.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "message": {
+            "description": "The same, as a sentence for a person, e.g. \"DP-2 extends 960 px past\nthe canvas's right edge\".",
+            "type": "string"
+          },
+          "output": {
+            "description": "The output's configuration key (its connector name, e.g. `DP-2`, for\na plain name match), as `PUT /config/outputs/{key}` takes it.",
+            "type": "string"
+          },
+          "right": {
+            "description": "Whole canvas pixels past the canvas's right edge.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "top": {
+            "description": "Whole canvas pixels past the canvas's top edge.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "output",
+          "left",
+          "top",
+          "right",
+          "bottom",
+          "message"
+        ],
+        "type": "object"
+      },
+      "SliceUnits": {
+        "description": "The unit every output's `geometry.slice`, `geometry.rasterFootprint` and\n`arrangeOffset` is stored in: `projection.sliceUnits`, one per\ninstallation, so a resolution change treats every slice alike.\n\nWhichever is stored, the slicer always crops whole canvas pixels; see\n[`effective_slice_px`].",
+        "enum": [
+          "percent",
+          "pixels"
+        ],
+        "type": "string"
       },
       "Status": {
         "description": "Reconciliation status, as served by `GET /status`.\n\nAnswers \"is this appliance doing what I asked, and will it still be after\na reboot\" from one call: `state` and `divergences` alone say whether\ndesired state is fulfilled *right now*, but say nothing about whether the\ndocument behind that answer survives a restart, whether the machine has\ncaught up with a write still in flight, or whether the environment it\ndepends on is otherwise healthy. See `docs/specification.md`'s `/status`\nsection for the predicate spelled out for client authors.",
@@ -7365,7 +7453,7 @@
                 }
               }
             },
-            "description": "The persisted document. `null` removes the whole projection section. Retention note: while the effective mode is Simple, an otherwise-present projection body that omits `canvas` keeps the previously saved canvas rather than clearing it, so a Simple-mode save cannot accidentally discard a retained Warp canvas. A body that switches the mode to `exact` likewise keeps the previous canvas when it omits one, and the merged document is kept (stripped of corner and center correction) if it satisfies the Exact rules, or reset to the Exact defaults derived from the outputs' positions otherwise; a bare `{\"mode\":\"exact\"}` therefore keeps a layout that already conforms. Writes that stay in Exact are literal. PUT is otherwise literal. To actually clear the shared canvas, use DELETE /config/projection/canvas."
+            "description": "The persisted document. `null` removes the whole projection section. Retention note: while the effective mode is Simple, an otherwise-present projection body that omits `canvas` keeps the previously saved canvas rather than clearing it, so a Simple-mode save cannot accidentally discard a retained Warp canvas. A body that switches the mode to `exact` likewise keeps the previous canvas when it omits one, and the merged document is kept (stripped of corner and center correction) if it satisfies the Exact rules, or reset to the Exact defaults derived from the outputs' positions otherwise; a bare `{\"mode\":\"exact\"}` therefore keeps a layout that already conforms. Writes that stay in Exact are literal. PUT is otherwise literal. To actually clear the shared canvas, use DELETE /config/projection/canvas. An omitted `sliceUnits` keeps the previous unit (a body that creates the canvas stores `pixels`), and a body naming the other unit converts the outputs' slices, which this route leaves unchanged; see `ProjectionConfig.sliceUnits`."
           },
           "422": {
             "description": "Validation failed"

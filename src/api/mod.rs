@@ -369,6 +369,7 @@ pub fn validate_configuration_against(
     previous: &DesiredState,
     context: &ValidationContext,
 ) -> ApiResult<()> {
+    crate::projection_policy::settle_slice_units(next, previous);
     crate::projection_policy::preserve_retained(next, previous);
     crate::projection_policy::transition(next, previous, context.allow_overlaps).map_err(
         |errors| {

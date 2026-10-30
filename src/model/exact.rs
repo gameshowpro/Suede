@@ -24,6 +24,14 @@
 //! [`crate::projection_policy::transition`] applies [`enter`] and [`leave`]
 //! to every working-copy replacement that changes the mode.
 //!
+//! Exact stores its slices in whole canvas pixels
+//! ([`SliceUnits::Pixels`]): [`enter`] converts a percent document before it
+//! judges it, [`defaults`] writes pixels, and leaving keeps them, so the round
+//! trip stays byte-identical. The rules still accept a percent document
+//! whose slices sit within [`PIXEL_EPS`] of whole pixels, which is what an
+//! Exact document saved before slice units existed holds, so such a document
+//! keeps loading; the first write converts it.
+//!
 //! Exact needs the canvas slicer. On a tiled appliance
 //! (`allow_overlaps = false`) it is unavailable, for the reason
 //! [`unavailable_reason`] gives; that one function is the policy, so
@@ -31,7 +39,10 @@
 
 use super::arrangement::seam_extents;
 use super::desired::{DesiredState, OutputConfig};
-use super::geometry::{validate_slices, CanvasConfig, CanvasRect, OutputGeometry, ProjectionMode};
+use super::geometry::{
+    to_canvas_units, validate_slices, CanvasConfig, CanvasRect, OutputGeometry, ProjectionMode,
+    SliceUnits,
+};
 
 /// Unit destination pins, in TL, TR, BR, BL order: no corner correction.
 pub const UNIT_CORNERS: [[f64; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
@@ -148,8 +159,25 @@ pub fn rule_problems(desired: &DesiredState, canvas: &CanvasConfig) -> Vec<Strin
         else {
             continue;
         };
-        let Ok([x, y, width, height]) = geometry.slice.pixel_rect(canvas) else {
-            continue;
+        // Pixels are judged as stored: integers, which validation has
+        // already required. A percent document (only ever an Exact document
+        // saved before slice units) is judged on its fractions, within
+        // `PIXEL_EPS` of whole pixels, never on a rounding of them.
+        let [x, y, width, height] = match desired.slice_units() {
+            // A fractional pixel slice is refused by validation already.
+            SliceUnits::Pixels if super::geometry::first_fractional(geometry.slice).is_some() => {
+                continue
+            }
+            SliceUnits::Pixels => [
+                geometry.slice.x,
+                geometry.slice.y,
+                geometry.slice.width,
+                geometry.slice.height,
+            ],
+            SliceUnits::Percent => match geometry.slice.pixel_rect(canvas) {
+                Ok(rect) => rect,
+                Err(_) => continue,
+            },
         };
         let one_to_one = whole(x)
             && whole(y)
@@ -283,6 +311,7 @@ pub fn conforms(desired: &DesiredState) -> Result<(), Vec<String>> {
     if enabled == 0 {
         errors.push("shared canvas rendering requires at least one enabled output".into());
     }
+    let units = desired.slice_units();
     let mut slices = Vec::new();
     for (index, output) in desired.outputs.iter().enumerate() {
         if !output.enable {
@@ -301,7 +330,7 @@ pub fn conforms(desired: &DesiredState) -> Result<(), Vec<String>> {
         };
         match logical_raster(output) {
             Some((width, height)) => {
-                if let Err(error) = geometry.validate_for_output(canvas, width, height) {
+                if let Err(error) = geometry.validate_for_output(canvas, units, width, height) {
                     errors.push(format!("{prefix}.geometry {error}"));
                 }
             }
@@ -310,7 +339,10 @@ pub fn conforms(desired: &DesiredState) -> Result<(), Vec<String>> {
             }
             None => {}
         }
-        slices.push(geometry.slice);
+        match to_canvas_units(geometry.slice, units, canvas) {
+            Ok(slice) => slices.push(slice),
+            Err(error) => errors.push(format!("{prefix}.geometry {error}")),
+        }
     }
     if let Some(canvas) = canvas {
         if slices.len() == enabled && !slices.is_empty() {
@@ -360,8 +392,10 @@ pub fn strip(desired: &DesiredState) -> DesiredState {
 /// The canvas is the whole-pixel bounding box of the enabled outputs'
 /// logical rasters at their integer `position`s (aspect = width / height,
 /// render width = width); each enabled output's slice is its positioned
-/// rectangle, normalized, so it is 1:1 by construction, with unit pins, a
-/// centered remap, and a raster footprint equal to the slice. An enabled
+/// rectangle in whole canvas pixels (`sliceUnits: "pixels"`, every other
+/// output's geometry converted to match), so it is 1:1 by construction,
+/// with unit pins, a centered remap, and a raster footprint equal to the
+/// slice. An enabled
 /// output whose effective scale is not 1 gets `scale: 1.0`. The arrangement
 /// record and every output's `arrangeOffset` are dropped, and correction is
 /// stripped from disabled outputs too. Everything else (blend, gamma, black
@@ -434,23 +468,39 @@ pub fn defaults(desired: &DesiredState) -> Result<DesiredState, Vec<String>> {
     }
 
     let mut reset = strip(desired);
-    let projection = reset.projection.get_or_insert_with(Default::default);
-    projection.canvas = Some(canvas);
-    projection.arrangement = None;
-    // The same normalization `convert_layout_candidate` and the slicer's
-    // canonical-slice recovery use: pixels over the canvas width on both
-    // axes, because canvas units are isotropic.
-    let unit = width as f64;
     for output in &mut reset.outputs {
         output.arrange_offset = None;
     }
+    // Every geometry the reset does not replace (a disabled output's) moves
+    // to pixels with the rest. Measured on the document's own canvas when it
+    // has one; without one its percent fractions have no pixels to stand
+    // for, so they are measured on the new canvas.
+    let units = reset.slice_units();
+    if units != SliceUnits::Pixels {
+        let measure = reset
+            .projection
+            .as_ref()
+            .and_then(|projection| projection.canvas)
+            .filter(|old| old.dimensions().is_ok())
+            .unwrap_or(canvas);
+        for output in &mut reset.outputs {
+            if let Some(geometry) = output.geometry.as_mut() {
+                super::slice_units::convert_geometry(geometry, units, SliceUnits::Pixels, &measure)
+                    .map_err(|error| vec![error])?;
+            }
+        }
+    }
+    let projection = reset.projection.get_or_insert_with(Default::default);
+    projection.canvas = Some(canvas);
+    projection.arrangement = None;
+    projection.set_slice_units(SliceUnits::Pixels);
     for (index, x, y, w, h) in rects {
         let output = &mut reset.outputs[index];
         let slice = CanvasRect {
-            x: (x - min_x) as f64 / unit,
-            y: (y - min_y) as f64 / unit,
-            width: w as f64 / unit,
-            height: h as f64 / unit,
+            x: (x - min_x) as f64,
+            y: (y - min_y) as f64,
+            width: w as f64,
+            height: h as f64,
         };
         output.geometry = Some(OutputGeometry {
             slice,
@@ -466,10 +516,13 @@ pub fn defaults(desired: &DesiredState) -> Result<DesiredState, Vec<String>> {
 }
 
 /// Enter Exact mode: `desired` with `projection.mode` set to `exact` (a
-/// projection section is created if there is none), [`strip`]ped, and kept
-/// if it then [`conforms`]; otherwise replaced by its [`defaults`]. A write
-/// that switches to Exact and edits geometry in the same request is judged
-/// as the one merged document it produces.
+/// projection section is created if there is none), converted to whole
+/// canvas pixels if it is in percent (edges rounded, see
+/// [`super::geometry::effective_slice_px`]), [`strip`]ped, and kept if it
+/// then [`conforms`]; otherwise replaced by its [`defaults`]. A write that
+/// switches to Exact and edits geometry in the same request is judged as
+/// the one merged document it produces. A percent document with no valid
+/// canvas cannot be converted; it does not conform either, so it is reset.
 ///
 /// Fails only when the document must be reset and the defaults cannot be
 /// derived, or do not themselves conform (outputs whose positions do not
@@ -480,6 +533,9 @@ pub fn enter(desired: &DesiredState) -> Result<(DesiredState, Transition), Vec<S
         .projection
         .get_or_insert_with(Default::default)
         .mode = ProjectionMode::Exact;
+    // Without a canvas there is nothing to measure the conversion against,
+    // and nothing that could conform: the reset below writes pixels.
+    let _ = super::slice_units::convert_document(&mut candidate, SliceUnits::Pixels);
     let stripped = strip(&candidate);
     match conforms(&stripped) {
         Ok(()) => Ok((stripped, Transition::Kept)),
@@ -504,26 +560,6 @@ pub fn leave(desired: &DesiredState, to: ProjectionMode) -> DesiredState {
         projection.mode = to;
     }
     left
-}
-
-/// The integer source rectangle a near-whole-pixel slice stands for.
-///
-/// Validation accepts an Exact slice whose pixel rectangle is within
-/// [`PIXEL_EPS`] of whole pixels, because normalized coordinates carry
-/// rounding error; the slicer's integer copy needs the integers themselves.
-/// The canvas planner applies this to every output that carries no
-/// correction, in every mode, so a slice plans the same way in Exact and
-/// after leaving it. A rectangle that is not within that tolerance on every
-/// component is returned unchanged.
-pub fn whole_pixel_source(source: [f64; 4]) -> [f64; 4] {
-    if source
-        .iter()
-        .all(|value| value.is_finite() && whole(*value))
-    {
-        source.map(|value| value.round() + 0.0)
-    } else {
-        source
-    }
 }
 
 #[cfg(test)]
@@ -562,9 +598,40 @@ mod tests {
         }
     }
 
+    fn pixels(x: f64, y: f64, w: f64, h: f64) -> CanvasRect {
+        CanvasRect {
+            x,
+            y,
+            width: w,
+            height: h,
+        }
+    }
+
     /// A 2x2 grid of 1920x1080 outputs with 160 px overlaps on both axes,
-    /// on a 3680x2000 canvas, recorded as an Exact arrangement.
+    /// on a 3680x2000 canvas, recorded as an Exact arrangement, in whole
+    /// pixels as Exact stores it.
     fn grid_2x2(mode: ProjectionMode) -> DesiredState {
+        let mut document = grid_2x2_percent(mode);
+        for output in &mut document.outputs {
+            let position = output.position.unwrap();
+            output.geometry = Some(geometry(pixels(
+                f64::from(position.x),
+                f64::from(position.y),
+                1920.0,
+                1080.0,
+            )));
+        }
+        document
+            .projection
+            .as_mut()
+            .unwrap()
+            .set_slice_units(SliceUnits::Pixels);
+        document
+    }
+
+    /// [`grid_2x2`] in fractions of the canvas, with no `sliceUnits`: what
+    /// every document saved before slice units holds.
+    fn grid_2x2_percent(mode: ProjectionMode) -> DesiredState {
         let mut document = DesiredState::new();
         for (index, (x, y)) in [(0, 0), (1760, 0), (0, 920), (1760, 920)]
             .into_iter()
@@ -634,9 +701,21 @@ mod tests {
         assert!(conforms(&document).is_ok());
     }
 
+    /// An Exact document saved before slice units is percent; it must keep
+    /// validating (load-time validation would otherwise drop its geometry),
+    /// judged on its fractions within `PIXEL_EPS`.
+    #[test]
+    fn an_exact_document_saved_in_percent_still_validates() {
+        let document = grid_2x2_percent(ProjectionMode::Exact);
+        assert_eq!(document.slice_units(), SliceUnits::Percent);
+        assert_eq!(errors(&document), Vec::<String>::new());
+        assert!(conforms(&document).is_ok());
+    }
+
     #[test]
     fn a_half_pixel_slice_offset_is_refused_with_its_numbers() {
-        let mut document = grid_2x2(ProjectionMode::Exact);
+        // In percent, the fractions are judged as they are.
+        let mut document = grid_2x2_percent(ProjectionMode::Exact);
         document.outputs[0].geometry.as_mut().unwrap().slice.x = 0.5 / W;
         assert_eq!(
             errors(&document),
@@ -648,11 +727,32 @@ mod tests {
         // The same rule in Simple is no rule at all.
         document.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
         assert!(document.validate(true).is_ok());
+
+        // In pixels a fraction is no pixel at all, in any mode, and it is
+        // reported once.
+        let mut document = grid_2x2(ProjectionMode::Exact);
+        document.outputs[0].geometry.as_mut().unwrap().slice.x = 0.5;
+        let refused = [
+            "outputs[0].geometry geometry.slice must be whole canvas pixels while \
+             projection.sliceUnits is \"pixels\"; x is 0.5",
+        ];
+        assert_eq!(errors(&document), refused);
+        document.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
+        assert_eq!(errors(&document), refused);
     }
 
     #[test]
     fn a_slice_of_the_wrong_size_is_refused() {
         let mut document = grid_2x2(ProjectionMode::Exact);
+        document.outputs[1].geometry.as_mut().unwrap().slice.width = 1919.0;
+        assert_eq!(
+            errors(&document),
+            [
+                "outputs[1].geometry.slice must be a whole-pixel rectangle of exactly 1920×1080 \
+                 canvas pixels in exact mode; got 1919×1080 at (1760, 0)"
+            ]
+        );
+        let mut document = grid_2x2_percent(ProjectionMode::Exact);
         document.outputs[1].geometry.as_mut().unwrap().slice.width = 1919.5 / W;
         assert_eq!(
             errors(&document),
@@ -666,7 +766,7 @@ mod tests {
     #[test]
     fn a_slice_hanging_off_the_canvas_is_refused() {
         let mut document = grid_2x2(ProjectionMode::Exact);
-        document.outputs[3].geometry.as_mut().unwrap().slice.x = 1800.0 / W;
+        document.outputs[3].geometry.as_mut().unwrap().slice.x = 1800.0;
         assert_eq!(
             errors(&document),
             [
@@ -727,12 +827,7 @@ mod tests {
     fn an_overlap_on_an_axis_without_a_seam_is_inert() {
         let mut document = DesiredState::new();
         let mut output = hd("HDMI-1", 0, 0);
-        output.geometry = Some(geometry(CanvasRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1.0,
-            height: 1080.0 / 1920.0,
-        }));
+        output.geometry = Some(geometry(pixels(0.0, 0.0, 1920.0, 1080.0)));
         document.outputs.push(output);
         document.projection = Some(ProjectionConfig {
             mode: ProjectionMode::Exact,
@@ -740,6 +835,7 @@ mod tests {
                 aspect: 1920.0 / 1080.0,
                 render_width: 1920,
             }),
+            slice_units: Some(SliceUnits::Pixels),
             arrangement: Some(Arrangement {
                 rows: 1,
                 columns: 1,
@@ -770,12 +866,7 @@ mod tests {
         let mut document = DesiredState::new();
         let mut output = hd("HDMI-1", 0, 0);
         output.transform = Some(Transform::Rotate90);
-        output.geometry = Some(geometry(CanvasRect {
-            x: 0.0,
-            y: 0.0,
-            width: 1.0,
-            height: 1920.0 / 1080.0,
-        }));
+        output.geometry = Some(geometry(pixels(0.0, 0.0, 1080.0, 1920.0)));
         document.outputs.push(output);
         document.projection = Some(ProjectionConfig {
             mode: ProjectionMode::Exact,
@@ -783,12 +874,13 @@ mod tests {
                 aspect: 1080.0 / 1920.0,
                 render_width: 1080,
             }),
+            slice_units: Some(SliceUnits::Pixels),
             ..ProjectionConfig::default()
         });
         assert_eq!(errors(&document), Vec::<String>::new());
 
         // The landscape slice the unrotated mode would suggest is not 1:1.
-        document.outputs[0].geometry.as_mut().unwrap().slice.height = 1.0;
+        document.outputs[0].geometry.as_mut().unwrap().slice.height = 1080.0;
         assert_eq!(
             errors(&document),
             [
@@ -840,6 +932,21 @@ mod tests {
         assert!(entered.validate(true).is_ok());
     }
 
+    /// Entering converts a percent document to pixels by rounding its
+    /// edges, and judges the result: a layout a few ulps off whole pixels
+    /// (the slice 12 snap's case) is kept as the integers it stands for.
+    #[test]
+    fn a_conforming_percent_document_enters_in_whole_pixels() {
+        let mut simple = grid_2x2_percent(ProjectionMode::Simple);
+        let slice = &mut simple.outputs[1].geometry.as_mut().unwrap().slice;
+        slice.x = 1_759.999_999_999_999_8 / W;
+        slice.width = 1_920.000_000_000_000_2 / W;
+        let (entered, transition) = enter(&simple).unwrap();
+        assert_eq!(transition, Transition::Kept);
+        assert_eq!(json(&entered), json(&grid_2x2(ProjectionMode::Exact)));
+        assert!(entered.validate(true).is_ok());
+    }
+
     #[test]
     fn entering_strips_correction_and_keeps_an_otherwise_conforming_document() {
         let mut warp = grid_2x2(ProjectionMode::Warp);
@@ -853,12 +960,13 @@ mod tests {
 
     #[test]
     fn a_calibrated_warp_document_resets_to_the_defaults() {
-        let mut warp = grid_2x2(ProjectionMode::Warp);
+        let mut warp = grid_2x2_percent(ProjectionMode::Warp);
         for output in &mut warp.outputs {
             let geometry = output.geometry.as_mut().unwrap();
             geometry.corners = [[0.02, 0.0], [1.0, 0.01], [0.98, 1.0], [0.0, 0.99]];
+            // Still 1919 px once the edges are rounded on entry.
             geometry.slice.x += 0.25 / W;
-            geometry.slice.width -= 0.5 / W;
+            geometry.slice.width -= 1.5 / W;
         }
         warp.outputs[1].arrange_offset = Some(crate::model::ArrangeOffset { x: 0.001, y: 0.0 });
         warp.projection.as_mut().unwrap().gamma = 2.4;
@@ -872,6 +980,7 @@ mod tests {
 
         let projection = reset.projection.as_ref().unwrap();
         assert_eq!(projection.mode, ProjectionMode::Exact);
+        assert_eq!(projection.slice_units, Some(SliceUnits::Pixels));
         // Non-geometry fields of the write are honored.
         assert_eq!(projection.gamma, 2.4);
         // The positions' bounding box, which this fixture's positions make
@@ -885,7 +994,7 @@ mod tests {
                 .zip([(0.0, 0.0), (1760.0, 0.0), (0.0, 920.0), (1760.0, 920.0)])
         {
             let geometry = output.geometry.as_ref().unwrap();
-            assert_eq!(geometry.slice, slice_px(x, y, 1920.0, 1080.0));
+            assert_eq!(geometry.slice, pixels(x, y, 1920.0, 1080.0));
             assert_eq!(geometry.raster_footprint, geometry.slice);
             assert_eq!(geometry.corners, UNIT_CORNERS);
             assert_eq!(geometry.center, NEUTRAL_CENTER);
@@ -896,7 +1005,7 @@ mod tests {
 
     #[test]
     fn a_fractional_simple_document_resets_and_fixes_its_scale() {
-        let mut simple = grid_2x2(ProjectionMode::Simple);
+        let mut simple = grid_2x2_percent(ProjectionMode::Simple);
         simple.projection.as_mut().unwrap().canvas = Some(CanvasConfig {
             aspect: W / 2000.0,
             render_width: 3000,
@@ -940,14 +1049,15 @@ mod tests {
         assert!(matches!(transition, Transition::Reset { .. }));
         let canvas = reset.projection.as_ref().unwrap().canvas.unwrap();
         assert_eq!(canvas.dimensions(), Ok((3000, 1920)));
-        let rect = reset.outputs[0]
-            .geometry
-            .as_ref()
-            .unwrap()
-            .slice
-            .pixel_rect(&canvas)
-            .unwrap();
-        assert_eq!(whole_pixel_source(rect), [0.0, 0.0, 1080.0, 1920.0]);
+        assert_eq!(reset.slice_units(), SliceUnits::Pixels);
+        assert_eq!(
+            reset.outputs[0].geometry.as_ref().unwrap().slice,
+            pixels(0.0, 0.0, 1080.0, 1920.0)
+        );
+        assert_eq!(
+            reset.outputs[1].geometry.as_ref().unwrap().slice,
+            pixels(1080.0, 0.0, 1920.0, 1080.0)
+        );
         assert!(reset.validate(true).is_ok(), "{:?}", reset.validate(true));
     }
 
@@ -971,9 +1081,10 @@ mod tests {
 
     #[test]
     fn a_reset_document_also_round_trips() {
-        let mut simple = grid_2x2(ProjectionMode::Simple);
-        simple.outputs[0].geometry.as_mut().unwrap().slice.x = 0.25 / W;
-        let (exact, _) = enter(&simple).unwrap();
+        let mut simple = grid_2x2_percent(ProjectionMode::Simple);
+        simple.outputs[0].geometry.as_mut().unwrap().slice.width = 1918.5 / W;
+        let (exact, transition) = enter(&simple).unwrap();
+        assert!(matches!(transition, Transition::Reset { .. }));
         for to in [ProjectionMode::Simple, ProjectionMode::Warp] {
             let (back, transition) = enter(&leave(&exact, to)).unwrap();
             assert_eq!(transition, Transition::Kept);
@@ -981,13 +1092,33 @@ mod tests {
         }
     }
 
+    /// What the slice 12 snap did for a near-whole source, entering now
+    /// does by rounding edges: a fraction a few ulps off whole pixels plans
+    /// and stores the integers, and a real half pixel rounds half up.
     #[test]
-    fn whole_pixel_source_rounds_only_within_tolerance() {
+    fn near_whole_and_half_pixel_edges_round_to_whole_pixels() {
+        let canvas = CanvasConfig {
+            aspect: W / 2000.0,
+            render_width: 3680,
+        };
+        let near = slice_px(
+            1_759.999_999_999_999_8,
+            0.0,
+            1_920.000_000_000_000_2,
+            1080.0,
+        );
         assert_eq!(
-            whole_pixel_source([1759.9999999999998, 0.0, 1920.0000000000002, 1080.0]),
+            super::super::geometry::effective_slice_px(near, SliceUnits::Percent, &canvas)
+                .unwrap()
+                .source(),
             [1760.0, 0.0, 1920.0, 1080.0]
         );
-        let fractional = [0.5, 0.0, 1920.0, 1080.0];
-        assert_eq!(whole_pixel_source(fractional), fractional);
+        let half = slice_px(0.5, 0.0, 1920.0, 1080.0);
+        assert_eq!(
+            super::super::geometry::effective_slice_px(half, SliceUnits::Percent, &canvas)
+                .unwrap()
+                .source(),
+            [1.0, 0.0, 1920.0, 1080.0]
+        );
     }
 }
