@@ -2517,6 +2517,53 @@ mod tests {
     const ARRANGE_2X2_20: &str = r#"{"rows":2,"columns":2,"overlapX":0.2,"overlapY":0.2}"#;
 
     #[tokio::test]
+    async fn exact_arrangement_derives_the_canvas_and_rounds_to_whole_pixels() {
+        let harness = arrangement_harness(4);
+        harness
+            .state
+            .store
+            .update(|document| {
+                document.projection.as_mut().unwrap().mode = crate::model::ProjectionMode::Exact;
+            })
+            .unwrap();
+
+        // 0.083 of 1920 is 159.36 px; 0.1481 of 1080 is 159.95 px.
+        let uri = "/api/v1/projection/arrangement?rows=2&columns=2&overlapX=0.083&overlapY=0.1481";
+        let (status, dry) = call(&harness, "GET", uri, None).await;
+        assert_eq!(status, StatusCode::OK, "{dry}");
+        assert_eq!(dry["overlapXPx"], 159, "{dry}");
+        assert_eq!(dry["overlapYPx"], 160, "{dry}");
+        assert_eq!(dry["canvas"]["renderWidth"], 3681, "{dry}");
+        assert_eq!(dry["arrangement"]["contentScale"], 1.0);
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(r#"{"rows":2,"columns":2,"overlapX":0.083,"overlapY":0.1481}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["canvas"]["renderWidth"], 3681, "{body}");
+        assert_eq!(body["projection"]["mode"], "exact");
+
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(r#"{"rows":2,"columns":2,"contentScale":0.9}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body.to_string().contains(
+                "projection.arrangement.contentScale is 0.9; exact mode arranges at content scale 1"
+            ),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
     async fn uncommitted_arrangement_reaches_the_outputs_but_not_the_disk() {
         let harness = arrangement_harness(4);
         let before = harness.state.store.get();

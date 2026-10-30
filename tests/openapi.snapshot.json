@@ -360,6 +360,17 @@
             "$ref": "#/components/schemas/Arrangement",
             "description": "The resolved five values. In overlap mode `overlapX` and `overlapY`\nare exactly the requested ones: the solver never changes an overlap."
           },
+          "canvas": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CanvasConfig",
+                "description": "Exact mode only: the canvas the arrangement derives, which applying\nit writes to `projection.canvas`."
+              }
+            ]
+          },
           "generation": {
             "format": "int64",
             "minimum": 0,
@@ -388,6 +399,24 @@
           },
           "overhang": {
             "$ref": "#/components/schemas/Overhang"
+          },
+          "overlapXPx": {
+            "description": "Exact mode only: the horizontal overlap in whole pixels after\nrounding the requested `overlapX` to the nearest whole pixel (never\nbelow 0) of the seam extent it is a fraction of.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "overlapYPx": {
+            "description": "Exact mode only: as `overlapXPx`, vertically.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "revision": {
             "format": "int64",
@@ -487,6 +516,17 @@
             "$ref": "#/components/schemas/Arrangement",
             "description": "The resolved five values, exactly as [`apply`] records them."
           },
+          "canvas": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CanvasConfig",
+                "description": "Exact mode only: the canvas derived from the arrangement, the\nwhole-pixel bounding box of the arranged slices. [`apply`] writes it\nto `projection.canvas`. Absent in Simple and Warp, where the canvas is\nthe operator's."
+              }
+            ]
+          },
           "impliedAspect": {
             "description": "The canvas aspect at which the requested overlaps would fill both\naxes exactly, with no overhang and no band. Reported, never applied:\nchanging the aspect resizes the headless canvas and the browser, so\nit is the operator's decision.",
             "format": "double",
@@ -502,6 +542,24 @@
           "overhang": {
             "$ref": "#/components/schemas/Overhang",
             "description": "How far the grid overshoots the canvas on each axis, as a fraction of\nthe canvas extent; see [`Overhang`]."
+          },
+          "overlapXPx": {
+            "description": "Exact mode only: the horizontal overlap in whole pixels of the\nraster extent `overlapX` is a fraction of (see [`solve_exact`]).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "overlapYPx": {
+            "description": "Exact mode only: the vertical overlap in whole pixels.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "unusedCanvas": {
             "$ref": "#/components/schemas/UnusedCanvas",

@@ -332,6 +332,18 @@ pub struct ArrangementDryRun {
     pub limits: Option<ArrangementLimits>,
     pub outputs: Vec<ArrangedOutput>,
     pub warnings: Vec<String>,
+    /// Exact mode only: the canvas the arrangement derives, which applying
+    /// it writes to `projection.canvas`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<crate::model::CanvasConfig>,
+    /// Exact mode only: the horizontal overlap in whole pixels after
+    /// rounding the requested `overlapX` to the nearest whole pixel (never
+    /// below 0) of the seam extent it is a fraction of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_x_px: Option<u32>,
+    /// Exact mode only: as `overlapXPx`, vertically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_y_px: Option<u32>,
     pub revision: u64,
     pub generation: u64,
 }
@@ -382,6 +394,9 @@ pub async fn get_arrangement(
         limits,
         outputs: solution.outputs,
         warnings: solution.warnings,
+        canvas: solution.canvas,
+        overlap_x_px: solution.overlap_x_px,
+        overlap_y_px: solution.overlap_y_px,
         revision: document.revision,
         generation,
     }))

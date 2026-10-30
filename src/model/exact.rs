@@ -95,7 +95,7 @@ fn mode_raster(output: &OutputConfig) -> Option<(u32, u32)> {
     ))
 }
 
-fn whole(value: f64) -> bool {
+pub(crate) fn whole(value: f64) -> bool {
     (value - value.round()).abs() <= PIXEL_EPS
 }
 
@@ -185,6 +185,23 @@ pub fn rule_problems(desired: &DesiredState, canvas: &CanvasConfig) -> Vec<Strin
     problems
 }
 
+/// The message for an arrangement content scale other than 1, shared by the
+/// document rule and the arrangement solver's refusal of such a request.
+pub(crate) fn content_scale_message(scale: f64) -> String {
+    format!(
+        "projection.arrangement.contentScale is {scale}; exact mode arranges at content scale 1"
+    )
+}
+
+/// The message for an arrangement seam that is not a whole number of pixels,
+/// shared by the document rule and the arrangement solver.
+pub(crate) fn fractional_overlap_message(pixels: f64) -> String {
+    format!(
+        "projection.arrangement implies a {} px overlap; exact mode arranges in whole pixels",
+        px(pixels)
+    )
+}
+
 /// The Exact rule for `projection.arrangement`: content scale 1, and every
 /// seam's overlap a whole number of pixels of the raster extent it is a
 /// fraction of. Without a canvas, or when the grid cannot be measured
@@ -199,10 +216,7 @@ fn arrangement_problems(desired: &DesiredState, canvas: Option<&CanvasConfig>) -
         return problems;
     };
     if arrangement.content_scale != 1.0 {
-        problems.push(format!(
-            "projection.arrangement.contentScale is {}; exact mode arranges at content scale 1",
-            arrangement.content_scale
-        ));
+        problems.push(content_scale_message(arrangement.content_scale));
     }
     let Some(canvas) = canvas else {
         return problems;
@@ -226,11 +240,7 @@ fn arrangement_problems(desired: &DesiredState, canvas: Option<&CanvasConfig>) -
             .map(|extent| overlap * extent)
             .find(|pixels| !whole(*pixels))
         {
-            problems.push(format!(
-                "projection.arrangement implies a {} px overlap; exact mode arranges in whole \
-                 pixels",
-                px(pixels)
-            ));
+            problems.push(fractional_overlap_message(pixels));
         }
     }
     problems

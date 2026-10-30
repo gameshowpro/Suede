@@ -71,7 +71,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use super::desired::{DesiredState, OutputConfig, Transform};
-use super::geometry::{CanvasConfig, CanvasRect, OutputGeometry};
+use super::exact;
+use super::geometry::{CanvasConfig, CanvasRect, OutputGeometry, ProjectionMode};
 
 /// Two slice rectangles are the same arrangement when every edge agrees to
 /// within this many normalized canvas units.
@@ -227,6 +228,19 @@ pub struct ArrangementSolution {
     pub outputs: Vec<ArrangedOutput>,
     /// Advisory notes about the solution; never a reason to refuse it.
     pub warnings: Vec<String>,
+    /// Exact mode only: the canvas derived from the arrangement, the
+    /// whole-pixel bounding box of the arranged slices. [`apply`] writes it
+    /// to `projection.canvas`. Absent in Simple and Warp, where the canvas is
+    /// the operator's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<CanvasConfig>,
+    /// Exact mode only: the horizontal overlap in whole pixels of the
+    /// raster extent `overlapX` is a fraction of (see [`solve_exact`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_x_px: Option<u32>,
+    /// Exact mode only: the vertical overlap in whole pixels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap_y_px: Option<u32>,
 }
 
 /// The overlaps one axis can take, holding the other axis at its requested
@@ -698,6 +712,167 @@ pub fn solve(
             })
             .collect(),
         warnings,
+        canvas: None,
+        overlap_x_px: None,
+        overlap_y_px: None,
+    })
+}
+
+/// Round one axis's requested overlap fraction to a whole number of pixels.
+///
+/// The fraction is taken of the seam extent: the smaller raster extent of
+/// the two slots a seam joins (see [`seam_extents`]). Returns the pixel
+/// count (nearest whole pixel, never below 0) and the fraction that pixel
+/// count is of that extent, which is what the solution records. An axis
+/// without a seam has no overlap: `(0, 0.0)`. When an axis has seams of
+/// different extents the first one is the reference and the others must
+/// come out whole too (the caller checks); a 100% overlap is refused.
+fn whole_overlap(label: &str, requested: f64, seams: &[f64]) -> Result<(u32, f64), String> {
+    let Some(&extent) = seams.iter().find(|extent| **extent > 0.0) else {
+        return Ok((0, 0.0));
+    };
+    let pixels = (requested * extent).round().max(0.0);
+    if pixels >= extent {
+        return Err(format!(
+            "{label} of {requested} rounds to {pixels} px, the whole {extent} px seam; overlap \
+             cannot reach 100%"
+        ));
+    }
+    Ok((pixels as u32, pixels / extent))
+}
+
+/// Solve a whole-pixel grid for Exact mode.
+///
+/// Exact is strictly 1:1, so the arrangement has no free scale: the content
+/// scale is 1 (a `contentScale` request of anything else is refused with the
+/// same message the document rule uses), the requested overlaps are rounded
+/// to whole pixels, and the canvas is derived rather than taken from the
+/// document, as the whole-pixel bounding box of the grid.
+///
+/// The overlap fraction `overlapX` is a fraction of the seam extent, the
+/// smaller of the two adjacent raster widths (`overlapY`: heights), so
+/// `overlapXPx = round(overlapX * 1920)` for a row of 1920-wide outputs. The
+/// rounding is to the nearest whole pixel, never below 0. The solution
+/// records the rounded fraction (`px / extent`) as `overlapX`/`overlapY`,
+/// plus `overlapXPx`/`overlapYPx`. An axis without a seam reports zero.
+/// `allowUnusedCanvas` has no meaning here: the derived canvas has no
+/// unused band and no overhang. Overlap-fraction limits are not computed.
+///
+/// An [`OutputConfig::arrange_offset`] is still added after placement, as in
+/// the other modes; one that leaves a slice off the whole-pixel grid or
+/// outside the canvas is refused when the document is validated.
+pub fn solve_exact(
+    outputs: &[OutputConfig],
+    request: &ArrangementRequest,
+    raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
+) -> Result<ArrangementSolution, String> {
+    if let Some(scale) = request.content_scale {
+        if scale != 1.0 {
+            return Err(exact::content_scale_message(scale));
+        }
+        if request.overlap_x.is_some() || request.overlap_y.is_some() {
+            return Err(
+                "arrangement is over-determined: give overlapX and overlapY, or contentScale, \
+                 but not both"
+                    .into(),
+            );
+        }
+    }
+    let enabled: Vec<&OutputConfig> = outputs.iter().filter(|output| output.enable).collect();
+    // The raster extents do not depend on the canvas; any valid one will do
+    // to measure them.
+    let probe = CanvasConfig {
+        aspect: 1.0,
+        render_width: 1,
+    };
+    let probe_metrics = grid(&enabled, &probe, request.rows, request.columns, &raster)?;
+    let seams = |extents: &[f64]| -> Vec<f64> {
+        extents
+            .windows(2)
+            .map(|pair| pair[0].min(pair[1]))
+            .collect()
+    };
+    let x_seams = seams(&probe_metrics.col_width);
+    let y_seams = seams(&probe_metrics.row_height);
+
+    let requested_x = checked_overlap("overlapX", request.overlap_x)?;
+    let requested_y = checked_overlap("overlapY", request.overlap_y)?;
+    let (px_x, overlap_x) = whole_overlap("overlapX", requested_x, &x_seams)?;
+    let (px_y, overlap_y) = whole_overlap("overlapY", requested_y, &y_seams)?;
+    for (overlap, seams) in [(overlap_x, &x_seams), (overlap_y, &y_seams)] {
+        if let Some(pixels) = seams
+            .iter()
+            .filter(|extent| **extent > 0.0)
+            .map(|extent| overlap * extent)
+            .find(|pixels| !exact::whole(*pixels))
+        {
+            return Err(exact::fractional_overlap_message(pixels));
+        }
+    }
+
+    let (extent_w, extent_h) = probe_metrics.effective_extent(overlap_x, overlap_y);
+    let (width, height) = (extent_w.round(), extent_h.round());
+    if !(width >= 1.0
+        && height >= 1.0
+        && width <= f64::from(u32::MAX)
+        && height <= f64::from(u32::MAX))
+    {
+        return Err("the arranged grid has no positive size".into());
+    }
+    let canvas = CanvasConfig {
+        aspect: width / height,
+        render_width: width as u32,
+    };
+    if canvas.dimensions()? != (width as u32, height as u32) {
+        return Err("the arranged canvas cannot be represented exactly".into());
+    }
+
+    let metrics = grid(&enabled, &canvas, request.rows, request.columns, &raster)?;
+    let arrangement = Arrangement {
+        rows: request.rows,
+        columns: request.columns,
+        overlap_x,
+        overlap_y,
+        content_scale: 1.0,
+    };
+    let placement = place(&metrics, &arrangement);
+
+    let mut warnings = Vec::new();
+    for (label, value, neighbors) in [
+        ("overlapX", overlap_x, "columns"),
+        ("overlapY", overlap_y, "rows"),
+    ] {
+        if value > HIGH_OVERLAP {
+            warnings.push(format!(
+                "{label} of {:.0}% leaves little unique content in each of the {neighbors}",
+                value * 100.0
+            ));
+        }
+    }
+
+    Ok(ArrangementSolution {
+        arrangement,
+        unused_canvas: UnusedCanvas::default(),
+        overhang: Overhang::default(),
+        implied_aspect: canvas.aspect,
+        outputs: enabled
+            .iter()
+            .zip(placement.rects)
+            .map(|(output, mut slice)| {
+                if let Some(offset) = output.arrange_offset {
+                    slice.x += offset.x;
+                    slice.y += offset.y;
+                }
+                ArrangedOutput {
+                    key: output.r#match.key(),
+                    slice,
+                }
+            })
+            .collect(),
+        warnings,
+        canvas: Some(canvas),
+        overlap_x_px: Some(px_x),
+        overlap_y_px: Some(px_y),
     })
 }
 
@@ -747,11 +922,16 @@ fn unused_canvas_gate(
 ///
 /// The one place that turns "this document has no canvas" into the error a
 /// client sees; [`solve`] itself is given a canvas and cannot report it.
+/// A document in Exact mode is solved by [`solve_exact`] instead, which
+/// derives the canvas rather than reading it.
 pub fn solve_document(
     document: &DesiredState,
     request: &ArrangementRequest,
     raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
 ) -> Result<ArrangementSolution, String> {
+    if is_exact(document) {
+        return solve_exact(&document.outputs, request, raster);
+    }
     let canvas = document
         .projection
         .as_ref()
@@ -903,6 +1083,9 @@ pub fn limits_document(
     request: &ArrangementRequest,
     raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
 ) -> Result<ArrangementLimits, String> {
+    if is_exact(document) {
+        return Err("overlap limits are not computed in exact mode".into());
+    }
     let canvas = document
         .projection
         .as_ref()
@@ -968,6 +1151,13 @@ fn bisect(mut valid_end: f64, mut invalid_end: f64, valid: &impl Fn(f64) -> bool
     valid_end
 }
 
+fn is_exact(document: &DesiredState) -> bool {
+    document
+        .projection
+        .as_ref()
+        .is_some_and(|projection| projection.mode == ProjectionMode::Exact)
+}
+
 /// Write a solution into a document.
 ///
 /// Only `geometry.slice` is replaced: an output that was already
@@ -975,6 +1165,10 @@ fn bisect(mut valid_end: f64, mut invalid_end: f64, valid: &impl Fn(f64) -> bool
 /// with no geometry at all is seeded with identity geometry, exactly as the
 /// layout conversion does. Outputs the solution does not name — the
 /// disabled ones — are untouched.
+///
+/// A solution carrying a derived [`ArrangementSolution::canvas`] (Exact
+/// mode) also replaces `projection.canvas`, and each arranged output's
+/// `rasterFootprint` follows its slice, as the Exact defaults have it.
 ///
 /// The caller validates the result; a solution can be arithmetically fine
 /// and still produce a document validation rejects (a gap between slices,
@@ -989,7 +1183,12 @@ pub fn apply(document: &mut DesiredState, solution: &ArrangementSolution) {
             continue;
         };
         match output.geometry.as_mut() {
-            Some(geometry) => geometry.slice = arranged.slice,
+            Some(geometry) => {
+                geometry.slice = arranged.slice;
+                if solution.canvas.is_some() {
+                    geometry.raster_footprint = arranged.slice;
+                }
+            }
             None => {
                 output.geometry = Some(OutputGeometry {
                     slice: arranged.slice,
@@ -1002,6 +1201,9 @@ pub fn apply(document: &mut DesiredState, solution: &ArrangementSolution) {
     }
     if let Some(projection) = document.projection.as_mut() {
         projection.arrangement = Some(solution.arrangement);
+        if let Some(canvas) = solution.canvas {
+            projection.canvas = Some(canvas);
+        }
     }
 }
 
@@ -2462,5 +2664,243 @@ mod tests {
                 "overlapY": { "min": 0.0, "max": 0.25, "hasSeam": false }
             })
         );
+    }
+
+    // --- Exact mode: whole-pixel arrangement ---------------------------------
+
+    fn exact_document(enabled: usize) -> DesiredState {
+        let mut document = document(enabled);
+        document.projection.as_mut().unwrap().mode = ProjectionMode::Exact;
+        document
+    }
+
+    fn exact_overlap_request(
+        rows: u32,
+        columns: u32,
+        overlap_x: Option<f64>,
+        overlap_y: Option<f64>,
+    ) -> ArrangementRequest {
+        let mut asked = request(rows, columns, overlap_x, overlap_y, None);
+        asked.allow_unused_canvas = false;
+        asked
+    }
+
+    /// Plans the document through the slicer's layout and asserts every
+    /// enabled output gets an integer source at its raster size.
+    #[track_caller]
+    fn assert_plans_integer_sources(document: &DesiredState) {
+        let observed: Vec<crate::model::Output> = document
+            .outputs
+            .iter()
+            .map(|config| {
+                let mode = config.mode.unwrap();
+                crate::model::Output {
+                    name: config.r#match.key(),
+                    active: true,
+                    make: None,
+                    model: None,
+                    serial: None,
+                    current_mode: Some(mode),
+                    modes: vec![mode],
+                    rect: crate::model::Rect {
+                        x: 0,
+                        y: 0,
+                        width: mode.width,
+                        height: mode.height,
+                    },
+                    scale: None,
+                    transform: None,
+                    adaptive_sync_status: None,
+                }
+            })
+            .collect();
+        let plan =
+            crate::projection::layout::canvas_plan_with_correction(document, &observed, true)
+                .unwrap();
+        assert_eq!(plan.slices.len(), document.outputs.len());
+        for slice in &plan.slices {
+            let source = slice.source_rect.unwrap();
+            for component in source {
+                assert_eq!(component, component.round(), "{source:?}");
+            }
+            assert_eq!(
+                (source[2], source[3]),
+                (f64::from(slice.slice.width), f64::from(slice.slice.height))
+            );
+            assert!(slice.geometry.is_none());
+        }
+    }
+
+    /// The overlap fraction is a fraction of the seam extent: the smaller
+    /// adjacent raster width for `overlapX`, height for `overlapY`. So 160 px
+    /// of overlap on 1920x1080 outputs is overlapX = 160/1920 = 1/12 and
+    /// overlapY = 160/1080 = 4/27, not one shared percentage.
+    #[test]
+    fn exact_two_by_two_yields_whole_pixel_overlaps_and_a_derived_canvas() {
+        let mut document = exact_document(4);
+        let asked = exact_overlap_request(2, 2, Some(160.0 / 1920.0), Some(160.0 / 1080.0));
+        let solution = solve_document(&document, &asked, mode_raster).unwrap();
+        assert_eq!(solution.overlap_x_px, Some(160));
+        assert_eq!(solution.overlap_y_px, Some(160));
+        assert_eq!(solution.arrangement.content_scale, 1.0);
+        assert_eq!(solution.canvas.unwrap().dimensions().unwrap(), (3680, 2000));
+        assert_eq!(solution.unused_canvas, UnusedCanvas::default());
+        assert_eq!(solution.overhang, Overhang::default());
+
+        apply(&mut document, &solution);
+        assert_eq!(
+            document.projection.as_ref().unwrap().canvas,
+            solution.canvas
+        );
+        crate::model::exact::conforms(&document).unwrap();
+        document.validate(true).unwrap();
+        assert!(in_effect(&document, mode_raster));
+        assert_plans_integer_sources(&document);
+    }
+
+    #[test]
+    fn exact_rounds_to_the_nearest_whole_pixel_and_never_below_zero() {
+        let document = exact_document(4);
+        // 0.083 of 1920 is 159.36 px -> 159; 0.1481 of 1080 is 159.95 -> 160.
+        let solution = solve_document(
+            &document,
+            &exact_overlap_request(2, 2, Some(0.083), Some(0.1481)),
+            mode_raster,
+        )
+        .unwrap();
+        assert_eq!(solution.overlap_x_px, Some(159));
+        assert_eq!(solution.overlap_y_px, Some(160));
+        close(solution.arrangement.overlap_x, 159.0 / 1920.0);
+        close(solution.arrangement.overlap_y, 160.0 / 1080.0);
+        assert_eq!(solution.canvas.unwrap().dimensions().unwrap(), (3681, 2000));
+
+        // Half a pixel rounds up; a tiny overlap rounds down to 0.
+        let solution = solve_document(
+            &document,
+            &exact_overlap_request(2, 2, Some(0.5 / 1920.0), Some(0.0001)),
+            mode_raster,
+        )
+        .unwrap();
+        assert_eq!(solution.overlap_x_px, Some(1));
+        assert_eq!(solution.overlap_y_px, Some(0));
+
+        // 8.3% on both axes is 159 px of 1920 and 90 px of 1080.
+        let solution = solve_document(
+            &document,
+            &exact_overlap_request(2, 2, Some(0.083), Some(0.083)),
+            mode_raster,
+        )
+        .unwrap();
+        assert_eq!(solution.overlap_x_px, Some(159));
+        assert_eq!(solution.overlap_y_px, Some(90));
+
+        let mut applied = document.clone();
+        apply(&mut applied, &solution);
+        crate::model::exact::conforms(&applied).unwrap();
+    }
+
+    #[test]
+    fn exact_one_by_three_with_no_overlap_is_a_wide_canvas() {
+        let mut document = exact_document(3);
+        let solution =
+            solve_document(&document, &request(1, 3, None, None, None), mode_raster).unwrap();
+        assert_eq!(solution.canvas.unwrap().dimensions().unwrap(), (5760, 1080));
+        assert_eq!(solution.overlap_x_px, Some(0));
+        apply(&mut document, &solution);
+        crate::model::exact::conforms(&document).unwrap();
+        assert!(in_effect(&document, mode_raster));
+        assert_plans_integer_sources(&document);
+    }
+
+    #[test]
+    fn exact_refuses_a_content_scale_other_than_one_with_the_document_wording() {
+        let document = exact_document(4);
+        let error = solve_document(
+            &document,
+            &request(2, 2, None, None, Some(0.9)),
+            mode_raster,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "projection.arrangement.contentScale is 0.9; exact mode arranges at content scale 1"
+        );
+        assert_eq!(error, crate::model::exact::content_scale_message(0.9));
+        // A content scale of exactly 1 is the only one Exact has.
+        let solution = solve_document(
+            &document,
+            &request(2, 2, None, None, Some(1.0)),
+            mode_raster,
+        )
+        .unwrap();
+        assert_eq!(solution.canvas.unwrap().dimensions().unwrap(), (3840, 2160));
+        assert!(solve_document(
+            &document,
+            &request(2, 2, Some(0.1), None, Some(1.0)),
+            mode_raster
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn exact_refuses_an_overlap_that_rounds_to_the_whole_seam() {
+        let document = exact_document(2);
+        let error = solve_document(
+            &document,
+            &exact_overlap_request(1, 2, Some(0.9999), None),
+            mode_raster,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot reach 100%"), "{error}");
+    }
+
+    #[test]
+    fn exact_rotated_outputs_arrange_at_their_swapped_raster() {
+        let mut document = exact_document(2);
+        for output in &mut document.outputs {
+            output.transform = Some(Transform::Rotate90);
+        }
+        let solution = solve_document(
+            &document,
+            &exact_overlap_request(1, 2, Some(100.0 / 1080.0), None),
+            mode_raster,
+        )
+        .unwrap();
+        assert_eq!(solution.overlap_x_px, Some(100));
+        assert_eq!(solution.canvas.unwrap().dimensions().unwrap(), (2060, 1920));
+        apply(&mut document, &solution);
+        crate::model::exact::conforms(&document).unwrap();
+    }
+
+    #[test]
+    fn simple_and_warp_arrangements_are_unchanged_by_exact_support() {
+        for mode in [ProjectionMode::Simple, ProjectionMode::Warp] {
+            let mut document = document(4);
+            document.projection.as_mut().unwrap().mode = mode;
+            let solution = solve_document(
+                &document,
+                &request(2, 2, Some(0.2), Some(0.2), None),
+                mode_raster,
+            )
+            .unwrap();
+            assert_eq!(solution.canvas, None, "{mode:?}");
+            assert_eq!(solution.overlap_x_px, None, "{mode:?}");
+            assert_eq!(solution.overlap_y_px, None, "{mode:?}");
+            close(solution.arrangement.overlap_x, 0.2);
+            close(solution.arrangement.content_scale, 0.9);
+            let before = document.projection.as_ref().unwrap().canvas;
+            apply(&mut document, &solution);
+            assert_eq!(document.projection.as_ref().unwrap().canvas, before);
+            // A content scale other than 1 is still fine outside Exact.
+            solve_document(
+                &document,
+                &request(2, 2, None, None, Some(0.9)),
+                mode_raster,
+            )
+            .unwrap();
+            // And the wire form carries no Exact fields.
+            let value = serde_json::to_value(&solution).unwrap();
+            assert!(value.get("canvas").is_none() && value.get("overlapXPx").is_none());
+        }
     }
 }
