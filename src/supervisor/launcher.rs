@@ -403,6 +403,32 @@ fn build_preset(app: &AppConfig, context: &LaunchContext, chosen: Option<&Path>)
     }
 }
 
+/// The device scale factor a launch with `args` forces on the browser, for
+/// the mapping verdict: the value of the last `--force-device-scale-factor=`
+/// argument (Chromium keeps the last occurrence of a switch, which is how an
+/// `extraArgs` entry overrides the preset's `1`), for a `chromium-kiosk` app.
+/// `None` when that cannot be known: any other launcher (Suede forces no
+/// scale factor on Firefox or an arbitrary program), no such argument, a
+/// value that is not a positive number, or the switch given without one.
+pub fn browser_scale_factor(app: &AppConfig, args: &[String]) -> Option<f64> {
+    if !matches!(app.launcher, Launcher::ChromiumKiosk { .. }) {
+        return None;
+    }
+    const SWITCH: &str = "--force-device-scale-factor";
+    let last = args.iter().rev().find(|arg| {
+        arg.as_str() == SWITCH
+            || arg
+                .strip_prefix(SWITCH)
+                .is_some_and(|rest| rest.starts_with('='))
+    })?;
+    last.strip_prefix(SWITCH)?
+        .strip_prefix('=')?
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|factor| factor.is_finite() && *factor > 0.0)
+}
+
 fn profile_dir_for(root: &Path, app_id: &str) -> PathBuf {
     root.join(app_id)
 }
@@ -615,6 +641,48 @@ mod tests {
             program: None,
             grant_capture: true,
         }
+    }
+
+    #[test]
+    fn the_chromium_preset_forces_a_browser_scale_factor_of_one() {
+        let app = app("show", chromium("https://example.com"));
+        let spec = build(&app, &context(), None);
+        assert_eq!(browser_scale_factor(&app, &spec.args), Some(1.0));
+    }
+
+    #[test]
+    fn a_later_extra_arg_overrides_the_preset_scale_factor() {
+        let with = |extra: &[&str]| {
+            let mut launcher = chromium("https://example.com");
+            if let Launcher::ChromiumKiosk { extra_args, .. } = &mut launcher {
+                *extra_args = extra.iter().map(|arg| arg.to_string()).collect();
+            }
+            let app = app("show", launcher);
+            let spec = build(&app, &context(), None);
+            browser_scale_factor(&app, &spec.args)
+        };
+        assert_eq!(with(&["--force-device-scale-factor=2"]), Some(2.0));
+        assert_eq!(with(&["--force-device-scale-factor=1.0"]), Some(1.0));
+        // Given without a value, or with one that is not a number, the
+        // browser's choice is unknown rather than the preset's.
+        assert_eq!(with(&["--force-device-scale-factor"]), None);
+        assert_eq!(with(&["--force-device-scale-factor=auto"]), None);
+        // A different switch sharing the prefix is not this one.
+        assert_eq!(with(&["--force-device-scale-factor-other=3"]), Some(1.0));
+    }
+
+    #[test]
+    fn other_launchers_have_no_known_browser_scale_factor() {
+        let firefox = app(
+            "fx",
+            Launcher::FirefoxKiosk {
+                uri: "https://example.com".into(),
+                extra_args: vec!["--force-device-scale-factor=1".into()],
+                program: None,
+            },
+        );
+        let spec = build(&firefox, &context(), None);
+        assert_eq!(browser_scale_factor(&firefox, &spec.args), None);
     }
 
     #[test]

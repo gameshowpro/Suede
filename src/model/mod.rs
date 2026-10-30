@@ -9,10 +9,12 @@ pub mod desired;
 pub mod exact;
 pub mod geometry;
 pub mod limits;
+pub mod mapping;
 pub mod observed;
 
 pub use arrangement::*;
 pub use black_lift::*;
 pub use desired::*;
 pub use geometry::*;
+pub use mapping::{CaptureFacts, CaptureKind, OutputMapping, TransformOwner};
 pub use observed::*;

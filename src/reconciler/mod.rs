@@ -222,6 +222,8 @@ impl Reconciler {
             snapshot.clone(),
             events.clone(),
         ));
+        // Launches record the browser scale factor for the mapping verdict.
+        supervisor.attach_snapshot(snapshot.clone());
         Self {
             sway,
             audio,
@@ -1112,6 +1114,17 @@ impl Reconciler {
         // to report (see `ProjectionReport`).
         self.publish_slicer_running(manager.slicer_running());
         self.snapshot.set_slicer_pid(manager.slicer_pid());
+        drop(manager);
+        // Without a canvas (and outside direct presentation, which then
+        // presents nothing) sway tiles the active app's fullscreen window
+        // across the outputs itself: the tiled mapping derivation. A
+        // calibration pattern there is drawn per output by blend overlays,
+        // which the tiled derivation does not describe.
+        let tiled = canvas.is_none()
+            && self.direct.is_none()
+            && desired.active_app.is_some()
+            && projection.test_pattern.is_none();
+        self.publish_mapping_context(desired, config_generation, tiled);
         (canvas, divergences)
     }
 
@@ -1121,7 +1134,7 @@ impl Reconciler {
     async fn sync_projection(
         &self,
         desired: &crate::model::DesiredState,
-        _config_generation: u64,
+        config_generation: u64,
         _plan: Option<()>,
         _restart_slicer: bool,
         _shared_producer_retired: bool,
@@ -1129,6 +1142,8 @@ impl Reconciler {
         // No slicer ever runs in this build, so there is exactly one
         // liveness fact to publish, once.
         self.publish_slicer_running(false);
+        // And every layout is tiled by sway.
+        self.publish_mapping_context(desired, config_generation, desired.active_app.is_some());
         if desired.projection.is_some() {
             (
                 None,
@@ -1141,6 +1156,55 @@ impl Reconciler {
             )
         } else {
             (None, Vec::new())
+        }
+    }
+
+    /// Record this pass's daemon-side mapping facts: every enabled output's
+    /// compositor scale and transform as sway reports them now, whether sway
+    /// tiles them itself (`tiled`, for `config_generation`), and the active
+    /// app. The verdicts are recomputed, and an SSE listener told, only when
+    /// these differ from the previous pass's (see
+    /// [`Snapshot::set_mapping_context`]), so an idle pass costs a
+    /// comparison.
+    fn publish_mapping_context(
+        &self,
+        desired: &crate::model::DesiredState,
+        config_generation: u64,
+        tiled: bool,
+    ) {
+        use crate::model::mapping::{MappingContext, OutputContext};
+        let outputs = self
+            .snapshot
+            .outputs()
+            .into_iter()
+            .filter(|output| {
+                output.active
+                    && output.rect.width > 0
+                    && !crate::checks::is_synthetic_output(&output.name)
+            })
+            .map(|output| {
+                (
+                    output.name,
+                    OutputContext {
+                        scale: output.scale,
+                        transform: output
+                            .transform
+                            .as_deref()
+                            .and_then(crate::model::Transform::from_sway),
+                    },
+                )
+            })
+            .collect();
+        let context = MappingContext {
+            outputs,
+            tiled: tiled.then_some(config_generation),
+            active_app: desired.active_app.clone(),
+        };
+        if self.snapshot.set_mapping_context(context) {
+            self.events
+                .publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                    self.snapshot.projection_report(),
+                )));
         }
     }
 
@@ -2868,6 +2932,53 @@ mod tests {
             1,
             "an unchanged level must not be written again"
         );
+        harness.supervisor.shutdown().await;
+    }
+
+    /// A tiled appliance has no slicer: the pass derives each enabled
+    /// output's mapping itself, from sway's scale and transform and the
+    /// launched app, and recomputes it only when one of those changes.
+    #[tokio::test]
+    async fn a_tiled_pass_derives_each_outputs_mapping_once() {
+        let harness = harness();
+        harness
+            .store
+            .update(|state| {
+                state.apps.push(app("renderer", None, None));
+                state.active_app = Some("renderer".into());
+            })
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        let generation = harness.store.generation();
+        let control = harness.snapshot.projection_control();
+        let names: Vec<_> = control.outputs.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["HDMI-A-1", "HDMI-A-2"], "enabled outputs only");
+        for output in &control.outputs {
+            let mapping = output.mapping.as_ref().expect("tiled mapping");
+            assert_eq!(mapping.sampling_path, crate::model::SamplingMode::Tiled);
+            assert_eq!(mapping.generation, Some(generation));
+            assert_eq!(mapping.output_scale, Some(1.0));
+            // An exec launcher forces no browser scale factor.
+            assert_eq!(
+                mapping.unverified,
+                vec!["browser scale factor unknown".to_string()]
+            );
+        }
+
+        let recomputes = harness.snapshot.mapping_recomputes();
+        harness.reconciler.reconcile().await;
+        assert_eq!(
+            harness.snapshot.mapping_recomputes(),
+            recomputes,
+            "an idle pass changes no input"
+        );
+
+        harness
+            .store
+            .update(|state| state.active_app = None)
+            .unwrap();
+        harness.reconciler.reconcile().await;
+        assert!(harness.snapshot.projection_control().outputs.is_empty());
         harness.supervisor.shutdown().await;
     }
 

@@ -12,7 +12,8 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use super::blend::SlicerSpec;
-use crate::model::{ProjectionMode, Renderer, SamplingMode};
+use crate::model::mapping::SlicerMappingFacts;
+use crate::model::{CaptureFacts, ProjectionMode, Renderer, SamplingMode};
 
 /// The only protocol version understood by this release.
 pub const CONTROL_VERSION: u32 = 1;
@@ -99,6 +100,20 @@ pub enum ControlEventKind {
         /// but not here has no note.
         #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
         sampling_notes: BTreeMap<String, String>,
+        /// What each affected output's installed mapping from the canvas
+        /// is, for the daemon's whole-number verdict
+        /// ([`crate::model::OutputMapping`]). Same subset as
+        /// `sampling_modes`: an output a generation did not rebuild keeps
+        /// the facts it last reported.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        mappings: BTreeMap<String, SlicerMappingFacts>,
+    },
+    /// The slicer (re)established how it obtains the canvas: at startup,
+    /// and again only when a later capture's facts differ (a resize to a
+    /// new format, a GPU-to-CPU fallback). A pattern run reports `pattern`
+    /// once. Never per frame.
+    CaptureEstablished {
+        capture: CaptureFacts,
     },
     Submitted {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

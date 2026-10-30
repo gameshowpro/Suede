@@ -761,6 +761,132 @@ mod tests {
         assert_eq!(body, serde_json::json!({"running": true}));
     }
 
+    async fn projection_stats_body(harness: &Harness) -> serde_json::Value {
+        let response = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/projection/stats")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn unit_context(tiled: Option<u64>) -> crate::model::mapping::MappingContext {
+        use crate::model::mapping::{MappingContext, OutputContext};
+        MappingContext {
+            outputs: std::collections::BTreeMap::from([(
+                "DP-1".to_string(),
+                OutputContext {
+                    scale: Some(1.0),
+                    transform: Some(crate::model::Transform::Rotate180),
+                },
+            )]),
+            tiled,
+            active_app: Some("show".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn projection_stats_carry_a_slicer_mapping() {
+        let harness = harness(None);
+        let snapshot = &harness.state.snapshot;
+        snapshot.set_slicer_running(true);
+        snapshot.set_mapping_context(unit_context(None));
+        snapshot.record_app_launch("show", Some(1.0));
+        snapshot.record_capture(crate::model::CaptureFacts {
+            kind: crate::model::CaptureKind::Dmabuf,
+            format: Some("XR24".into()),
+            modifier: Some("0x0000000000000000".into()),
+            converted: false,
+        });
+        snapshot.update_projection_control_with_mapping(|status, mapping| {
+            status.config_generation.applied = Some(12);
+            mapping.slicer.insert(
+                "DP-1".into(),
+                crate::model::mapping::SlicerMappingFacts {
+                    ratio_x: 1.0,
+                    ratio_y: 1.0,
+                    whole_pixel_origin: true,
+                    identity_geometry: true,
+                    sampling_path: crate::model::SamplingMode::Exact,
+                    owns_transforms: true,
+                    owned_transform: crate::model::Transform::Rotate180,
+                    crop_honored: true,
+                },
+            );
+        });
+
+        let body = projection_stats_body(&harness).await;
+        assert_eq!(
+            body["control"]["capture"],
+            serde_json::json!({
+                "kind": "dmabuf",
+                "format": "XR24",
+                "modifier": "0x0000000000000000",
+                "converted": false,
+            })
+        );
+        assert_eq!(
+            body["control"]["outputs"][0],
+            serde_json::json!({
+                "name": "DP-1",
+                "mapping": {
+                    "ratioX": 1.0,
+                    "ratioY": 1.0,
+                    "wholeNumber": true,
+                    "samplingPath": "exact",
+                    "transformOwner": "slicer",
+                    "transform": "180",
+                    "outputScale": 1.0,
+                    "browserScaleFactor": 1.0,
+                    "verified": true,
+                    "unverified": [],
+                    "generation": 12,
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_stats_carry_a_tiled_mapping() {
+        let harness = harness(None);
+        let snapshot = &harness.state.snapshot;
+        snapshot.set_mapping_context(unit_context(Some(5)));
+        snapshot.record_app_launch("show", Some(1.0));
+
+        let body = projection_stats_body(&harness).await;
+        assert_eq!(body["running"], false);
+        let output = &body["control"]["outputs"][0];
+        assert_eq!(output["name"], "DP-1");
+        assert!(output.get("samplingMode").is_none());
+        assert_eq!(
+            output["mapping"],
+            serde_json::json!({
+                "ratioX": 1.0,
+                "ratioY": 1.0,
+                "wholeNumber": true,
+                "samplingPath": "tiled",
+                "transformOwner": "compositor",
+                "transform": "180",
+                "outputScale": 1.0,
+                "browserScaleFactor": 1.0,
+                "verified": false,
+                "unverified": ["rotated by the compositor"],
+                "generation": 5,
+            })
+        );
+        assert!(body["control"].get("capture").is_none());
+    }
+
     #[tokio::test]
     async fn gpu_telemetry_is_unavailable_before_the_first_sample() {
         let (status, body) = get_json("/api/v1/system/gpu").await;

@@ -1317,6 +1317,37 @@
         ],
         "type": "object"
       },
+      "CaptureFacts": {
+        "description": "The capture the running slicer established, reported each time it is\n(re)established with different facts.",
+        "properties": {
+          "converted": {
+            "description": "Whether presenting this format changes pixel values (a 10-bit\nsource presented as 8 bits, for example). Every 8-bit RGB capture\nformat is a lossless channel reorder and reports `false`.",
+            "type": "boolean"
+          },
+          "format": {
+            "description": "Pixel format: a DRM fourcc such as `XR24` for a screencopy capture,\nthe Vulkan format name for a shared image. Absent for a pattern.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/CaptureKind"
+          },
+          "modifier": {
+            "description": "DRM format modifier of a dmabuf capture, as a hexadecimal string\n(`0x...`): modifiers do not fit a JSON number exactly.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "converted"
+        ],
+        "type": "object"
+      },
       "CaptureIntervals": {
         "description": "How many canvas periods elapsed between one capture reaching the slicer\nand the previous one, bucketed over the reporting interval. A period is\n`1000 / canvas refresh` when the canvas output reports one, else the\n16.667 ms of an assumed 60 Hz. A healthy capture loop that keeps up with\nevery canvas frame counts almost entirely in `one`; a loop that can only\nmanage every second frame (the four-projector rig's CPU path before the\nGPU one existed — see `crate::projection::gpu`'s module doc) counts\nalmost entirely in `two`.",
         "properties": {
@@ -1349,6 +1380,16 @@
           "more"
         ],
         "type": "object"
+      },
+      "CaptureKind": {
+        "description": "How the slicer obtains the canvas it maps.",
+        "enum": [
+          "dmabuf",
+          "shm",
+          "shared",
+          "pattern"
+        ],
+        "type": "string"
       },
       "CaptureProfile": {
         "additionalProperties": false,
@@ -3502,6 +3543,88 @@
         ],
         "type": "object"
       },
+      "OutputMapping": {
+        "description": "Whether the chain from the canvas to one output is verified to scale by a\nwhole number, and every fact the verdict was made from.\n\nComputed once whenever one of its inputs changes (a slicer apply, a\ncapture being established, an output's scale or transform, an app\nlaunch), never per statistics interval. Presentation (zero-copy scanout\nor a composited frame) is deliberately not part of it; that stays in\n`lastInterval.outputs[].zeroCopyPresented`.\n\nWhat it does **not** claim: anything inside the browser (CSS or canvas\nscaling, video decode scaling, color management), the compositor's blit\nwhen it composites the frame, the DRM color pipeline, the display's own\nscaler and mode handling, and the pixel values Suede changes on purpose\n(seam blending, black lift, gamma). It is about which canvas pixel lands\non which output pixel, and whether the capture format survives intact.",
+        "properties": {
+          "browserScaleFactor": {
+            "description": "The device scale factor the active browser was launched with: `1`\nfor a `chromium-kiosk` launch that forces it, null when unknown (any\nother launcher, an overriding `extraArgs` value Suede cannot parse,\nno launch yet) and while the slicer draws a pattern, which no browser\nis in the chain of.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "generation": {
+            "description": "The desired-state (working-copy) generation these facts describe:\nthe slicer's `configGeneration.applied`, or the reconciled generation\non the tiled path. A client compares it with the working-copy\ngeneration it holds and shows nothing while the two differ. Null when\nthe slicer's generation is unknown.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "outputScale": {
+            "description": "The compositor scale in effect on the output, when reported.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ratioX": {
+            "description": "Output pixels per canvas pixel, horizontally (1 at 1:1, 2 at a 2x\nupscale).",
+            "format": "double",
+            "type": "number"
+          },
+          "ratioY": {
+            "description": "Output pixels per canvas pixel, vertically.",
+            "format": "double",
+            "type": "number"
+          },
+          "samplingPath": {
+            "$ref": "#/components/schemas/SamplingMode",
+            "description": "The sampling path actually taken: `exact` for the integer copy, the\nkernel otherwise, `tiled` when sway tiles the outputs itself and no\nslicer runs."
+          },
+          "transform": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Transform",
+                "description": "The output's sway transform, when the compositor reports one."
+              }
+            ]
+          },
+          "transformOwner": {
+            "$ref": "#/components/schemas/TransformOwner"
+          },
+          "unverified": {
+            "description": "Each failing check, in operator language. Empty exactly when\n`verified`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "verified": {
+            "description": "Every check passed: the exact copy at 1:1, or `nearest` at a whole\nratio above 1, at output scale 1, from an unconverted capture, with\nany transform applied by the slicer, and a browser scale factor of\n1 whenever a browser is in the chain.",
+            "type": "boolean"
+          },
+          "wholeNumber": {
+            "description": "Both ratios are whole numbers of at least 1, the source origin is a\nwhole canvas pixel, and there is no corner or center correction.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ratioX",
+          "ratioY",
+          "wholeNumber",
+          "samplingPath",
+          "transformOwner",
+          "verified"
+        ],
+        "type": "object"
+      },
       "OutputMatch": {
         "additionalProperties": false,
         "description": "Rule selecting which physical output a config entry applies to.",
@@ -4438,6 +4561,17 @@
               "null"
             ]
           },
+          "mapping": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/OutputMapping",
+                "description": "Whether the chain from the canvas to this output is verified to\nscale by a whole number (1:1 included), and the facts behind that.\nPresent only while it describes something current: removed the\nmoment the slicer session it came from ends, and on a tiled\nappliance derived by the daemon instead (`samplingPath: tiled`, with\nevery lifecycle field above absent). Compare `mapping.generation`\nwith the working-copy generation before trusting it."
+              }
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -4500,6 +4634,17 @@
             "type": [
               "number",
               "null"
+            ]
+          },
+          "capture": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CaptureFacts",
+                "description": "The capture the current slicer session established, as last\nreported: what `outputs[].mapping` judged the capture clause from.\nAbsent with no slicer session (and on a tiled appliance)."
+              }
             ]
           },
           "childGeneration": {
@@ -5211,7 +5356,8 @@
           "bicubic",
           "lanczos",
           "easu",
-          "area"
+          "area",
+          "tiled"
         ],
         "type": "string"
       },
@@ -5593,6 +5739,14 @@
           "flipped-90",
           "flipped-180",
           "flipped-270"
+        ],
+        "type": "string"
+      },
+      "TransformOwner": {
+        "description": "Who applies an output's sway transform.",
+        "enum": [
+          "slicer",
+          "compositor"
         ],
         "type": "string"
       },

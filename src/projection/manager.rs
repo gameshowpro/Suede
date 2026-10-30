@@ -435,7 +435,13 @@ impl BlendManager {
         let lift_changed = self.snapshot.update_projection_control(|control| {
             control.black_lift = None;
         });
-        if stats_changed || running_changed || lift_changed {
+        // The per-output mapping verdicts go too: a stopped slicer's last
+        // apply describes nothing on screen any more. The rest of the
+        // control block (generations, `samplingMode`) stays as the last
+        // session left it, for diagnosis, which is exactly why the verdict
+        // must not stay beside it.
+        let mapping_changed = self.snapshot.clear_slicer_mapping();
+        if stats_changed || running_changed || lift_changed || mapping_changed {
             self.publish_projection_report();
         }
     }
@@ -635,11 +641,19 @@ impl BlendManager {
         let running = self.slicer.as_ref().map(|s| s.fingerprint);
         if wanted == running {
             if let Some(spec) = spec {
-                if !self
-                    .slicer
-                    .as_ref()
-                    .is_some_and(|running| running.live_control)
+                if let Some(running) = self.slicer.as_ref().filter(|running| !running.live_control)
                 {
+                    // A child without live control (the CPU renderer) is
+                    // fingerprinted on its complete spec, so a match means
+                    // this working copy resolves to the one snapshot it
+                    // installs, its generation zero (`--spec`). Correlate it
+                    // the way the live path below does, so the child's
+                    // applied generation (and every mapping stamped with
+                    // it) follows an unrelated edit instead of going stale.
+                    let session = running.session.clone();
+                    let desired = running.desired.clone();
+                    record_config_generation(&running.config_generations, 0, config_generation);
+                    self.mark_control_requested(&session, 0, config_generation, &desired);
                     return Vec::new();
                 }
                 let session = self
@@ -807,14 +821,15 @@ impl BlendManager {
                 // --spec is generation zero in this new session. Do not
                 // enqueue a duplicate no-op revision: it would be applied
                 // without a repaint and obscure the initial presentation.
-                if live_control {
-                    self.mark_control_requested(
-                        &self.slicer.as_ref().expect("child just started").session,
-                        0,
-                        config_generation,
-                        &desired,
-                    );
-                }
+                // A child without live control requests it too: it reports
+                // generation zero applied once it has set up (the CPU
+                // renderer's one `applied`, which carries its mapping facts).
+                self.mark_control_requested(
+                    &self.slicer.as_ref().expect("child just started").session,
+                    0,
+                    config_generation,
+                    &desired,
+                );
                 Vec::new()
             }
             Err(error) => vec![Divergence::new(
@@ -857,7 +872,7 @@ fn update_control_status_for_config(
     event: ControlEvent,
     config_generation: Option<u64>,
 ) -> bool {
-    snapshot.update_projection_control(|status| {
+    snapshot.update_projection_control_with_mapping(|status, mapping| {
         status.session = Some(event.session);
         match event.kind {
             ControlEventKind::BlackLift { status: lift } => {
@@ -909,6 +924,7 @@ fn update_control_status_for_config(
                 upload_ms,
                 sampling_modes,
                 sampling_notes,
+                mappings,
             } => {
                 let advances_applied = status
                     .child_generation
@@ -929,9 +945,16 @@ fn update_control_status_for_config(
                     OutputStage::Applied,
                 );
                 set_output_sampling(&mut status.outputs, sampling_modes, sampling_notes);
+                // Recorded in the same critical section as the applied
+                // generation above, so the verdict and the generation it is
+                // stamped with change together (see `Snapshot`).
+                mapping.slicer.extend(mappings);
                 status.build_ms = build_ms.or(status.build_ms);
                 status.upload_ms = upload_ms.or(status.upload_ms);
                 clear_failure_through(&mut status.last_failure, event.generation);
+            }
+            ControlEventKind::CaptureEstablished { capture } => {
+                mapping.capture = Some(capture);
             }
             ControlEventKind::Submitted { outputs } => {
                 highest_generation(&mut status.child_generation.submitted, event.generation);
@@ -1034,15 +1057,7 @@ fn set_output_generation(
         let index = match statuses.iter().position(|status| status.name == *name) {
             Some(index) => index,
             None => {
-                statuses.push(ProjectionControlOutputStatus {
-                    name: name.clone(),
-                    built_generation: None,
-                    applied_generation: None,
-                    submitted_generation: None,
-                    presented_generation: None,
-                    sampling_mode: None,
-                    sampling_note: None,
-                });
+                statuses.push(ProjectionControlOutputStatus::named(name.clone()));
                 statuses.len() - 1
             }
         };
@@ -1069,15 +1084,7 @@ fn set_output_sampling(
         let index = match statuses.iter().position(|status| status.name == name) {
             Some(index) => index,
             None => {
-                statuses.push(ProjectionControlOutputStatus {
-                    name,
-                    built_generation: None,
-                    applied_generation: None,
-                    submitted_generation: None,
-                    presented_generation: None,
-                    sampling_mode: None,
-                    sampling_note: None,
-                });
+                statuses.push(ProjectionControlOutputStatus::named(name));
                 statuses.len() - 1
             }
         };
@@ -1181,62 +1188,82 @@ fn spawn_slicer_stdout_reader(
                         break;
                     }
                 };
-                if let Ok(event) = serde_json::from_slice::<ControlEvent>(&line) {
-                    if event_belongs_to_session(&event, &state.session) {
-                        let current = state.current_epoch.lock().unwrap();
-                        if *current != state.epoch {
-                            break;
-                        }
-                        if event.version == super::control::CONTROL_VERSION {
-                            let config_generation =
-                                config_generation_for(&state.config_generations, event.generation);
-                            if update_control_status_for_config(&snapshot, event, config_generation)
-                            {
-                                events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
-                                    snapshot.projection_report(),
-                                )));
-                            }
-                        } else {
-                            state.protocol_mismatch.store(true, Ordering::SeqCst);
-                        }
-                    } else {
-                        tracing::debug!("ignored a control event from another slicer session");
-                    }
-                    continue;
-                }
-                match serde_json::from_slice::<crate::model::ProjectionStats>(&line) {
-                    Ok(stats) => {
-                        // A stats line only ever arrives from a live
-                        // process, so this is as good a place as any to
-                        // affirm liveness too — the reconciler sets it after
-                        // every `sync_slicer` call, but a client that only
-                        // watches events should not have to wait for the
-                        // next reconciliation pass to hear it.
-                        // Keep the epoch check and publication in one mutex
-                        // critical section.  An old reader may publish just
-                        // before a stop clears status, never after a new
-                        // child has replaced it.
-                        let current = state.current_epoch.lock().unwrap();
-                        if *current != state.epoch {
-                            break;
-                        }
-                        snapshot.set_projection_stats(Some(stats));
-                        snapshot.set_slicer_running(true);
-                        snapshot.set_slicer_pid(Some(state.pid));
-                        events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
-                            snapshot.projection_report(),
-                        )));
-                        drop(current);
-                    }
-                    Err(error) => {
-                        tracing::debug!(%error, "could not parse a slicer stdout line");
-                    }
+                if handle_slicer_line(&line, &snapshot, &events, &state).is_break() {
+                    break;
                 }
             }
         });
     if let Err(error) = build {
         tracing::warn!(%error, "could not start the slicer-stats reader thread");
     }
+}
+
+/// Act on one slicer stdout record: a lifecycle event of this session, or
+/// an interval of frame statistics. `Break` ends the reader (a newer child
+/// has replaced this one). Separate from the thread so tests can drive the
+/// exact path a record takes, statistics included.
+///
+/// Only a lifecycle event can recompute a mapping verdict, and only when it
+/// carries changed facts (`applied`, `capture_established`); a statistics
+/// interval never touches one.
+fn handle_slicer_line(
+    line: &[u8],
+    snapshot: &Snapshot,
+    events: &EventHub,
+    state: &SlicerReaderState,
+) -> std::ops::ControlFlow<()> {
+    use std::ops::ControlFlow;
+    if let Ok(event) = serde_json::from_slice::<ControlEvent>(line) {
+        if event_belongs_to_session(&event, &state.session) {
+            let current = state.current_epoch.lock().unwrap();
+            if *current != state.epoch {
+                return ControlFlow::Break(());
+            }
+            if event.version == super::control::CONTROL_VERSION {
+                let config_generation =
+                    config_generation_for(&state.config_generations, event.generation);
+                if update_control_status_for_config(snapshot, event, config_generation) {
+                    events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                        snapshot.projection_report(),
+                    )));
+                }
+            } else {
+                state.protocol_mismatch.store(true, Ordering::SeqCst);
+            }
+        } else {
+            tracing::debug!("ignored a control event from another slicer session");
+        }
+        return ControlFlow::Continue(());
+    }
+    match serde_json::from_slice::<crate::model::ProjectionStats>(line) {
+        Ok(stats) => {
+            // A stats line only ever arrives from a live
+            // process, so this is as good a place as any to
+            // affirm liveness too — the reconciler sets it after
+            // every `sync_slicer` call, but a client that only
+            // watches events should not have to wait for the
+            // next reconciliation pass to hear it.
+            // Keep the epoch check and publication in one mutex
+            // critical section.  An old reader may publish just
+            // before a stop clears status, never after a new
+            // child has replaced it.
+            let current = state.current_epoch.lock().unwrap();
+            if *current != state.epoch {
+                return ControlFlow::Break(());
+            }
+            snapshot.set_projection_stats(Some(stats));
+            snapshot.set_slicer_running(true);
+            snapshot.set_slicer_pid(Some(state.pid));
+            events.publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                snapshot.projection_report(),
+            )));
+            drop(current);
+        }
+        Err(error) => {
+            tracing::debug!(%error, "could not parse a slicer stdout line");
+        }
+    }
+    ControlFlow::Continue(())
 }
 
 /// Track the slicer's last non-empty stderr line, trimmed and length-capped
@@ -2127,6 +2154,7 @@ mod tests {
                     upload_ms: Some(1.0),
                     sampling_modes: std::collections::BTreeMap::new(),
                     sampling_notes: std::collections::BTreeMap::new(),
+                    mappings: std::collections::BTreeMap::new(),
                 },
             ),
         );
@@ -2161,6 +2189,7 @@ mod tests {
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::new(),
                     sampling_notes: std::collections::BTreeMap::new(),
+                    mappings: std::collections::BTreeMap::new(),
                 },
             ),
             Some(41),
@@ -2199,6 +2228,7 @@ mod tests {
                 upload_ms: None,
                 sampling_modes: std::collections::BTreeMap::new(),
                 sampling_notes: std::collections::BTreeMap::new(),
+                mappings: std::collections::BTreeMap::new(),
             },
         );
         if event_belongs_to_session(&old, "current") {
@@ -2224,6 +2254,7 @@ mod tests {
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::new(),
                     sampling_notes: std::collections::BTreeMap::new(),
+                    mappings: std::collections::BTreeMap::new(),
                 },
             ),
             Some(80),
@@ -2241,6 +2272,7 @@ mod tests {
                     upload_ms: None,
                     sampling_modes: std::collections::BTreeMap::new(),
                     sampling_notes: std::collections::BTreeMap::new(),
+                    mappings: std::collections::BTreeMap::new(),
                 },
             ),
             Some(70),
@@ -2349,6 +2381,7 @@ mod tests {
                         crate::model::SamplingMode::Bilinear,
                     )]),
                     sampling_notes: std::collections::BTreeMap::new(),
+                    mappings: std::collections::BTreeMap::new(),
                 },
             ),
         );
@@ -2437,6 +2470,7 @@ mod tests {
                         crate::model::SamplingMode::Exact,
                     )]),
                     sampling_notes: std::collections::BTreeMap::new(),
+                    mappings: std::collections::BTreeMap::new(),
                 },
             ),
         );
@@ -2539,6 +2573,7 @@ mod tests {
                     crate::model::SamplingMode::Exact,
                 )]),
                 sampling_notes: std::collections::BTreeMap::new(),
+                mappings: std::collections::BTreeMap::new(),
             },
             ControlEventKind::Submitted {
                 outputs: vec!["DP-1".to_string()],
@@ -2600,5 +2635,382 @@ mod tests {
         let reset = manager.snapshot.projection_control();
         assert!(reset.outputs.is_empty());
         assert!(reset.child_generation.presented.is_none());
+    }
+
+    // --- per-output mapping telemetry -----------------------------------
+
+    fn reader_state(session: &str, config_generation: u64) -> SlicerReaderState {
+        SlicerReaderState {
+            current_epoch: Arc::new(Mutex::new(1)),
+            epoch: 1,
+            pid: 4242,
+            session: session.to_string(),
+            config_generations: Arc::new(Mutex::new(BTreeMap::from([(0, config_generation)]))),
+            protocol_mismatch: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn event_line(session: &str, generation: u64, kind: ControlEventKind) -> Vec<u8> {
+        serde_json::to_vec(&ControlEvent::new(session.into(), generation, kind)).unwrap()
+    }
+
+    fn stats_line() -> Vec<u8> {
+        use crate::model::{CaptureIntervals, FrameCost, ProjectionStats};
+        serde_json::to_vec(&ProjectionStats {
+            measured_at: 1,
+            interval_seconds: 10.0,
+            free_run: false,
+            canvas_fps: 60.0,
+            presented_fps: 60.0,
+            frames_superseded: 0,
+            stalls: 0,
+            per_frame_ms: FrameCost {
+                waiting: 1.0,
+                snapshot: 1.0,
+                requesting: 1.0,
+                blending: 1.0,
+                gpu: 0.0,
+            },
+            presentation_feedback: true,
+            offset_ms: None,
+            straddles: 0,
+            gate_holds: 0,
+            renderer: "gpu".to_string(),
+            presentation_backend: None,
+            timestamp_source: None,
+            capture_intervals: CaptureIntervals::default(),
+            outputs: Vec::new(),
+            gpu_timing: None,
+        })
+        .unwrap()
+    }
+
+    fn exact_facts(owned: crate::model::Transform) -> crate::model::mapping::SlicerMappingFacts {
+        crate::model::mapping::SlicerMappingFacts {
+            ratio_x: 1.0,
+            ratio_y: 1.0,
+            whole_pixel_origin: true,
+            identity_geometry: true,
+            sampling_path: crate::model::SamplingMode::Exact,
+            owns_transforms: true,
+            owned_transform: owned,
+            crop_honored: true,
+        }
+    }
+
+    fn applied_with(
+        facts: crate::model::mapping::SlicerMappingFacts,
+        sampling: crate::model::SamplingMode,
+    ) -> ControlEventKind {
+        ControlEventKind::Applied {
+            outputs: vec!["DP-1".into()],
+            build_ms: None,
+            upload_ms: None,
+            sampling_modes: BTreeMap::from([("DP-1".to_string(), sampling)]),
+            sampling_notes: BTreeMap::new(),
+            mappings: BTreeMap::from([("DP-1".to_string(), facts)]),
+        }
+    }
+
+    fn dmabuf_capture() -> ControlEventKind {
+        ControlEventKind::CaptureEstablished {
+            capture: crate::model::CaptureFacts {
+                kind: crate::model::CaptureKind::Dmabuf,
+                format: Some("XR24".into()),
+                modifier: Some("0x0000000000000000".into()),
+                converted: false,
+            },
+        }
+    }
+
+    /// The daemon-side facts a reconciliation pass would set: one unit-scale
+    /// output with `transform`, and an active app launched at factor 1.
+    fn set_unit_context(snapshot: &Snapshot, transform: crate::model::Transform) {
+        use crate::model::mapping::{MappingContext, OutputContext};
+        snapshot.set_mapping_context(MappingContext {
+            outputs: BTreeMap::from([(
+                "DP-1".to_string(),
+                OutputContext {
+                    scale: Some(1.0),
+                    transform: Some(transform),
+                },
+            )]),
+            tiled: None,
+            active_app: Some("show".into()),
+        });
+        snapshot.record_app_launch("show", Some(1.0));
+    }
+
+    fn mapping_of(snapshot: &Snapshot) -> Option<crate::model::OutputMapping> {
+        snapshot
+            .projection_control()
+            .outputs
+            .into_iter()
+            .find(|output| output.name == "DP-1")
+            .and_then(|output| output.mapping)
+    }
+
+    #[test]
+    fn a_mapping_is_recomputed_once_per_fact_event_and_never_per_stats_interval() {
+        let snapshot = Arc::new(Snapshot::new());
+        let events = EventHub::new();
+        let state = reader_state("session", 41);
+        set_unit_context(&snapshot, crate::model::Transform::Normal);
+        let before = snapshot.mapping_recomputes();
+
+        let feed = |line: Vec<u8>| {
+            assert!(handle_slicer_line(&line, &snapshot, &events, &state).is_continue());
+        };
+        feed(event_line(
+            "session",
+            0,
+            applied_with(
+                exact_facts(crate::model::Transform::Normal),
+                crate::model::SamplingMode::Exact,
+            ),
+        ));
+        assert_eq!(snapshot.mapping_recomputes(), before + 1, "the apply");
+        feed(event_line("session", 0, dmabuf_capture()));
+        assert_eq!(snapshot.mapping_recomputes(), before + 2, "the capture");
+
+        for _ in 0..3 {
+            feed(stats_line());
+        }
+        assert!(
+            snapshot.projection_stats().is_some(),
+            "the intervals landed"
+        );
+        assert_eq!(
+            snapshot.mapping_recomputes(),
+            before + 2,
+            "a statistics interval never recomputes the verdict"
+        );
+        // Lifecycle stages that carry no facts do not recompute either.
+        feed(event_line(
+            "session",
+            0,
+            ControlEventKind::Presented {
+                outputs: vec!["DP-1".into()],
+            },
+        ));
+        assert_eq!(snapshot.mapping_recomputes(), before + 2);
+
+        let mapping = mapping_of(&snapshot).expect("mapping published");
+        assert!(mapping.verified, "{:?}", mapping.unverified);
+        assert_eq!(mapping.generation, Some(41));
+        assert_eq!(
+            snapshot
+                .projection_control()
+                .capture
+                .unwrap()
+                .format
+                .as_deref(),
+            Some("XR24")
+        );
+    }
+
+    /// The filter is live: an apply that switches an output's kernel
+    /// carries new facts, and the verdict follows.
+    #[test]
+    fn a_live_filter_change_recomputes_the_verdict() {
+        let snapshot = Arc::new(Snapshot::new());
+        let events = EventHub::new();
+        let state = reader_state("session", 41);
+        set_unit_context(&snapshot, crate::model::Transform::Normal);
+        state.config_generations.lock().unwrap().insert(1, 42);
+        state.config_generations.lock().unwrap().insert(2, 43);
+        let upscale = |sampling| crate::model::mapping::SlicerMappingFacts {
+            ratio_x: 2.0,
+            ratio_y: 2.0,
+            sampling_path: sampling,
+            ..exact_facts(crate::model::Transform::Normal)
+        };
+        for line in [
+            event_line("session", 0, dmabuf_capture()),
+            event_line(
+                "session",
+                1,
+                applied_with(
+                    upscale(crate::model::SamplingMode::Nearest),
+                    crate::model::SamplingMode::Nearest,
+                ),
+            ),
+        ] {
+            let _ = handle_slicer_line(&line, &snapshot, &events, &state);
+        }
+        let mapping = mapping_of(&snapshot).unwrap();
+        assert!(mapping.verified, "{:?}", mapping.unverified);
+        assert_eq!(mapping.generation, Some(42));
+
+        let _ = handle_slicer_line(
+            &event_line(
+                "session",
+                2,
+                applied_with(
+                    upscale(crate::model::SamplingMode::Bilinear),
+                    crate::model::SamplingMode::Bilinear,
+                ),
+            ),
+            &snapshot,
+            &events,
+            &state,
+        );
+        let mapping = mapping_of(&snapshot).unwrap();
+        assert!(!mapping.verified);
+        assert_eq!(
+            mapping.unverified,
+            vec!["bilinear filter at 2× (choose nearest for pixel replication)".to_string()]
+        );
+        assert_eq!(mapping.generation, Some(43));
+    }
+
+    /// The facts and the generation they are stamped with move together:
+    /// an equivalent working copy that needed no control message is
+    /// installed too, so the mapping follows it without a recompute.
+    #[test]
+    fn an_equivalent_working_copy_restamps_the_mapping_without_recomputing() {
+        let manager = manager_for_test();
+        set_unit_context(&manager.snapshot, crate::model::Transform::Normal);
+        let spec = minimal_slicer_spec();
+        manager.mark_control_requested("session", 0, 41, &spec);
+        update_control_status_for_config(
+            &manager.snapshot,
+            ControlEvent::new("session".into(), 0, dmabuf_capture()),
+            Some(41),
+        );
+        update_control_status_for_config(
+            &manager.snapshot,
+            ControlEvent::new(
+                "session".into(),
+                0,
+                applied_with(
+                    exact_facts(crate::model::Transform::Normal),
+                    crate::model::SamplingMode::Exact,
+                ),
+            ),
+            Some(41),
+        );
+        assert_eq!(mapping_of(&manager.snapshot).unwrap().generation, Some(41));
+        let before = manager.snapshot.mapping_recomputes();
+        manager.mark_control_requested("session", 0, 42, &spec);
+        assert_eq!(mapping_of(&manager.snapshot).unwrap().generation, Some(42));
+        assert_eq!(manager.snapshot.mapping_recomputes(), before);
+
+        // A newer request still building leaves the mapping on the
+        // installed generation: the client hides it until the apply.
+        manager.mark_control_requested("session", 1, 43, &spec);
+        assert_eq!(mapping_of(&manager.snapshot).unwrap().generation, Some(42));
+    }
+
+    /// The CPU renderer's startup `applied` (it has no live controller):
+    /// a 180 output there is rotated by the compositor, which Suede cannot
+    /// verify.
+    #[test]
+    fn a_cpu_output_rotated_by_the_compositor_is_not_verified() {
+        let snapshot = Arc::new(Snapshot::new());
+        let events = EventHub::new();
+        let state = reader_state("cpu", 41);
+        set_unit_context(&snapshot, crate::model::Transform::Rotate180);
+        let cpu = crate::model::mapping::SlicerMappingFacts {
+            owns_transforms: false,
+            owned_transform: crate::model::Transform::Normal,
+            ..exact_facts(crate::model::Transform::Normal)
+        };
+        for line in [
+            event_line(
+                "cpu",
+                0,
+                ControlEventKind::CaptureEstablished {
+                    capture: crate::model::CaptureFacts {
+                        kind: crate::model::CaptureKind::Shm,
+                        format: Some("XR24".into()),
+                        modifier: None,
+                        converted: false,
+                    },
+                },
+            ),
+            event_line(
+                "cpu",
+                0,
+                applied_with(cpu, crate::model::SamplingMode::Exact),
+            ),
+        ] {
+            let _ = handle_slicer_line(&line, &snapshot, &events, &state);
+        }
+        let control = snapshot.projection_control();
+        assert_eq!(
+            control.outputs[0].sampling_mode,
+            Some(crate::model::SamplingMode::Exact),
+            "the CPU renderer now reports its sampling mode too"
+        );
+        let mapping = mapping_of(&snapshot).unwrap();
+        assert_eq!(
+            mapping.transform_owner,
+            crate::model::TransformOwner::Compositor
+        );
+        assert!(!mapping.verified);
+        assert_eq!(
+            mapping.unverified,
+            vec!["rotated by the compositor".to_string()]
+        );
+    }
+
+    /// The stale control block: once the slicer stops, its last
+    /// `samplingMode` and generations stay for diagnosis, but no mapping
+    /// verdict survives beside them.
+    #[test]
+    fn a_stopped_slicer_leaves_no_mapping_behind() {
+        let manager = manager_for_test();
+        set_unit_context(&manager.snapshot, crate::model::Transform::Normal);
+        for kind in [
+            dmabuf_capture(),
+            applied_with(
+                exact_facts(crate::model::Transform::Normal),
+                crate::model::SamplingMode::Exact,
+            ),
+        ] {
+            update_control_status_for_config(
+                &manager.snapshot,
+                ControlEvent::new("session".into(), 0, kind),
+                Some(41),
+            );
+        }
+        assert!(mapping_of(&manager.snapshot).is_some());
+
+        manager.clear_projection_stats();
+        let control = manager.snapshot.projection_control();
+        assert!(control.capture.is_none());
+        assert_eq!(control.outputs.len(), 1);
+        assert!(control.outputs[0].mapping.is_none());
+        assert_eq!(
+            control.outputs[0].sampling_mode,
+            Some(crate::model::SamplingMode::Exact),
+            "the rest of the stale block is untouched"
+        );
+        let json = serde_json::to_value(manager.snapshot.projection_report()).unwrap();
+        assert!(json["control"]["outputs"][0].get("mapping").is_none());
+    }
+
+    /// A new session starts with no facts: the old child's mapping and
+    /// capture cannot describe the replacement.
+    #[test]
+    fn a_new_session_does_not_inherit_the_old_mapping() {
+        let manager = manager_for_test();
+        set_unit_context(&manager.snapshot, crate::model::Transform::Normal);
+        for kind in [
+            dmabuf_capture(),
+            applied_with(
+                exact_facts(crate::model::Transform::Normal),
+                crate::model::SamplingMode::Exact,
+            ),
+        ] {
+            update_control_status(&manager.snapshot, ControlEvent::new("old".into(), 0, kind));
+        }
+        manager
+            .snapshot
+            .set_projection_control(ProjectionControlStatus::default());
+        let control = manager.snapshot.projection_control();
+        assert!(control.outputs.is_empty());
+        assert!(control.capture.is_none());
     }
 }

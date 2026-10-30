@@ -1074,6 +1074,11 @@ pub struct ProjectionControlStatus {
     pub upload_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_failure: Option<ProjectionControlFailure>,
+    /// The capture the current slicer session established, as last
+    /// reported: what `outputs[].mapping` judged the capture clause from.
+    /// Absent with no slicer session (and on a tiled appliance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<crate::model::CaptureFacts>,
     /// Per-output lifecycle prevents global submitted/presented values from
     /// implying an atomic wall-wide flip.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1189,6 +1194,37 @@ pub struct ProjectionControlOutputStatus {
     /// instead. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_note: Option<String>,
+    /// Whether the chain from the canvas to this output is verified to
+    /// scale by a whole number (1:1 included), and the facts behind that.
+    /// Present only while it describes something current: removed the
+    /// moment the slicer session it came from ends, and on a tiled
+    /// appliance derived by the daemon instead (`samplingPath: tiled`, with
+    /// every lifecycle field above absent). Compare `mapping.generation`
+    /// with the working-copy generation before trusting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping: Option<crate::model::OutputMapping>,
+}
+
+impl ProjectionControlOutputStatus {
+    /// An entry for `name` with nothing reported yet.
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            built_generation: None,
+            applied_generation: None,
+            submitted_generation: None,
+            presented_generation: None,
+            sampling_mode: None,
+            sampling_note: None,
+            mapping: None,
+        }
+    }
+
+    /// Whether this entry carries nothing but its name, as one left behind
+    /// by a tiled mapping that no longer applies.
+    pub(crate) fn is_blank(&self) -> bool {
+        *self == Self::named(self.name.clone())
+    }
 }
 
 impl ProjectionControlStatus {

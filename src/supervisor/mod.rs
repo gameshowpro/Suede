@@ -118,6 +118,10 @@ pub struct Supervisor {
     /// all the supervisor needs from it, and bootstrap config is otherwise
     /// the API layer's concern.
     allowed_programs: Vec<String>,
+    /// Where each launch's browser scale factor is recorded for the mapping
+    /// verdict ([`crate::model::OutputMapping`]); attached once by the
+    /// reconciler that shares this supervisor.
+    snapshot: std::sync::OnceLock<Arc<crate::snapshot::Snapshot>>,
 }
 
 impl Supervisor {
@@ -143,7 +147,15 @@ impl Supervisor {
             context,
             apps: Mutex::new(HashMap::new()),
             allowed_programs,
+            snapshot: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Record every later launch's browser scale factor in `snapshot`. The
+    /// first attachment wins; a second reconciler over the same supervisor
+    /// (only tests build one) shares the same facts.
+    pub fn attach_snapshot(&self, snapshot: Arc<crate::snapshot::Snapshot>) {
+        let _ = self.snapshot.set(snapshot);
     }
 
     /// A supervisor managing nothing, with its profiles and logs under
@@ -1073,6 +1085,19 @@ impl Supervisor {
             ?pid,
             "launched app"
         );
+
+        // The fact this launch fixes for the mapping verdict: the device
+        // scale factor its arguments force on the browser, recorded at the
+        // launch itself so it describes the running process.
+        if let Some(snapshot) = self.snapshot.get() {
+            let factor = launcher::browser_scale_factor(&managed.config, &args);
+            if snapshot.record_app_launch(&managed.config.id, factor) {
+                self.events
+                    .publish(ServerEvent::ProjectionStatsChanged(Box::new(
+                        snapshot.projection_report(),
+                    )));
+            }
+        }
 
         managed.child = Some(child);
         managed.status.pid = pid;

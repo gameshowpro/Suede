@@ -1710,6 +1710,13 @@ struct State {
     stdout: super::control::StdoutWriter,
     /// The CPU row painters, fixed from the spec this slicer started with.
     cpu: CpuRenderers,
+    /// The control session every lifecycle event carries, for the events
+    /// emitted outside a `Controller` (the capture report).
+    control_session: String,
+    /// The capture last reported with `CaptureEstablished`, by its raw
+    /// identity, so a per-frame `ensure_capture_buffer` compares three
+    /// integers and reports only when they change. See [`report_capture`].
+    capture_reported: Option<(crate::model::CaptureKind, u32, Option<u64>)>,
 }
 
 /// Which CPU row loops paint frames: the plain ones, or the variants that
@@ -2686,6 +2693,8 @@ pub fn run_with_shared_input_until(
         measurement: super::adaptive::MeasurementSchedule::default(),
         stdout: super::control::StdoutWriter::spawn(),
         cpu: CpuRenderers::new(spec.marker_palette()),
+        control_session: spec.control_session.clone(),
+        capture_reported: None,
     };
     for global in globals.contents().clone_list() {
         if global.interface == "wl_output" && global.version >= 4 {
@@ -2900,6 +2909,7 @@ pub fn run_with_shared_input_until(
         );
         adopt_output_transforms(&mut state, spec)?;
         create_present_buffers(&mut state, &shm, dmabuf.as_ref(), &handle)?;
+        report_pattern_capture(&mut state);
         if !animated(pattern) && state.capture.backend == Some(Backend::Gpu) {
             state.static_canvases = build_static_canvases(&mut state, spec, pattern)?;
         }
@@ -3497,6 +3507,7 @@ fn initialize_warp_control(
     }
     if effective == Renderer::Cpu {
         configure_adaptive(state, spec, 0);
+        report_cpu_applied(state, spec);
         return Ok(());
     }
     // The controller builds every output through `sampling_warp` with the
@@ -3745,6 +3756,176 @@ fn sampling_notes(prepared: &super::warp_update::Prepared) -> BTreeMap<String, S
         .collect()
 }
 
+/// The canvas rectangle an output maps, in canvas pixels: the slice's
+/// source rectangle, or without one the unit-density `[x, y, logical width,
+/// logical height]` both renderers' copy paths and `sampling_warp` mean.
+fn mapped_source(slice: &super::blend::SliceSpec, size: (u32, u32)) -> [f64; 4] {
+    slice.source_rect.unwrap_or([
+        f64::from(slice.slice.x),
+        f64::from(slice.slice.y),
+        f64::from(size.0),
+        f64::from(size.1),
+    ])
+}
+
+fn whole_pixel(value: f64) -> bool {
+    (value - value.round()).abs() <= 1e-9
+}
+
+/// The mapping facts of one output a renderer maps through `source` (the
+/// canvas rectangle it actually reads) onto its `size` logical raster.
+fn mapping_facts(
+    slice: &super::blend::SliceSpec,
+    size: (u32, u32),
+    source: [f64; 4],
+    sampling: crate::model::SamplingMode,
+    gpu: bool,
+) -> crate::model::mapping::SlicerMappingFacts {
+    crate::model::mapping::SlicerMappingFacts {
+        ratio_x: f64::from(size.0) / source[2],
+        ratio_y: f64::from(size.1) / source[3],
+        whole_pixel_origin: whole_pixel(source[0]) && whole_pixel(source[1]),
+        identity_geometry: slice
+            .geometry
+            .as_ref()
+            .is_none_or(|geometry| matches!(geometry.warp(size.0, size.1), Ok(None))),
+        sampling_path: sampling,
+        owns_transforms: gpu,
+        owned_transform: owned_transform(gpu, slice.transform),
+        crop_honored: true,
+    }
+}
+
+/// The mapping facts of each output of `prepared` on the GPU renderer,
+/// which owns every slice transform and realizes the configured source
+/// rectangle through its exact copy or its warp. The sampling path is the
+/// shader's ([`super::warp_update::SamplingPath::mode`]), so a live filter
+/// change that switches an output between kernels re-reports it.
+fn installed_mappings(
+    prepared: &super::warp_update::Prepared,
+) -> BTreeMap<String, crate::model::mapping::SlicerMappingFacts> {
+    prepared
+        .outputs
+        .iter()
+        .filter_map(|output| {
+            let slice = prepared.spec.slices.get(output.index)?;
+            Some((
+                output.name.clone(),
+                mapping_facts(
+                    slice,
+                    output.size,
+                    mapped_source(slice, output.size),
+                    output.sampling.mode(),
+                    true,
+                ),
+            ))
+        })
+        .collect()
+}
+
+/// What one output of the CPU renderer reports at startup: its sampling
+/// mode, note and mapping facts, or `None` for an animated pattern, which
+/// draws its counter in output space and samples no canvas at all.
+///
+/// CPU content never resamples: a CPU presenter has no warp (only a
+/// transform-owning GPU presenter does), so `Blend::sample` byte-copies the
+/// whole-pixel slice rectangle at the presenter's size, origin clamped to
+/// the canvas, whatever source rectangle was configured. The facts say so:
+/// exact at 1:1 from that origin, and `cropHonored: false` when the
+/// configured rectangle is a different one. A static pattern is resampled
+/// from its own canvas picture through the configured rectangle with the
+/// CPU's cut of the kernel (`present_pattern`), and is reported as that.
+/// The CPU renderer never owns a transform: the compositor applies it.
+fn cpu_output_report(
+    spec: &SlicerSpec,
+    slice: &super::blend::SliceSpec,
+    size: (u32, u32),
+) -> Option<(
+    crate::model::SamplingMode,
+    Option<String>,
+    crate::model::mapping::SlicerMappingFacts,
+)> {
+    match spec.pattern {
+        Some(pattern) if animated(pattern) => None,
+        Some(_) => {
+            let source = slice.source_rect.unwrap_or([
+                f64::from(slice.slice.x),
+                f64::from(slice.slice.y),
+                f64::from(slice.slice.width),
+                f64::from(slice.slice.height),
+            ]);
+            let warp = super::warp::Warp::identity(size.0, size.1)
+                .with_source_rect(source)
+                .ok()?;
+            let kernel =
+                super::resample::Kernel::select(spec.filter, super::resample::minification(&warp));
+            let (mode, note) = super::resample::cpu_sampling(spec.filter, kernel);
+            Some((mode, note, mapping_facts(slice, size, source, mode, false)))
+        }
+        None => {
+            let copied = [
+                f64::from(slice.slice.x.max(0)),
+                f64::from(slice.slice.y.max(0)),
+                f64::from(size.0),
+                f64::from(size.1),
+            ];
+            let configured = mapped_source(slice, size);
+            let mut facts = mapping_facts(
+                slice,
+                size,
+                copied,
+                crate::model::SamplingMode::Exact,
+                false,
+            );
+            facts.crop_honored = configured
+                .iter()
+                .zip(copied)
+                .all(|(configured, copied)| (configured - copied).abs() <= 1e-9);
+            Some((crate::model::SamplingMode::Exact, None, facts))
+        }
+    }
+}
+
+/// The CPU renderer's one `applied` event, for generation zero (`--spec`):
+/// it has no live controller, so its spec is installed exactly once, and
+/// any change replaces the process. Carries what the GPU's `applied` would:
+/// every output, its sampling mode and note, and its mapping facts.
+fn report_cpu_applied(state: &State, spec: &SlicerSpec) {
+    let mut outputs = Vec::new();
+    let mut sampling_modes = BTreeMap::new();
+    let mut sampling_notes = BTreeMap::new();
+    let mut mappings = BTreeMap::new();
+    for (presenter, slice) in state.presenters.iter().zip(&spec.slices) {
+        outputs.push(presenter.name.clone());
+        let Some(size) = presenter.configured else {
+            continue;
+        };
+        let Some((mode, note, facts)) = cpu_output_report(spec, slice, size) else {
+            continue;
+        };
+        sampling_modes.insert(presenter.name.clone(), mode);
+        if let Some(note) = note {
+            sampling_notes.insert(presenter.name.clone(), note);
+        }
+        mappings.insert(presenter.name.clone(), facts);
+    }
+    let event = super::control::ControlEvent::new(
+        spec.control_session.clone(),
+        0,
+        super::control::ControlEventKind::Applied {
+            outputs,
+            build_ms: None,
+            upload_ms: None,
+            sampling_modes,
+            sampling_notes,
+            mappings,
+        },
+    );
+    if let Ok(line) = serde_json::to_string(&event) {
+        state.stdout.event(line);
+    }
+}
+
 /// Install only between synchronous GPU submissions: Gpu::blend/sync have
 /// already waited their fence, so no SSBO reader remains in flight.
 /// Stage the complete affected set before changing any active matrix/table.
@@ -3866,6 +4047,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
     let mut changed: Vec<_> = prepared.outputs.iter().map(|o| o.name.clone()).collect();
     let sampling_modes = sampling_modes(&prepared);
     let sampling_notes = sampling_notes(&prepared);
+    let mappings = installed_mappings(&prepared);
     for output in &mut prepared.outputs {
         let presenter = &mut state.presenters[output.index];
         presenter.transfer = std::mem::take(&mut output.table);
@@ -3898,6 +4080,7 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
             outputs: changed,
             sampling_modes,
             sampling_notes,
+            mappings,
             build_ms: Some(prepared.build_ms),
             upload_ms: Some(upload_ms),
         },
@@ -4136,6 +4319,9 @@ fn run_shared_source(
                             source_format.is_none_or(|format| format == description.format),
                             "shared texture: pool slots have different formats"
                         );
+                        if source_format.is_none() {
+                            emit_capture(state, shared_capture_facts(description.format));
+                        }
                         source_format = Some(description.format);
                         let index = description.slot;
                         let started = Instant::now();
@@ -4266,6 +4452,7 @@ fn arm_copy(
         }
     }
     ensure_capture_buffer(state, shm, dmabuf, handle)?;
+    report_capture(state);
     let first_copy_done = state.capture.first_copy_done;
     if !first_copy_done {
         print_renderer_decision(state);
@@ -4517,6 +4704,129 @@ fn print_renderer_decision(state: &State) {
         Some(Backend::Cpu) | None => {
             eprintln!("slicer: renderer cpu (shm)");
         }
+    }
+}
+
+/// A DRM fourcc as its four characters (`XR24`); a wl_shm format code is
+/// its DRM fourcc except for the two codes wl_shm numbers itself.
+fn fourcc_text(format: u32) -> String {
+    let fourcc = match format {
+        0 => u32::from_le_bytes(*b"AR24"),
+        1 => u32::from_le_bytes(*b"XR24"),
+        other => other,
+    };
+    let bytes = fourcc.to_le_bytes();
+    if bytes.iter().all(|b| b.is_ascii_graphic() || *b == b' ') {
+        String::from_utf8_lossy(&bytes).trim_end().to_string()
+    } else {
+        format!("{format:#010x}")
+    }
+}
+
+/// The capture this slicer has established right now, by raw identity:
+/// `(kind, format, modifier)`. `None` until a capture buffer exists.
+fn capture_identity(state: &State) -> Option<(crate::model::CaptureKind, u32, Option<u64>)> {
+    use crate::model::CaptureKind;
+    match state.capture.backend {
+        Some(Backend::Gpu) => {
+            let (image, _) = state.capture.gpu_images.get(state.capture.gpu_slot)?;
+            Some((CaptureKind::Dmabuf, image.fourcc, Some(image.modifier)))
+        }
+        Some(Backend::Cpu) | None => {
+            state.capture.buffer.as_ref()?;
+            let (format, ..) = state.capture.offered?;
+            Some((CaptureKind::Shm, format, None))
+        }
+    }
+}
+
+/// What [`capture_identity`] means for the mapping verdict. Every format the
+/// slicer accepts on either path (`gpu::format_for_fourcc`, [`pixel_format`])
+/// holds 8-bit R, G and B, which both renderers carry through as a channel
+/// reorder; anything else would be a value conversion.
+fn capture_facts(
+    (kind, format, modifier): (crate::model::CaptureKind, u32, Option<u64>),
+) -> crate::model::CaptureFacts {
+    let lossless = match kind {
+        crate::model::CaptureKind::Dmabuf => {
+            let fourcc = |code: &[u8; 4]| u32::from_le_bytes(*code);
+            [
+                fourcc(b"XR24"),
+                fourcc(b"AR24"),
+                fourcc(b"XB24"),
+                fourcc(b"AB24"),
+            ]
+            .contains(&format)
+        }
+        _ => pixel_format(format).is_some(),
+    };
+    crate::model::CaptureFacts {
+        kind,
+        format: Some(fourcc_text(format)),
+        modifier: modifier.map(|modifier| format!("{modifier:#018x}")),
+        converted: !lossless,
+    }
+}
+
+/// Emit `CaptureEstablished` when the capture differs from the one last
+/// reported: at startup and after a mid-run reallocation that changed its
+/// kind, format or modifier. Called after every `ensure_capture_buffer`,
+/// which is per capture, so the unchanged case is three integer compares.
+fn report_capture(state: &mut State) {
+    let Some(identity) = capture_identity(state) else {
+        return;
+    };
+    if state.capture_reported == Some(identity) {
+        return;
+    }
+    state.capture_reported = Some(identity);
+    emit_capture(state, capture_facts(identity));
+}
+
+/// One `CaptureEstablished` lifecycle event, in order with the rest.
+fn emit_capture(state: &State, capture: crate::model::CaptureFacts) {
+    let event = super::control::ControlEvent::new(
+        state.control_session.clone(),
+        0,
+        super::control::ControlEventKind::CaptureEstablished { capture },
+    );
+    if let Ok(line) = serde_json::to_string(&event) {
+        state.stdout.event(line);
+    }
+}
+
+/// The source of a pattern run: nothing is captured and no browser is in
+/// the chain. Reported once, before the pattern's first apply.
+fn report_pattern_capture(state: &mut State) {
+    let identity = (crate::model::CaptureKind::Pattern, 0, None);
+    if state.capture_reported == Some(identity) {
+        return;
+    }
+    state.capture_reported = Some(identity);
+    emit_capture(
+        state,
+        crate::model::CaptureFacts {
+            kind: crate::model::CaptureKind::Pattern,
+            format: None,
+            modifier: None,
+            converted: false,
+        },
+    );
+}
+
+/// The shared producer's image format, as a capture: protocol v1 accepts
+/// 8-bit RGBA/BGRA and 10-bit RGB10A2 UNORM (`gpu::shared`), and only the
+/// 8-bit ones survive an 8-bit presentation unchanged.
+fn shared_capture_facts(format: i32) -> crate::model::CaptureFacts {
+    let format = ash::vk::Format::from_raw(format);
+    crate::model::CaptureFacts {
+        kind: crate::model::CaptureKind::Shared,
+        format: Some(format!("{format:?}")),
+        modifier: None,
+        converted: !matches!(
+            format,
+            ash::vk::Format::R8G8B8A8_UNORM | ash::vk::Format::B8G8R8A8_UNORM
+        ),
     }
 }
 
@@ -8464,6 +8774,8 @@ mod tests {
             measurement: super::super::adaptive::MeasurementSchedule::default(),
             stdout: super::super::control::StdoutWriter::spawn(),
             cpu: CpuRenderers::new(None),
+            control_session: String::new(),
+            capture_reported: None,
         }
     }
 
@@ -9660,6 +9972,112 @@ mod tests {
             assert!(sampling_notes(&prepared).is_empty());
             assert!(!requires_linear_sampling(&spec).unwrap());
         }
+    }
+
+    fn prepared_for(spec: &SlicerSpec, size: (u32, u32)) -> super::super::warp_update::Prepared {
+        let mut controller =
+            super::super::warp_update::Controller::new(spec, vec![size], 1).expect("controller");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(prepared) = controller.poll() {
+                return prepared;
+            }
+            assert!(Instant::now() < deadline, "worker did not finish");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The GPU apply reports what its build installed: ratio and origin
+    /// from the source rectangle, the shader's sampling path, and the slice
+    /// transform the GPU renderer owns.
+    #[test]
+    fn a_gpu_apply_reports_the_mapping_it_installed() {
+        use crate::model::SamplingMode;
+        let mut spec = pattern_spec();
+        spec.canvas_width = 640;
+        spec.canvas_height = 480;
+        let size = (240, 180);
+
+        let mut rotated = spec.clone();
+        rotated.slices[0].transform = Transform::Rotate180;
+        let facts = &installed_mappings(&prepared_for(&rotated, size))["DP-1"];
+        assert_eq!((facts.ratio_x, facts.ratio_y), (1.0, 1.0));
+        assert!(facts.whole_pixel_origin && facts.identity_geometry && facts.crop_honored);
+        assert_eq!(facts.sampling_path, SamplingMode::Exact);
+        assert!(facts.owns_transforms);
+        assert_eq!(facts.owned_transform, Transform::Rotate180);
+
+        let mut upscale = spec.clone();
+        upscale.filter = crate::model::ResampleFilter::Nearest;
+        upscale.slices[0].source_rect = Some([30.0, 20.0, 120.0, 90.0]);
+        let facts = &installed_mappings(&prepared_for(&upscale, size))["DP-1"];
+        assert_eq!((facts.ratio_x, facts.ratio_y), (2.0, 2.0));
+        assert_eq!(facts.sampling_path, SamplingMode::Nearest);
+
+        let mut fractional = spec;
+        fractional.slices[0].source_rect = Some([30.5, 20.0, 240.0, 180.0]);
+        let facts = &installed_mappings(&prepared_for(&fractional, size))["DP-1"];
+        assert!(!facts.whole_pixel_origin);
+        assert_eq!(facts.sampling_path, SamplingMode::Bilinear);
+    }
+
+    /// CPU content is a byte copy of the whole-pixel slice rectangle, and
+    /// the compositor applies the transform: the CPU renderer says exactly
+    /// that, including when the configured crop is a different one.
+    #[test]
+    fn the_cpu_renderer_reports_its_byte_copy() {
+        use crate::model::SamplingMode;
+        let mut spec = pattern_spec();
+        spec.renderer = Renderer::Cpu;
+        spec.slices[0].transform = Transform::Rotate180;
+        let size = (240, 180);
+        let (mode, note, facts) = cpu_output_report(&spec, &spec.slices[0], size).unwrap();
+        assert_eq!(mode, SamplingMode::Exact);
+        assert!(note.is_none());
+        assert_eq!((facts.ratio_x, facts.ratio_y), (1.0, 1.0));
+        assert!(facts.whole_pixel_origin && facts.crop_honored);
+        assert!(!facts.owns_transforms);
+        assert_eq!(facts.owned_transform, Transform::Normal);
+
+        // A scaled crop is not what the CPU copies.
+        spec.slices[0].source_rect = Some([30.0, 20.0, 120.0, 90.0]);
+        let (_, _, facts) = cpu_output_report(&spec, &spec.slices[0], size).unwrap();
+        assert_eq!((facts.ratio_x, facts.ratio_y), (1.0, 1.0));
+        assert!(!facts.crop_honored);
+
+        // A static pattern is resampled through the crop with the CPU's
+        // cut of the kernel; an animated one samples no canvas at all.
+        spec.pattern = Some(TestPattern::Grid);
+        spec.filter = crate::model::ResampleFilter::Lanczos;
+        let (mode, note, facts) = cpu_output_report(&spec, &spec.slices[0], size).unwrap();
+        assert_eq!(mode, SamplingMode::Bilinear);
+        assert!(note.unwrap().contains("lanczos is GPU-only"));
+        assert_eq!((facts.ratio_x, facts.ratio_y), (2.0, 2.0));
+        assert!(facts.crop_honored);
+        spec.pattern = Some(TestPattern::Sync);
+        assert!(cpu_output_report(&spec, &spec.slices[0], size).is_none());
+    }
+
+    #[test]
+    fn capture_facts_name_the_format_and_whether_it_converts() {
+        use crate::model::CaptureKind;
+        let xr24 = u32::from_le_bytes(*b"XR24");
+        let facts = capture_facts((CaptureKind::Dmabuf, xr24, Some(0x0300_0000_0060_6014)));
+        assert_eq!(facts.format.as_deref(), Some("XR24"));
+        assert_eq!(facts.modifier.as_deref(), Some("0x0300000000606014"));
+        assert!(!facts.converted);
+        let xr30 = u32::from_le_bytes(*b"XR30");
+        assert!(capture_facts((CaptureKind::Dmabuf, xr30, Some(0))).converted);
+        // wl_shm's own two codes, then a DRM fourcc it shares.
+        let shm = capture_facts((CaptureKind::Shm, 1, None));
+        assert_eq!(shm.format.as_deref(), Some("XR24"));
+        assert!(!shm.converted && shm.modifier.is_none());
+        assert_eq!(fourcc_text(0), "AR24");
+        assert!(!capture_facts((CaptureKind::Shm, u32::from_le_bytes(*b"BG24"), None)).converted);
+        let shared = shared_capture_facts(ash::vk::Format::A2B10G10R10_UNORM_PACK32.as_raw());
+        assert!(shared.converted);
+        assert_eq!(shared.format.as_deref(), Some("A2B10G10R10_UNORM_PACK32"));
+        assert!(!shared_capture_facts(ash::vk::Format::B8G8R8A8_UNORM.as_raw()).converted);
     }
 
     fn pattern_spec() -> SlicerSpec {

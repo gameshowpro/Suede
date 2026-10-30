@@ -89,6 +89,10 @@ pub enum SamplingMode {
     /// Box (area) averaging, applied automatically when an axis minifies by
     /// more than 2x.
     Area,
+    /// No slicer: sway tiles one fullscreen window across the outputs, one
+    /// texel per pixel at output scale 1. Reported only as a per-output
+    /// `mapping.samplingPath`, never as a slicer's `samplingMode`.
+    Tiled,
 }
 
 /// A canvas rectangle in isotropic canvas units.

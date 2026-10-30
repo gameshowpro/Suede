@@ -2,11 +2,61 @@
 //!
 //! Everything here is re-derived from Sway and PipeWire; none of it is persisted.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
+use crate::model::mapping::{MappingContext, MappingInputs, SlicerMappingFacts};
 use crate::model::{
-    Output, ProjectionControlStatus, ProjectionReport, ProjectionStats, Status, Window,
+    CaptureFacts, Output, ProjectionControlOutputStatus, ProjectionControlStatus, ProjectionReport,
+    ProjectionStats, SamplingMode, Status, Window,
 };
+
+/// Control lifecycle state and the inputs its per-output mapping verdicts
+/// are derived from, behind one lock so a slicer event's facts and the
+/// generation they describe always change together.
+#[derive(Default)]
+struct ControlState {
+    status: ProjectionControlStatus,
+    mapping: MappingInputs,
+}
+
+impl ControlState {
+    /// Re-derive every output's `mapping` from `self.mapping`. The one place
+    /// the verdict is computed; `recomputes` counts each call.
+    fn recompute(&mut self, recomputes: &AtomicU64) {
+        recomputes.fetch_add(1, Ordering::Relaxed);
+        let mut derived = self.mapping.derive(self.status.config_generation.applied);
+        for output in &mut self.status.outputs {
+            output.mapping = derived.remove(&output.name);
+        }
+        for (name, mapping) in derived {
+            let mut output = ProjectionControlOutputStatus::named(name);
+            output.mapping = Some(mapping);
+            self.status.outputs.push(output);
+        }
+        self.status.outputs.retain(|output| !output.is_blank());
+        self.status.capture = self.mapping.capture.clone();
+    }
+
+    /// Keep each slicer mapping's `generation` on the generation the slicer
+    /// has installed. Not a recompute: the facts of an output a newer
+    /// generation did not rebuild still describe it (its per-output build
+    /// key was unchanged), and an equivalent snapshot that needed no control
+    /// message is installed too (see `BlendManager::mark_control_requested`).
+    fn stamp_generation(&mut self) {
+        if self.mapping.context.tiled.is_some() {
+            return;
+        }
+        let applied = self.status.config_generation.applied;
+        for output in &mut self.status.outputs {
+            if let Some(mapping) = &mut output.mapping {
+                if mapping.sampling_path != SamplingMode::Tiled {
+                    mapping.generation = applied;
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct Snapshot {
@@ -28,7 +78,12 @@ pub struct Snapshot {
     slicer_pid: RwLock<Option<u32>>,
     /// Live-control progress is distinct from interval frame statistics so
     /// a static source can still show whether a requested edit was installed.
-    projection_control: RwLock<ProjectionControlStatus>,
+    /// Holds the per-output mapping inputs too; see [`ControlState`].
+    projection_control: RwLock<ControlState>,
+    /// How many times a mapping verdict has been derived: only ever when
+    /// one of its inputs changed. Read by tests that prove a statistics
+    /// interval never recomputes it.
+    mapping_recomputes: AtomicU64,
     projection_geometry: RwLock<crate::model::observed::ProjectionGeometryStatus>,
     /// How this session presents, as resolved once at startup against the
     /// compositor the daemon found (see [`crate::presentation::resolve`]).
@@ -250,7 +305,7 @@ impl Snapshot {
     }
 
     pub fn projection_control(&self) -> ProjectionControlStatus {
-        let mut control = self.projection_control.read().unwrap().clone();
+        let mut control = self.projection_control.read().unwrap().status.clone();
         if let Some(lift) = &mut control.black_lift {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -261,15 +316,19 @@ impl Snapshot {
         control
     }
 
-    /// Replace control lifecycle state, reporting whether a client needs an
-    /// observed-state update.
+    /// Replace control lifecycle state for a new slicer session, reporting
+    /// whether a client needs an observed-state update. The previous
+    /// session's mapping facts and capture go with it: they described a
+    /// process that no longer renders.
     pub fn set_projection_control(&self, control: ProjectionControlStatus) -> bool {
         let mut guard = self.projection_control.write().unwrap();
-        if *guard == control {
-            return false;
-        }
-        *guard = control;
-        true
+        let before = guard.status.clone();
+        guard.status = control;
+        guard.mapping.slicer.clear();
+        guard.mapping.capture = None;
+        guard.recompute(&self.mapping_recomputes);
+        guard.stamp_generation();
+        guard.status != before
     }
 
     /// Mutate control lifecycle state while holding its write lock.  The
@@ -280,10 +339,71 @@ impl Snapshot {
         &self,
         update: impl FnOnce(&mut ProjectionControlStatus),
     ) -> bool {
+        self.update_projection_control_with_mapping(|status, _| update(status))
+    }
+
+    /// [`Self::update_projection_control`], also handing the closure the
+    /// mapping inputs. The verdict is recomputed only when the closure
+    /// changed those inputs, in the same critical section, so a slicer
+    /// apply's facts and its applied generation are never seen apart.
+    pub fn update_projection_control_with_mapping(
+        &self,
+        update: impl FnOnce(&mut ProjectionControlStatus, &mut MappingInputs),
+    ) -> bool {
         let mut guard = self.projection_control.write().unwrap();
-        let before = guard.clone();
-        update(&mut guard);
-        *guard != before
+        let before = guard.status.clone();
+        let inputs_before = guard.mapping.clone();
+        let ControlState { status, mapping } = &mut *guard;
+        update(status, mapping);
+        if guard.mapping != inputs_before {
+            guard.recompute(&self.mapping_recomputes);
+        }
+        guard.stamp_generation();
+        guard.status != before
+    }
+
+    /// Merge one slicer apply's per-output facts. Returns whether a client
+    /// needs an observed-state update.
+    pub fn record_slicer_mapping(
+        &self,
+        facts: std::collections::BTreeMap<String, SlicerMappingFacts>,
+    ) -> bool {
+        self.update_projection_control_with_mapping(|_, mapping| mapping.slicer.extend(facts))
+    }
+
+    /// Record the capture the current slicer session established.
+    pub fn record_capture(&self, capture: CaptureFacts) -> bool {
+        self.update_projection_control_with_mapping(|_, mapping| mapping.capture = Some(capture))
+    }
+
+    /// Forget the slicer session's mapping facts and capture, as its process
+    /// stops, so no verdict outlives the rendering it described.
+    pub fn clear_slicer_mapping(&self) -> bool {
+        self.update_projection_control_with_mapping(|_, mapping| {
+            mapping.slicer.clear();
+            mapping.capture = None;
+        })
+    }
+
+    /// Record the daemon-side mapping facts of one reconciliation pass.
+    /// Recomputes only when they differ from the previous pass's.
+    pub fn set_mapping_context(&self, context: MappingContext) -> bool {
+        self.update_projection_control_with_mapping(|_, mapping| mapping.context = context)
+    }
+
+    /// Record the browser scale factor `app` was just launched with (`None`
+    /// when unknown).
+    pub fn record_app_launch(&self, app: &str, browser_scale_factor: Option<f64>) -> bool {
+        self.update_projection_control_with_mapping(|_, mapping| {
+            mapping
+                .launches
+                .insert(app.to_string(), browser_scale_factor);
+        })
+    }
+
+    /// How many times a mapping verdict has been derived.
+    pub fn mapping_recomputes(&self) -> u64 {
+        self.mapping_recomputes.load(Ordering::Relaxed)
     }
 
     /// What `GET /projection/stats` and `projection_stats_changed` serve:
