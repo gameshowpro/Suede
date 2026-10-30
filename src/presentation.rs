@@ -1154,6 +1154,7 @@ mod tests {
             pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
+            filter: Default::default(),
             slices: order
                 .iter()
                 .enumerate()

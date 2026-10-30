@@ -38,9 +38,20 @@ pub enum ProjectionMode {
 pub enum SamplingMode {
     /// Pixel-for-pixel; no interpolation was needed.
     Exact,
+    /// Nearest-texel sampling.
+    Nearest,
     /// Bilinear interpolation, because the source and destination rasters
     /// did not line up 1:1.
     Bilinear,
+    /// Catmull-Rom bicubic interpolation.
+    Bicubic,
+    /// Lanczos-3 windowed sinc.
+    Lanczos,
+    /// Edge-adaptive upscaling (FSR 1.0 EASU).
+    Easu,
+    /// Box (area) averaging, applied automatically when an axis minifies by
+    /// more than 2x.
+    Area,
 }
 
 /// A canvas rectangle in isotropic canvas units.

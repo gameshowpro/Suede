@@ -1545,6 +1545,7 @@ mod tests {
             pattern: None,
             free_run: false,
             renderer: crate::model::Renderer::Cpu,
+            filter: Default::default(),
             slices: Vec::new(),
         }
     }

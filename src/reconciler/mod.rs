@@ -961,6 +961,7 @@ impl Reconciler {
                             },
                             free_run: projection.free_run,
                             renderer: projection.renderer,
+                            filter: projection.filter,
                             highlight_overlaps: projection.temporary.highlight_overlaps,
                             slices: plan.slices,
                         });

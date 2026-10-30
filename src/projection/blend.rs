@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{CanvasRect, ProjectionConfig, Rect, Renderer, TestPattern};
+use crate::model::{CanvasRect, ProjectionConfig, Rect, Renderer, ResampleFilter, TestPattern};
 
 use super::layout::{LayoutParticipant, LayoutSpec};
 
@@ -144,6 +144,10 @@ pub struct SlicerSpec {
     /// Which pipeline to blend with; see [`crate::model::Renderer`].
     #[serde(default)]
     pub renderer: Renderer,
+    /// Resampling filter for outputs that do not map 1:1; see
+    /// [`crate::model::ResampleFilter`]. Not yet consumed by either renderer.
+    #[serde(default, skip_serializing_if = "ResampleFilter::is_default")]
+    pub filter: ResampleFilter,
     /// Full configured roster, independently of which outputs can present —
     /// the sole source of blend-weight truth (via
     /// [`super::layout::Evaluator`]) for every canvas plan this daemon
@@ -1484,6 +1488,7 @@ mod tests {
             pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
+            filter: Default::default(),
             highlight_overlaps: false,
             slices: vec![SliceSpec {
                 source_rect: None,
@@ -1505,6 +1510,24 @@ mod tests {
         assert!(json.contains(r#""participants":["#), "{json}");
         let back: SlicerSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(back, spec);
+
+        // The filter is omitted while default, and every other value crosses
+        // the process boundary intact.
+        assert!(!json.contains(r#""filter""#), "{json}");
+        for filter in [
+            ResampleFilter::Nearest,
+            ResampleFilter::Bicubic,
+            ResampleFilter::Lanczos,
+            ResampleFilter::Easu,
+        ] {
+            let mut spec = spec.clone();
+            spec.filter = filter;
+            let json = serde_json::to_string(&spec).unwrap();
+            let name = serde_json::to_value(filter).unwrap();
+            assert!(json.contains(&format!(r#""filter":{name}"#)), "{json}");
+            let back: SlicerSpec = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.filter, filter);
+        }
     }
 
     fn channel((a, b): (u16, u8), input: u32) -> u8 {

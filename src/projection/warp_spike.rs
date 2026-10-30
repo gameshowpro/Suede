@@ -393,6 +393,7 @@ mod tests {
             pattern: None,
             free_run: false,
             renderer: Default::default(),
+            filter: Default::default(),
             slices: vec![SliceSpec {
                 source_rect: None,
                 geometry: None,

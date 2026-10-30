@@ -115,6 +115,15 @@ pub struct ProjectionConfig {
     pub free_run: bool,
     /// Which pipeline the slicer composites with; see [`Renderer`].
     pub renderer: Renderer,
+    /// The resampling filter for any output whose source and destination
+    /// rasters are not 1:1, one value for the whole installation.
+    ///
+    /// Neutral under the integer copy: an output that copies pixels exactly
+    /// ignores it. Omitted from the serialized document while it is the
+    /// default, so state files written by this version stay readable by older
+    /// daemons.
+    #[serde(default, skip_serializing_if = "ResampleFilter::is_default")]
+    pub filter: ResampleFilter,
     /// The grid arrangement last applied, as a record of what was asked for.
     ///
     /// Explicit geometry stays canonical: this holds the resolved rows,
@@ -142,6 +151,7 @@ impl Default for ProjectionConfig {
             test_pattern: None,
             free_run: false,
             renderer: Renderer::Auto,
+            filter: ResampleFilter::default(),
             arrangement: None,
             temporary: TemporarySettings::default(),
         }
@@ -199,6 +209,34 @@ pub enum Renderer {
     Auto,
     Cpu,
     Gpu,
+}
+
+/// The interpolation used where an output does not map 1:1 onto its source.
+///
+/// Minification by more than 2x on an axis is box-filtered automatically
+/// whatever this says; it is not configurable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ResampleFilter {
+    /// Linear interpolation between the four nearest texels.
+    #[default]
+    Bilinear,
+    /// The single nearest texel; crisp at whole-number scales, aliased at
+    /// others.
+    Nearest,
+    /// Catmull-Rom bicubic interpolation.
+    Bicubic,
+    /// Lanczos-3 windowed sinc.
+    Lanczos,
+    /// Edge-adaptive upscaling (the FSR 1.0 EASU kernel).
+    Easu,
+}
+
+impl ResampleFilter {
+    /// Whether this is the default, for `skip_serializing_if`.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// A built-in projection test pattern.
@@ -1768,6 +1806,33 @@ mod tests {
         Transform::Flipped180,
         Transform::Flipped270,
     ];
+
+    #[test]
+    fn resample_filter_defaults_to_bilinear_and_round_trips() {
+        // An old document names no filter.
+        let old: ProjectionConfig = serde_json::from_str(r#"{"mode":"simple"}"#).unwrap();
+        assert_eq!(old.filter, ResampleFilter::Bilinear);
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("filter").is_none(), "{json}");
+
+        for (name, filter) in [
+            ("bilinear", ResampleFilter::Bilinear),
+            ("nearest", ResampleFilter::Nearest),
+            ("bicubic", ResampleFilter::Bicubic),
+            ("lanczos", ResampleFilter::Lanczos),
+            ("easu", ResampleFilter::Easu),
+        ] {
+            let config: ProjectionConfig =
+                serde_json::from_value(serde_json::json!({ "filter": name })).unwrap();
+            assert_eq!(config.filter, filter);
+            let back: ProjectionConfig =
+                serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+            assert_eq!(back, config);
+        }
+        assert!(serde_json::from_str::<ProjectionConfig>(r#"{"filter":"sharp"}"#).is_err());
+        // `area` is reported, never configured.
+        assert!(serde_json::from_str::<ProjectionConfig>(r#"{"filter":"area"}"#).is_err());
+    }
 
     #[test]
     fn transform_classification_and_physical_size() {

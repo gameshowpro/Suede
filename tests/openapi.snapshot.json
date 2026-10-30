@@ -4211,6 +4211,15 @@
               }
             ]
           },
+          "filter": {
+            "default": "bilinear",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResampleFilter",
+                "description": "The resampling filter for any output whose source and destination\nrasters are not 1:1, one value for the whole installation.\n\nNeutral under the integer copy: an output that copies pixels exactly\nignores it. Omitted from the serialized document while it is the\ndefault, so state files written by this version stay readable by older\ndaemons."
+              }
+            ]
+          },
           "freeRun": {
             "default": false,
             "description": "Let each output take frames at its own pace.\n\nOff (the default), the slicer commits a frame to every output together\nand does not commit the next until all of them have taken it, so the\nsame frame is on every display at once. On, each output is handed the\nnewest frame the moment it is ready for one: displays at different\nrefresh rates each run at their own, and the wall gives up being in\nstep. Only for installations that cannot share a rate.",
@@ -4987,6 +4996,17 @@
         ],
         "type": "string"
       },
+      "ResampleFilter": {
+        "description": "The interpolation used where an output does not map 1:1 onto its source.\n\nMinification by more than 2x on an axis is box-filtered automatically\nwhatever this says; it is not configurable.",
+        "enum": [
+          "bilinear",
+          "nearest",
+          "bicubic",
+          "lanczos",
+          "easu"
+        ],
+        "type": "string"
+      },
       "ResolutionLimits": {
         "description": "Known allocation limits used by the recommendation calculation.",
         "properties": {
@@ -5064,7 +5084,12 @@
         "description": "How a slicer output actually sampled its captured source.\n\nDistinct from [`ProjectionMode`]: a Simple-mode crop that happens to sit\non an integer pixel boundary samples `Exact` just like an identity Warp\noutput would, while a fractional crop or corner pin in either mode needs\n`Bilinear`. This is a report of the sampling path taken, not of which\npipeline requested it.",
         "enum": [
           "exact",
-          "bilinear"
+          "nearest",
+          "bilinear",
+          "bicubic",
+          "lanczos",
+          "easu",
+          "area"
         ],
         "type": "string"
       },

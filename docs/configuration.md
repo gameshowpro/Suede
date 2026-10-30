@@ -1437,6 +1437,7 @@ Warp adds retained corner and center correction to the same content selection:
 | `temporary` | object | `{ "highlightOverlaps": false }` | Temporary calibration aids that are never saved. `highlightOverlaps` draws the seam lineup lines; see [Highlighting overlaps](#highlight-overlaps) |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
+| `filter` | string | `bilinear` | `bilinear`, `nearest`, `bicubic`, `lanczos`, or `easu`; the resampling filter for outputs that do not map 1:1. Accepted and saved now, but it takes effect in a later release: every output still samples bilinear or exact. Omitted from the saved document while it is `bilinear` |
 | `arrangement` | object or null | `null` | Optional. The resolved record of the last applied [grid arrangement](#grid-arrangement): `{ rows, columns, overlapX, overlapY, contentScale }`. A record of intent, not canonical geometry — a later manual geometry edit leaves it in place |
 
 #### Adaptive black lift

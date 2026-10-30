@@ -1115,6 +1115,7 @@ mod tests {
             pattern: None,
             free_run: false,
             renderer: Renderer::Gpu,
+            filter: Default::default(),
             slices: ["A", "B"]
                 .into_iter()
                 .enumerate()

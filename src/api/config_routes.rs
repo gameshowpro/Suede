@@ -2425,6 +2425,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn projection_filter_roundtrips_every_variant_and_rejects_unknown_values() {
+        let harness = harness(None);
+        for name in ["nearest", "bicubic", "lanczos", "easu"] {
+            let input = serde_json::json!({"filter": name}).to_string();
+            let (status, body) =
+                call(&harness, "PUT", "/api/v1/config/projection", Some(&input)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["projection"]["filter"], name);
+            let (_, body) = call(&harness, "GET", "/api/v1/config", None).await;
+            assert_eq!(body["projection"]["filter"], name);
+        }
+        // The default is not serialized, so a document that never named a
+        // filter and one that names bilinear are the same document.
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"filter":"bilinear"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["projection"].get("filter").is_none(), "{body}");
+        for bad in [r#"{"filter":"sharp"}"#, r#"{"filter":"area"}"#] {
+            let (status, _) = call(&harness, "PUT", "/api/v1/config/projection", Some(bad)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        }
+    }
+
     // --- grid arrangement --------------------------------------------------
 
     /// `count` enabled outputs at 1920x1080, plus a 3840-wide 16:9 shared

@@ -10188,6 +10188,7 @@ mod reconstruction {
             pattern: None,
             free_run: false,
             renderer: crate::model::Renderer::Cpu,
+            filter: Default::default(),
             layout: plan.layout,
             coverage_rects: plan.coverage_rects,
             highlight_overlaps: projection.temporary.highlight_overlaps,
