@@ -207,3 +207,18 @@ Checks that the **Resampling filter** select treats a missing `filter` as
 `bilinear`, previews a document carrying the chosen filter (omitting it again
 for `bilinear`), shows each output's reported `samplingMode` and `samplingNote`
 in the timing table, and hides in Exact mode without altering the saved value.
+
+## Whole-number chip browser check
+
+```sh
+NODE_PATH=/tmp/suede-ui-tests/node_modules \
+PLAYWRIGHT_BROWSERS_PATH=/tmp/suede-ui-tests/browsers \
+node tests/ui/chip.cjs
+```
+
+Checks the per-output whole-number chip against a fixture `/projection/stats`:
+exactly one chip for one verified output among a composited-rotated, a
+fractional and a lagging-generation output; labels and tooltip facts; the
+editor's muted `unverified` hint; hiding while the requested generation is
+newer; whole-number and tiled labels; and no chip or claim without a mapping
+(including a stopped slicer).

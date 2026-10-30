@@ -1786,6 +1786,30 @@ stack. Stacks are accepted only when every pair is a stack; mixed stack/seam
 layouts are rejected. `rasterFootprint` is separate physical calibration and
 is initially copied from `slice` by conversion.
 
+#### The whole-number chip {: #whole-number-chip }
+
+On the Displays tab, an output's box in the layout diagram and the header of its settings show a green chip when Suede has verified that the output shows the canvas at a whole-number scale. The label reads **1:1 verified** at a ratio of 1, **2× whole-number verified** at a whole ratio above 1 (**2×3× whole-number verified** when the two axes differ), and **1:1 (tiled)** on an appliance where the compositor tiles the outputs itself and no slicer runs. Hover the chip to list the facts behind it: ratio, sampling path, transform owner, output scale, browser scale factor and capture.
+
+The verdict comes from the daemon, as `control.outputs[].mapping` in `GET /projection/stats`. It is computed when an input changes (a configuration is installed, a capture is established, an output's scale or transform changes, an app is launched) and never on a statistics interval. `verified` is true only when every check below passes; otherwise `unverified` lists each failing check, and the settings of that output show the list as a muted hint.
+
+What it checks:
+
+- **Whole-number geometry.** Both ratios are whole numbers of at least 1, the crop starts on a whole canvas pixel, and there is no corner or center correction. Failures read `scaling 1.5× is not a whole number`, `fractional crop origin` and `corner or center correction`.
+- **The sampling path.** At 1:1 the exact integer copy must be the path taken; above 1:1 it must be `nearest`. Failures read `bilinear sampling at 1× instead of the exact copy` and `bilinear filter at 2× (choose nearest for pixel replication)`, with the configured filter's name in place of `bilinear`. See [Resampling filter](#resampling-filter).
+- **The crop.** `the CPU renderer copies the whole-pixel slice, not the configured crop` when the CPU renderer cannot honor the configured crop.
+- **The capture.** The format must survive intact: `capture format converted`, or `capture format unknown` when no capture has been reported.
+- **Output scale.** The compositor scale must be 1: `output scale 1.5`, or `output scale unknown`.
+- **Transform ownership.** A rotation or mirror must be applied by the slicer, which permutes pixels without resampling. When the compositor applies it instead, the chip reads `rotated by the compositor` or `flipped by the compositor`; `output transform unknown` when the compositor did not report one.
+- **The browser scale factor.** Whenever a browser is in the chain it must have been launched at a device scale factor of 1: `browser scale factor 2`, or `browser scale factor unknown` for any launcher Suede cannot vouch for, or for `extraArgs` that override the factor.
+
+When the chip is hidden:
+
+- While the verdict is not for the working copy the page holds. Each verdict carries the configuration generation it describes; the chip appears only while that equals the page's current generation. After an edit the chip disappears until the new configuration is installed, and the existing pending indicator stands alone.
+- While `verified` is false. The chip is never shown for a partial result; the reasons appear in the output's settings only.
+- When there is no mapping: the slicer is stopped (its mapping is removed), no app is active on a tiled appliance, or a test pattern is showing on a tiled appliance. The canvas line then says nothing about one-to-one sampling.
+
+What it cannot see: anything inside the browser (CSS or canvas scaling, video decode scaling, color management), the compositor's blit when it composites the frame, the DRM color pipeline, the display's own scaler and mode handling, and the pixel values Suede changes on purpose (seam blending, black lift, gamma). It is about which canvas pixel lands on which output pixel, and whether the capture format survives intact. Whether a frame was presented by zero-copy scanout or composited is reported separately, as `zeroCopyPresented` in the frame timing table, and is not part of the verdict.
+
 #### Retaining and clearing calibration {: #retaining-calibration }
 
 Calibration — `canvas` and each output's `geometry` — is precious: it is the

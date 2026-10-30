@@ -63,3 +63,10 @@ The Displays tab gained the **Exact** mode button, first in the **Exact | Simple
 - `assets/screenshots/details/unplugged-outputs.avif`
 
 `assets/screenshots/details/warp-editor.avif` was checked and does not need retaking: its crop is the Warp and geometry pin editor and does not include the mode toggle. The other captures are on other tabs. No procedure for retaking screenshots is documented in this repository, so this note does not give one.
+
+The Displays tab also gained the whole-number chip: a green **1:1 verified** (or **N× whole-number verified**, or **1:1 (tiled)**) pill on each verified output's box in the layout diagram and in the header of the output's settings, and a muted hint under that header when an output is not verified. These captures predate it, so they need retaking once the chip can show on a verified system:
+
+- `assets/screenshots/displays.avif`
+- `assets/screenshots/details/unplugged-outputs.avif`
+
+Read more: [The whole-number chip](configuration.md#whole-number-chip).

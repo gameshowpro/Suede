@@ -607,7 +607,9 @@ window.addEventListener("error", (event) => {
     </div>
     <div class="panel hidden" id="output-editor">
       <h2>Configure <span id="output-name" class="mono"></span>
-        <span id="output-display" class="muted" style="font-size:14px;font-weight:400"></span></h2>
+        <span id="output-display" class="muted" style="font-size:14px;font-weight:400"></span>
+        <span id="output-mapping-chip"></span></h2>
+      <p class="hint" id="output-mapping-hint" hidden></p>
       <div class="fields">
         <div><label for="o-enable">Enabled</label>
           <input type="checkbox" role="switch" class="switch" id="o-enable" data-config-field="enable"></div>
@@ -1973,7 +1975,7 @@ function renderLayout() {
       el.style.bottom = "10px"; el.style.width = "120px"; el.style.height = "42px";
     }
     const display = displayName(known);
-    el.innerHTML = `<b>${escape(known.name)}</b>` +
+    el.innerHTML = `<b>${escape(known.name)}</b><span class="mapping-slot">${mappingChipHtml(known.name)}</span>` +
       (display ? `<span class="muted">${escape(display)}</span>` : "") +
       `<span>${sizeLabel(r)}${enabled ? "" : " (disabled)"}</span>` +
       (known.connected ? ""
@@ -2136,6 +2138,62 @@ function renderLayout() {
 // The canvas the active app renders into: the bounding box of the configured
 // layout. Overlapping regions are inside the box once — authored once,
 // projected twice — so no arithmetic beyond the bounding box is needed.
+// The whole-number chip (see "The whole-number chip" in the configuration
+// reference). It states only what the daemon's per-output `mapping` verdict
+// says, and only while that verdict describes the working copy this page
+// holds: the verdict carries the configuration generation it was made for,
+// and a newer requested generation hides the chip so the existing pending
+// indicator stands alone. Without telemetry nothing is claimed.
+const TILED_CHIP_LABEL = "1:1 (tiled)";
+function outputMapping(name) {
+  return projectionStats?.control?.outputs?.find((o) => o.name === name)?.mapping ?? null;
+}
+function mappingIsCurrent(mapping) {
+  return !!mapping && mapping.generation != null && configGeneration != null &&
+    String(mapping.generation) === String(configGeneration);
+}
+function mappingLabel(m) {
+  if (m.samplingPath === "tiled") return TILED_CHIP_LABEL;
+  const near = (a, b) => Math.abs(a - b) < 1e-9;
+  if (near(m.ratioX, 1) && near(m.ratioY, 1)) return "1:1 verified";
+  const n = (v) => String(Math.round(v));
+  return near(m.ratioX, m.ratioY)
+    ? `${n(m.ratioX)}× whole-number verified`
+    : `${n(m.ratioX)}×${n(m.ratioY)}× whole-number verified`;
+}
+function mappingTooltip(m) {
+  const cap = projectionStats?.control?.capture;
+  const capture = cap
+    ? [cap.kind, cap.format, cap.modifier, cap.converted ? "converted" : "not converted"].filter(Boolean).join(" ")
+    : "not applicable";
+  const ratio = (a, b) => Math.abs(a - b) < 1e-9 ? `${displayNumber(a, 4)}×` : `${displayNumber(a, 4)}× horizontal, ${displayNumber(b, 4)}× vertical`;
+  return [
+    `Ratio: ${ratio(m.ratioX, m.ratioY)} output pixels per canvas pixel`,
+    `Sampling path: ${m.samplingPath}`,
+    `Transform owner: ${m.transformOwner}${m.transform ? ` (${m.transform})` : ""}`,
+    `Output scale: ${m.outputScale != null ? displayNumber(m.outputScale, 4) : "unknown"}`,
+    `Browser scale factor: ${m.browserScaleFactor != null ? displayNumber(m.browserScaleFactor, 4) : "not applicable"}`,
+    `Capture: ${capture}`,
+  ].join("\n");
+}
+function mappingChipHtml(name) {
+  const m = outputMapping(name);
+  if (!m || !m.verified || !mappingIsCurrent(m)) return "";
+  return `<span class="pill ok mapping-chip" title="${escape(mappingTooltip(m))}">${escape(mappingLabel(m))}</span>`;
+}
+function renderMappingChips() {
+  for (const el of document.querySelectorAll("#layout .display-box")) {
+    const slot = el.querySelector(".mapping-slot");
+    if (slot) slot.innerHTML = mappingChipHtml(el.dataset.name);
+  }
+  const chip = $("output-mapping-chip"), hint = $("output-mapping-hint");
+  if (!chip || !hint) return;
+  chip.innerHTML = selected ? mappingChipHtml(selected) : "";
+  const m = selected ? outputMapping(selected) : null;
+  const show = !!m && !m.verified && mappingIsCurrent(m) && m.unverified?.length > 0;
+  hint.hidden = !show;
+  hint.textContent = show ? `Not verified as whole-number scaling: ${m.unverified.join("; ")}.` : "";
+}
 function renderLayoutSize() {
   const el = $("layout-size");
   // Exactly what the daemon plans from: enabled configured entries, whether
@@ -2298,6 +2356,7 @@ function selectOutput(name, redrawLayout = true) {
   syncTransformControls(existing?.adopted?.transform ?? output?.transform ?? "normal");
 
   renderOutputBackgroundChoices(existing?.background);
+  renderMappingChips();
 
   // Say which of the two states this is: configured but dark, or attached.
   $("o-note").textContent = !existing ? "not yet in the layout"
@@ -3708,6 +3767,7 @@ function renderWarpEditor() {
 }
 function renderWarpStatus() {
   const g = projectionStats?.geometry, c = projectionStats?.control;
+  renderMappingChips();
   const requested = config?.projection?.mode ?? "simple", forcedSimple = requested === "warp" && !warpAvailable();
   $("warp-capability").textContent = requested === "exact"
     ? "Exact: every output shows its canvas pixels one-to-one. Scaling controls are unavailable."
@@ -3741,16 +3801,10 @@ function renderWarpStatus() {
   renderDirtyStatus();
 }
 function oneToOneStatus() {
-  if (isExact()) return "Exact mode: every output is one-to-one.";
-  const g = warpOutput()?.geometry, mode = rasterDimensions(warpOutput()), c = config?.projection?.canvas;
-  if (!g || !mode || !c) return "One-to-one status unavailable.";
-  const h = Math.max(1, Math.round(c.renderWidth / c.aspect));
-  const slice = [g.slice.x*c.renderWidth, g.slice.y*c.aspect*h,
-    g.slice.width*c.renderWidth, g.slice.height*c.aspect*h];
-  const exact = g.center.every(v=>v===.5) &&
-    g.corners.every((p,i)=>p.every((v,a)=>v===unitPins[i][a])) &&
-    slice.every(Number.isInteger) && slice[2]===mode.width && slice[3]===mode.height;
-  return exact ? "Selected output: one-to-one sampling." : "Selected output: resampled (not one-to-one).";
+  // Telemetry only: nothing is claimed without a current verdict.
+  const m = outputMapping(warpOutput()?.match?.name);
+  if (!m || !mappingIsCurrent(m)) return "";
+  return m.verified ? `Selected output: ${mappingLabel(m)}.` : "Selected output: not verified as whole-number scaling.";
 }
 function renderCanvas() {
   const c = config?.projection?.canvas;
@@ -3761,8 +3815,8 @@ function renderCanvas() {
   const derivedHeight = Math.max(1, Math.round(width / aspect));
   const derivedMp = (width * derivedHeight / 1e6).toFixed(1);
   $("canvas-current").textContent = (c && pixels)
-    ? `Canvas ${c.renderWidth} × ${pixels.height} (${mp} MP); aspect ${displayNumber(c.aspect, 4)}. ${oneToOneStatus()}`
-    : `Canvas derived from layout: ${width} × ${derivedHeight} (${derivedMp} MP); aspect ${displayNumber(aspect, 4)}. ${oneToOneStatus()}`;
+    ? `Canvas ${c.renderWidth} × ${pixels.height} (${mp} MP); aspect ${displayNumber(c.aspect, 4)}. ${oneToOneStatus()}`.trim()
+    : `Canvas derived from layout: ${width} × ${derivedHeight} (${derivedMp} MP); aspect ${displayNumber(aspect, 4)}. ${oneToOneStatus()}`.trim();
   if (!$("warp-canvas").contains(document.activeElement)) {
     $("canvas-aspect").value = c ? editNumber(c.aspect, 4) : editNumber(aspect, 4);
     $("canvas-width").value = c?.renderWidth ?? width;
@@ -6038,7 +6092,7 @@ function connect() {
     // decides warp-controls'/output-warp's hidden state), not just
     // renderWarpStatus — otherwise recovered capability leaves the editor
     // hidden until something unrelated happens to redraw it.
-    renderProjectionTiming(); renderWarpEditor(); renderPipeline();
+    renderProjectionTiming(); renderWarpEditor(); renderPipeline(); renderMappingChips(); renderCanvas();
   });
   source.addEventListener("gpu_changed", (e) => {
     if (stream !== source) return;

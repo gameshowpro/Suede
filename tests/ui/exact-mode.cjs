@@ -198,7 +198,7 @@ function resetDocument(from) {
     assert.equal(await page.locator('#slice-x').getAttribute('step'), '1');
     assert(!(await visible('content-scale')), 'content scale hidden');
     assert.match(await page.locator('#source-size').textContent(), /Crop 1920 × 1080 px/);
-    assert.match(await page.locator('#canvas-current').textContent(), /Exact mode: every output is one-to-one/);
+    assert.doesNotMatch(await page.locator('#canvas-current').textContent(), /one-to-one|1:1/, 'no claim without telemetry');
 
     // A fractional crop is refused in the page; a daemon 422 rolls back verbatim.
     await page.evaluate(() => selectOutput(config.outputs[1].match.name));
