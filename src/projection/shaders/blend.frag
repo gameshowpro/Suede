@@ -57,7 +57,11 @@ layout(push_constant) uniform PushConstants {
     vec4 inverse_row2;
     vec2 center;
     uint warp_enabled;
-    uint padding;
+    // Bits 0..3: the output transform the exact copy (`warp_enabled == 0`)
+    // permutes texels by, coded as `transform_flags` in gpu.rs does. Bits
+    // 4..7 are reserved for a filter selector; every other bit is zero. The
+    // warp path ignores it: its inverse rows already compose the transform.
+    uint flags;
     // Absolute canvas pixel-boundary x, y, width, height, at byte 96.
     vec4 source_rect;
     // Global adaptive-lift state. Dynamic transfer entries use these fields;
@@ -73,6 +77,34 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 layout(location = 0) out vec4 outColor;
+
+// The exact copy's inverse transform permutation, indexed by the transform
+// code in `pc.flags` bits 0..3: 0 normal, 1 90, 2 180, 3 270, 4 flipped,
+// 5 flipped-90, 6 flipped-180, 7 flipped-270. Bit `t` of each mask says
+// whether code `t` first swaps the physical axes, then mirrors the logical
+// x, then mirrors the logical y. Codes 8..15 have no bits and copy as
+// normal. `Transform::logical_index` in desired.rs is the reference; the
+// `exact_permutation_masks_in_both_shaders_match_logical_index` test in
+// gpu.rs reads these three lines and holds them to it.
+const uint EXACT_SWAP_AXES = 0xAAu;
+const uint EXACT_MIRROR_X = 0x96u;
+const uint EXACT_MIRROR_Y = 0xCCu;
+
+// The logical (as-viewed) pixel index of physical target pixel `p` on the
+// exact path. `pc.width`/`pc.height` are the physical raster and
+// `pc.logical_width`/`pc.logical_height` the logical one, so a mirrored
+// index stays in range. Normal (code 0) returns `p` unchanged.
+uvec2 exact_logical_index(uvec2 p) {
+    uint t = pc.flags & 0xfu;
+    uvec2 q = ((EXACT_SWAP_AXES >> t) & 1u) != 0u ? p.yx : p;
+    if (((EXACT_MIRROR_X >> t) & 1u) != 0u) {
+        q.x = pc.logical_width - 1u - q.x;
+    }
+    if (((EXACT_MIRROR_Y >> t) & 1u) != 0u) {
+        q.y = pc.logical_height - 1u - q.y;
+    }
+    return q;
+}
 
 void main() {
     // `gl_FragCoord` is window space for whatever viewport this job's draw
@@ -165,7 +197,10 @@ void main() {
                 i = head.y;
             }
         } else {
-            uvec2 q = uvec2(p);
+            // Sync shapes are on the logical raster, so an exact copy that
+            // owns a transform hit-tests the logical index, as the warp
+            // branch above does through `local`.
+            uvec2 q = exact_logical_index(uvec2(p));
             for (uint g = 0u; g < pc.groups; ++g) {
                 uvec4 box = shapes[i];
                 uvec4 head = shapes[i + 1u];
@@ -212,20 +247,24 @@ void main() {
             c = uvec3(round(t.rgb * 255.0));
         }
     } else {
+        // The integer copy: physical pixel `p` shows logical pixel `q` of
+        // the slice, so an owned transform is a pure texel permutation and
+        // never a resample. The transfer table stays physical (`ab` above).
+        uvec2 q = exact_logical_index(uvec2(p));
         // Validate unsigned origins before addition or y inversion. An
         // out-of-canvas pixel is opaque black, including with nonzero lift.
         uvec2 canvas_size = uvec2(textureSize(canvas, 0));
         if (pc.source_x >= canvas_size.x || pc.source_y >= canvas_size.y ||
-            uint(p.x) >= canvas_size.x - pc.source_x ||
-            uint(p.y) >= canvas_size.y - pc.source_y) {
+            q.x >= canvas_size.x - pc.source_x ||
+            q.y >= canvas_size.y - pc.source_y) {
             outColor = vec4(0.0, 0.0, 0.0, 1.0);
             return;
         }
-        int cy = int(pc.source_y) + p.y;
+        int cy = int(pc.source_y) + int(q.y);
         if (pc.y_invert != 0u) {
             cy = int(pc.canvas_height) - 1 - cy;
         }
-        vec4 t = texelFetch(sampler2D(canvas, canvasSampler), ivec2(int(pc.source_x) + p.x, cy), 0);
+        vec4 t = texelFetch(sampler2D(canvas, canvasSampler), ivec2(int(pc.source_x) + int(q.x), cy), 0);
         // Same fixed-point shade as `Blend::rows`: `out = min((a*in)>>8 + b, 255)`
         // per channel, rounding the sampled float back to the byte it came from
         // first so both paths start from the identical integer.

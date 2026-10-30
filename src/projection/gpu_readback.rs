@@ -9,7 +9,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
 fn embedded_fragment_offsets_match_every_rust_push_constant_member() {
-    let words: Vec<u32> = FRAG_SPV
+    // Both blend pipelines take the same push constants.
+    for spirv in [FRAG_SPV, MARKER_FRAG_SPV] {
+        assert_push_constant_offsets(spirv);
+    }
+}
+
+fn assert_push_constant_offsets(spirv: &[u8]) {
+    let words: Vec<u32> = spirv
         .chunks_exact(4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
         .collect();
@@ -63,7 +70,7 @@ fn embedded_fragment_offsets_match_every_rust_push_constant_member() {
         rows + 32,
         std::mem::offset_of!(PushConstants, center),
         std::mem::offset_of!(PushConstants, warp_enabled),
-        std::mem::offset_of!(PushConstants, padding),
+        std::mem::offset_of!(PushConstants, flags),
         std::mem::offset_of!(PushConstants, source_rect),
         std::mem::offset_of!(PushConstants, dynamic_lift),
         std::mem::offset_of!(PushConstants, dynamic_maximum),
@@ -743,6 +750,160 @@ fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
     Ok(())
 }
 
+const ALL_TRANSFORMS: [crate::model::Transform; 8] = {
+    use crate::model::Transform::*;
+    [
+        Normal, Rotate90, Rotate180, Rotate270, Flipped, Flipped90, Flipped180, Flipped270,
+    ]
+};
+
+/// Every transform at 1:1 through the integer copy, byte for byte: a 17x9
+/// logical raster (physical 9x17 when the transform swaps axes) at an
+/// integral origin in a 23x15 canvas, with a pixel-unique source so any
+/// misplaced texel is visible. The reference permutes the plain logical
+/// reference render by `Transform::logical_index`.
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+fn exact_copy_is_byte_exact_under_every_transform() -> anyhow::Result<()> {
+    let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM];
+    let logical = [17u32, 9];
+    let canvas_size = [23u32, 15];
+    let origin = [3u32, 2];
+    let rgba: Vec<[u8; 4]> = (0..canvas_size[1])
+        .flat_map(|y| {
+            (0..canvas_size[0]).map(move |x| {
+                [
+                    (x * 10 + 1) as u8,
+                    (y * 16 + 3) as u8,
+                    (x * 5 + y * 7) as u8,
+                    255,
+                ]
+            })
+        })
+        .collect();
+    let logical_table = vec![(256u16, 0u8); (logical[0] * logical[1]) as usize];
+    let mut cases = 0;
+    let mut worst_error = 0;
+    for target_format in formats {
+        let mut gpu = Gpu::new(None)?;
+        println!("GPU readback: {}", gpu.describe());
+        for source_format in formats {
+            let pixels: Vec<u8> = rgba
+                .iter()
+                .flat_map(|p| encode(*p, source_format))
+                .collect();
+            for invert in [false, true] {
+                let logical_ref = reference(
+                    &rgba,
+                    canvas_size,
+                    logical,
+                    origin,
+                    invert,
+                    None,
+                    &logical_table,
+                );
+                for transform in ALL_TRANSFORMS {
+                    let (pw, ph) = transform.physical_size((logical[0], logical[1]));
+                    let size = [pw, ph];
+                    let table = vec![(256u16, 0u8); (pw * ph) as usize];
+                    let constants =
+                        PushConstants::canvas(origin, size, canvas_size[1], invert, None)
+                            .with_exact_transform(transform);
+                    let canvas = Image::new(&gpu, canvas_size, source_format)?;
+                    let target = Image::new(&gpu, size, target_format)?;
+                    let got = draw(
+                        &mut gpu,
+                        &canvas,
+                        &target,
+                        &pixels,
+                        constants,
+                        &table,
+                        target_format,
+                    )?;
+                    for (i, got) in got.chunks_exact(4).enumerate() {
+                        let p = [i as u32 % pw, i as u32 / pw];
+                        let [lx, ly] = transform.logical_index(p, (logical[0], logical[1]));
+                        let want =
+                            encode(logical_ref[(ly * logical[0] + lx) as usize], target_format);
+                        assert_eq!(got[3], 255, "alpha {transform:?} pixel {p:?}");
+                        for channel in 0..3 {
+                            let error = got[channel].abs_diff(want[channel]);
+                            worst_error = worst_error.max(error);
+                            assert!(
+                                error == 0,
+                                "transform={transform:?} source={source_format:?} target={target_format:?} invert={invert} pixel={p:?} channel={channel}: got {} want {}",
+                                got[channel],
+                                want[channel]
+                            );
+                        }
+                    }
+                    cases += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "GPU exact transform readback passed: {cases} cases, worst channel error {worst_error} byte(s); tolerance 0"
+    );
+    Ok(())
+}
+
+/// The `sync` pattern (mode 1) on an exact output that owns a transform
+/// hit-tests the logical index: shapes are laid out on the logical raster.
+#[test]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+fn sync_pattern_on_a_rotated_exact_output_follows_the_logical_raster() -> anyhow::Result<()> {
+    let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM];
+    let logical = [17u32, 9];
+    let shape_rects = [[2u32, 1, 7, 4], [9, 5, 15, 8]];
+    let mut cases = 0;
+    for target_format in formats {
+        let mut gpu = Gpu::new(None)?;
+        let canvas = Image::new(&gpu, [1, 1], vk::Format::R8G8B8A8_UNORM)?;
+        for invert in [false, true] {
+            for transform in ALL_TRANSFORMS {
+                let (pw, ph) = transform.physical_size((logical[0], logical[1]));
+                let size = [pw, ph];
+                let table = vec![(256u16, 0u8); (pw * ph) as usize];
+                gpu.set_transfer(2, pw, ph, &table)?;
+                gpu.set_sync_shapes(
+                    2,
+                    1,
+                    &[[2, 1, 15, 8], [2, 4, 0, 0], shape_rects[0], shape_rects[1]],
+                )?;
+                let target = Image::new(&gpu, size, target_format)?;
+                let mut constants = PushConstants::canvas([0, 0], size, 1, invert, None)
+                    .with_exact_transform(transform);
+                constants.mode = 1;
+                constants.groups = 1;
+                let got = draw_installed(
+                    &mut gpu,
+                    TestCanvas::Pixels(&canvas, &[0, 0, 0, 255]),
+                    &target,
+                    constants,
+                    target_format,
+                )?;
+                for (i, got) in got.chunks_exact(4).enumerate() {
+                    let p = [i as u32 % pw, i as u32 / pw];
+                    let [lx, ly] = transform.logical_index(p, (logical[0], logical[1]));
+                    let lit = shape_rects
+                        .iter()
+                        .any(|r| lx >= r[0] && lx < r[2] && ly >= r[1] && ly < r[3]);
+                    let byte = if lit { 255 } else { 0 };
+                    assert_eq!(
+                        got,
+                        [byte, byte, byte, 255],
+                        "transform={transform:?} target={target_format:?} invert={invert} pixel={p:?}"
+                    );
+                }
+                cases += 1;
+            }
+        }
+    }
+    println!("GPU sync exact transform readback passed: {cases} cases, tolerance 0");
+    Ok(())
+}
+
 #[test]
 #[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
 fn tagged_dynamic_transfer_matches_the_documented_rounding_and_outside_black() -> anyhow::Result<()>
@@ -1279,6 +1440,7 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         source_x: 0,
         source_y: 0,
         warp: Some(&warp),
+        transform: crate::model::Transform::Normal,
     };
     assert!(gpu
         .blend(&capture, false, &[job])
@@ -1292,6 +1454,7 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         source_x: 0,
         source_y: 0,
         warp: Some(&wrong_size),
+        transform: crate::model::Transform::Normal,
     };
     assert!(gpu
         .blend(&capture, false, &[job])
@@ -1305,6 +1468,7 @@ fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyh
         source_x: 0,
         source_y: 0,
         warp: None,
+        transform: crate::model::Transform::Normal,
     };
     assert!(gpu
         .blend(&capture, false, &[job])

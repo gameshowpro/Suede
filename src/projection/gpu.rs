@@ -340,6 +340,11 @@ pub struct BlendJob<'a> {
     /// Inverse sampling; None preserves integer texel fetch. The warp and
     /// transfer table must describe this target at unit source pixel density.
     pub warp: Option<&'a super::warp::Warp>,
+    /// The output transform the integer texel fetch permutes by when `warp`
+    /// is `None`: the target is then that transform's physical raster of a
+    /// logical slice at `source_x`/`source_y`. Must be `Normal` with a warp,
+    /// which composes its own transform.
+    pub transform: crate::model::Transform,
 }
 
 #[derive(Clone, Copy)]
@@ -412,6 +417,8 @@ struct RenderJob<'a> {
     source_x: u32,
     source_y: u32,
     warp: Option<&'a super::warp::Warp>,
+    /// See [`BlendJob::transform`].
+    transform: crate::model::Transform,
 }
 
 /// One output-local transfer table in an atomic [`Gpu::replace_transfers`]
@@ -557,7 +564,11 @@ struct PushConstants {
     inverse_rows: [[f32; 4]; 3],
     center: [f32; 2],
     warp_enabled: u32,
-    padding: u32,
+    /// Bits 0..3: the output transform the exact copy (`warp_enabled == 0`)
+    /// permutes texels by, as [`transform_flags`] encodes it. Bits 4..7 are
+    /// reserved for a filter selector; every other bit is zero. Ignored on
+    /// the warp path, whose inverse rows already compose the transform.
+    flags: u32,
     source_rect: [f32; 4],
     dynamic_lift: f32,
     dynamic_maximum: u32,
@@ -589,7 +600,7 @@ impl PushConstants {
             inverse_rows: warp.map_or([[0.0; 4]; 3], |w| w.inverse_rows()),
             center: warp.map_or([0.5; 2], |w| w.center()),
             warp_enabled: u32::from(warp.is_some()),
-            padding: 0,
+            flags: 0,
             source_rect: warp
                 .and_then(|w| w.source_rect())
                 .unwrap_or([
@@ -606,6 +617,18 @@ impl PushConstants {
         }
     }
 
+    /// Make an exact-copy block (`warp` was `None`) permute texels by
+    /// `transform`: `width`/`height` stay the physical target and the
+    /// logical raster becomes the transform's, which the shader's inverse
+    /// permutation needs. `Normal` leaves the block as it was.
+    fn with_exact_transform(mut self, transform: crate::model::Transform) -> Self {
+        debug_assert_eq!(self.warp_enabled, 0, "a warp composes its own transform");
+        self.flags = (self.flags & !TRANSFORM_FLAGS_MASK) | transform_flags(transform);
+        (self.logical_width, self.logical_height) =
+            transform.physical_size((self.width, self.height));
+        self
+    }
+
     fn as_bytes(&self) -> &[u8] {
         // Safety: repr(C), all fields initialized, and no implicit padding.
         // Layout tests compare every member with the shipped SPIR-V.
@@ -615,6 +638,28 @@ impl PushConstants {
                 std::mem::size_of::<Self>(),
             )
         }
+    }
+}
+
+/// The bits of [`PushConstants`]'s `flags` that name the exact copy's
+/// transform.
+const TRANSFORM_FLAGS_MASK: u32 = 0xf;
+
+/// The shaders' code for an output transform, in `flags` bits 0..3. The
+/// shaders' `EXACT_SWAP_AXES`/`EXACT_MIRROR_X`/`EXACT_MIRROR_Y` masks are
+/// indexed by it; `exact_permutation_masks_in_both_shaders_match_logical_index`
+/// holds them to [`crate::model::Transform::logical_index`].
+fn transform_flags(transform: crate::model::Transform) -> u32 {
+    use crate::model::Transform;
+    match transform {
+        Transform::Normal => 0,
+        Transform::Rotate90 => 1,
+        Transform::Rotate180 => 2,
+        Transform::Rotate270 => 3,
+        Transform::Flipped => 4,
+        Transform::Flipped90 => 5,
+        Transform::Flipped180 => 6,
+        Transform::Flipped270 => 7,
     }
 }
 
@@ -3053,20 +3098,25 @@ impl Gpu {
             if job.warp.is_some_and(|warp| warp.source_rect().is_some()) {
                 continue;
             }
+            // The source is the logical slice; an exact copy under an
+            // axis-swapping transform draws it into the swapped target.
+            let (width, height) = job
+                .transform
+                .physical_size((job.target.width, job.target.height));
             let right = job
                 .source_x
-                .checked_add(job.target.width)
+                .checked_add(width)
                 .ok_or_else(|| anyhow!("blend_static: source x extent overflow"))?;
             let bottom = job
                 .source_y
-                .checked_add(job.target.height)
+                .checked_add(height)
                 .ok_or_else(|| anyhow!("blend_static: source y extent overflow"))?;
             if right > canvas.width || bottom > canvas.height {
                 bail!(
                     "blend_static: output {} source {}x{} at {},{} exceeds {}x{} canvas",
                     job.output,
-                    job.target.width,
-                    job.target.height,
+                    width,
+                    height,
                     job.source_x,
                     job.source_y,
                     canvas.width,
@@ -3126,6 +3176,8 @@ impl Gpu {
             if job.warp.is_some_and(|warp| warp.source_rect().is_some()) {
                 continue;
             }
+            // Logical extents, as in `blend_static`.
+            let (width, height) = job.transform.physical_size((width, height));
             let right = job
                 .source_x
                 .checked_add(width)
@@ -3178,6 +3230,7 @@ impl Gpu {
                 source_x: job.source_x,
                 source_y: job.source_y,
                 warp: job.warp,
+                transform: job.transform,
             })
             .collect();
         match self.render_targets(source, &render_jobs, &acquired.waits, &acquired.signals) {
@@ -3787,6 +3840,7 @@ impl Gpu {
                 source_x: job.source_x,
                 source_y: job.source_y,
                 warp: job.warp,
+                transform: job.transform,
             })
             .collect();
         self.render_targets(source, &jobs, &[], &[])
@@ -3822,6 +3876,9 @@ impl Gpu {
             let size = [job.target.width, job.target.height];
             if output.size != size || job.warp.is_some_and(|w| w.output_size() != size) {
                 bail!("blend: target, warp, and transfer dimensions must agree");
+            }
+            if job.warp.is_some() && !job.transform.is_normal() {
+                bail!("blend: a warp composes its own transform; the job's must be normal");
             }
             if let Source::Canvas { image, .. } = source {
                 validate_filtering(image.linear_filter_supported(), job.warp.is_some())?;
@@ -4056,6 +4113,9 @@ impl Gpu {
                 y_invert != 0,
                 job.warp,
             );
+            if job.warp.is_none() {
+                push_constants = push_constants.with_exact_transform(job.transform);
+            }
             push_constants.mode = mode;
             push_constants.groups = output.sync_groups;
             push_constants.dynamic_lift = self.dynamic_lift;
@@ -5222,13 +5282,130 @@ mod tests {
         assert_eq!((normal.logical_width, normal.logical_height), (640, 480));
     }
 
+    /// The flag codes are the ones the shaders' masks are indexed by, in the
+    /// documented order, inside bits 0..3, and leave bits 4..31 clear.
+    #[test]
+    fn transform_flags_encode_every_transform_in_bits_zero_to_three() {
+        use crate::model::Transform::*;
+        let order = [
+            Normal, Rotate90, Rotate180, Rotate270, Flipped, Flipped90, Flipped180, Flipped270,
+        ];
+        for (code, transform) in order.into_iter().enumerate() {
+            assert_eq!(transform_flags(transform), code as u32, "{transform:?}");
+            assert_eq!(
+                transform_flags(transform) & !TRANSFORM_FLAGS_MASK,
+                0,
+                "{transform:?}"
+            );
+        }
+        assert_eq!(TRANSFORM_FLAGS_MASK, 0xf);
+        for shader in [
+            include_str!("shaders/blend.frag"),
+            include_str!("shaders/blend_markers.frag"),
+        ] {
+            assert!(shader.contains("uint t = pc.flags & 0xfu;"));
+        }
+    }
+
+    /// Pins the shaders' inverse permutation to `Transform::logical_index`:
+    /// the three masks are read out of both shader sources and the shader's
+    /// `exact_logical_index` is replayed with them for every physical pixel
+    /// of a non-square raster under every transform.
+    #[test]
+    fn exact_permutation_masks_in_both_shaders_match_logical_index() {
+        use crate::model::Transform::*;
+        fn mask(shader: &str, name: &str) -> u32 {
+            let prefix = format!("const uint {name} = 0x");
+            let line = shader
+                .lines()
+                .find_map(|line| line.strip_prefix(prefix.as_str()))
+                .unwrap_or_else(|| panic!("{name} missing"));
+            let hex = line.strip_suffix("u;").expect("uint literal");
+            u32::from_str_radix(hex, 16).unwrap()
+        }
+        let plain = include_str!("shaders/blend.frag");
+        let marked = include_str!("shaders/blend_markers.frag");
+        for name in ["EXACT_SWAP_AXES", "EXACT_MIRROR_X", "EXACT_MIRROR_Y"] {
+            assert_eq!(mask(plain, name), mask(marked, name), "{name}");
+        }
+        let swap = mask(plain, "EXACT_SWAP_AXES");
+        let mirror_x = mask(plain, "EXACT_MIRROR_X");
+        let mirror_y = mask(plain, "EXACT_MIRROR_Y");
+        let logical = (5, 3);
+        for transform in [
+            Normal, Rotate90, Rotate180, Rotate270, Flipped, Flipped90, Flipped180, Flipped270,
+        ] {
+            let constants = PushConstants::canvas(
+                [0, 0],
+                {
+                    let (w, h) = transform.physical_size(logical);
+                    [w, h]
+                },
+                3,
+                false,
+                None,
+            )
+            .with_exact_transform(transform);
+            assert_eq!((constants.logical_width, constants.logical_height), logical);
+            let t = constants.flags & 0xf;
+            for py in 0..constants.height {
+                for px in 0..constants.width {
+                    // `exact_logical_index` in blend.frag, line for line.
+                    let mut q = if (swap >> t) & 1 != 0 {
+                        [py, px]
+                    } else {
+                        [px, py]
+                    };
+                    if (mirror_x >> t) & 1 != 0 {
+                        q[0] = constants.logical_width - 1 - q[0];
+                    }
+                    if (mirror_y >> t) & 1 != 0 {
+                        q[1] = constants.logical_height - 1 - q[1];
+                    }
+                    assert_eq!(
+                        q,
+                        transform.logical_index([px, py], logical),
+                        "{transform:?} physical ({px}, {py})"
+                    );
+                }
+            }
+        }
+        // Codes 8..15 are unassigned and copy as normal.
+        for t in 8..16 {
+            assert_eq!(((swap | mirror_x | mirror_y) >> t) & 1, 0);
+        }
+    }
+
+    #[test]
+    fn exact_transform_sets_flags_and_logical_size_and_normal_is_a_no_op() {
+        use crate::model::Transform;
+        let plain = PushConstants::canvas([3, 4], [640, 480], 480, true, None);
+        let normal = plain.with_exact_transform(Transform::Normal);
+        assert_eq!(normal.as_bytes(), plain.as_bytes());
+        let rotated = PushConstants::canvas([3, 4], [480, 640], 480, true, None)
+            .with_exact_transform(Transform::Rotate90);
+        assert_eq!((rotated.width, rotated.height), (480, 640));
+        assert_eq!((rotated.logical_width, rotated.logical_height), (640, 480));
+        assert_eq!(rotated.flags, 1);
+        assert_eq!(rotated.warp_enabled, 0);
+        let bytes = rotated.as_bytes();
+        let word =
+            |offset: usize| u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        assert_eq!(word(92), 1, "flags at byte 92");
+        assert_eq!((word(120), word(124)), (640, 480));
+        let flipped = PushConstants::canvas([0, 0], [640, 480], 480, false, None)
+            .with_exact_transform(Transform::Flipped180);
+        assert_eq!(flipped.flags, 6);
+        assert_eq!((flipped.logical_width, flipped.logical_height), (640, 480));
+    }
+
     #[test]
     fn push_constants_match_warp_shader_layout() {
         assert_eq!(std::mem::size_of::<PushConstants>(), 128);
         assert_eq!(std::mem::offset_of!(PushConstants, inverse_rows), 32);
         assert_eq!(std::mem::offset_of!(PushConstants, center), 80);
         assert_eq!(std::mem::offset_of!(PushConstants, warp_enabled), 88);
-        assert_eq!(std::mem::offset_of!(PushConstants, padding), 92);
+        assert_eq!(std::mem::offset_of!(PushConstants, flags), 92);
         assert_eq!(std::mem::offset_of!(PushConstants, source_rect), 96);
         assert_eq!(std::mem::offset_of!(PushConstants, dynamic_lift), 112);
         assert_eq!(std::mem::offset_of!(PushConstants, dynamic_maximum), 116);

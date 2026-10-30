@@ -483,7 +483,15 @@ struct Presenter {
     transfer: Vec<(u16, u8)>,
     /// Tagged shape table for adaptive mode; fixed tables remain byte exact.
     dynamic_table: Option<Vec<u32>>,
+    /// The warp the transfer table was built through. On the GPU renderer a
+    /// presenter that owns a non-normal transform always has one, even
+    /// while the shader takes the exact copy; the CPU renderer samples
+    /// through it whenever it is `Some`.
     warp: Option<super::warp::Warp>,
+    /// How the GPU shader samples this output: the exact copy, permuted by
+    /// the owned transform, or bilinear through `warp`. Installed together
+    /// with `warp`; see [`Presenter::gpu_sampling`].
+    sampling: super::warp_update::SamplingPath,
     /// [`AxisSamples`] for `warp`, rebuilt only when `warp_revision` moves
     /// past `sample_revision` — see `present_frame_cpu`. `None` whenever
     /// `warp` is `None`, exactly like the old per-pixel `warp.is_none()`
@@ -1506,6 +1514,17 @@ impl Presenter {
     fn buffer_size(&self) -> Option<(u32, u32)> {
         self.configured
             .map(|size| self.transform.physical_size(size))
+    }
+
+    /// What a GPU blend or sync job passes the shader: no warp and the
+    /// transform to permute by on the exact path, even when `warp` holds the
+    /// transform-only warp the table was built through; `warp` and `Normal`
+    /// otherwise (a warp composes its own transform).
+    fn gpu_sampling(&self) -> (Option<&super::warp::Warp>, Transform) {
+        match self.sampling {
+            super::warp_update::SamplingPath::Exact(transform) => (None, transform),
+            super::warp_update::SamplingPath::Bilinear => (self.warp.as_ref(), Transform::Normal),
+        }
     }
 
     /// This presenter's outstanding answer under `signal`, as of `now`.
@@ -2789,6 +2808,7 @@ pub fn run_with_shared_input_until(
             transfer: Vec::new(),
             dynamic_table: None,
             warp: None,
+            sampling: super::warp_update::SamplingPath::Exact(Transform::Normal),
             sample: None,
             sample_revision: None,
             warp_revision: 0,
@@ -3275,14 +3295,13 @@ fn requested_warp(spec: &SlicerSpec) -> anyhow::Result<bool> {
 /// crop, but excludes the exact integer-copy proof.
 fn requires_linear_sampling(spec: &SlicerSpec) -> Result<bool, String> {
     spec.slices.iter().try_fold(false, |required, slice| {
+        let size = (slice.slice.width as u32, slice.slice.height as u32);
+        // Still built, so a malformed mapping is rejected here as before;
+        // whether the shader samples through it is `sampling_path`'s call.
+        super::warp_update::sampling_warp(spec, slice, size, slice.transform)?;
         Ok(required
-            || super::warp_update::sampling_warp(
-                spec,
-                slice,
-                (slice.slice.width as u32, slice.slice.height as u32),
-                slice.transform,
-            )?
-            .is_some())
+            || super::warp_update::sampling_path(spec, slice, size, slice.transform)
+                == super::warp_update::SamplingPath::Bilinear)
     })
 }
 
@@ -3331,8 +3350,10 @@ fn report_capability(
 /// presenter owning its output transform gets the transform-only warp
 /// `sampling_warp` builds for it (also installed as its `warp`, so table
 /// and sampler agree): a physical raster cannot be filled through the
-/// integer copy path. Any later warp/size mismatch shows up as identity
-/// pixels, not a panic. Single-threaded — this runs at startup, not per
+/// integer copy path. Its `sampling` still says whether the shader takes
+/// the exact copy, permuted by the transform, instead of sampling through
+/// that warp (`warp_update::exact_copy`). Any later warp/size mismatch
+/// shows up as identity pixels, not a panic. Single-threaded — this runs at startup, not per
 /// frame — through the same row evaluator `warp_update`'s ongoing rebuilds
 /// use, so there is exactly one place this math lives.
 fn bootstrap_transfers(state: &mut State, spec: &SlicerSpec) -> anyhow::Result<()> {
@@ -3355,11 +3376,17 @@ fn bootstrap_transfers(state: &mut State, spec: &SlicerSpec) -> anyhow::Result<(
             .map(|l| l.index(&slice.output).map(|i| (l, i)))
             .transpose()
             .map_err(anyhow::Error::msg)?;
-        let warp = if presenter.owns_transform() {
-            super::warp_update::sampling_warp(spec, slice, logical, presenter.transform)
-                .map_err(anyhow::Error::msg)?
+        let (warp, sampling) = if presenter.owns_transform() {
+            (
+                super::warp_update::sampling_warp(spec, slice, logical, presenter.transform)
+                    .map_err(anyhow::Error::msg)?,
+                super::warp_update::sampling_path(spec, slice, logical, presenter.transform),
+            )
         } else {
-            None
+            (
+                None,
+                super::warp_update::SamplingPath::Exact(Transform::Normal),
+            )
         };
         let mut transfer = vec![(0u16, 0u8); width as usize * height as usize];
         super::warp_update::fill_rows(
@@ -3374,6 +3401,7 @@ fn bootstrap_transfers(state: &mut State, spec: &SlicerSpec) -> anyhow::Result<(
         );
         presenter.transfer = transfer;
         presenter.warp = warp;
+        presenter.sampling = sampling;
     }
     Ok(())
 }
@@ -3670,6 +3698,20 @@ fn static_pattern_rgba(
     Ok(rgba)
 }
 
+/// The `samplingMode` each output of `prepared` reports: the shader's path
+/// ([`super::warp_update::SamplingPath`]), not whether the table has a warp.
+/// A presenter that owns a 180 transform at 1:1 has a table warp and still
+/// reports `exact`.
+fn sampling_modes(
+    prepared: &super::warp_update::Prepared,
+) -> BTreeMap<String, crate::model::SamplingMode> {
+    prepared
+        .outputs
+        .iter()
+        .map(|o| (o.name.clone(), o.sampling.mode()))
+        .collect()
+}
+
 /// Install only between synchronous GPU submissions: Gpu::blend/sync have
 /// already waited their fence, so no SSBO reader remains in flight.
 /// Stage the complete affected set before changing any active matrix/table.
@@ -3703,7 +3745,10 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
                 && p.buffer_size() == Some(output.buffer_size)
         })
     });
-    let filtering_restart = prepared.outputs.iter().any(|output| output.warp.is_some())
+    let filtering_restart = prepared
+        .outputs
+        .iter()
+        .any(|output| output.sampling == super::warp_update::SamplingPath::Bilinear)
         && state
             .capture
             .gpu_images
@@ -3786,25 +3831,13 @@ fn apply_warp_updates(state: &mut State) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut changed: Vec<_> = prepared.outputs.iter().map(|o| o.name.clone()).collect();
-    let sampling_modes = prepared
-        .outputs
-        .iter()
-        .map(|o| {
-            (
-                o.name.clone(),
-                if o.warp.is_some() {
-                    crate::model::SamplingMode::Bilinear
-                } else {
-                    crate::model::SamplingMode::Exact
-                },
-            )
-        })
-        .collect();
+    let sampling_modes = sampling_modes(&prepared);
     for output in &mut prepared.outputs {
         let presenter = &mut state.presenters[output.index];
         presenter.transfer = std::mem::take(&mut output.table);
         presenter.dynamic_table = output.dynamic_table.take();
         presenter.warp = output.warp.take();
+        presenter.sampling = output.sampling;
         presenter.slice = output.slice;
         presenter.warp_revision = prepared.generation;
         presenter.stale = true;
@@ -5151,12 +5184,14 @@ fn present_frame_direct_source(
         .iter()
         .map(|&index| {
             let p = &state.presenters[index];
+            let (warp, transform) = p.gpu_sampling();
             gpu::display::DirectBlendJob {
                 display: index,
                 output: index,
                 source_x: p.slice.x.max(0) as u32,
                 source_y: p.slice.y.max(0) as u32,
-                warp: p.warp.as_ref(),
+                warp,
+                transform,
             }
         })
         .collect();
@@ -5466,12 +5501,14 @@ fn gpu_blend_due_source(
         .map(|d| {
             let presenter = &presenters[d.index];
             let (_, image) = &presenter.gpu_buffers[d.slot];
+            let (warp, transform) = presenter.gpu_sampling();
             gpu::BlendJob {
                 target: image,
                 output: d.index,
                 source_x: presenter.slice.x.max(0) as u32,
                 source_y: presenter.slice.y.max(0) as u32,
-                warp: presenter.warp.as_ref(),
+                warp,
+                transform,
             }
         })
         .collect();
@@ -5864,6 +5901,11 @@ impl Blend<'_> {
     }
 
     fn sample(&self, x: u32, y: u32) -> Option<[u8; 3]> {
+        // No transform permutation here, unlike the GPU shader's exact
+        // branch: the CPU renderer never owns an output transform
+        // (`owned_transform`), so it always presents the logical raster and
+        // the compositor rotates or mirrors it. This copy is therefore
+        // already byte exact under every transform.
         let Some(axes) = self.sample else {
             let source_x = self.source_x.checked_add(x)?;
             let source_y = self.source_y.checked_add(y)?;
@@ -6270,8 +6312,9 @@ fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
     let gpu = state.gpu.as_mut().context("direct GPU unavailable")?;
     for &index in &due {
         let p = &state.presenters[index];
-        // Logical, like every sync shape: the shader hit-tests them through
-        // the warp at its logical size, whatever transform the target has.
+        // Logical, like every sync shape: the shader hit-tests them at the
+        // logical raster, through the warp or the exact copy's inverse
+        // permutation, whatever transform the target has.
         let (width, height) = p.configured.context("direct output has no mode")?;
         let groups =
             super::pattern::sync_rects(width, height, frame, &p.name, snapshot_id, unix_ms);
@@ -6283,12 +6326,14 @@ fn present_sync_direct(state: &mut State, frame: u32) -> anyhow::Result<bool> {
         .iter()
         .map(|&index| {
             let p = &state.presenters[index];
+            let (warp, transform) = p.gpu_sampling();
             gpu::display::DirectBlendJob {
                 display: index,
                 output: index,
                 source_x: p.slice.x.max(0) as u32,
                 source_y: p.slice.y.max(0) as u32,
-                warp: p.warp.as_ref(),
+                warp,
+                transform,
             }
         })
         .collect();
@@ -6666,8 +6711,9 @@ fn present_sync_gpu(
     };
     for d in &due {
         let presenter = &presenters[d.index];
-        // Logical, not the buffer size: an owned transform's warp carries
-        // the logical size to the shader, which hit-tests shapes there.
+        // Logical, not the buffer size: an owned transform's warp, or the
+        // exact copy's push constants, carry the logical size to the shader,
+        // which hit-tests shapes there.
         let Some((width, height)) = presenter.configured else {
             continue;
         };
@@ -6686,6 +6732,7 @@ fn present_sync_gpu(
         .filter_map(|d| {
             let presenter = &presenters[d.index];
             let (_, image) = presenter.gpu_buffers.get(d.slot)?;
+            let (warp, transform) = presenter.gpu_sampling();
             Some(gpu::BlendJob {
                 target: image,
                 output: d.index,
@@ -6694,7 +6741,8 @@ fn present_sync_gpu(
                 // one thing whichever mode built it.
                 source_x: presenter.slice.x.max(0) as u32,
                 source_y: presenter.slice.y.max(0) as u32,
-                warp: presenter.warp.as_ref(),
+                warp,
+                transform,
             })
         })
         .collect();
@@ -9044,6 +9092,7 @@ mod tests {
             transfer: Vec::new(),
             dynamic_table: None,
             warp: None,
+            sampling: super::super::warp_update::SamplingPath::Exact(Transform::Normal),
             sample: None,
             sample_revision: None,
             warp_revision: 0,
@@ -9141,6 +9190,11 @@ mod tests {
             .warp
             .as_ref()
             .expect("owned transforms always warp");
+        // The table's warp; the shader still takes the exact copy.
+        assert_eq!(
+            presenter.sampling,
+            super::super::warp_update::SamplingPath::Exact(Transform::Rotate90)
+        );
         assert_eq!(warp.output_size(), [240, 180]);
         assert_eq!(warp.logical_size(), [180, 240]);
         assert_eq!(warp.source_rect(), Some([30.0, 0.0, 180.0, 240.0]));
@@ -9155,6 +9209,66 @@ mod tests {
                     "logical pixel ({lx}, {ly})"
                 );
             }
+        }
+    }
+
+    /// A GPU presenter that owns a 180 transform at 1:1 keeps the table warp
+    /// but hands the shader the exact copy, and reports `exact`; a half
+    /// pixel crop offset makes it sample, and report, bilinear. Both the
+    /// bootstrap tables and a control build agree.
+    #[test]
+    fn gpu_presenter_with_180_at_one_to_one_reports_exact_and_a_crop_offset_bilinear() {
+        let mut spec = pattern_spec();
+        spec.slices[0].transform = Transform::Rotate180;
+        let rect = spec.slices[0].slice;
+        let size = (rect.width as u32, rect.height as u32);
+        let mut offset = spec.clone();
+        offset.slices[0].source_rect = Some([30.5, 20.0, 240.0, 180.0]);
+        for (spec, expected) in [
+            (&spec, crate::model::SamplingMode::Exact),
+            (&offset, crate::model::SamplingMode::Bilinear),
+        ] {
+            let mut state = bare_state(vec![]);
+            state.presenters = vec![bare_presenter("DP-1", size, rect)];
+            state.capture.backend = Some(Backend::Gpu);
+            adopt_output_transforms(&mut state, spec).unwrap();
+            let presenter = &state.presenters[0];
+            assert!(presenter.owns_transform());
+            assert!(
+                presenter.warp.is_some(),
+                "the table is built through a warp"
+            );
+            assert_eq!(presenter.sampling.mode(), expected);
+            let (warp, transform) = presenter.gpu_sampling();
+            if expected == crate::model::SamplingMode::Exact {
+                assert!(warp.is_none());
+                assert_eq!(transform, Transform::Rotate180);
+            } else {
+                assert!(warp.is_some());
+                assert_eq!(transform, Transform::Normal);
+            }
+            assert_eq!(
+                requires_linear_sampling(spec).unwrap(),
+                expected == crate::model::SamplingMode::Bilinear
+            );
+
+            let mut controller = super::super::warp_update::Controller::new(spec, vec![size], 1)
+                .expect("controller");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let prepared = loop {
+                if let Some(prepared) = controller.poll() {
+                    break prepared;
+                }
+                assert!(Instant::now() < deadline, "worker did not finish");
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            assert!(prepared.outputs[0].warp.is_some());
+            assert_eq!(
+                sampling_modes(&prepared),
+                BTreeMap::from([("DP-1".to_string(), expected)])
+            );
+            // The bootstrap table and the control build agree pixel for pixel.
+            assert_eq!(prepared.outputs[0].table, presenter.transfer);
         }
     }
 
@@ -9504,6 +9618,7 @@ mod tests {
             transfer: transfer.clone(),
             dynamic_table: None,
             warp: None,
+            sampling: super::super::warp_update::SamplingPath::Exact(Transform::Normal),
             sample: None,
             sample_revision: None,
             warp_revision: 0,
@@ -9631,6 +9746,7 @@ mod tests {
                 transfer: vec![(256, 0); 16],
                 dynamic_table: None,
                 warp: None,
+                sampling: super::super::warp_update::SamplingPath::Exact(Transform::Normal),
                 sample: None,
                 sample_revision: None,
                 warp_revision: 7,

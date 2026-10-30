@@ -962,6 +962,36 @@ impl Transform {
             Self::Flipped270 => [h - y, w - x],
         }
     }
+
+    /// Map a logical pixel index in a `logical` raster to the index of the
+    /// same pixel in the physical raster ([`Transform::physical_size`]).
+    ///
+    /// Defined as [`Transform::to_physical`] applied to the pixel center and
+    /// floored, so the chirality is inherited from that one `match`. Centers
+    /// sit half a pixel from every boundary, so the floor is never ambiguous.
+    pub fn physical_index(self, [x, y]: [u32; 2], (w, h): (u32, u32)) -> [u32; 2] {
+        let [px, py] = self.to_physical(
+            [f64::from(x) + 0.5, f64::from(y) + 0.5],
+            (f64::from(w), f64::from(h)),
+        );
+        [px.floor() as u32, py.floor() as u32]
+    }
+
+    /// Inverse of [`Transform::physical_index`]: map a physical pixel index
+    /// back to the logical index in a `logical` raster. Integer arithmetic
+    /// only; the tests check it against `to_physical` for every transform.
+    pub fn logical_index(self, [px, py]: [u32; 2], (w, h): (u32, u32)) -> [u32; 2] {
+        match self {
+            Self::Normal => [px, py],
+            Self::Rotate90 => [w - 1 - py, px],
+            Self::Rotate180 => [w - 1 - px, h - 1 - py],
+            Self::Rotate270 => [py, h - 1 - px],
+            Self::Flipped => [w - 1 - px, py],
+            Self::Flipped90 => [py, px],
+            Self::Flipped180 => [px, h - 1 - py],
+            Self::Flipped270 => [w - 1 - py, h - 1 - px],
+        }
+    }
 }
 
 /// What Suede observed and pinned because the configuration named none.
@@ -1806,6 +1836,51 @@ mod tests {
             for i in 0..4 {
                 for j in i + 1..4 {
                     assert_ne!(got[i], got[j], "{transform:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transform_index_permutation_round_trips_and_is_a_bijection() {
+        let logical = (5, 3);
+        for transform in ALL_TRANSFORMS {
+            let (pw, ph) = transform.physical_size(logical);
+            let mut seen = vec![false; (pw * ph) as usize];
+            for y in 0..logical.1 {
+                for x in 0..logical.0 {
+                    let [px, py] = transform.physical_index([x, y], logical);
+                    assert!(px < pw && py < ph, "{transform:?} ({x}, {y})");
+                    let slot = &mut seen[(py * pw + px) as usize];
+                    assert!(!*slot, "{transform:?} ({x}, {y}) collides");
+                    *slot = true;
+                    assert_eq!(
+                        transform.logical_index([px, py], logical),
+                        [x, y],
+                        "{transform:?} ({x}, {y})"
+                    );
+                }
+            }
+            assert!(seen.iter().all(|&s| s), "{transform:?} is not onto");
+        }
+    }
+
+    #[test]
+    fn transform_physical_index_agrees_with_to_physical_on_centers() {
+        let logical = (5, 3);
+        for transform in ALL_TRANSFORMS {
+            for y in 0..logical.1 {
+                for x in 0..logical.0 {
+                    let [cx, cy] =
+                        transform.to_physical([f64::from(x) + 0.5, f64::from(y) + 0.5], (5.0, 3.0));
+                    // A center maps to a center, so it is exactly n + 0.5.
+                    assert_eq!(cx.fract(), 0.5, "{transform:?} ({x}, {y})");
+                    assert_eq!(cy.fract(), 0.5, "{transform:?} ({x}, {y})");
+                    assert_eq!(
+                        transform.physical_index([x, y], logical),
+                        [cx.floor() as u32, cy.floor() as u32],
+                        "{transform:?} ({x}, {y})"
+                    );
                 }
             }
         }

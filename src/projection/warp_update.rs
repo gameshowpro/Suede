@@ -54,7 +54,12 @@ pub struct Output {
     /// The raster `table`, `dynamic_table` and `warp` are built on: `size`
     /// through the slice's output transform, which the GPU presenter owns.
     pub buffer_size: (u32, u32),
+    /// The warp the transfer table was built through. A presenter that owns
+    /// a non-normal transform always has one, even when the shader takes
+    /// the exact copy; `sampling` says which path the shader takes.
     pub warp: Option<Warp>,
+    /// How the shader samples this output; see [`sampling_path`].
+    pub sampling: SamplingPath,
     pub table: Vec<(u16, u8)>,
     /// Tagged dynamic shape entries. This is populated only for adaptive
     /// transfer; fixed mode retains the exact `(a, b)` table above.
@@ -600,19 +605,24 @@ pub(crate) fn maximum_coverage(spec: &SlicerSpec) -> u32 {
     )
 }
 
-/// The sampler for `slice` on a presenter whose configured (logical) size is
-/// `size` and which applies `transform` itself (`Normal` when it does not
-/// own one). `None` only for an exact integer copy; otherwise the geometry
-/// warp or an identity one, carrying the source rectangle.
+/// The warp the transfer table for `slice` is built through, on a presenter
+/// whose configured (logical) size is `size` and which applies `transform`
+/// itself (`Normal` when it does not own one). `None` only for an exact
+/// integer copy without a transform; otherwise the geometry warp or an
+/// identity one, carrying the source rectangle.
 ///
 /// A non-normal `transform` always yields a warp built on the physical
-/// raster (`Warp::for_output`), identity pins included: the integer copy
-/// path cannot rotate, and bilinear sampling at exact texel centers draws
-/// the same picture. Its source rectangle is the slice's, or, without one,
-/// the unit-density `[x, y, logical width, logical height]` the copy path
-/// and `Warp::canvas_at`'s fallback both mean. Every caller in the
-/// controller passes `slice.transform`: the controller only runs on the GPU
-/// renderer, which owns every output transform.
+/// raster (`Warp::for_output`), identity pins included, because the table
+/// walk ([`fill_generic`]) can only fill a physical raster through one. That
+/// is the table's warp, not necessarily the shader's: an identity-pinned,
+/// unit-density, integer-origin slice still takes the exact copy, which
+/// permutes texels by the transform instead of sampling — see
+/// [`exact_copy`], which decides that separately. Its source rectangle is
+/// the slice's, or, without one, the unit-density `[x, y, logical width,
+/// logical height]` the copy path and `Warp::canvas_at`'s fallback both
+/// mean. Every caller in the controller passes `slice.transform`: the
+/// controller only runs on the GPU renderer, which owns every output
+/// transform.
 pub(crate) fn sampling_warp(
     spec: &SlicerSpec,
     slice: &SliceSpec,
@@ -659,6 +669,83 @@ pub(crate) fn sampling_warp(
     ))
 }
 
+/// How the GPU shader samples one output: the integer copy, which permutes
+/// texels by the output transform the presenter owns (`Normal` when it owns
+/// none), or bilinear sampling through the output's warp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplingPath {
+    Exact(crate::model::Transform),
+    Bilinear,
+}
+
+impl SamplingPath {
+    /// What the control status reports for this path.
+    pub fn mode(self) -> crate::model::SamplingMode {
+        match self {
+            Self::Exact(_) => crate::model::SamplingMode::Exact,
+            Self::Bilinear => crate::model::SamplingMode::Bilinear,
+        }
+    }
+}
+
+/// [`exact_copy`] as a [`SamplingPath`].
+pub(crate) fn sampling_path(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    size: (u32, u32),
+    transform: crate::model::Transform,
+) -> SamplingPath {
+    exact_copy(spec, slice, size, transform).map_or(SamplingPath::Bilinear, SamplingPath::Exact)
+}
+
+/// Whether the shader may draw `slice` as an integer copy on a presenter
+/// whose configured (logical) size is `size` and which applies `transform`
+/// itself, and if so the transform the copy permutes texels by.
+///
+/// Separate from [`sampling_warp`], which keeps building the table's warp:
+/// this only decides how the shader samples. It is `Some(transform)` when
+/// there is no geometric correction (no geometry, or identity pins and a
+/// neutral center on the logical raster) and the source is a unit-density,
+/// integer-origin rectangle at the slice's own origin inside the canvas
+/// ([`super::layout::exact_source`] on the logical raster). Under those
+/// conditions the transform-only table warp maps each physical pixel center
+/// to the canvas texel center at `origin + Transform::logical_index(p)`,
+/// which is what the shader's exact branch fetches, so table and copy agree.
+///
+/// For `Transform::Normal` this is exactly the `None` case of
+/// [`sampling_warp`], including the slice-origin copy with no source
+/// rectangle at all. A non-normal transform without a source rectangle
+/// checks its implied unit-density one, so a slice reaching past the canvas
+/// edge keeps the warp path it always had.
+pub(crate) fn exact_copy(
+    spec: &SlicerSpec,
+    slice: &SliceSpec,
+    size: (u32, u32),
+    transform: crate::model::Transform,
+) -> Option<crate::model::Transform> {
+    let identity = slice
+        .geometry
+        .as_ref()
+        .is_none_or(|g| matches!(g.warp(size.0, size.1), Ok(None)));
+    if !identity {
+        return None;
+    }
+    let source = match slice.source_rect {
+        Some(source) => source,
+        None if transform.is_normal() => return Some(transform),
+        None => [
+            f64::from(slice.slice.x),
+            f64::from(slice.slice.y),
+            f64::from(size.0),
+            f64::from(size.1),
+        ],
+    };
+    (source[0] == f64::from(slice.slice.x)
+        && source[1] == f64::from(slice.slice.y)
+        && super::layout::exact_source(source, size, (spec.canvas_width, spec.canvas_height)))
+    .then_some(transform)
+}
+
 /// Shared row evaluator for scoped builds and the measured pool candidate,
 /// and the one place the inverse map, bounds clamp and canvas-bounds test
 /// live: [`fill_rows`] and [`fill_dynamic_rows`] were near-duplicates of this
@@ -688,7 +775,9 @@ fn fill_generic<T: Copy>(
     let width = size.0;
     // Without a warp each pixel is a unit-density integer copy of the
     // logical raster. `sampling_warp` gives every presenter that owns an
-    // output transform a warp, so a physical raster never gets here.
+    // output transform a warp, so a physical raster never gets here without
+    // one. The shader may still take the exact copy for such a presenter
+    // (`exact_copy`); the table is built through the warp either way.
     for (offset, value) in dest.iter_mut().enumerate() {
         let x = (offset % width as usize) as u32;
         let y = (first_row + offset / width as usize) as u32;
@@ -912,6 +1001,7 @@ fn build(
         let slice = &request.keys[index].slice;
         let logical = sizes[index];
         let warp = sampling_warp(spec, slice, logical, slice.transform)?;
+        let sampling = sampling_path(spec, slice, logical, slice.transform);
         // Tables are built on the raster the presenter attaches: physical
         // when it owns an axis-swapping transform.
         let (width, height) = slice.transform.physical_size(logical);
@@ -986,6 +1076,7 @@ fn build(
             size: logical,
             buffer_size: (width, height),
             warp,
+            sampling,
             table,
             dynamic_table,
             key: request.keys[index].clone(),
@@ -1227,6 +1318,260 @@ mod tests {
         )
         .unwrap()
         .is_none());
+    }
+
+    const ALL_TRANSFORMS: [crate::model::Transform; 8] = {
+        use crate::model::Transform::*;
+        [
+            Normal, Rotate90, Rotate180, Rotate270, Flipped, Flipped90, Flipped180, Flipped270,
+        ]
+    };
+
+    /// Slice A of [`fixture`] narrowed to a 6×8 logical raster at (2, 0) so
+    /// the axis-swapping transforms see a non-square raster.
+    fn exact_fixture() -> (SlicerSpec, SliceSpec, (u32, u32)) {
+        let spec = fixture();
+        let mut slice = spec.slices[0].clone();
+        slice.slice = Rect {
+            x: 2,
+            y: 0,
+            width: 6,
+            height: 8,
+        };
+        (spec, slice, (6, 8))
+    }
+
+    #[test]
+    fn exact_copy_holds_for_every_transform_at_unit_density() {
+        let (spec, slice, size) = exact_fixture();
+        let identity = Geometry {
+            corners: [[0.0, 0.0], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]],
+            center: [0.5, 0.5],
+        };
+        for transform in ALL_TRANSFORMS {
+            for geometry in [None, Some(identity.clone())] {
+                for source_rect in [None, Some([2.0, 0.0, 6.0, 8.0])] {
+                    let mut slice = slice.clone();
+                    slice.geometry = geometry.clone();
+                    slice.source_rect = source_rect;
+                    slice.transform = transform;
+                    assert_eq!(
+                        exact_copy(&spec, &slice, size, transform),
+                        Some(transform),
+                        "{transform:?} {geometry:?} {source_rect:?}"
+                    );
+                    assert_eq!(
+                        sampling_path(&spec, &slice, size, transform),
+                        SamplingPath::Exact(transform)
+                    );
+                    // The table keeps its warp whenever a transform is owned.
+                    assert_eq!(
+                        sampling_warp(&spec, &slice, size, transform)
+                            .unwrap()
+                            .is_some(),
+                        !transform.is_normal(),
+                        "{transform:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_copy_refuses_anything_but_an_integer_unit_density_copy() {
+        let (spec, slice, size) = exact_fixture();
+        let with = |edit: &dyn Fn(&mut SliceSpec)| {
+            let mut slice = slice.clone();
+            edit(&mut slice);
+            slice
+        };
+        let cases: [(&str, SliceSpec); 7] = [
+            (
+                "fractional origin",
+                with(&|s| s.source_rect = Some([2.5, 0.0, 6.0, 8.0])),
+            ),
+            (
+                "non-unit size",
+                with(&|s| s.source_rect = Some([2.0, 0.0, 5.0, 8.0])),
+            ),
+            (
+                "origin other than the slice's",
+                with(&|s| s.source_rect = Some([3.0, 0.0, 6.0, 8.0])),
+            ),
+            (
+                "non-identity pins",
+                with(&|s| {
+                    s.geometry = Some(Geometry {
+                        corners: [[0.5, 0.0], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]],
+                        center: [0.5, 0.5],
+                    })
+                }),
+            ),
+            (
+                "off-center remap",
+                with(&|s| {
+                    s.geometry = Some(Geometry {
+                        corners: [[0.0, 0.0], [6.0, 0.0], [6.0, 8.0], [0.0, 8.0]],
+                        center: [0.4, 0.5],
+                    })
+                }),
+            ),
+            (
+                "source rect outside the canvas",
+                with(&|s| {
+                    s.slice.x = 8;
+                    s.source_rect = Some([8.0, 0.0, 6.0, 8.0]);
+                }),
+            ),
+            (
+                "negative source origin",
+                with(&|s| {
+                    s.slice.x = -1;
+                    s.source_rect = Some([-1.0, 0.0, 6.0, 8.0]);
+                }),
+            ),
+        ];
+        for transform in ALL_TRANSFORMS {
+            for (name, slice) in &cases {
+                assert_eq!(
+                    exact_copy(&spec, slice, size, transform),
+                    None,
+                    "{transform:?}: {name}"
+                );
+                assert_eq!(
+                    sampling_path(&spec, slice, size, transform),
+                    SamplingPath::Bilinear,
+                    "{transform:?}: {name}"
+                );
+            }
+        }
+        // Without a source rectangle, an owned transform checks the implied
+        // unit-density one, so a slice past the canvas edge keeps its warp
+        // path. `Normal` keeps today's unconditional slice-origin copy.
+        let past_edge = with(&|s| s.slice.x = 8);
+        for transform in ALL_TRANSFORMS {
+            assert_eq!(
+                exact_copy(&spec, &past_edge, size, transform).is_some(),
+                transform.is_normal(),
+                "{transform:?}"
+            );
+        }
+    }
+
+    /// For `Normal`, the shader's exact decision is exactly the table's
+    /// "no warp" decision, over every slice the other tests here build.
+    #[test]
+    fn exact_copy_agrees_with_sampling_warp_for_normal_on_every_fixture() {
+        let (exact_spec, exact_slice, exact_size) = exact_fixture();
+        let mut cases: Vec<(SlicerSpec, SliceSpec, (u32, u32))> = Vec::new();
+        for spec in [fixture(), moved(fixture(), 0), moved(fixture(), 1)] {
+            for slice in spec.slices.clone() {
+                cases.push((spec.clone(), slice, (8, 8)));
+            }
+        }
+        let public = public_layout_fixture();
+        for slice in public.slices.clone() {
+            cases.push((public.clone(), slice, (6, 8)));
+        }
+        for source_rect in [
+            None,
+            Some([2.0, 0.0, 6.0, 8.0]),
+            Some([2.5, 0.0, 6.0, 8.0]),
+            Some([2.0, 0.0, 5.0, 8.0]),
+            Some([3.0, 0.0, 6.0, 8.0]),
+            Some([-0.25, 0.0, 6.0, 8.0]),
+            Some([8.0, 0.0, 6.0, 8.0]),
+        ] {
+            let mut slice = exact_slice.clone();
+            slice.source_rect = source_rect;
+            cases.push((exact_spec.clone(), slice, exact_size));
+        }
+        let mut explicit = fixture();
+        explicit.slices[0].source_rect = Some([4.0, 0.0, 8.0, 8.0]);
+        cases.push((explicit.clone(), explicit.slices[0].clone(), (8, 8)));
+        explicit.slices[0].slice.x = 4;
+        cases.push((explicit.clone(), explicit.slices[0].clone(), (8, 8)));
+        let normal = crate::model::Transform::Normal;
+        let mut exact = 0;
+        for (spec, slice, size) in &cases {
+            let warp = sampling_warp(spec, slice, *size, normal).unwrap();
+            let copy = exact_copy(spec, slice, *size, normal);
+            assert_eq!(copy.is_some(), warp.is_none(), "{slice:?}");
+            exact += usize::from(copy.is_some());
+        }
+        // Both outcomes are exercised.
+        assert!(exact > 0 && exact < cases.len());
+    }
+
+    /// The table walk and the shader's exact branch must name the same
+    /// canvas texel for every physical pixel: the transform-only table warp
+    /// maps physical pixel `p`'s center to the texel center at
+    /// `origin + Transform::logical_index(p)`, the texel the shader fetches.
+    #[test]
+    fn transform_table_warp_maps_each_physical_pixel_to_its_logical_index() {
+        let (spec, slice, size) = exact_fixture();
+        let origin = [f64::from(slice.slice.x), f64::from(slice.slice.y)];
+        for transform in ALL_TRANSFORMS {
+            assert!(exact_copy(&spec, &slice, size, transform).is_some());
+            let warp = sampling_warp(&spec, &slice, size, transform).unwrap();
+            let warp = warp.unwrap_or_else(|| {
+                Warp::identity(size.0, size.1)
+                    .with_source_rect([origin[0], origin[1], 6.0, 8.0])
+                    .unwrap()
+            });
+            let (pw, ph) = transform.physical_size(size);
+            assert_eq!(warp.output_size(), [pw, ph]);
+            for py in 0..ph {
+                for px in 0..pw {
+                    let [lx, ly] = transform.logical_index([px, py], size);
+                    let [cx, cy] = warp
+                        .clamped_canvas_at(f64::from(px) + 0.5, f64::from(py) + 0.5, origin)
+                        .unwrap();
+                    let expected = [
+                        origin[0] + f64::from(lx) + 0.5,
+                        origin[1] + f64::from(ly) + 0.5,
+                    ];
+                    assert!(
+                        (cx - expected[0]).abs() < 1e-9 && (cy - expected[1]).abs() < 1e-9,
+                        "{transform:?} physical ({px}, {py}): table samples ({cx}, {cy}), \
+                         exact copy fetches {expected:?}"
+                    );
+                    assert_eq!(warp.coverage(px, py), 1.0, "{transform:?} ({px}, {py})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn built_outputs_carry_the_shader_path_separately_from_the_table_warp() {
+        let mut spec = fixture();
+        spec.black_lift = 0.0;
+        spec.slices[0].transform = crate::model::Transform::Rotate180;
+        spec.slices[1].transform = crate::model::Transform::Rotate180;
+        spec.slices[1].source_rect = Some([4.5, 0.0, 8.0, 8.0]);
+        let sizes = [(8, 8); 2];
+        let prepared = build(
+            Request {
+                generation: 1,
+                keys: validate(&spec, &sizes).unwrap(),
+                spec,
+            },
+            &sizes,
+            &[0, 1],
+            1,
+        )
+        .unwrap();
+        let exact = &prepared.outputs[0];
+        assert!(exact.warp.is_some());
+        assert_eq!(
+            exact.sampling,
+            SamplingPath::Exact(crate::model::Transform::Rotate180)
+        );
+        assert_eq!(exact.sampling.mode(), crate::model::SamplingMode::Exact);
+        let crop = &prepared.outputs[1];
+        assert!(crop.warp.is_some());
+        assert_eq!(crop.sampling, SamplingPath::Bilinear);
+        assert_eq!(crop.sampling.mode(), crate::model::SamplingMode::Bilinear);
     }
 
     #[test]
