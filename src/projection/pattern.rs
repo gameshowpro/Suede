@@ -37,9 +37,34 @@ pub fn render(width: u32, height: u32, spec: &OverlaySpec) -> Vec<u8> {
         // `sync_unavailable`.
         Some(TestPattern::Sync) => sync_unavailable(&mut rgb, width, height),
         Some(TestPattern::WarpAlignment) => warp_alignment(&mut rgb, width, height, spec),
+        Some(TestPattern::Coordinates) => coordinates(&mut rgb, width, height, spec),
         None => {}
     }
     rgb
+}
+
+/// The `coordinates` pattern: each canvas pixel `(x, y)` is
+/// `R = x & 0xFF`, `G = y & 0xFF`, `B = ((x >> 8) & 0x0F) << 4 | ((y >> 8) & 0x0F)`,
+/// unique up to 4096×4096 (the encoding wraps beyond that). Canvas indices come
+/// through the footprint exactly as the grid's do, so at 1:1 this is
+/// `rect.origin + local index`.
+fn coordinates(rgb: &mut [u8], width: u32, height: u32, spec: &OverlaySpec) {
+    let rect = footprint(spec, width, height);
+    for y in 0..height as i32 {
+        let gy = to_canvas(y, height, rect[1], rect[3]).floor() as i64;
+        for x in 0..width as i32 {
+            let gx = to_canvas(x, width, rect[0], rect[2]).floor() as i64;
+            put(rgb, width, x, y, coordinate_color(gx, gy));
+        }
+    }
+}
+
+fn coordinate_color(x: i64, y: i64) -> [u8; 3] {
+    [
+        (x & 0xFF) as u8,
+        (y & 0xFF) as u8,
+        ((((x >> 8) & 0x0F) << 4) | ((y >> 8) & 0x0F)) as u8,
+    ]
 }
 
 /// This picture's true footprint in canvas space: the configured fractional,
@@ -1163,6 +1188,49 @@ mod tests {
     fn pixel(rgb: &[u8], width: u32, x: i32, y: i32) -> [u8; 3] {
         let offset = (y as usize * width as usize + x as usize) * 3;
         [rgb[offset], rgb[offset + 1], rgb[offset + 2]]
+    }
+
+    #[test]
+    fn coordinates_encodes_every_pixel_uniquely() {
+        let sp = spec(
+            TestPattern::Coordinates,
+            Rect {
+                x: 0,
+                y: 0,
+                width: 300,
+                height: 260,
+            },
+        );
+        let rgb = render(300, 260, &sp);
+        assert_eq!(pixel(&rgb, 300, 0, 0), [0, 0, 0]);
+        assert_eq!(pixel(&rgb, 300, 255, 0), [255, 0, 0]);
+        assert_eq!(pixel(&rgb, 300, 256, 0), [0, 0, 0x10]);
+        assert_eq!(pixel(&rgb, 300, 299, 259), [43, 3, 0x11]);
+        let mut seen = std::collections::HashSet::new();
+        for y in 0..64 {
+            for x in 0..64 {
+                assert!(seen.insert(pixel(&rgb, 300, x, y)), "duplicate at {x},{y}");
+            }
+        }
+        // A pixel straddling the 256 boundary on both axes carries the carry bits.
+        assert_eq!(pixel(&rgb, 300, 256, 256), [0, 0, 0x11]);
+    }
+
+    #[test]
+    fn coordinates_uses_canvas_origin() {
+        let sp = spec(
+            TestPattern::Coordinates,
+            Rect {
+                x: 1000,
+                y: 300,
+                width: 8,
+                height: 8,
+            },
+        );
+        let rgb = render(8, 8, &sp);
+        // (1000, 300): R = 1000 & 255 = 232, G = 300 & 255 = 44, B = 3<<4 | 1.
+        assert_eq!(pixel(&rgb, 8, 0, 0), [232, 44, 0x31]);
+        assert_eq!(pixel(&rgb, 8, 7, 7), [239, 51, 0x31]);
     }
 
     #[test]

@@ -5401,7 +5401,8 @@
           "gamma",
           "identify",
           "sync",
-          "warp-alignment"
+          "warp-alignment",
+          "coordinates"
         ],
         "type": "string"
       },

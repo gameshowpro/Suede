@@ -248,6 +248,13 @@ pub enum TestPattern {
     /// 10% grid lines and center alignment circle on dark gray for warp geometry.
     #[serde(rename = "warp-alignment")]
     WarpAlignment,
+    /// Every canvas pixel encodes its own position, for pixel-exact
+    /// verification: with `x` and `y` the global canvas pixel coordinates,
+    /// red is `x & 0xFF`, green is `y & 0xFF`, and blue is
+    /// `((x >> 8) & 0x0F) << 4 | ((y >> 8) & 0x0F)`. Every pixel is unique up
+    /// to 4096×4096; beyond that the encoding wraps. No text and no
+    /// anti-aliasing, so a capture can be compared byte for byte.
+    Coordinates,
 }
 
 impl DesiredState {

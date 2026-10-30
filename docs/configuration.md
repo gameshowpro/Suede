@@ -2120,6 +2120,7 @@ The pattern picker is on the [Displays tab](screenshots.md#displays).
 |---|---|
 | `grid` | Geometry, focus, and seam alignment: 100 px color tiles with crosses, each labeled with its canvas pixel coordinates and the output name. Misaligned projectors show doubled crosses in the overlap; aligned ones show one. |
 | `warp-alignment` | Corner and center-pin calibration: 10% grid lines and a center alignment circle on dark gray, drawn in canvas space so the same lines line up across outputs regardless of each one's slice crop. |
+| `coordinates` | Pixel-exact verification: every canvas pixel `(x, y)` is colored by its own position, with red `x & 0xFF`, green `y & 0xFF`, and blue `((x >> 8) & 0x0F) << 4 \| ((y >> 8) & 0x0F)`. Each pixel is unique up to 4096×4096 canvas pixels (the encoding wraps beyond that). There is no text or shaping, so a capture of an output can be compared byte for byte against the encoding of the canvas pixels it should show. Turn off `blend` and set `blackLift` to 0 first, since ramps and lift apply to it like any pattern. |
 | `white` | The blend ramps in isolation, and brightness mismatch between projectors. |
 | `black` | Tuning `blackLift`: the seams glow with doubled projector black; raise the lift until the rest of the image matches them. |
 | `gamma` | Measuring `gamma`: candidate patches sit inside a stripe field that averages to half light. From a distance, the patch that melts into its stripes names the projector's gamma; the configured value is underlined. |

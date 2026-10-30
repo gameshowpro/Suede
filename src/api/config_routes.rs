@@ -2100,6 +2100,16 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["projection"]["testPattern"], "grid");
 
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"testPattern":"coordinates"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["projection"]["testPattern"], "coordinates");
+
         let (status, _) = call(
             &harness,
             "PUT",

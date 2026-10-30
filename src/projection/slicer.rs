@@ -6163,7 +6163,8 @@ fn animated(pattern: TestPattern) -> bool {
         | TestPattern::Black
         | TestPattern::Gamma
         | TestPattern::Identify
-        | TestPattern::WarpAlignment => false,
+        | TestPattern::WarpAlignment
+        | TestPattern::Coordinates => false,
     }
 }
 
@@ -8959,6 +8960,7 @@ mod tests {
             TestPattern::Gamma,
             TestPattern::Identify,
             TestPattern::WarpAlignment,
+            TestPattern::Coordinates,
         ] {
             assert!(!animated(pattern), "{pattern:?} must stay one-shot");
         }
