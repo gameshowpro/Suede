@@ -115,9 +115,9 @@ node tests/ui/warp-source.cjs
 
 The retained `packet7_private.py` (internal research record, not published)
 starts a temporary production daemon, managed Chromium source, and separate
-headless Sway on brain. Stage it, the selected candidate as `suede`, and the
+headless Sway on [System A](../../docs/developer/test-systems.md#system-a). Stage it, the selected candidate as `suede`, and the
 source fixture as `warp-source.html` in a fresh `/tmp/suede-packet7-*` directory,
-then run `python3 packet7_private.py --root /tmp/suede-packet7-<run>` on brain. It uses
+then run `python3 packet7_private.py --root /tmp/suede-packet7-<run>` on System A. It uses
 loopback ports 19088 (daemon), 19089 (source), and 19222 (source CDP), checks
 that they are unused, and records its own process identities. Stop it by
 creating `<root>/stop`; it also expires after 15 minutes. Keep the SSH runner
@@ -156,7 +156,7 @@ Private headless receipts and local fixture passes do not close physical-rig,
 touch, optical, or manual gates. Keep operator identity, date, workload,
 candidate hash, observation, and raw evidence for each manual item in the
 Packet 7 record (internal research record, not published). Pi testing remains on hold
-until all required brain acceptance, including manual checks, is complete.
+until all required System A acceptance, including manual checks, is complete.
 
 ## Panel layout browser check
 

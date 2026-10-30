@@ -1098,7 +1098,7 @@ mod tests {
         }
     }
 
-    /// The configuration of a real four-projector wall (brain, September
+    /// The configuration of a real four-projector wall (System A, September
     /// 2026): a 3864x2300 canvas at aspect 1.68, columns overlapping by 225
     /// pixels and rows that touch with a 0.07-pixel sliver. That sliver is
     /// what made the old minimum-distance rule paint a bright triangle at
@@ -1108,7 +1108,7 @@ mod tests {
     /// many pixels to sweep exhaustively in a debug build — is sampled at a
     /// coprime stride so the samples do not line up with any edge.
     #[test]
-    fn production_matches_oracle_for_brains_four_projector_wall() {
+    fn production_matches_oracle_for_system_a_four_projector_wall() {
         const SCALE: f64 = 3864.0;
         let (w, h) = (0.5291176764326357, 0.2976286929933576);
         let (column_x, row_y) = (0.47088232356736426, 0.29760940224473764);
@@ -1130,7 +1130,7 @@ mod tests {
     /// then straddles its neighbor in BOTH axes, so it is the layout that
     /// most exercises the choice of seam axis and the cross-range, and the
     /// one where the two implementations are most likely to disagree.
-    /// Sampled like brain's wall above: dense bands across every seam and
+    /// Sampled like System A's wall above: dense bands across every seam and
     /// every crop edge, a coprime stride elsewhere.
     #[test]
     fn production_matches_oracle_for_a_misaligned_2x2_grid() {

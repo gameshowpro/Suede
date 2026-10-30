@@ -632,7 +632,7 @@ fn reference(
 }
 
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn shipped_shader_matches_reference_pixels() -> anyhow::Result<()> {
     let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM];
     let mut cases = 0;
@@ -763,7 +763,7 @@ const ALL_TRANSFORMS: [crate::model::Transform; 8] = {
 /// misplaced texel is visible. The reference permutes the plain logical
 /// reference render by `Transform::logical_index`.
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn exact_copy_is_byte_exact_under_every_transform() -> anyhow::Result<()> {
     let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM];
     let logical = [17u32, 9];
@@ -891,7 +891,7 @@ fn filter_fixture(size: [u32; 2]) -> Vec<[u8; 4]> {
 /// - `lanczos` 2: as bicubic, plus the GPU's approximate `sin` across 36
 ///   taps and their normalization.
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn filters_match_cpu_reference() -> anyhow::Result<()> {
     use crate::model::ResampleFilter;
     use crate::projection::resample::{self, Kernel};
@@ -1403,7 +1403,7 @@ fn benchmark_filters_at_4x_upscale() -> anyhow::Result<()> {
 /// The `sync` pattern (mode 1) on an exact output that owns a transform
 /// hit-tests the logical index: shapes are laid out on the logical raster.
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn sync_pattern_on_a_rotated_exact_output_follows_the_logical_raster() -> anyhow::Result<()> {
     let formats = [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM];
     let logical = [17u32, 9];
@@ -1457,7 +1457,7 @@ fn sync_pattern_on_a_rotated_exact_output_follows_the_logical_raster() -> anyhow
 }
 
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn tagged_dynamic_transfer_matches_the_documented_rounding_and_outside_black() -> anyhow::Result<()>
 {
     use crate::projection::blend::{dynamic_shade, pack_dynamic_shape};
@@ -1521,7 +1521,7 @@ fn tagged_dynamic_transfer_matches_the_documented_rounding_and_outside_black() -
 }
 
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn source_measurement_reuses_its_target_without_stale_samples_or_padding() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let white = [255u8, 255, 255, 255].repeat(4);
@@ -1559,7 +1559,7 @@ fn source_measurement_reuses_its_target_without_stale_samples_or_padding() -> an
 }
 
 #[test]
-#[ignore = "benchmark only; run explicitly on brain"]
+#[ignore = "benchmark only; run explicitly on System A"]
 fn benchmark_source_measurement_grid_readback_25_frames() -> anyhow::Result<()> {
     // This is an offscreen draw+measurement microbenchmark, not a playback
     // claim. It retains source, target, transfer, and measurement resources.
@@ -1627,7 +1627,7 @@ fn benchmark_source_measurement_grid_readback_25_frames() -> anyhow::Result<()> 
 }
 
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn sync_shapes_keep_output_local_coordinates_with_scaled_source_rectangles() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let format = vk::Format::R8G8B8A8_UNORM;
@@ -1692,7 +1692,7 @@ fn sync_shapes_keep_output_local_coordinates_with_scaled_source_rectangles() -> 
 }
 
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let format = vk::Format::R8G8B8A8_UNORM;
@@ -1912,7 +1912,7 @@ fn transfer_replacement_is_atomic_and_reaches_the_shader() -> anyhow::Result<()>
 }
 
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A"]
 fn uploaded_static_canvas_is_sampled_by_the_production_shader() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let format = vk::Format::R8G8B8A8_UNORM;
@@ -1943,7 +1943,7 @@ fn uploaded_static_canvas_is_sampled_by_the_production_shader() -> anyhow::Resul
 }
 
 #[test]
-#[ignore = "requires exportable DRM images; run explicitly on brain"]
+#[ignore = "requires exportable DRM images; run explicitly on System A"]
 fn dmabuf_sampling_contract_rejects_incompatible_jobs_before_recording() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let format = format_for_fourcc(FOURCC_AB24)?;
@@ -2280,7 +2280,7 @@ fn local_table_fallback_under_small_heap_pressure() -> anyhow::Result<()> {
 /// and SUEDE_GPU_TABLE_MEMORY=host for comparison. Measures CPU time spent on
 /// table updates, including no-op comparisons, without a shared-hardware target.
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain outside timing campaigns"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A outside timing campaigns"]
 fn benchmark_four_output_transfer_replacement_and_noop() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let size = [1920, 1080];
@@ -2349,7 +2349,7 @@ fn benchmark_four_output_transfer_replacement_and_noop() -> anyhow::Result<()> {
 /// Qualify the fixed-table path used by the production campaign, including
 /// its per-pixel no-op packing comparison and ownership reuse on replacement.
 #[test]
-#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on brain outside timing campaigns"]
+#[ignore = "requires a Vulkan 1.3 GPU; run explicitly on System A outside timing campaigns"]
 fn benchmark_four_output_fixed_transfer_replacement_and_noop() -> anyhow::Result<()> {
     let mut gpu = Gpu::new(None)?;
     let size = [1920, 1080];

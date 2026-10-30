@@ -796,7 +796,7 @@ mod tests {
 
     #[test]
     fn percent_of_the_trained_link() {
-        // Brain idle: 344 MB/s on Gen 3 x16 (15,760 MB/s) is 2.2 %.
+        // System A idle: 344 MB/s on Gen 3 x16 (15,760 MB/s) is 2.2 %.
         assert_eq!(pcie_percent(344, Some(3), Some(16)), Some(2.2));
         assert_eq!(pcie_percent(28, Some(3), Some(16)), Some(0.2));
         assert_eq!(pcie_percent(0, Some(1), Some(1)), Some(0.0));

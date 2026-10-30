@@ -2,13 +2,13 @@
 <html lang="en-US">
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Brain manual testing</title>
+<title>System A manual testing</title>
 <style>
 body{font:17px/1.5 system-ui;background:#111827;color:#e5e7eb;max-width:850px;margin:32px auto;padding:0 20px}
 a{color:#93c5fd}button{font:inherit;padding:12px 18px;margin:5px;border:1px solid #64748b;border-radius:6px;cursor:pointer}
 button[aria-pressed=true]{background:#2563eb;color:white}pre{white-space:pre-wrap}small{color:#cbd5e1}
 </style>
-<h1>Brain manual testing</h1>
+<h1>System A manual testing</h1>
 <p><a id="editor" target="_blank" rel="noopener">Open geometry editor</a> · <a id="second" target="_blank" rel="noopener">Open a second editor</a></p>
 <p>These buttons change the real source on the physical displays. In the editor, choose <strong>Test pattern → None — show content</strong> to see it.</p>
 <div id="modes"><button data-mode="grid">Static grid</button><button data-mode="dark">Static dark</button><button data-mode="bright">Static bright</button><button data-mode="moving">Moving content</button></div>
@@ -40,7 +40,7 @@ document.querySelector('#installed').href=`http://${host}:9088/`;
 let finished=false;
 async function post(path,body={}){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw Error(`${r.status} ${r.statusText}`);}
 for(const b of document.querySelectorAll('[data-mode]'))b.onclick=async()=>{try{await post('/source-mode',{mode:b.dataset.mode});document.querySelector('#message').textContent=`Requested ${b.textContent.toLowerCase()}.`;}catch(e){document.querySelector('#message').textContent=e.message;}};
-document.querySelector('#restore').onclick=async()=>{if(!confirm('End this manual session and restore brain’s installed service? Test saves remain in the session evidence directory.'))return;try{await post('/stop');finished=true;document.querySelector('#restored').hidden=false;}catch(e){document.querySelector('#message').textContent=e.message;}};
+document.querySelector('#restore').onclick=async()=>{if(!confirm('End this manual session and restore System A’s installed service? Test saves remain in the session evidence directory.'))return;try{await post('/stop');finished=true;document.querySelector('#restored').hidden=false;}catch(e){document.querySelector('#message').textContent=e.message;}};
 async function refresh(){if(finished)return;try{const [s,p,c]=await Promise.all(['/session','/probe','/command'].map(p=>fetch(p,{cache:'no-store'}).then(r=>r.json())));document.querySelector('#lease').textContent=`Session ${s.status}. Automatic restoration: ${new Date(s.expiresAt).toLocaleString()}.`;for(const b of document.querySelectorAll('[data-mode]'))b.setAttribute('aria-pressed',String(b.dataset.mode===c.mode));const v=p.probe;document.querySelector('#probe').textContent=v?`Source: ${v.window.innerWidth} × ${v.window.innerHeight}; DPR ${v.window.devicePixelRatio}\nCanvas/WebGL: ${v.canvas.backingWidth} × ${v.canvas.backingHeight} / ${v.webgl.drawingBufferWidth} × ${v.webgl.drawingBufferHeight}\nResponsive layout: ${v.responsiveLayout}; source mode: ${v.mode}\nUpdated: ${v.timestamp}`:'Waiting for the source browser…';}catch(e){document.querySelector('#message').textContent=`Session unavailable: ${e.message}`;}}
 refresh();setInterval(refresh,1500);
 </script>

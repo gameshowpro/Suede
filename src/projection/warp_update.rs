@@ -884,13 +884,13 @@ fn fill_generic<T: Copy>(
 /// `value_of` also gets the pixel center's canvas position BEFORE the
 /// source-border texel-center clamp. Markers must be placed from that
 /// position. An output pixel can be much smaller than a canvas pixel (about
-/// a quarter on brain), and then a blue line, which lies against the
+/// a quarter on System A), and then a blue line, which lies against the
 /// source's own edge and is two output pixels wide, falls entirely inside
 /// the half-texel border that the clamp moves every sample out of.
 ///
 /// Kept separate so the ordinary tables keep `fill_generic` exactly as it
 /// was. `highlight_overlaps_only_adds_tags_and_is_a_no_op_when_off` and
-/// `brains_wall_carries_both_marker_colors_through_the_real_pipeline` hold
+/// `system_a_wall_carries_both_marker_colors_through_the_real_pipeline` hold
 /// the two walks to the same coverage and transfer values.
 #[allow(clippy::too_many_arguments)]
 fn fill_marked<T: Copy>(
@@ -1850,7 +1850,7 @@ mod tests {
         assert_eq!(spec.marker_palette().unwrap().green(), 174);
     }
 
-    /// Brain's 2x2 wall, end to end: the real canvas plan with corner-pin
+    /// System A's 2x2 wall, end to end: the real canvas plan with corner-pin
     /// correction, the real table build and the GPU packing. Every output
     /// must carry both colors. Each output pixel here is about a quarter of
     /// a canvas pixel, so a blue line (half a canvas pixel at the source's
@@ -1858,7 +1858,7 @@ mod tests {
     /// clamps positions into; the markers must be placed from the unclamped
     /// position or blue disappears.
     #[test]
-    fn brains_wall_carries_both_marker_colors_through_the_real_pipeline() {
+    fn system_a_wall_carries_both_marker_colors_through_the_real_pipeline() {
         use crate::model::{CanvasConfig, CanvasRect, Mode, OutputConfig, OutputGeometry};
         use crate::projection::blend::{marker_of_packed, MARKER_BLUE, MARKER_NONE, MARKER_ORANGE};
         let canvas = CanvasConfig {

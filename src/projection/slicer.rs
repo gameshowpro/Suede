@@ -97,7 +97,7 @@
 //! frame callbacks when it *commits* an output's frame, before the page flip
 //! lands, so a head whose flip misses the driver's deadline and lands a
 //! vblank late answers the callback exactly on time and the gate opens
-//! anyway. Measured on `brain` (test-log Entry 2) with the `sync` pattern:
+//! anyway. Measured on System A (test-log Entry 2) with the `sync` pattern:
 //! all three outputs presented every frame at 60 fps — `presented 600` each,
 //! no discards, no stalls — while `wp_presentation` reported a mean offset
 //! of exactly one refresh period, held for 30–60 seconds at a time, on both
@@ -204,7 +204,7 @@
 //! says which precondition a wall is failing, and it is trusted only for
 //! the conditions this process can check for itself — the buffer's size
 //! against the output's mode, and the modifier the driver actually chose.
-//! It cannot say "no" from the dmabuf feedback alone. On `brain` (test-log
+//! It cannot say "no" from the dmabuf feedback alone. On System A (test-log
 //! Entry 2) the default feedback named no scanout tranche at all and every
 //! presented frame was nonetheless zero-copy, so an absent tranche is
 //! reported as `unconfirmed`. The proof is `zeroCopyPresented` in
@@ -306,7 +306,7 @@ const GPU_CAPTURE_SLOTS: usize = 2;
 /// Scanning out therefore holds two buffers per output at once (on screen,
 /// and queued for the next vblank), leaving the slicer's next commit with no
 /// free slot: it reused a busy one and overwrote a buffer still being
-/// scanned out. Measured on `brain` (test-log Entry 2): `buffer reuse` went
+/// scanned out. Measured on System A (test-log Entry 2): `buffer reuse` went
 /// from 0 in 43 consecutive sampled intervals to 609–1781 per 10 s the
 /// moment scanout was enabled, with the GPU fence wait doubled and the
 /// compositor's CPU up an order of magnitude. Three slots restore the
@@ -678,7 +678,7 @@ struct FrameStats {
     /// buffer-selection comment in `present_frame`. It is also the counter
     /// that catches a pool sized for the wrong buffer lifetime: direct
     /// scanout holds one more buffer per output than compositing does, and
-    /// this went from 0 to hundreds per interval on `brain` until the GPU
+    /// this went from 0 to hundreds per interval on System A until the GPU
     /// path grew a third slot ([`GPU_PRESENT_SLOTS`]).
     buffer_reuse: u32,
     /// Commit cycles the gate held past one canvas period waiting for a
@@ -4722,7 +4722,7 @@ fn fourcc_name(fourcc: u32) -> String {
 /// What the startup line can honestly say about one output's Present buffer.
 ///
 /// Three answers, not two, because the default dmabuf feedback is not
-/// evidence of a negative: on `brain` (test-log Entry 2) wlroots' default
+/// evidence of a negative: on System A (test-log Entry 2) wlroots' default
 /// feedback carried no scanout-flagged tranche for the chosen fourcc, this
 /// function said "no", and every single presented frame came back
 /// zero-copy anyway. The tranche flag is a hint about what the compositor
@@ -8156,7 +8156,7 @@ mod tests {
         );
 
         // And the other way round: the callback came back, the flip has not.
-        // This is the case `brain` was failing — every output answering its
+        // This is the case System A was failing — every output answering its
         // callback while one was a whole refresh behind.
         let late_flip = Some(Duration::from_millis(12));
         assert!(
@@ -8687,7 +8687,7 @@ mod tests {
 
     #[test]
     fn a_compositor_that_flagged_no_scanout_tranche_is_unconfirmed_not_a_no() {
-        // Regression guard for test-log Entry 2: on `brain` the default
+        // Regression guard for test-log Entry 2: on System A the default
         // feedback named no scanout tranche and 100 % of presented frames
         // were zero-copy regardless, so this branch must not claim a
         // negative it cannot know.
@@ -10105,10 +10105,10 @@ mod tests {
 ///
 /// The layouts here are the ones whose seam geometry has actually been got
 /// wrong on a wall, per `.claude/plans/warp-fixes.md`. Layout `d`
-/// (`brain_scaled_slices(0.07)`, brain's real 0.07-canvas-pixel row sliver,
+/// (`system_a_scaled_slices(0.07)`, System A's real 0.07-canvas-pixel row sliver,
 /// as opposed to `c`'s exact touch) is the wall geometry that produced a
 /// wedge-shaped error at the row boundary under round 1's minimum-distance
-/// rule; `row_independence_brain_scaled_rows_overlap_sliver` is round 2's
+/// rule; `row_independence_system_a_scaled_rows_overlap_sliver` is round 2's
 /// acceptance test for it. Layout `e` (`misaligned_grid_slices`) is a wall
 /// one percent out of true, whose seams ran a gradient along their own
 /// length under round 2's per-edge rule;
@@ -10146,7 +10146,7 @@ mod reconstruction {
     /// canvas pixels, as `geometry.slice` stores it) and an independent
     /// destination raster size (`mode.width`/`mode.height`, whatever the
     /// output's own resolution is). The two are equal, integer values for
-    /// every slice except `brain_scaled_slices`' bottom row when it carries
+    /// every slice except `system_a_scaled_slices`' bottom row when it carries
     /// a sub-pixel sliver: the destination is still an integer raster (it
     /// has to be), but the source that raster is placed against in the
     /// `Evaluator`'s canvas-space geometry can be fractional.
@@ -10374,11 +10374,11 @@ mod reconstruction {
         (slices, x2, col_width, y2, strip_height)
     }
 
-    /// brain's real wall geometry, scaled to this 400x260 canvas: two
+    /// System A's real wall geometry, scaled to this 400x260 canvas: two
     /// columns overlapping 5.75% of the canvas width (nearest integer pixel
-    /// to brain's measured 5.8%), two rows separated by `row_sliver` canvas
+    /// to System A's measured 5.8%), two rows separated by `row_sliver` canvas
     /// pixels of overlap — `0.0` is an exact touch (`c`, as before),
-    /// `0.07` is brain's real sub-pixel sliver (`d`), the value that
+    /// `0.07` is System A's real sub-pixel sliver (`d`), the value that
     /// produces the wedge. Returns `(slices, row_boundary)`.
     ///
     /// The destination (raster) height of the bottom row is derived from
@@ -10387,7 +10387,7 @@ mod reconstruction {
     /// integer buffer regardless of the sliver, but the canvas-space source
     /// rectangle the `Evaluator` sees for it is not, which is exactly what
     /// lets a sub-pixel sliver exist in the first place.
-    fn brain_scaled_slices(row_sliver: f64) -> (Vec<(&'static str, SliceGeom)>, i32) {
+    fn system_a_scaled_slices(row_sliver: f64) -> (Vec<(&'static str, SliceGeom)>, i32) {
         let col1_width = 212;
         let overlap_x = 23;
         let col2_x = col1_width - overlap_x; // 189
@@ -10766,30 +10766,30 @@ mod reconstruction {
     }
 
     #[test]
-    fn brain_scaled_columns_overlap_rows_touch() {
-        // brain's real wall (see the SEAM slice notes in
+    fn system_a_scaled_columns_overlap_rows_touch() {
+        // System A's real wall (see the SEAM slice notes in
         // .claude/plans/warp-fixes.md): two columns overlapping 5.8% of the
         // canvas width, two rows that touch with essentially no overlap.
         // Scaled to this 400x260 canvas at integer pixels: the nearest
         // integer overlap to 5.8% of 400 (23.2px) is 23px, i.e. 5.75%.
-        let (slices, row_boundary) = brain_scaled_slices(0.0);
+        let (slices, row_boundary) = system_a_scaled_slices(0.0);
         assert_reconstructs(
-            "brain-scaled: columns overlap 5.75%, rows touch",
+            "System A scaled: columns overlap 5.75%, rows touch",
             &slices,
             Some(row_boundary),
         );
     }
 
     #[test]
-    fn brain_scaled_columns_overlap_rows_overlap_sliver() {
-        // As above, but with brain's real measured 0.07-canvas-pixel row
+    fn system_a_scaled_columns_overlap_rows_overlap_sliver() {
+        // As above, but with System A's real measured 0.07-canvas-pixel row
         // sliver instead of an exact touch. The sum-to-one composite still
         // passes here (see the module doc comment: it cannot see a wrong
-        // SPLIT, only a wrong total) — `row_independence_brain_scaled_rows_overlap_sliver`
+        // SPLIT, only a wrong total) — `row_independence_system_a_scaled_rows_overlap_sliver`
         // below is the test that catches the wedge this sliver produces.
-        let (slices, row_boundary) = brain_scaled_slices(0.07);
+        let (slices, row_boundary) = system_a_scaled_slices(0.07);
         assert_reconstructs(
-            "brain-scaled: columns overlap 5.75%, rows overlap by a 0.07px sliver",
+            "System A scaled: columns overlap 5.75%, rows overlap by a 0.07px sliver",
             &slices,
             Some(row_boundary),
         );
@@ -10951,7 +10951,7 @@ mod reconstruction {
         // No column split at all in this layout (a single output per row),
         // so every column has exactly one covering row-slice outside the
         // row-overlap band: a trivial sanity check that the harness itself
-        // is not the source of any deviation seen in the brain-scaled
+        // is not the source of any deviation seen in the System A scaled
         // layouts below.
         let canvas = build_flat_canvas();
         let slices = two_strip_slices();
@@ -10970,14 +10970,14 @@ mod reconstruction {
     }
 
     #[test]
-    fn row_independence_brain_scaled_rows_touch() {
+    fn row_independence_system_a_scaled_rows_touch() {
         let canvas = build_flat_canvas();
-        let (slices, row_boundary) = brain_scaled_slices(0.0);
+        let (slices, row_boundary) = system_a_scaled_slices(0.0);
         let spec = slicer_spec(&slices, true);
         // Sample column: 10% into the column-overlap band from its left
         // edge (189 + 10% of 23px).
         assert_row_independence(
-            "brain-scaled, rows touch exactly",
+            "System A scaled, rows touch exactly",
             &spec,
             &canvas,
             &["C1R1", "C2R1"],
@@ -10990,9 +10990,9 @@ mod reconstruction {
     }
 
     #[test]
-    fn row_independence_brain_scaled_rows_overlap_sliver() {
+    fn row_independence_system_a_scaled_rows_overlap_sliver() {
         let canvas = build_flat_canvas();
-        let (slices, row_boundary) = brain_scaled_slices(0.07);
+        let (slices, row_boundary) = system_a_scaled_slices(0.07);
         let spec = slicer_spec(&slices, true);
         // Round 2's acceptance test (see .claude/plans/warp-fixes.md,
         // "Round 2 ... Slice SEAM"). Under round 1's minimum-distance rule
@@ -11002,7 +11002,7 @@ mod reconstruction {
         // ramp, so it is clamped to 1 at every sampled pixel center and the
         // column split is the same on every row.
         assert_row_independence(
-            "brain-scaled, rows overlap by a 0.07px sliver",
+            "System A scaled, rows overlap by a 0.07px sliver",
             &spec,
             &canvas,
             &["C1R1", "C2R1"],

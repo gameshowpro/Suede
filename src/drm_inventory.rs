@@ -725,7 +725,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
-    const BRAIN_EDIDS: [(&str, &[u8]); 4] = [
+    const SYSTEM_A_EDIDS: [(&str, &[u8]); 4] = [
         ("DP-1", include_bytes!("fixtures/drm/system-a-DP-1.edid")),
         ("DP-2", include_bytes!("fixtures/drm/system-a-DP-2.edid")),
         ("DP-3", include_bytes!("fixtures/drm/system-a-DP-3.edid")),
@@ -740,7 +740,7 @@ mod tests {
     const SYSTEM_A_GETCONNECTOR: &str = include_str!("fixtures/drm/system-a-getconnector.json");
 
     /// The four System A manufacturers, as hwdata spells them.
-    fn brain_pnp() -> PnpNames {
+    fn system_a_pnp() -> PnpNames {
         PnpNames::parse_pnp_ids(
             "ACI\tAncor Communications Inc\n\
              GSM\tLG Electronics\n\
@@ -758,11 +758,11 @@ mod tests {
         modes: Vec<[i32; 3]>,
     }
 
-    fn brain_sway() -> Vec<SwayIdentity> {
+    fn system_a_sway() -> Vec<SwayIdentity> {
         serde_json::from_str(SYSTEM_A_SWAY).unwrap()
     }
 
-    fn brain_kernel_modes() -> HashMap<String, Vec<KernelMode>> {
+    fn system_a_kernel_modes() -> HashMap<String, Vec<KernelMode>> {
         #[derive(serde::Deserialize)]
         struct Connector {
             modes: Vec<[u32; 9]>,
@@ -790,10 +790,10 @@ mod tests {
     }
 
     #[test]
-    fn brain_edids_parse_to_exactly_what_sway_reports() {
-        let pnp = brain_pnp();
-        let sway = brain_sway();
-        for (name, edid) in BRAIN_EDIDS {
+    fn system_a_edids_parse_to_exactly_what_sway_reports() {
+        let pnp = system_a_pnp();
+        let sway = system_a_sway();
+        for (name, edid) in SYSTEM_A_EDIDS {
             let identity = parse_edid(edid, &pnp).expect("a valid EDID");
             let reported = sway.iter().find(|o| o.name == name).unwrap();
             assert_eq!(identity.make, reported.make, "{name} make");
@@ -808,8 +808,8 @@ mod tests {
 
     #[test]
     fn edid_fallbacks_cover_every_serial_rule() {
-        let pnp = brain_pnp();
-        let parse = |index: usize| parse_edid(BRAIN_EDIDS[index].1, &pnp).unwrap();
+        let pnp = system_a_pnp();
+        let parse = |index: usize| parse_edid(SYSTEM_A_EDIDS[index].1, &pnp).unwrap();
         // DP-1: a serial descriptor.
         assert_eq!(parse(0).serial.as_deref(), Some("B8LMIB558821"));
         // DP-2: no serial descriptor, so the numeric serial.
@@ -822,13 +822,13 @@ mod tests {
 
     #[test]
     fn an_unknown_manufacturer_is_its_three_letter_code() {
-        let identity = parse_edid(BRAIN_EDIDS[0].1, &PnpNames::default()).unwrap();
+        let identity = parse_edid(SYSTEM_A_EDIDS[0].1, &PnpNames::default()).unwrap();
         assert_eq!(identity.make, "ACI");
     }
 
     #[test]
     fn a_missing_product_name_falls_back_to_the_product_code() {
-        let mut edid = BRAIN_EDIDS[0].1.to_vec();
+        let mut edid = SYSTEM_A_EDIDS[0].1.to_vec();
         // Retag DP-1's 0xFC descriptor as a data string, fix the checksum.
         let position = (0..4)
             .map(|i| 0x36 + i * 18)
@@ -836,16 +836,16 @@ mod tests {
             .unwrap();
         edid[position + 3] = 0xFE;
         fix_checksum(&mut edid);
-        let identity = parse_edid(&edid, &brain_pnp()).unwrap();
+        let identity = parse_edid(&edid, &system_a_pnp()).unwrap();
         assert_eq!(identity.model, format!("0x{:04X}", 9208));
     }
 
     #[test]
     fn a_zero_numeric_serial_with_no_descriptor_is_absent() {
-        let mut edid = BRAIN_EDIDS[1].1.to_vec();
+        let mut edid = SYSTEM_A_EDIDS[1].1.to_vec();
         edid[0x0C..0x10].fill(0);
         fix_checksum(&mut edid);
-        assert_eq!(parse_edid(&edid, &brain_pnp()).unwrap().serial, None);
+        assert_eq!(parse_edid(&edid, &system_a_pnp()).unwrap().serial, None);
     }
 
     #[test]
@@ -858,16 +858,16 @@ mod tests {
 
     #[test]
     fn invalid_edids_have_no_identity() {
-        let pnp = brain_pnp();
+        let pnp = system_a_pnp();
         assert!(parse_edid(&[], &pnp).is_none());
-        assert!(parse_edid(&BRAIN_EDIDS[0].1[..100], &pnp).is_none());
-        let mut bad_checksum = BRAIN_EDIDS[0].1.to_vec();
+        assert!(parse_edid(&SYSTEM_A_EDIDS[0].1[..100], &pnp).is_none());
+        let mut bad_checksum = SYSTEM_A_EDIDS[0].1.to_vec();
         bad_checksum[0x7F] ^= 1;
         assert!(parse_edid(&bad_checksum, &pnp).is_none());
-        let mut bad_header = BRAIN_EDIDS[0].1.to_vec();
+        let mut bad_header = SYSTEM_A_EDIDS[0].1.to_vec();
         bad_header[0] = 1;
         assert!(parse_edid(&bad_header, &pnp).is_none());
-        let mut version_two = BRAIN_EDIDS[0].1.to_vec();
+        let mut version_two = SYSTEM_A_EDIDS[0].1.to_vec();
         version_two[0x12] = 2;
         fix_checksum(&mut version_two);
         assert!(parse_edid(&version_two, &pnp).is_none());
@@ -917,9 +917,9 @@ mod tests {
     }
 
     #[test]
-    fn brain_kernel_modes_become_exactly_sways_mode_list() {
-        let kernel = brain_kernel_modes();
-        for reported in brain_sway() {
+    fn system_a_kernel_modes_become_exactly_sways_mode_list() {
+        let kernel = system_a_kernel_modes();
+        for reported in system_a_sway() {
             let modes = modes_from_kernel(&kernel[&reported.name]);
             let ours: Vec<[i32; 3]> = modes
                 .iter()
@@ -971,9 +971,9 @@ mod tests {
 
     /// A fake sysfs tree shaped like System A's, and a query answering from the
     /// recorded GETCONNECTOR data.
-    fn brain_tree() -> tempfile::TempDir {
+    fn system_a_tree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        for (index, (name, edid)) in BRAIN_EDIDS.iter().enumerate() {
+        for (index, (name, edid)) in SYSTEM_A_EDIDS.iter().enumerate() {
             let path = dir.path().join(format!("card1-{name}"));
             std::fs::create_dir(&path).unwrap();
             std::fs::write(path.join("status"), "connected\n").unwrap();
@@ -987,8 +987,8 @@ mod tests {
         dir
     }
 
-    fn brain_query() -> impl FnMut(&Path, u32) -> std::io::Result<Vec<KernelMode>> {
-        let kernel = brain_kernel_modes();
+    fn system_a_query() -> impl FnMut(&Path, u32) -> std::io::Result<Vec<KernelMode>> {
+        let kernel = system_a_kernel_modes();
         move |card: &Path, id: u32| {
             assert_eq!(card, Path::new("/dev/dri/card1"));
             let name = format!("DP-{}", (id - 129) / 4 + 1);
@@ -997,13 +997,13 @@ mod tests {
     }
 
     #[test]
-    fn a_brain_shaped_tree_reads_like_sways_outputs() {
-        let dir = brain_tree();
+    fn a_system_a_shaped_tree_reads_like_sways_outputs() {
+        let dir = system_a_tree();
         let inventory = read_in(
             dir.path(),
             Path::new("/dev/dri"),
-            &brain_pnp(),
-            brain_query(),
+            &system_a_pnp(),
+            system_a_query(),
         );
         assert_eq!(
             inventory
@@ -1018,7 +1018,7 @@ mod tests {
         assert_eq!(inventory.get("DP-3").unwrap().connector_id, Some(137));
 
         let simulated = inventory.simulated_outputs();
-        let sway = brain_sway();
+        let sway = system_a_sway();
         for output in &simulated {
             let reported = sway.iter().find(|o| o.name == output.name).unwrap();
             let raw: Vec<RawMode> = reported
@@ -1057,15 +1057,15 @@ mod tests {
 
     #[test]
     fn preflight_refuses_what_direct_mode_cannot_learn() {
-        let dir = brain_tree();
+        let dir = system_a_tree();
         let card = dir.path().join("card1-DP-2");
 
         std::fs::remove_file(card.join("connector_id")).unwrap();
         let inventory = read_in(
             dir.path(),
             Path::new("/dev/dri"),
-            &brain_pnp(),
-            brain_query(),
+            &system_a_pnp(),
+            system_a_query(),
         );
         let error = inventory.preflight().unwrap_err();
         assert!(
@@ -1078,27 +1078,27 @@ mod tests {
         let inventory = read_in(
             dir.path(),
             Path::new("/dev/dri"),
-            &brain_pnp(),
-            brain_query(),
+            &system_a_pnp(),
+            system_a_query(),
         );
         let error = inventory.preflight().unwrap_err();
         assert!(error.contains("DP-2") && error.contains("EDID"), "{error}");
-        std::fs::write(card.join("edid"), BRAIN_EDIDS[1].1).unwrap();
+        std::fs::write(card.join("edid"), SYSTEM_A_EDIDS[1].1).unwrap();
 
         let failing = |_: &Path, _: u32| Err(std::io::Error::other("ioctl refused"));
-        let inventory = read_in(dir.path(), Path::new("/dev/dri"), &brain_pnp(), failing);
+        let inventory = read_in(dir.path(), Path::new("/dev/dri"), &system_a_pnp(), failing);
         let error = inventory.preflight().unwrap_err();
         assert!(error.contains("ioctl refused"), "{error}");
     }
 
     #[test]
     fn preflight_refuses_two_cards_and_an_empty_wall() {
-        let dir = brain_tree();
+        let dir = system_a_tree();
         std::fs::rename(dir.path().join("card1-DP-4"), dir.path().join("card2-DP-4")).unwrap();
-        let kernel = brain_kernel_modes();
+        let kernel = system_a_kernel_modes();
         let query =
             move |_: &Path, id: u32| Ok(kernel[&format!("DP-{}", (id - 129) / 4 + 1)].clone());
-        let inventory = read_in(dir.path(), Path::new("/dev/dri"), &brain_pnp(), query);
+        let inventory = read_in(dir.path(), Path::new("/dev/dri"), &system_a_pnp(), query);
         let error = inventory.preflight().unwrap_err();
         assert!(error.contains("more than one card"), "{error}");
 
@@ -1112,7 +1112,7 @@ mod tests {
         // plugged into it; card1 (NVIDIA) drives the wall. Direct
         // presentation, and the login profile's own render-node choice
         // (packaging/provision.sh), must agree on card1 — see F1a.
-        let dir = brain_tree();
+        let dir = system_a_tree();
         let igpu = dir.path().join("card0-HDMI-1");
         std::fs::create_dir(&igpu).unwrap();
         std::fs::write(igpu.join("status"), "disconnected\n").unwrap();
@@ -1120,20 +1120,20 @@ mod tests {
         let inventory = read_in(
             dir.path(),
             Path::new("/dev/dri"),
-            &brain_pnp(),
-            brain_query(),
+            &system_a_pnp(),
+            system_a_query(),
         );
         assert_eq!(inventory.preflight(), Ok(PathBuf::from("/dev/dri/card1")));
     }
 
     #[test]
     fn exact_refresh_recovers_millihertz_from_sways_hertz() {
-        let dir = brain_tree();
+        let dir = system_a_tree();
         let inventory = read_in(
             dir.path(),
             Path::new("/dev/dri"),
-            &brain_pnp(),
-            brain_query(),
+            &system_a_pnp(),
+            system_a_query(),
         );
         let dp1 = inventory.get("DP-1").unwrap();
         assert_eq!(dp1.exact_refresh_millihz(1920, 1080, 59.939), Some(59_939));

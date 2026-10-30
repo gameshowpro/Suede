@@ -211,7 +211,7 @@ fn seam_pairs(sources: &[CanvasRect]) -> Vec<SeamPair> {
             }
             let (x0, x1) = (r.x.max(q.x), right(r).min(right(q)));
             let (y0, y1) = (r.y.max(q.y), bottom(r).min(bottom(q)));
-            // Positive area only: rectangles that merely touch — brain's
+            // Positive area only: rectangles that merely touch — System A's
             // two rows, before the 0.07-pixel sliver — form no seam at all.
             if !(x1 > x0 && y1 > y0) {
                 continue;
@@ -649,7 +649,7 @@ impl Evaluator {
     /// calibrating; being approximate about a rare multi-neighbor row is the
     /// cheaper half of that trade.
     ///
-    /// A sub-pixel ramp denominator — brain's 0.07-pixel row sliver, say —
+    /// A sub-pixel ramp denominator — System A's 0.07-pixel row sliver, say —
     /// still counts as a ramp here, exactly as it does in the tables, so its
     /// two bands land within one band width of each other and overpaint. That is
     /// honest: the configuration really does say those rectangles overlap,
@@ -1393,10 +1393,10 @@ mod tests {
         }
     }
 
-    /// Brain's four-projector wall, exactly as the daemon holds it: canvas
+    /// System A's four-projector wall, exactly as the daemon holds it: canvas
     /// aspect 1.68 at 3864 px wide, columns overlapping by 225 px and rows
     /// touching with a 0.07-pixel sliver.
-    fn brain_layout() -> LayoutSpec {
+    fn system_a_layout() -> LayoutSpec {
         let (width, height) = (0.5291176764326357, 0.2976286929933576);
         let (right_x, bottom_y) = (0.47088232356736426, 0.29760940224473764);
         let (footprint_w, footprint_h) = (0.4968944099378882, 0.2795031055900621);
@@ -1421,7 +1421,7 @@ mod tests {
         }
     }
 
-    /// Property 3: on brain's real configuration the horizontal seam between
+    /// Property 3: on System A's real configuration the horizontal seam between
     /// the bottom two slices (DP-3 and DP-4) is the same at EVERY row inside
     /// them, including the very first row below the row boundary. The
     /// 0.07-pixel sliver where the two rows touch is a real straddle, but its
@@ -1432,8 +1432,8 @@ mod tests {
     /// below the boundary were a flat 128/128 instead of the gamma ramp,
     /// which is the bright triangle seen at the center of the wall.
     #[test]
-    fn brain_horizontal_seam_has_no_wedge_below_the_row_boundary() {
-        let layout = brain_layout();
+    fn system_a_horizontal_seam_has_no_wedge_below_the_row_boundary() {
+        let layout = system_a_layout();
         let evaluator = Evaluator::new(&layout, 3864, 2300).unwrap();
         let bottom_index = evaluator.index("DP-3").unwrap();
         let other_index = evaluator.index("DP-4").unwrap();
@@ -1477,7 +1477,7 @@ mod tests {
 
     /// Property 4: a sub-pixel overlap sliver is indistinguishable, at every
     /// sampled pixel center, from rectangles that exactly touch. This is the
-    /// general statement of what brain's 0.07-pixel row overlap does.
+    /// general statement of what System A's 0.07-pixel row overlap does.
     #[test]
     fn a_sub_pixel_sliver_weighs_the_same_as_exactly_touching_rectangles() {
         let sliver = 0.07 / 100.0;
@@ -1810,7 +1810,7 @@ mod tests {
     }
 
     /// A marker line is two pixels of the output that draws it, not two
-    /// canvas pixels. On brain, a 0.5277 x 0.2967 source of a 900-pixel
+    /// canvas pixels. On System A, a 0.5277 x 0.2967 source of a 900-pixel
     /// canvas shown at 1920x1080 has about 4.04 output pixels per canvas
     /// pixel, so each line is just under half a canvas pixel wide.
     #[test]
@@ -2064,7 +2064,7 @@ mod tests {
         assert_eq!(stacked.marker_at(0, 50.0, 50.0, widths), MARKER_NONE);
     }
 
-    /// A 2x2 wall that is slightly out of true, on brain's canvas: the
+    /// A 2x2 wall that is slightly out of true, on System A's canvas: the
     /// right column sits 1% of the canvas width lower than the left column,
     /// and the bottom row 1% further right than the top row. Every seam is
     /// still straight — only the slices meeting along it are offset.

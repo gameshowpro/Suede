@@ -4210,7 +4210,7 @@ mod tests {
 
     #[test]
     fn mismatched_rates_warn_and_name_both_outputs() {
-        // Brain's two projectors, verbatim: both advertise both rates.
+        // System A's two projectors, verbatim: both advertise both rates.
         let outputs = vec![
             output_running_at("DP-1", 60.0, &[59.939]),
             output_running_at("DP-3", 59.939, &[60.0]),

@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# Fails when a real test-appliance name leaks into the public docs, or when a
-# "System X" alias appears without linking back to its profile.
+# Fails when a real test-appliance name leaks into the public docs or the
+# source and tests, or when a "System X" alias appears in the docs without
+# linking back to its profile.
 #
-# Public docs (docs/) refer to Suede's test appliances only by alias (System
-# A, System B, System C, ...) - never by hostname, IP, username or SSID. The
-# alias-to-real-name mapping lives in the "Alias lookup and current status"
-# table at the top of .claude/test-beds.md, which is gitignored and local
+# Public docs (docs/), the source (src/) and the tests (tests/) refer to
+# Suede's test appliances only by alias (System A, System B, System C, ...) -
+# never by hostname, IP, username or SSID. The real-name scan is a
+# case-insensitive match where the name is bounded by non-letters, so it also
+# catches names embedded in identifiers (name_pnp, NAME_EDIDS). Binary files
+# (such as .spv shaders) are skipped. The alias-to-real-name mapping lives in
+# the "Alias lookup and current status" table at the top of
+# .claude/test-beds.md, which is gitignored and local
 # only, so a fresh checkout or CI has nothing to compare against: this check
 # then exits 0 with a note. The second check (every "System X" occurrence is
 # a link to its profile) does not depend on that file and always runs.
@@ -15,6 +20,7 @@ set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 DOCS_DIR="docs"
+SCAN_DIRS=("docs" "src" "tests")
 LOOKUP=".claude/test-beds.md"
 PROFILE_PAGE="developer/test-systems.md"
 
@@ -39,8 +45,8 @@ else
   else
     while IFS= read -r name; do
       [ -z "$name" ] && continue
-      if hits="$(grep -rniwE -- "$name" "$DOCS_DIR")"; then
-        echo "check-machine-names: real machine name '$name' found under $DOCS_DIR/ - use its alias instead:" >&2
+      if hits="$(grep -rnIiE -- "(^|[^a-z])${name}([^a-z]|\$)" "${SCAN_DIRS[@]}")"; then
+        echo "check-machine-names: real machine name '$name' found under ${SCAN_DIRS[*]} - use its alias instead:" >&2
         echo "$hits" >&2
         status=1
       fi
