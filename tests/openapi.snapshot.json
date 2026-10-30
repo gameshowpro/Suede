@@ -4236,7 +4236,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ProjectionMode",
-                "description": "Which geometry pipeline is requested. Warp settings remain retained\nwhile simple mode is active."
+                "description": "Which geometry pipeline is requested. Warp settings remain retained\nwhile simple mode is active.\n\nSwitching to `exact` judges the document the write produces, any\ngeometry edits in the same request included, as one merged document\nwith the previous working copy: an omitted `canvas` or output\n`geometry` keeps the previous one, so a bare `{\"mode\":\"exact\"}`\nswitches the current layout. Corner and center correction is stripped\n(Exact does not retain it), and if the result satisfies the Exact\nrules it is kept as it is; otherwise its canvas and slices are reset\nto the Exact defaults derived from the outputs' positions. Writes\nthat stay in `exact` are literal. Switching from `exact` to\n`simple` or `warp` changes only the mode, since an Exact document\nalready renders identically in both, so switching straight back\nreproduces the same document."
               }
             ]
           },
@@ -4679,8 +4679,9 @@
         "type": "object"
       },
       "ProjectionMode": {
-        "description": "The selected projection pipeline.",
+        "description": "The selected projection pipeline, declared from most to least\nrestrictive.",
         "enum": [
+          "exact",
           "simple",
           "warp"
         ],
@@ -7096,7 +7097,7 @@
                 }
               }
             },
-            "description": "The persisted document. `null` removes the whole projection section. Retention note: while the effective mode is Simple, an otherwise-present projection body that omits `canvas` keeps the previously saved canvas rather than clearing it, so a Simple-mode save cannot accidentally discard a retained Warp canvas. PUT is otherwise literal. To actually clear the shared canvas, use DELETE /config/projection/canvas."
+            "description": "The persisted document. `null` removes the whole projection section. Retention note: while the effective mode is Simple, an otherwise-present projection body that omits `canvas` keeps the previously saved canvas rather than clearing it, so a Simple-mode save cannot accidentally discard a retained Warp canvas. A body that switches the mode to `exact` likewise keeps the previous canvas when it omits one, and the merged document is kept (stripped of corner and center correction) if it satisfies the Exact rules, or reset to the Exact defaults derived from the outputs' positions otherwise; a bare `{\"mode\":\"exact\"}` therefore keeps a layout that already conforms. Writes that stay in Exact are literal. PUT is otherwise literal. To actually clear the shared canvas, use DELETE /config/projection/canvas."
           },
           "422": {
             "description": "Validation failed"

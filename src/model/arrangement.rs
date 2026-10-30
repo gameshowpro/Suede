@@ -760,6 +760,37 @@ pub fn solve_document(
     solve(&document.outputs, canvas, request, raster)
 }
 
+/// The raster extent, in raster pixels, that each seam's overlap fraction
+/// is taken of: for every adjacent pair of columns, the smaller of their
+/// widths (`.0`), and for every adjacent pair of rows, the smaller of their
+/// heights (`.1`). A seam beside an empty column or row has extent zero, so
+/// it moves nothing, exactly as in [`place`]. `overlapX * extent` is the
+/// overlap in pixels that seam implies.
+///
+/// Built from [`grid`]'s own metrics, so it cannot disagree with the
+/// solver. Fails with the solver's errors when the grid cannot be measured
+/// (no outputs, more outputs than slots, an unknown raster, an invalid
+/// canvas). Exact mode's whole-pixel arrangement rule
+/// ([`crate::model::exact`]) reads this; it is also the natural source for
+/// a per-axis pixel overlap report.
+pub(crate) fn seam_extents(
+    outputs: &[OutputConfig],
+    canvas: &CanvasConfig,
+    rows: u32,
+    columns: u32,
+    raster: impl Fn(&OutputConfig) -> Option<(u32, u32)>,
+) -> Result<(Vec<f64>, Vec<f64>), String> {
+    let enabled: Vec<&OutputConfig> = outputs.iter().filter(|output| output.enable).collect();
+    let metrics = grid(&enabled, canvas, rows, columns, &raster)?;
+    let seams = |extents: &[f64]| -> Vec<f64> {
+        extents
+            .windows(2)
+            .map(|pair| pair[0].min(pair[1]))
+            .collect()
+    };
+    Ok((seams(&metrics.col_width), seams(&metrics.row_height)))
+}
+
 /// Per-axis overlap limits for an overlap-mode request.
 ///
 /// For each axis, the closed range of overlaps [`solve`] accepts for this

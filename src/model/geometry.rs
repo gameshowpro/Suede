@@ -15,15 +15,52 @@ const MAX_SLICE_SPAN: f64 = 16.0;
 const TOPOLOGY_EPS: f64 = 1.0e-12;
 const SHARED_EDGE_EPS: f64 = 1.0e-10;
 
-/// The selected projection pipeline.
+/// The selected projection pipeline, declared from most to least
+/// restrictive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ProjectionMode {
+    /// Strictly one-to-one: every enabled output shows exactly its own
+    /// raster's worth of canvas pixels, at whole-pixel canvas coordinates,
+    /// at output scale 1, without correction. Needs the canvas slicer, so it
+    /// is unavailable on a tiled appliance (`allow_overlaps = false`).
+    /// See [`crate::model::exact`].
+    Exact,
     /// Shared rectangular content selection and scaling, without correction.
     #[default]
     Simple,
     /// Configured canvas slice rectangles and destination corner pins.
     Warp,
+}
+
+impl ProjectionMode {
+    /// Whether the mode renders through the shared canvas even when the
+    /// document names none, so a canvas is required. Simple uses one only
+    /// when it is configured.
+    pub fn requires_canvas(self) -> bool {
+        match self {
+            Self::Exact | Self::Warp => true,
+            Self::Simple => false,
+        }
+    }
+
+    /// Whether the slicer applies the retained destination correction
+    /// (corner pins and center remap) and presents a unit-scale raster.
+    pub fn applies_correction(self) -> bool {
+        match self {
+            Self::Warp => true,
+            Self::Exact | Self::Simple => false,
+        }
+    }
+
+    /// The mode's lowercase wire name, for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Simple => "simple",
+            Self::Warp => "warp",
+        }
+    }
 }
 
 /// How a slicer output actually sampled its captured source.

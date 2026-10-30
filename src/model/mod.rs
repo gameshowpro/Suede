@@ -6,6 +6,7 @@
 pub mod arrangement;
 pub mod black_lift;
 pub mod desired;
+pub mod exact;
 pub mod geometry;
 pub mod limits;
 pub mod observed;

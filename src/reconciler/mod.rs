@@ -1195,7 +1195,7 @@ impl Reconciler {
             match crate::projection::layout::canvas_plan_with_correction(
                 desired,
                 &self.snapshot.outputs(),
-                policy.effective_mode == crate::model::ProjectionMode::Warp,
+                policy.effective_mode.applies_correction(),
             ) {
                 Ok(plan) => {
                     *self.last_good_canvas_plan.lock().unwrap() = Some(plan.clone());

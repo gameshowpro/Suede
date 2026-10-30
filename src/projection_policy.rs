@@ -1,7 +1,7 @@
 //! Public geometry capability policy. Saved parameters are never the fallback.
 
 use crate::model::observed::ProjectionGeometryStatus;
-use crate::model::{DesiredState, ProjectionControlStatus, ProjectionMode, Renderer};
+use crate::model::{exact, DesiredState, ProjectionControlStatus, ProjectionMode, Renderer};
 
 pub fn status(
     desired: &DesiredState,
@@ -46,16 +46,24 @@ pub fn status(
         // Keep an already selected warp through its child replacement probe.
         // A pending report is not a negative capability result. Controls still
         // require available=true; an actual startup false selects simple.
-        effective_mode: if projection.mode == ProjectionMode::Warp
-            && (available == Some(true)
-                || (available.is_none()
-                    && previous.is_some_and(|p| {
-                        p.effective_mode == ProjectionMode::Warp
-                            && p.requested_renderer == projection.renderer
-                    }))) {
+        effective_mode: match projection.mode {
             ProjectionMode::Warp
-        } else {
-            ProjectionMode::Simple
+                if available == Some(true)
+                    || (available.is_none()
+                        && previous.is_some_and(|p| {
+                            p.effective_mode == ProjectionMode::Warp
+                                && p.requested_renderer == projection.renderer
+                        })) =>
+            {
+                ProjectionMode::Warp
+            }
+            ProjectionMode::Warp | ProjectionMode::Simple => ProjectionMode::Simple,
+            // Exact renders through the same uncorrected canvas plan as
+            // Simple, so reporting Simple here keeps every consumer's
+            // `== Warp` test right. Reporting `exact` itself (and the
+            // `exactAvailable` capability beside `warpAvailable`) is the
+            // status slice's work; see `exact::unavailable_reason`.
+            ProjectionMode::Exact => ProjectionMode::Simple,
         },
         warp_available: available,
         reason,
@@ -65,14 +73,25 @@ pub fn status(
 
 /// Preserve omitted calibration for Simple clients, without overwriting explicit
 /// shared canvas or slice edits. Explicit output deletion remains deletion.
+///
+/// Simple only. Warp writes are literal, and so are writes that stay in
+/// Exact; a write that switches *into* Exact gets the same refill from
+/// [`transition`], so it is judged as the one merged document it produces.
 pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
-    let simple = next
-        .projection
-        .as_ref()
-        .is_none_or(|p| p.mode == ProjectionMode::Simple);
+    let simple = next.projection.as_ref().is_none_or(|p| match p.mode {
+        ProjectionMode::Simple => true,
+        ProjectionMode::Exact | ProjectionMode::Warp => false,
+    });
     if !simple {
         return;
     }
+    refill_omitted(next, previous);
+}
+
+/// Fill an omitted `projection.canvas` and each output's omitted `geometry`
+/// from `previous`, matching outputs by their `match` rule. Present values
+/// are never touched, and an output `next` no longer lists stays gone.
+fn refill_omitted(next: &mut DesiredState, previous: &DesiredState) {
     if let Some(old) = &previous.projection {
         if old.canvas.is_some() {
             let projection = next.projection.get_or_insert_with(Default::default);
@@ -94,6 +113,72 @@ pub fn preserve_retained(next: &mut DesiredState, previous: &DesiredState) {
     }
 }
 
+/// Apply the projection-mode switching rules to a working-copy
+/// replacement, after [`preserve_retained`] and before validation.
+///
+/// Runs only when `next`'s mode differs from `previous`'s (a missing
+/// projection section counts as Simple):
+///
+/// * **Into Exact** (from Simple or Warp): the write is one merged document
+///   with the previous working copy. An omitted canvas or output geometry
+///   is first refilled from `previous`, exactly as [`preserve_retained`]
+///   does for Simple, so a bare `{"mode":"exact"}` is judged on the layout
+///   it would actually switch. [`exact::enter`] then keeps that document
+///   once stripped of correction if it conforms, and otherwise resets its
+///   geometry to the Exact defaults. Skipped where Exact is
+///   unavailable ([`exact::unavailable_reason`]), so validation refuses the
+///   write with that reason rather than with whatever a reset would trip
+///   over.
+/// * **Out of Exact** (to Simple or Warp): [`exact::leave`], which changes
+///   only the mode; the Exact document already renders identically in the
+///   new mode, which is what makes an immediate round trip byte-identical.
+/// * **Simple and Warp**: nothing here; their retained-calibration
+///   behavior is [`preserve_retained`]'s.
+///
+/// Returns what entering Exact did, or `None` when no Exact transition ran.
+/// Fails with the reasons when a reset was needed and the defaults could not
+/// be derived.
+pub fn transition(
+    next: &mut DesiredState,
+    previous: &DesiredState,
+    allow_overlaps: bool,
+) -> Result<Option<exact::Transition>, Vec<String>> {
+    let mode = |document: &DesiredState| {
+        document
+            .projection
+            .as_ref()
+            .map(|projection| projection.mode)
+            .unwrap_or_default()
+    };
+    let (from, to) = (mode(previous), mode(next));
+    match (from, to) {
+        (ProjectionMode::Exact, ProjectionMode::Exact)
+        | (ProjectionMode::Simple, ProjectionMode::Simple)
+        | (ProjectionMode::Warp, ProjectionMode::Warp)
+        | (ProjectionMode::Simple, ProjectionMode::Warp)
+        | (ProjectionMode::Warp, ProjectionMode::Simple) => Ok(None),
+        (ProjectionMode::Simple | ProjectionMode::Warp, ProjectionMode::Exact) => {
+            if exact::unavailable_reason(allow_overlaps).is_some() {
+                return Ok(None);
+            }
+            refill_omitted(next, previous);
+            let (entered, transition) = exact::enter(next)?;
+            if let exact::Transition::Reset { reasons } = &transition {
+                tracing::info!(
+                    reasons = %reasons.join("; "),
+                    "entering exact mode reset the projection layout to the exact defaults"
+                );
+            }
+            *next = entered;
+            Ok(Some(transition))
+        }
+        (ProjectionMode::Exact, ProjectionMode::Simple | ProjectionMode::Warp) => {
+            *next = exact::leave(next, to);
+            Ok(None)
+        }
+    }
+}
+
 pub fn validate_activation(
     next: &DesiredState,
     previous: &DesiredState,
@@ -102,8 +187,11 @@ pub fn validate_activation(
     allow_overlaps: bool,
 ) -> Result<(), String> {
     let next_mode = next.projection.as_ref().map(|p| p.mode).unwrap_or_default();
-    if next_mode != ProjectionMode::Warp {
-        return Ok(());
+    match next_mode {
+        ProjectionMode::Warp => {}
+        // Neither needs a capability probe: Exact's integer copy and Simple's
+        // rectangles run on every slicer pipeline.
+        ProjectionMode::Exact | ProjectionMode::Simple => return Ok(()),
     }
     let before_mode = previous
         .projection
@@ -542,5 +630,259 @@ mod tests {
         fallback.outputs[0].geometry.as_mut().unwrap().slice.x = 2.0;
         assert_eq!(app.oneshot(put(&fallback)).await.unwrap().status(), 422);
         assert_eq!(h.state.store.effective_with_generation(), accepted);
+    }
+
+    /// Two 100x100 outputs overlapping by 10 px, reset into Exact from their
+    /// positions alone.
+    fn exact_saved() -> DesiredState {
+        let mut d = DesiredState::new();
+        for (name, x) in [("A", 0), ("B", 90)] {
+            let mut output = OutputConfig::new(OutputMatch::by_name(name));
+            output.mode = Some(crate::model::Mode {
+                width: 100,
+                height: 100,
+                refresh_hz: 60.0,
+            });
+            output.position = Some(crate::model::Position { x, y: 0 });
+            d.outputs.push(output);
+        }
+        d.projection = Some(ProjectionConfig {
+            gamma: 2.4,
+            ..Default::default()
+        });
+        let (entered, transition) = exact::enter(&d).unwrap();
+        assert!(matches!(transition, exact::Transition::Reset { .. }));
+        assert!(
+            entered.validate(true).is_ok(),
+            "{:?}",
+            entered.validate(true)
+        );
+        entered
+    }
+
+    /// What `api::validate_configuration_against` does to a replacement
+    /// before validating it, on a slicer appliance.
+    fn replace(mut next: DesiredState, previous: &DesiredState) -> DesiredState {
+        preserve_retained(&mut next, previous);
+        transition(&mut next, previous, true).unwrap();
+        assert!(next.validate(true).is_ok(), "{:?}", next.validate(true));
+        next
+    }
+
+    fn with_mode(document: &DesiredState, mode: ProjectionMode) -> DesiredState {
+        let mut next = document.clone();
+        next.projection.as_mut().unwrap().mode = mode;
+        next
+    }
+
+    #[test]
+    fn exact_round_trips_through_simple_and_warp_byte_identically() {
+        let exact = exact_saved();
+        let start = serde_json::to_string(&exact).unwrap();
+        for to in [ProjectionMode::Simple, ProjectionMode::Warp] {
+            let left = replace(with_mode(&exact, to), &exact);
+            // Leaving changes the mode and nothing else.
+            assert_eq!(left, exact::leave(&exact, to), "{to:?}");
+            let back = replace(with_mode(&left, ProjectionMode::Exact), &left);
+            assert_eq!(serde_json::to_string(&back).unwrap(), start, "{to:?}");
+        }
+    }
+
+    #[test]
+    fn entering_exact_resets_a_calibrated_warp_document() {
+        let warp = saved();
+        let mut next = with_mode(&warp, ProjectionMode::Exact);
+        // The canvas the warp document used is not the positions' box.
+        next.projection
+            .as_mut()
+            .unwrap()
+            .canvas
+            .as_mut()
+            .unwrap()
+            .render_width = 150;
+        let outcome = transition(&mut next, &warp, true).unwrap();
+        assert!(
+            matches!(outcome, Some(exact::Transition::Reset { .. })),
+            "{outcome:?}"
+        );
+        let geometry = next.outputs[0].geometry.as_ref().unwrap();
+        assert_eq!(geometry.corners, exact::UNIT_CORNERS);
+        assert_eq!(geometry.center, exact::NEUTRAL_CENTER);
+        assert_eq!(
+            next.projection
+                .as_ref()
+                .unwrap()
+                .canvas
+                .unwrap()
+                .render_width,
+            100
+        );
+        assert!(next.validate(true).is_ok(), "{:?}", next.validate(true));
+    }
+
+    #[test]
+    fn a_switch_into_exact_is_judged_with_the_omitted_layout_refilled() {
+        let simple = with_mode(&exact_saved(), ProjectionMode::Simple);
+        // A bare `{"mode":"exact"}`: no canvas, and an output edit that
+        // dropped a geometry.
+        let mut next = with_mode(&simple, ProjectionMode::Exact);
+        next.projection.as_mut().unwrap().canvas = None;
+        next.outputs[1].geometry = None;
+        let outcome = transition(&mut next, &simple, true).unwrap();
+        assert_eq!(outcome, Some(exact::Transition::Kept));
+        assert_eq!(next, with_mode(&simple, ProjectionMode::Exact));
+    }
+
+    #[test]
+    fn a_write_that_stays_in_exact_is_literal() {
+        let exact = exact_saved();
+        let mut next = exact.clone();
+        next.projection.as_mut().unwrap().canvas = None;
+        preserve_retained(&mut next, &exact);
+        assert_eq!(transition(&mut next, &exact, true).unwrap(), None);
+        assert!(next.projection.as_ref().unwrap().canvas.is_none());
+        assert!(next
+            .validate(true)
+            .unwrap_err()
+            .contains(&"projection.canvas is required in exact mode".to_string()));
+    }
+
+    #[test]
+    fn a_write_that_stays_in_exact_is_not_transitioned() {
+        let exact = exact_saved();
+        let mut next = exact.clone();
+        next.outputs[0].scale = Some(2.0);
+        assert_eq!(transition(&mut next, &exact, true).unwrap(), None);
+        assert_eq!(next.outputs[0].scale, Some(2.0));
+        assert_eq!(
+            next.validate(true).unwrap_err(),
+            ["outputs[0].scale must be 1.0 in exact mode"]
+        );
+    }
+
+    #[test]
+    fn simple_and_warp_switches_are_left_to_retention() {
+        let warp = saved();
+        let mut simple = with_mode(&warp, ProjectionMode::Simple);
+        let untouched = simple.clone();
+        assert_eq!(transition(&mut simple, &warp, true).unwrap(), None);
+        assert_eq!(simple, untouched);
+        let mut back = with_mode(&simple, ProjectionMode::Warp);
+        let untouched = back.clone();
+        assert_eq!(transition(&mut back, &simple, true).unwrap(), None);
+        assert_eq!(back, untouched);
+    }
+
+    #[test]
+    fn a_tiled_appliance_is_not_reset_into_exact() {
+        let mut simple = exact_saved();
+        simple.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
+        simple.projection.as_mut().unwrap().canvas = None;
+        for output in &mut simple.outputs {
+            output.geometry = None;
+        }
+        // Edge to edge, as a tiled appliance needs them.
+        simple.outputs[1].position = Some(crate::model::Position { x: 100, y: 0 });
+        assert!(simple.validate(false).is_ok());
+        let mut next = with_mode(&simple, ProjectionMode::Exact);
+        assert_eq!(transition(&mut next, &simple, false).unwrap(), None);
+        assert_eq!(next, with_mode(&simple, ProjectionMode::Exact));
+        assert_eq!(next.validate(false).unwrap_err(), [exact::TILED_REASON]);
+    }
+
+    #[test]
+    fn a_reset_that_cannot_be_derived_fails_with_its_reasons() {
+        let mut simple = exact_saved();
+        simple.projection.as_mut().unwrap().mode = ProjectionMode::Simple;
+        simple.projection.as_mut().unwrap().canvas = None;
+        for output in &mut simple.outputs {
+            output.geometry = None;
+        }
+        simple.outputs[1].position = None;
+        let mut next = with_mode(&simple, ProjectionMode::Exact);
+        assert_eq!(
+            transition(&mut next, &simple, true).unwrap_err(),
+            ["outputs[1].position is required for a shared canvas"]
+        );
+    }
+
+    #[test]
+    fn exact_needs_no_warp_capability() {
+        let simple = with_mode(&exact_saved(), ProjectionMode::Simple);
+        let exact = with_mode(&simple, ProjectionMode::Exact);
+        assert!(validate_activation(&exact, &simple, &Default::default(), false, true).is_ok());
+        let status = status(&exact, &Default::default(), false, true, None);
+        assert_eq!(status.requested_mode, ProjectionMode::Exact);
+        assert_eq!(status.effective_mode, ProjectionMode::Simple);
+    }
+
+    #[cfg(feature = "projection")]
+    #[tokio::test]
+    async fn api_previews_round_trip_exact_through_simple_and_warp() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let mut h = crate::api::test_support::harness(None);
+        std::sync::Arc::make_mut(&mut h.state.bootstrap).allow_overlaps = true;
+        let app = crate::api::router(h.state.clone());
+        // Warp activation needs a verified capability; Exact does not.
+        h.state.snapshot.set_slicer_running(true);
+        h.state
+            .snapshot
+            .set_projection_control(ProjectionControlStatus {
+                requested_renderer: Some(Renderer::Auto),
+                effective_renderer: Some(Renderer::Gpu),
+                warp_available: Some(true),
+                ..Default::default()
+            });
+        let saved = h.state.store.replace(exact_saved()).unwrap();
+        let store = h.state.store.clone();
+        let put = move |d: &DesiredState| {
+            let (_, version) = store.effective_with_version();
+            Request::builder()
+                .method("PUT")
+                .uri("/api/v1/config")
+                .header("content-type", "application/json")
+                .header("if-config-generation", version.generation.to_string())
+                .header("if-config-epoch", version.epoch)
+                .body(Body::from(serde_json::to_vec(d).unwrap()))
+                .unwrap()
+        };
+        let mut start = saved.clone();
+        start.committed = false;
+        // Coming back to the saved document byte for byte leaves a working
+        // copy with no edit in it: the store reports it as committed, so it
+        // serializes exactly as the saved document does.
+        let saved_json = serde_json::to_string(&saved).unwrap();
+        for to in [ProjectionMode::Simple, ProjectionMode::Warp] {
+            let response = app
+                .clone()
+                .oneshot(put(&with_mode(&start, to)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{to:?}");
+            let left = h.state.store.effective();
+            assert_eq!(left, with_mode(&start, to), "{to:?}");
+            let response = app
+                .clone()
+                .oneshot(put(&with_mode(&left, ProjectionMode::Exact)))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200, "{to:?}");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let returned: DesiredState = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                serde_json::to_string(&returned).unwrap(),
+                saved_json,
+                "{to:?}"
+            );
+            assert_eq!(
+                serde_json::to_string(&h.state.store.effective()).unwrap(),
+                saved_json,
+                "{to:?}"
+            );
+            assert!(!h.state.store.has_unsaved_edits(), "{to:?}");
+        }
     }
 }

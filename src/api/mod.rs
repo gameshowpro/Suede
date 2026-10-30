@@ -359,12 +359,25 @@ impl ValidationContext {
 /// Takes no lock of its own, so it is safe to call from inside a state-store
 /// transition — which is where it has to run, or another client's write could
 /// land between the check and the swap.
+///
+/// Before validating, `next` gets Simple's retention refill and, when the
+/// projection mode changes, the Exact-mode switching rules
+/// ([`crate::projection_policy::transition`]): entering Exact may reset
+/// `next`'s geometry, so the document a caller gets back is the one stored.
 pub fn validate_configuration_against(
     next: &mut DesiredState,
     previous: &DesiredState,
     context: &ValidationContext,
 ) -> ApiResult<()> {
     crate::projection_policy::preserve_retained(next, previous);
+    crate::projection_policy::transition(next, previous, context.allow_overlaps).map_err(
+        |errors| {
+            ApiError::Validation(format!(
+                "cannot reset to the exact-mode defaults: {}",
+                errors.join("; ")
+            ))
+        },
+    )?;
     validate_configuration_literal(next, previous, context)
 }
 

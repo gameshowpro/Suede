@@ -71,6 +71,19 @@ pub struct DesiredState {
 pub struct ProjectionConfig {
     /// Which geometry pipeline is requested. Warp settings remain retained
     /// while simple mode is active.
+    ///
+    /// Switching to `exact` judges the document the write produces, any
+    /// geometry edits in the same request included, as one merged document
+    /// with the previous working copy: an omitted `canvas` or output
+    /// `geometry` keeps the previous one, so a bare `{"mode":"exact"}`
+    /// switches the current layout. Corner and center correction is stripped
+    /// (Exact does not retain it), and if the result satisfies the Exact
+    /// rules it is kept as it is; otherwise its canvas and slices are reset
+    /// to the Exact defaults derived from the outputs' positions. Writes
+    /// that stay in `exact` are literal. Switching from `exact` to
+    /// `simple` or `warp` changes only the mode, since an Exact document
+    /// already renders identically in both, so switching straight back
+    /// reproduces the same document.
     pub mode: ProjectionMode,
     /// Shared canvas dimensions for Simple, Warp, and capability fallback.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -608,14 +621,30 @@ impl DesiredState {
             }
         }
 
-        // A shared canvas has one complete configured roster in either
+        // A shared canvas has one complete configured roster in every
         // pipeline, including disconnected enabled outputs.
-        let shared = projection.canvas.is_some() || projection.mode == ProjectionMode::Warp;
+        let mut shared = projection.canvas.is_some() || projection.mode.requires_canvas();
+        let exact = match projection.mode {
+            ProjectionMode::Exact => true,
+            ProjectionMode::Simple | ProjectionMode::Warp => false,
+        };
+        // Exact on an appliance that cannot have it is refused with that one
+        // reason, rather than with every shared-canvas rule the document
+        // would also have to meet: none of them can make it acceptable.
+        if exact {
+            if let Some(reason) = super::exact::unavailable_reason(allow_overlaps) {
+                errors.push(reason.into());
+                shared = false;
+            }
+        }
         // One fact about the whole document, not one per output: emitted
         // here instead of inside the per-output loop below, which used to
         // repeat it once for every enabled output.
         if shared && projection.canvas.is_none() {
-            errors.push("projection.canvas is required in warp mode".into());
+            errors.push(format!(
+                "projection.canvas is required in {} mode",
+                projection.mode.name()
+            ));
         }
         let mut warp_slices = Vec::new();
         let enabled_count = self.outputs.iter().filter(|output| output.enable).count();
@@ -666,7 +695,7 @@ impl DesiredState {
                 errors.push(format!("{prefix}.mode allocation exceeds the 32MP limit"));
             }
             if let Err(error) =
-                output.presentation_dimensions(mode, projection.mode == ProjectionMode::Warp)
+                output.presentation_dimensions(mode, projection.mode.applies_correction())
             {
                 errors.push(format!("{prefix} {error}"));
             }
@@ -689,6 +718,10 @@ impl DesiredState {
                     if let Err(error) = validate_slices(canvas, &warp_slices) {
                         errors.push(format!("projection slices {error}"));
                     }
+                }
+                // The strictly one-to-one rules, on top of everything above.
+                if exact {
+                    errors.extend(super::exact::rule_problems(self, canvas));
                 }
             }
         }
@@ -750,7 +783,7 @@ impl DesiredState {
                     match &self.projection {
                         Some(projection) if projection.renderer != Renderer::Cpu
                             && projection.black_lift.adaptive().is_none()
-                            && (projection.canvas.is_some() || projection.mode == ProjectionMode::Warp) => {}
+                            && (projection.canvas.is_some() || projection.mode.requires_canvas()) => {}
                         _ => errors.push(format!("{prefix}.sharedInput requires a GPU canvas without adaptive black lift")),
                     }
                 }

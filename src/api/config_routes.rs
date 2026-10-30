@@ -705,8 +705,16 @@ pub async fn get_projection(
                        projection body that omits `canvas` keeps the \
                        previously saved canvas rather than clearing it, so \
                        a Simple-mode save cannot accidentally discard a \
-                       retained Warp canvas. PUT is otherwise literal. To \
-                       actually clear the shared canvas, use DELETE \
+                       retained Warp canvas. A body that switches the mode \
+                       to `exact` likewise keeps the previous canvas when it \
+                       omits one, and the merged document is kept (stripped \
+                       of corner and center correction) if it satisfies the \
+                       Exact rules, or reset to the Exact defaults derived \
+                       from the outputs' positions otherwise; a bare \
+                       `{\"mode\":\"exact\"}` therefore keeps a layout that \
+                       already conforms. Writes that stay in Exact are \
+                       literal. PUT is otherwise literal. To actually clear \
+                       the shared canvas, use DELETE \
                        /config/projection/canvas.",
         body = DesiredState),
         (status = 422, description = "Validation failed"),
@@ -2917,6 +2925,237 @@ mod tests {
         assert!(
             harness.requests.try_recv().is_err(),
             "an arrangement-only burst must not enqueue an ordinary debounced request"
+        );
+    }
+
+    // --- exact mode --------------------------------------------------------
+
+    /// Four 1920x1080 outputs positioned as a 2x2 grid with 160 px overlaps
+    /// (a 3680x2000 bounding box), in Simple mode, with slices normalized by
+    /// `unit` pixels on `canvas`.
+    fn simple_grid(canvas: CanvasConfig, unit: f64) -> DesiredState {
+        let mut document = DesiredState::new();
+        for (index, (x, y)) in [(0, 0), (1760, 0), (0, 920), (1760, 920)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut output = OutputConfig::new(OutputMatch::by_name(format!("HDMI-{}", index + 1)));
+            output.mode = Some(Mode {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60.0,
+            });
+            output.position = Some(crate::model::Position { x, y });
+            let slice = crate::model::CanvasRect {
+                x: f64::from(x) / unit,
+                y: f64::from(y) / unit,
+                width: 1920.0 / unit,
+                height: 1080.0 / unit,
+            };
+            output.geometry = Some(crate::model::OutputGeometry {
+                slice,
+                corners: crate::model::exact::UNIT_CORNERS,
+                center: crate::model::exact::NEUTRAL_CENTER,
+                raster_footprint: slice,
+            });
+            document.outputs.push(output);
+        }
+        document.projection = Some(ProjectionConfig {
+            canvas: Some(canvas),
+            ..ProjectionConfig::default()
+        });
+        document
+    }
+
+    /// The grid on a canvas of the right aspect but half the width, so
+    /// every slice is fractional in pixels.
+    fn fractional_simple_grid() -> DesiredState {
+        simple_grid(
+            CanvasConfig {
+                aspect: 3680.0 / 2000.0,
+                render_width: 1840,
+            },
+            3680.0,
+        )
+    }
+
+    /// The grid 1:1 on a 4000x2000 canvas, larger than the outputs'
+    /// bounding box, so a reset (which derives 3680x2000) is told apart from
+    /// a keep.
+    fn conforming_simple_grid() -> DesiredState {
+        simple_grid(
+            CanvasConfig {
+                aspect: 2.0,
+                render_width: 4000,
+            },
+            4000.0,
+        )
+    }
+
+    fn harness_with(allow_overlaps: bool, document: DesiredState) -> Harness {
+        let mut harness = harness(None);
+        std::sync::Arc::make_mut(&mut harness.state.bootstrap).allow_overlaps = allow_overlaps;
+        harness.router = crate::api::router(harness.state.clone());
+        harness
+            .state
+            .store
+            .update(|stored| *stored = document)
+            .unwrap();
+        harness
+    }
+
+    fn exact_grid() -> DesiredState {
+        let mut document = fractional_simple_grid();
+        document.projection.as_mut().unwrap().mode = crate::model::ProjectionMode::Exact;
+        crate::model::exact::defaults(&document).unwrap()
+    }
+
+    #[tokio::test]
+    async fn switching_a_fractional_simple_layout_to_exact_resets_it_to_the_defaults() {
+        let harness = harness_with(true, fractional_simple_grid());
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"mode":"exact"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let effective = harness.state.store.effective();
+        assert_eq!(body, serde_json::to_value(&effective).unwrap());
+        let projection = effective.projection.as_ref().unwrap();
+        assert_eq!(projection.mode, crate::model::ProjectionMode::Exact);
+        assert_eq!(projection.canvas.unwrap().dimensions(), Ok((3680, 2000)));
+        let mut expected = fractional_simple_grid();
+        expected.projection = Some(ProjectionConfig {
+            mode: crate::model::ProjectionMode::Exact,
+            ..ProjectionConfig::default()
+        });
+        let expected = crate::model::exact::defaults(&expected).unwrap();
+        assert_eq!(effective.outputs, expected.outputs);
+        assert_eq!(effective.projection, expected.projection);
+        assert!(crate::model::exact::conforms(&effective).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_bare_switch_to_exact_keeps_a_conforming_layout() {
+        let stored = conforming_simple_grid();
+        assert!(crate::model::exact::conforms(&stored).is_ok());
+        let harness = harness_with(true, stored.clone());
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"mode":"exact"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let effective = harness.state.store.effective();
+        let projection = effective.projection.as_ref().unwrap();
+        assert_eq!(projection.mode, crate::model::ProjectionMode::Exact);
+        // Kept: the omitted canvas is the stored 4000x2000 one, not the
+        // 3680x2000 a reset would derive, and no slice moved.
+        assert_eq!(
+            projection.canvas,
+            stored.projection.as_ref().unwrap().canvas
+        );
+        assert_eq!(effective.outputs, stored.outputs);
+        assert!(effective.validate(true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_bare_switch_to_exact_resets_a_non_conforming_layout() {
+        let stored = fractional_simple_grid();
+        assert!(crate::model::exact::conforms(&stored).is_err());
+        let harness = harness_with(true, stored.clone());
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"mode":"exact"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let effective = harness.state.store.effective();
+        let canvas = effective.projection.as_ref().unwrap().canvas.unwrap();
+        assert_eq!(canvas.dimensions(), Ok((3680, 2000)));
+        assert_ne!(Some(canvas), stored.projection.as_ref().unwrap().canvas);
+        assert_ne!(effective.outputs, stored.outputs);
+        for output in &effective.outputs {
+            assert_eq!(output.scale, Some(1.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_on_a_tiled_appliance_is_refused_with_the_tiled_reason() {
+        let mut document = DesiredState::new();
+        document.outputs.push(serde_json::from_str(OUTPUT).unwrap());
+        let harness = harness_with(false, document);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"mode":"exact"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["detail"], crate::model::exact::TILED_REASON, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_write_in_exact_mode_with_a_non_unit_scale_is_refused() {
+        let harness = harness_with(true, exact_grid());
+        let (_, mut config) = call(&harness, "GET", "/api/v1/config", None).await;
+        config["outputs"][1]["scale"] = serde_json::json!(2.0);
+        config["committed"] = serde_json::json!(false);
+        let (status, body) =
+            call(&harness, "PUT", "/api/v1/config", Some(&config.to_string())).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["detail"], "outputs[1].scale must be 1.0 in exact mode",
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_arrangement_at_another_content_scale_is_refused_in_exact_mode() {
+        let harness = harness_with(true, exact_grid());
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection/arrangement",
+            Some(r#"{"rows":2,"columns":2,"contentScale":0.9}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert!(
+            body["detail"].as_str().unwrap().contains(
+                "projection.arrangement.contentScale is 0.9; exact mode arranges at content \
+                 scale 1"
+            ),
+            "{body}"
+        );
+        assert_eq!(harness.state.store.effective(), harness.state.store.get());
+    }
+
+    #[tokio::test]
+    async fn a_reset_that_cannot_be_derived_is_a_422_naming_the_output() {
+        let mut document = fractional_simple_grid();
+        document.outputs[3].position = None;
+        let harness = harness_with(true, document);
+        let (status, body) = call(
+            &harness,
+            "PUT",
+            "/api/v1/config/projection",
+            Some(r#"{"mode":"exact"}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(
+            body["detail"],
+            "cannot reset to the exact-mode defaults: outputs[3].position is required for a \
+             shared canvas",
+            "{body}"
         );
     }
 }
