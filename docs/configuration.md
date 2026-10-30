@@ -1429,6 +1429,7 @@ Warp adds retained corner and center correction to the same content selection:
 | Field | Type | Default | Meaning |
 |---|---|---|---|
 | `mode` | string | `simple` | `exact`, `simple` or `warp`; see [Projection modes](#projection-modes). `exact` is strictly one-to-one at whole-pixel positions; `simple` crops and scales the shared canvas; `warp` adds retained geometric correction. A write that changes the mode and the geometry in one request is judged as one merged document |
+| `sliceUnits` | string | `percent` when absent; `pixels` for a new canvas | `percent` or `pixels`: the unit every output's `geometry.slice`, `geometry.rasterFootprint` and `arrangeOffset` is stored in. The slicer crops whole canvas pixels either way; see [Slice units](#slice-units). Omitted from the saved document while it is `percent` |
 | `canvas` | object or null | `null` | Shared `aspect` and authoritative `renderWidth`. Required for Warp; when absent, Simple uses integer output positions. `scale` is deprecated metadata and has no rendering effect |
 | `blend` | bool | `true` | `false` slices without ramps — overlapping beams still need the duplication, just unfaded |
 | `gamma` | number | `2.2` | The projectors' transfer gamma, 1.0-4.0; shapes every ramp's fall-off |
@@ -1561,7 +1562,7 @@ chosen filter is a poor fit:
 | Mode | What each output shows | Scale and correction | Use it when |
 |---|---|---|---|
 | `exact` | Exactly its own raster's worth of canvas pixels, at whole-pixel canvas coordinates | Output scale 1, no corner or center correction, no resampling | Pixel-for-pixel fidelity matters: LED walls, tiled panels, content authored at the wall's resolution |
-| `simple` (default) | A rectangular crop of the canvas, scaled to the raster | Any scale; fractional crops allowed | Flat layouts that need scaling or a canvas that is not the outputs' pixel size |
+| `simple` (default) | A rectangular crop of the canvas, scaled to the raster | Any scale; the crop is always whole canvas pixels | Flat layouts that need scaling or a canvas that is not the outputs' pixel size |
 | `warp` | The same crop, geometrically fitted to the surface | Retained corner pins and center remap | Projectors on curved, tilted or angled surfaces |
 
 The three modes share one canvas and the same `geometry.slice` crops. The mode
@@ -1616,7 +1617,11 @@ output scale 1`. See [`allow_overlaps`](#direct-scanout).
 Whenever a write changes `projection.mode`, the daemon applies the switch as
 one merged document:
 
-- **Into Exact** (from Simple or Warp). Corner pins and centers are stripped,
+- **Into Exact** (from Simple or Warp). Exact stores only pixels, so slices
+  and offsets are first converted to `pixels` (edges rounded; see
+  [Slice units](#slice-units)) and the layout is judged on the result: a
+  layout within half a pixel of one-to-one is kept. Corner pins and centers
+  are stripped,
   and the arrangement record is dropped unless it is valid in Exact. If the
   result satisfies the Exact rules, it is kept: slices, canvas and everything
   else stay as they were. Otherwise the layout is **reset** to the Exact
@@ -1637,7 +1642,8 @@ one merged document:
   already carries identity pins, a centered remap, scale 1 and whole-pixel
   slices, which Simple and Warp render pixel for pixel the same way.
 - **Round trip.** Exact to Simple to Exact, and Exact to Warp to Exact, with no
-  edits in between give a byte-identical document. Simple and Warp keep their
+  edits in between give a byte-identical document: leaving Exact keeps
+  `pixels`. Simple and Warp keep their
   own [retained calibration](#retaining-calibration) behavior.
 
 `GET /api/v1/projection/exact-transition` tells a client what a switch would do
@@ -1740,10 +1746,10 @@ Shared canvas rendering has explicit canvas and per-output geometry:
 |---|---|---|
 | `canvas.aspect` | positive number | Canvas width divided by height in isotropic canvas units |
 | `canvas.renderWidth` | integer | Chosen canvas width. It is authoritative; height is `round(renderWidth / aspect)`, at least one pixel |
-| `geometry.slice` | rectangle | The content rectangle in canvas units (`x`, `y`, `width`, `height`) |
+| `geometry.slice` | rectangle | The content rectangle (`x`, `y`, `width`, `height`) in the unit `projection.sliceUnits` names: fractions of the canvas in `percent`, whole canvas pixels in `pixels` |
 | `geometry.corners` | four pairs | Destination pins in output-local normalized coordinates, ordered TL, TR, BR, BL. Identity is `[[0,0],[1,0],[1,1],[0,1]]` |
 | `geometry.center` | pair | Horizontal and vertical center fractions, normally `[0.5,0.5]`, each constrained to `0.01..=0.99` |
-| `geometry.rasterFootprint` | rectangle | The calibrated light footprint in canvas units, independent of slice placement and pin edits |
+| `geometry.rasterFootprint` | rectangle | The calibrated light footprint, in the same unit as the slice (a measurement, so it need not be whole pixels), independent of slice placement and pin edits |
 
 !!! warning "Alpha-breaking rename: `source` is now `slice`"
     The field was named `geometry.source` before this release. Every response
@@ -1761,8 +1767,10 @@ the browser or change a neighbor's slice coverage.
 Canvas coordinates use `[0,1] × [0,1/aspect]`. If `renderWidth` is `W`, the
 canvas height is `H = max(1, round(W/aspect))`, with positive half-way values
 rounded up; `renderWidth` is the chosen allocation, with no separate scale
-field. A slice rectangle's
-continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`.
+field. In `percent`, a slice rectangle's
+continuous pixel rectangle is `[W*x, aspect*H*y, W*width, aspect*H*height]`,
+and the crop is that rectangle with its edges rounded to whole pixels (see
+[Slice units](#slice-units)).
 Corners are normalized to the output's as-viewed raster (the upright picture
 an operator sees on the mounted display after the output transform) and are
 ordered top-left, top-right, bottom-right, bottom-left. That raster is
@@ -1778,13 +1786,140 @@ canvas must be complete, and the appliance must set `allow_overlaps = true`.
 
 Every retained geometry is numerically validated even in Simple. With a shared
 canvas in either mode, each slice must have finite positive dimensions, visible canvas area,
-and coordinates bounded by ±16 times `max(1, 1/aspect)`. The clipped slice
+and coordinates bounded by ±16 times `max(1, 1/aspect)` (in `pixels`, the same
+bound applied to the pixels' equivalent fractions). A slice that rounds to less
+than one whole pixel on either axis is a `422`: `geometry.slice rounds to 0×1080
+canvas pixels; a slice needs at least one whole pixel on each axis`. The clipped slice
 graph must be connected through positive-area overlap or a shared edge
 segment; point contacts and gaps do not connect it. A pair whose original
 rectangles overlap by at least 80% of the smaller rectangle is a near-total
 stack. Stacks are accepted only when every pair is a stack; mixed stack/seam
 layouts are rejected. `rasterFootprint` is separate physical calibration and
 is initially copied from `slice` by conversion.
+
+#### Slice units {: #slice-units }
+
+`projection.sliceUnits` says what `geometry.slice`, `geometry.rasterFootprint`
+and `outputs[].arrangeOffset` are stored in. There is one unit per
+installation, so a resolution change treats every slice alike.
+
+| Unit | What is stored | The truth is | Wire form |
+|---|---|---|---|
+| `percent` | Fractions of the canvas, in the canvas units above: `x` and `width` over the canvas width, `y` and `height` over the same unit | The stored fractions; pixels are derived when they are used | Omitted: a document without `sliceUnits` is `percent` |
+| `pixels` | Whole canvas pixels from the canvas's top-left corner | The stored integers | `"sliceUnits": "pixels"` |
+
+**The slicer always crops whole canvas pixels.** A sub-pixel crop never makes
+sense, so whichever unit is stored, the crop is derived by rounding the
+rectangle's edges: `left = round(x·W)`, `right = round((x + width)·W)`,
+`width = right − left`, and likewise vertically, rounding half up. Rounding
+edges rather than sizes keeps neighbors that touch or overlap consistent: two
+slices sharing an edge share the rounded edge, and an overlap is the same
+whole number of pixels from either side. Nothing rounded is written back, so
+`percent` documents never drift.
+
+**A canvas resolution change** (a new `renderWidth`, or the rendering-scale
+presets):
+
+- In `percent`, the stored fractions are kept and the crop is derived again
+  from them, so every slice rescales with the canvas. Changing the width back
+  restores the original pixels, however many changes came in between.
+- In `pixels`, the stored integers are kept. A slice then no longer lines up
+  with the same part of the content, and one that now extends past the canvas
+  is reported, not moved (see [Slices past the canvas](#slices-past-the-canvas)).
+
+**Switching units converts.** A write that names a different `sliceUnits`
+converts every output's `geometry.slice`, `geometry.rasterFootprint` and
+`arrangeOffset` that it leaves unchanged from the previous working copy, and
+takes the ones it changes literally, in the unit it names. `percent` to
+`pixels` rounds the edges (the only time a stored value is rounded);
+`pixels` to `percent` is an exact division. The raster footprint is a
+measurement, so it is converted without rounding, except that a footprint
+equal to the slice stays equal to it. There is no separate switch endpoint:
+write the document with `sliceUnits` changed, or use the radio below.
+
+**An omitted unit keeps the current one.** A write with no
+`projection.sliceUnits` is read in the unit the previous working copy had, so
+a client that predates the field is unaffected. The one exception is a write
+that creates the canvas where there was none: **new canvases use `pixels`**,
+and the slices such a write carries are converted from fractions.
+**Exact mode always stores `pixels`**: entering Exact converts to pixels (see
+[Switching into and out of Exact](#exact-switching)), and leaving Exact keeps
+them, so the round trip stays byte-identical.
+
+**Blend footprints and arrangement offsets follow the unit.**
+`rasterFootprint` and `arrangeOffset` are in the same unit as the slice. In
+`pixels`, [grid arrangement](#grid-arrangement) writes rounded whole-pixel
+slices and `arrangeOffset` is in canvas pixels; in `percent` it writes the
+exact solution fractions and the offset is in canvas fractions.
+
+**A fractional pixel is refused.** While the unit is `pixels`, a non-integer
+`geometry.slice` value is a `422`, in every mode:
+
+```text
+outputs[1].geometry geometry.slice must be whole canvas pixels while projection.sliceUnits is "pixels"; x is 2000.5
+```
+
+##### Slices past the canvas {: #slices-past-the-canvas }
+
+A slice may extend past the canvas as long as part of it lies on the canvas.
+This happens in `pixels` when the canvas shrinks under fixed slices (the
+rendering-scale presets leave the slices where they are), and in either unit
+when a slice is dragged or arranged past an edge. The write is accepted and
+the daemon reports it; the part of the slice off the canvas renders black.
+Exact mode keeps its hard rule that every slice lies inside the canvas, and a
+slice with no area on the canvas at all stays a `422`.
+
+The report is `outOfCanvas`, in `projection.geometry` of the projection status
+and in the recommendation response, an array with one entry per enabled
+output that overhangs, omitted when empty:
+
+```json
+{
+  "output": "DP-2",
+  "left": 0, "top": 0, "right": 960, "bottom": 0,
+  "message": "DP-2 extends 960 px past the canvas's right edge"
+}
+```
+
+`output` is the key `PUT /config/outputs/{key}` takes. `left`, `top`, `right`
+and `bottom` are whole canvas pixels of the slice past each edge, `0` where it
+does not. `message` names every edge that overhangs, for example `DP-2 extends
+10 px past the canvas's left edge and 960 px past its right edge`. The
+recommendation also repeats each message among its `warnings`.
+
+In the web UI the Displays diagram hatches the part of each display's box that
+lies outside the canvas, in both units and every mode, and shows the daemon's
+message.
+
+##### In the reference UI {: #slice-units-ui }
+
+The **Slice from canvas** panel (X, Y, Width and Height of the selected
+output's slice, plus Content scale in Simple and Warp) has a **Percent |
+Pixels** choice. The choice is the stored `projection.sliceUnits`, not a
+display preference: changing it converts the slices as described above, and
+every write the page makes names the unit. It is hidden in Exact, which is
+always pixels. The panel adds a line saying what the current mode does with
+the rectangle, and shows the derived crop size and scale (for example `100% ·
+1:1`). Dragging a display in the diagram and nudging it with the arrow keys
+move by whole canvas pixels in both units; in `percent` the page stores
+`pixels / canvas`.
+
+##### For API clients {: #slice-units-clients }
+
+- Percent documents and writes behave as before. A document without
+  `sliceUnits` is `percent` and is neither converted nor rewritten when this
+  version first opens it.
+- A client that does not send `sliceUnits` keeps the stored unit, so it keeps
+  working in whichever the installation uses. A client that reads
+  `geometry.slice` must read `projection.sliceUnits` first: the same numbers
+  mean fractions in `percent` and pixels in `pixels`.
+- Read `outOfCanvas` rather than recomputing overhangs.
+
+!!! warning "Rolling back to an older build"
+    An older build does not know `sliceUnits` and refuses a document that
+    carries `"sliceUnits": "pixels"` (an unknown field) rather than misreading
+    it. Before rolling back, switch to `percent`, which writes no field, or
+    restore a saved state that was taken in `percent`.
 
 #### The whole-number chip {: #whole-number-chip }
 
@@ -1861,7 +1996,7 @@ for the canvas, and 32 megapixels per output. Driver and compositor allocation
 limits are unknown and are listed in the response. The endpoint does not
 resize a headless output or probe those limits.
 
-CPU Simple supports fractional crops and content scaling in projection-enabled
+CPU Simple supports arbitrary whole-pixel crops and content scaling in projection-enabled
 builds. Who applies a rotation depends on the renderer. On the GPU renderer
 at output scale `1.0`, the slicer presents a physically oriented buffer and
 declares its orientation with `wl_surface.set_buffer_transform`, so a rotated
@@ -2028,8 +2163,9 @@ as usual, where the same values are `projection.arrangement`; it carries no
 `limits` of its own — re-read either `GET` after a change to refresh them,
 since they reflect the document state the solve ran against.
 
-**`outputs[].arrangeOffset`** (`{x, y}`, normalized canvas units — the same
-space as `geometry.slice` — default `{0, 0}`) nudges one output's placement
+**`outputs[].arrangeOffset`** (`{x, y}`, in the same unit as
+`geometry.slice` — canvas fractions in `percent`, canvas pixels in `pixels` —
+default `{0, 0}`) nudges one output's placement
 after the solve, without moving anything else in the grid: the solver adds
 it to that output's computed `slice.x`/`slice.y` once placement is
 otherwise finished. `unusedCanvas`, `overhang`, the `allowUnusedCanvas` gate,
@@ -2278,10 +2414,14 @@ See the [Displays tab](screenshots.md#displays) for the Warp pin editor.
 Crop X/Y are canvas pixels. Content scale is enlargement from canvas pixels
 to output pixels: 200% maps a 960×540 crop to a 1920×1080 output. This differs
 from compositor **Output scale** and the read-only global **Rendering scale**.
-The canonical stored values are normalized rectangles; displayed crop pixels
-and percentages are derived, never separately stored. Width-only changes
-preserve those rectangles, pins, and physical footprints, avoiding drift on
-repeated resolution changes. Aspect edits keep crop pixel origins and content
+The stored values are in the unit chosen with the **Percent | Pixels** choice
+of the **Slice from canvas** panel (see [Slice units](#slice-units)); the crop
+pixels shown are the whole pixels the slicer uses, derived and never
+separately stored. In percent, width-only changes preserve the stored
+rectangles, pins, and physical footprints, so the slices rescale with the
+canvas and repeated resolution changes never drift. In pixels, they leave the
+stored pixels alone, and a slice left past the canvas is hatched in the
+diagram and reported. Aspect edits keep crop pixel origins and content
 scale anchored, exposing unused or out-of-bounds areas for adjustment.
 
 **Arrange automatically** accepts positive integer rows/columns, a Content

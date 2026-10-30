@@ -8,7 +8,7 @@ These are captures of the bundled reference web UI, which the daemon serves at `
 
 ## Displays {: #displays }
 
-The **Displays** tab on a healthy system: the layout and canvas settings, the test pattern picker, a preview of the canvas with the overlap regions drawn in, the outputs table, the edge blending and frame timing cards, and the per-output settings, shared content selection and Warp pin editor further down.
+The **Displays** tab on a healthy system: the layout and canvas settings, the test pattern picker, a preview of the canvas with the overlap regions drawn in, the outputs table, the edge blending and frame timing cards, and the per-output settings, the Slice from canvas panel and Warp pin editor further down.
 
 [![The Displays tab with four connected outputs, the canvas preview, edge blending and frame timing cards, and the Warp geometry editor](assets/screenshots/displays.avif){ width="1852" height="2070" loading=lazy }](assets/screenshots/displays.avif)
 
@@ -70,3 +70,10 @@ The Displays tab also gained the whole-number chip: a green **1:1 verified** (or
 - `assets/screenshots/details/unplugged-outputs.avif`
 
 Read more: [The whole-number chip](configuration.md#whole-number-chip).
+
+The Displays tab's content panel was renamed **Slice from canvas** and gained the **Percent | Pixels** choice; the diagram now hatches the part of a slice that lies outside the canvas. These captures predate both, so they need retaking:
+
+- `assets/screenshots/displays.avif`
+- `assets/screenshots/displays-disconnected.avif`
+
+Read more: [Slice units](configuration.md#slice-units).

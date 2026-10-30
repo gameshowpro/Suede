@@ -27,7 +27,7 @@ display**, and each term below is owned by exactly one stage:
 | Term | Pipeline stage | Coordinate space | Where it appears |
 |---|---|---|---|
 | canvas | shared content surface every output samples | normalized units: x 0..1, y 0..1/aspect | `projection.canvas` |
-| slice | the canvas region one output samples | canvas units | `geometry.slice` (formerly `source`) |
+| slice | the canvas region one output samples | fractions of the canvas or whole canvas pixels, per `projection.sliceUnits` | `geometry.slice` (formerly `source`) |
 | warp | projective correction applied to a slice | destination pins on the output | `geometry.corners`, `geometry.center`, `projection.mode: warp` |
 | output | the connector the compositor drives | raster pixels | `outputs[]`, `match` |
 | display | the physical device attached to an output | physical | observed state (`/outputs`), divergences |
@@ -627,7 +627,7 @@ See the [Displays tab](screenshots.md#displays) for the modes in the web UI.
 #### The Shared Virtual Canvas Architecture
 In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Exact, Simple and Warp share one virtual canvas and identical output slice crops (`geometry.slice`)**:
 - The headless browser renders to an isotropic continuous canvas `[0, 1] × [0, 1/aspect]`.
-- Each output display selects its rectangular content region in normalized canvas units.
+- Each output display selects its rectangular content region of the canvas, stored as fractions of the canvas (`percent`) or as whole canvas pixels (`pixels`). Either way the slicer crops whole canvas pixels, rounding the region's edges, never a sub-pixel crop. See [Slice units](configuration.md#slice-units).
 - In **Exact mode**, that content rectangle is exactly the output's raster at whole-pixel coordinates, so the mapping is an integer copy.
 - In **Simple mode**, that content rectangle is mapped directly to the output raster.
 - In **Warp mode**, the exact same content rectangle is geometrically warped to the destination corner pins in the output raster.
