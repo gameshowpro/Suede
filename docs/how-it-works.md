@@ -697,6 +697,25 @@ For each output pixel, the GPU fragment shader:
 
 **Precision.** The GPU readback tests compare the shader against an independent CPU reference on [System A](developer/test-systems.md#system-a), counting the largest per-channel error in 8-bit units. The allowed tolerance per filter is `nearest` 0, `area` 0, `bilinear` 1, `bicubic` 1 and `lanczos` 2. The measured worst error was 0 for `nearest`, `area` and `lanczos`, and 1 for `bilinear` and `bicubic`. The integer copy for 1:1 outputs is tested at tolerance 0 for every transform.
 
+#### Pixel-exact verification {: #pixel-exact-verification }
+`samplingMode: exact` on `control.outputs[]` means the output's pixels are a byte-for-byte copy of canvas pixels: the slicer reads the source texel at an integer index and writes it unchanged, with no filter and no interpolation. The integer copy covers all eight transforms (the four rotations and their mirrored forms), because the slicer permutes the texel index instead of sampling, so a rotated or flipped output at 1:1 with identity pins is as exact as an unrotated one.
+
+The [`coordinates` test pattern](configuration.md#projection-test-patterns) makes that claim checkable. Every canvas pixel is colored by its own position, so a capture of an output can be compared byte for byte against the encoding of the canvas pixels it should show. Turn off `blend` and set `blackLift` to 0 first.
+
+To run the check on an appliance, use `scripts/verify-exact-mapping.sh`; `scripts/exact-mapping/README.md` describes the static and browser variants, the flag sets tried, and the measured results.
+
+**Result on [System A](developer/test-systems.md#system-a).** Four 1920×1080 outputs on a 3840×2160 canvas, two of them at transform 180, all reporting `exact`:
+
+- The static pattern was exact on every output, including both 180 outputs.
+- Browser content was exact except for one canvas column, x = 2048, whose red value was one too high. The same column is already present in the compositor's headless source output, so it arrives before Suede captures anything and the slicer copied it faithfully. It is intermittent.
+- **No launcher flag was shown to fix it.** The column appeared with the launcher preset (6 of 8 runs), `--force-color-profile=srgb` (1 of 1) and `--disable-gpu-rasterization` (3 of 4). The single run with `--disable-accelerated-2d-canvas` was clean, but the preset was also clean in 2 of its 8 runs, so one clean run is not evidence. Suede therefore adds no launcher flag for it.
+
+**Boundaries.**
+
+- The harness captures through compositor screencopy, which is not scanout. It shows what the compositor presents, not what the display controller emits. The `direct-scanout` health check reports whether outputs are scanned out zero-copy, but nothing reads back the scanned-out pixels.
+- The static pattern is rendered inside Suede and does not cross the source capture, so it says nothing about that stage.
+- Rendering inside the browser is outside Suede. The harness cannot tell a browser fault from a compositor fault without a capture taken from inside the browser.
+
 #### 7. Interactive Low-Overhead Repainting
 Dragging corner pins or adjusting center fractions is not all GPU work:
 - The transformation matrices and transfer tables are rebuilt on builder threads, off the render thread, so a drag does not stall presentation — but the rebuild itself is CPU work, not a GPU control-path operation.
