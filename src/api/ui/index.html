@@ -733,7 +733,16 @@ window.addEventListener("error", (event) => {
             <option value="cpu">CPU</option>
             <option value="gpu">GPU</option>
           </select></div>
+        <div id="pj-filter-field"><label for="pj-filter">Resampling filter</label>
+          <select id="pj-filter">
+            <option value="bilinear">Bilinear</option>
+            <option value="nearest">Nearest</option>
+            <option value="bicubic">Bicubic</option>
+            <option value="lanczos">Lanczos</option>
+            <option value="easu">EASU</option>
+          </select></div>
       </div>
+      <p class="hint" id="pj-filter-hint">Applies where an output does not map 1:1 onto the canvas, on the GPU renderer. Bilinear is smooth and cheapest. Nearest keeps hard pixel edges but only looks even at whole-number scales. Bicubic and Lanczos are sharper when upscaling and cost more GPU time. EASU currently samples bilinear. <a data-docs-path="configuration/#resampling-filter" target="_blank" rel="noopener noreferrer">Learn about resampling filters</a>.</p>
       <p class="hint">Leave free run off to keep displays in step. Turn it on only for mismatched refresh rates; displays may then show different frames. <a data-docs-path="how-it-works/#keeping-the-displays-in-step" target="_blank" rel="noopener noreferrer">Learn about frame synchronization</a>.</p>
       <p class="hint">Auto prefers GPU blending and falls back to CPU. Forcing GPU prevents startup if it is unavailable. <a data-docs-path="how-it-works/#where-the-blend-runs" target="_blank" rel="noopener noreferrer">Learn about renderer choices</a>.</p>
       <div id="pj-timing" hidden style="margin-top:14px">
@@ -743,7 +752,7 @@ window.addEventListener("error", (event) => {
           content is drawing.</p>
         <div class="table-scroll" role="region" aria-label="Frame timing summary" tabindex="0"><table id="pj-timing-table"><tbody id="pj-timing-rows"></tbody></table></div>
         <div class="table-scroll" role="region" aria-label="Timing by output" tabindex="0"><table id="pj-timing-outputs-table" style="margin-top:8px"><thead><tr>
-          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th><th>Request to present</th><th>GPU span</th>
+          <th>Output</th><th>Presented</th><th>Discarded</th><th>Zero-copy</th><th>Refresh</th><th>Phase</th><th>Lag</th><th>Request to present</th><th>GPU span</th><th>Sampling</th>
         </tr></thead><tbody id="pj-timing-outputs"></tbody></table></div>
         <p class="hint" id="pj-timing-hint">These measurements describe presentation timing, not capture-to-glass latency. <a data-docs-path="how-it-works/#reading-frame-timing" target="_blank" rel="noopener noreferrer">Reading frame timing</a>.</p>
       </div>
@@ -3338,6 +3347,13 @@ function renderProjection(force = false) {
   for (const [id, key, fallback, digits] of [["pj-dark", "darkThreshold", .02, 4], ["pj-bright", "brightThreshold", .2, 4], ["pj-rise", "riseMs", 1000, 1], ["pj-fall", "fallMs", 250, 1], ["pj-slew", "slewPerSecond", .1, 6]]) $(id).value = editNumber(lift?.[key] ?? fallback, digits);
   $("pj-free").checked = projection?.freeRun ?? false;
   $("pj-renderer").value = projection?.renderer ?? "auto";
+  // The daemon omits `filter` while it is the default, so a missing field is
+  // bilinear. Exact mode is strictly 1:1, where every filter is neutral, so
+  // the control is hidden there (the field itself is left untouched).
+  $("pj-filter").value = projection?.filter ?? "bilinear";
+  const filterHidden = projection?.mode === "exact";
+  $("pj-filter-field").hidden = filterHidden;
+  $("pj-filter-hint").hidden = filterHidden;
 }
 
 function updateProjectionField(field) {
@@ -3367,6 +3383,11 @@ function updateProjectionField(field) {
   }
   else if (field === "pj-free") projection.freeRun = $("pj-free").checked;
   else if (field === "pj-renderer") projection.renderer = $("pj-renderer").value || "auto";
+  else if (field === "pj-filter") {
+    // Mirror the daemon's omit-when-default so a save never adds the field.
+    const filter = $("pj-filter").value || "bilinear";
+    if (filter === "bilinear") delete projection.filter; else projection.filter = filter;
+  }
   else if (field === "pj-lift-mode") projection.blackLift = $("pj-lift-mode").value === "adaptive" ? adaptiveLift() : level;
   else if (field === "pj-lift") {
     if (typeof projection.blackLift === "object" && projection.blackLift) projection.blackLift = { ...projection.blackLift, level: Number($("pj-lift").value) };
@@ -3864,6 +3885,14 @@ function renderProjectionTiming() {
     const total = lag.zero + lag.one + lag.two + lag.more;
     return total === 0 ? "—" : `${lag.zero}·${lag.one}·${lag.two}·${lag.more}`;
   };
+  // What each output actually samples with, from the slicer's own report
+  // (control.outputs[]); the qualifying note, when there is one, follows.
+  const samplingCell = (name) => {
+    const reported = projectionStats?.control?.outputs?.find((c) => c.name === name);
+    if (!reported?.samplingMode) return "—";
+    return escape(reported.samplingMode) +
+      (reported.samplingNote ? `<br><span class="hint">${escape(reported.samplingNote)}</span>` : "");
+  };
   $("pj-timing-outputs").innerHTML = s.outputs.map((o, index) =>
     `<tr><td class="mono">${escape(o.name)}</td><td>${o.presented}</td>` +
     `<td>${o.discarded}</td><td class="mono">${o.zeroCopyPresented}/${o.presented}</td>` +
@@ -3871,10 +3900,11 @@ function renderProjectionTiming() {
     `<td class="mono">${phaseCell(o)}</td>` +
     `<td class="mono">${lagCell(o.lagFrames)}</td>` +
     `<td class="mono">${timingSummary(o.commitToPresentMs)}</td>` +
-    `<td class="mono">${gpuDistribution(gpuTiming?.outputs?.find((timing) => timing.index === index)?.gpuSpanMs)}</td></tr>`).join("");
+    `<td class="mono">${gpuDistribution(gpuTiming?.outputs?.find((timing) => timing.index === index)?.gpuSpanMs)}</td>` +
+    `<td class="mono">${samplingCell(o.name)}</td></tr>`).join("");
 }
 
-for (const id of ["pj-blend", "pj-highlight-overlaps", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-renderer", "tp-pattern"]) {
+for (const id of ["pj-blend", "pj-highlight-overlaps", "pj-gamma", "pj-lift", "pj-lift-mode", "pj-dark", "pj-bright", "pj-rise", "pj-fall", "pj-slew", "pj-free", "pj-renderer", "pj-filter", "tp-pattern"]) {
   const el = $(id);
   // A number input commits on "change", never on "input": change fires on
   // blur and Enter for typed text, and per step for spinner clicks and

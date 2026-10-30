@@ -176,3 +176,16 @@ narrower than its padding, never produce a negative diagram scale. At wide
 widths it also checks the Displays left/right stacks, the selected output editor
 remaining below Layout, GPU/CPU placement and hiding behavior, and the Apps card
 spanning both columns. Below the breakpoint those groups return to one column.
+
+## Resampling filter browser check
+
+```sh
+NODE_PATH=/tmp/suede-ui-tests/node_modules \
+PLAYWRIGHT_BROWSERS_PATH=/tmp/suede-ui-tests/browsers \
+node tests/ui/filter.cjs
+```
+
+Checks that the **Resampling filter** select treats a missing `filter` as
+`bilinear`, previews a document carrying the chosen filter (omitting it again
+for `bilinear`), shows each output's reported `samplingMode` and `samplingNote`
+in the timing table, and hides in Exact mode without altering the saved value.

@@ -591,8 +591,9 @@ GPU renderer, `allow_overlaps = true`, over one 5 s interval:
 
 The pictures were the same: `grim` captures of the `grid` pattern under
 every transform (`180`, `90`, `270`, `flipped`, `flipped-90`) differed from
-the compositor-rotated build by at most 1/255 per channel, as expected from
-bilinear sampling at exact texel centers.
+the compositor-rotated build by at most 1/255 per channel. That comparison
+predates the integer copy: the slicer now copies a 1:1 rotated or flipped
+output byte for byte (reported as `exact`) rather than sampling it.
 
 A `zeroCopyPresented` of zero while `direct_scanout` is true means the
 compositor refused to flip: the buffer is the wrong size or format for the
@@ -619,7 +620,7 @@ See the [Displays tab](screenshots.md#displays) for both modes in the web UI.
 | **Black Level Compensation** | Fixed or adaptive black lift (see [Adaptive black lift](configuration.md#adaptive-black-lift)) | Fixed or adaptive black lift, same as Simple |
 | **Pipeline Overhead** | Minimal (direct hardware scanning or rectangular blit) | Low GPU fragment shader pass with inverse homography and precomputed transfer tables |
 | **Renderer Compatibility** | GPU and CPU fallback pipelines | Requires the GPU (Vulkan) pipeline; there is no EGL/GLES path |
-| **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity; bilinear interpolation on non-identity pins, or on any rotated output (exact at texel centers) |
+| **Sampling Precision** | Exact integer texel sampling | Exact integer sampling on identity, including 1:1 rotated or flipped outputs; the configured [resampling filter](configuration.md#resampling-filter) on non-identity pins or any non-1:1 scale |
 
 #### The Shared Virtual Canvas Architecture
 In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Simple and Warp share one virtual canvas and identical output slice crops (`geometry.slice`)**:
@@ -687,9 +688,14 @@ For each output pixel, the GPU fragment shader:
 1. Inverse-maps output raster coordinates $(x_{\text{out}}, y_{\text{out}})$ into continuous canvas coordinates $(u, v)$ via inverse homography and center remap.
 2. Samples the canvas:
    - **Identity geometry**: Retains an exact integer texel sampling path for 1:1 pixel-perfect rendering.
-   - **Rotated output** (transform other than `normal`, GPU renderer): always takes the bilinear path, even with identity pins, and reports `bilinear` sampling. Bilinear is exact at texel centers, so the picture is unchanged.
-   - **Non-identity geometry**: Uses hardware bilinear texture filtering (which can slightly soften fine text, recommending a modest increase in UI font scale or render resolution).
+   - **Rotated or flipped output** (transform other than `normal`, GPU renderer): at 1:1 with identity pins it is still an integer copy, with the slicer permuting the texel index instead of sampling, and reports `exact`.
+   - **Any other mapping** (a non-1:1 scale or non-identity geometry): uses the configured resampling filter, `bilinear` by default (which can slightly soften fine text, recommending a modest increase in UI font scale or render resolution). When an axis shrinks by more than 2x, a box average of up to 8x8 source pixels (`area`) is used regardless of the filter. See [Resampling filter](configuration.md#resampling-filter) for choosing one.
+   - **CPU renderer**: content is copied byte for byte at the slice rectangle; the filter applies to the GPU renderer. Only CPU test patterns use the CPU kernels (`nearest`, `bilinear`, `bicubic`).
+
+   When an output cannot use the filter exactly as configured, `samplingNote` on `control.outputs[]` says why: the area box was capped, or the filter (currently `easu`) fell back to bilinear.
 3. Evaluates precomputed transfer tables, indexed in **output raster space** (not canvas space), combining edge-blend ramps, border antialiasing coverage, and black lift.
+
+**Precision.** The GPU readback tests compare the shader against an independent CPU reference on [System A](developer/test-systems.md#system-a), counting the largest per-channel error in 8-bit units. The allowed tolerance per filter is `nearest` 0, `area` 0, `bilinear` 1, `bicubic` 1 and `lanczos` 2. The measured worst error was 0 for `nearest`, `area` and `lanczos`, and 1 for `bilinear` and `bicubic`. The integer copy for 1:1 outputs is tested at tolerance 0 for every transform.
 
 #### 7. Interactive Low-Overhead Repainting
 Dragging corner pins or adjusting center fractions is not all GPU work:

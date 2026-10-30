@@ -1437,7 +1437,7 @@ Warp adds retained corner and center correction to the same content selection:
 | `temporary` | object | `{ "highlightOverlaps": false }` | Temporary calibration aids that are never saved. `highlightOverlaps` draws the seam lineup lines; see [Highlighting overlaps](#highlight-overlaps) |
 | `freeRun` | bool | `false` | Let each output take frames at its own pace instead of all together; see [Keeping the displays in step](how-it-works.md#keeping-the-displays-in-step) |
 | `renderer` | string | `auto` | `auto`, `cpu`, or `gpu`; which pipeline the slicer blends with, see [Where the blend runs](how-it-works.md#where-the-blend-runs) |
-| `filter` | string | `bilinear` | `bilinear`, `nearest`, `bicubic`, `lanczos`, or `easu`; the resampling filter for outputs that do not map 1:1. Accepted and saved now, but it takes effect in a later release: every output still samples bilinear or exact. Omitted from the saved document while it is `bilinear` |
+| `filter` | string | `bilinear` | `bilinear`, `nearest`, `bicubic`, `lanczos`, or `easu`; the resampling filter for outputs that do not map 1:1; see [Resampling filter](#resampling-filter). Omitted from the saved document while it is `bilinear`, so a missing field means `bilinear` |
 | `arrangement` | object or null | `null` | Optional. The resolved record of the last applied [grid arrangement](#grid-arrangement): `{ rows, columns, overlapX, overlapY, contentScale }`. A record of intent, not canonical geometry — a later manual geometry edit leaves it in place |
 
 #### Adaptive black lift
@@ -1506,6 +1506,50 @@ generation shares one level across outputs; independent physical scanout is
 still governed by the existing presentation policy. Capture, logical,
 configuration, and control generations are different identities. Sample age
 continues increasing when the source is static, even after adaptation settles.
+
+#### Resampling filter {: #resampling-filter }
+
+`projection.filter` chooses how the GPU renderer interpolates wherever an
+output does not map one canvas pixel to one output pixel: any scale other than
+exactly 1, and any warped (keystoned) mapping. One setting covers the whole
+installation. It sits beside **Renderer** in the Frame timing card as
+**Resampling filter**.
+
+| Filter | Look | When to use it | GPU cost |
+|---|---|---|---|
+| `bilinear` (default) | Smooth, slightly soft | Anything in motion, warped outputs, and when you are unsure | Cheapest |
+| `nearest` | Hard pixel edges, no blur | Upscaling heavy, pixel-art or fine-grid content by a whole number (2x, 3x, 4x). At other scales, some source pixels repeat and others do not, and thin lines shimmer | Same as bilinear |
+| `bicubic` | Sharper than bilinear with a little edge overshoot | Upscaling text and line art by a non-whole factor | About 4 times bilinear |
+| `lanczos` | Sharpest of the interpolating filters, with mild ringing at hard edges | Upscaling still, detailed content when the GPU has spare time | About 8 times bilinear |
+| `easu` | Not available yet: outputs sample bilinear and report why in `samplingNote` | Do not rely on it | Same as bilinear |
+
+The costs are from a 4x-by-area upscale microbenchmark; see [Resampling filter
+cost](developer/gpu-timing.md#resampling-filter-cost-2026-10-30). Even
+`lanczos` on four outputs adds only a couple of milliseconds per presented
+frame, which matters only on a GPU already near its limit. Measure `gpuSpanMs`
+in `GET /api/v1/projection/stats` before and after if you are unsure.
+
+Things the filter does not change:
+
+- **1:1 outputs ignore it.** An output that maps exactly one canvas pixel to one
+  output pixel, including a 1:1 output rotated or flipped by the GPU slicer, is
+  a byte copy whatever the filter is.
+- **Shrinking is always averaged.** When an output shrinks the canvas by more
+  than 2x along an axis, the renderer averages a box of source pixels
+  (reported as `area`), up to 8x8, whatever `filter` says.
+- **It applies to the GPU renderer.** The CPU renderer has no warp support and
+  copies content bytes at the output's slice rectangle, so a filter has nothing
+  to act on there. Only CPU test patterns use the CPU resampling kernels, and
+  they implement `nearest`, `bilinear` and `bicubic`.
+
+`GET /api/v1/projection/recommendation` adds a warning to `warnings` when the
+chosen filter is a poor fit:
+
+- `nearest filter at a non-whole scale will alias`: `nearest` is selected and
+  an output's scale (output pixels per canvas pixel, at the current canvas
+  width) is not a whole number, or the output is warped.
+- `the lanczos filter needs the GPU renderer; the renderer is set to cpu, so
+  this filter is not used` (likewise for `easu`).
 
 #### Canvas and warp geometry {: #projection-geometry }
 
@@ -1855,10 +1899,17 @@ none of that policy layered on — read `geometry.effectiveMode` unless the
 question is specifically about the child process. Every mode field
 (`geometry.requestedMode`, `geometry.effectiveMode`, `control.requestedMode`,
 `control.effectiveMode`) and `control.outputs[].samplingMode` use the same
-lowercase strings as `projection.mode` in configuration. `samplingMode` is
-`bilinear` for a rotated output on the GPU renderer even with identity pins,
-because the slicer composes the rotation through the warp; bilinear sampling
-is exact at texel centers, so the picture is unchanged.
+lowercase strings as `projection.mode` in configuration. `samplingMode`
+reports the path the output actually takes: `exact` for a byte copy (a 1:1
+output on the GPU slicer, rotated or flipped included), `area` where the
+automatic box average applies, otherwise the configured
+[filter](#resampling-filter) name, or `bilinear` when the filter is not
+implemented. `samplingNote` is present only when something qualifies the mode:
+the area box was capped at 8x8 source pixels, or the configured filter
+(currently `easu`) is not implemented by the shader and the output sampled
+bilinear instead. Outputs on the CPU renderer report neither field, because
+the CPU renderer's content is a byte copy. The Displays tab shows both in the
+**Sampling** column of the per-output timing table.
 
 Complete schema examples are available for a [simple appliance](examples/four-output-appliance.json)
 and a [warp appliance](examples/four-output-warp.json). The warp example

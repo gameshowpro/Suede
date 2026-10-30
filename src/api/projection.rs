@@ -15,8 +15,8 @@ use crate::api::json::Json;
 use crate::error::{ApiError, ApiResult};
 use crate::model::{
     validate_slices, ArrangedOutput, Arrangement, ArrangementLimits, ArrangementRequest,
-    CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, Overhang, ProjectionMode, Transform,
-    UnusedCanvas,
+    CanvasConfig, CanvasRect, OutputConfig, OutputGeometry, Overhang, ProjectionMode, Renderer,
+    ResampleFilter, Transform, UnusedCanvas,
 };
 
 /// One converted output, addressed by its stable configuration key.
@@ -475,6 +475,26 @@ pub fn recommend_for_state(
     let mut sampled_density: Option<f64> = None;
     let mut exact_density: Option<(f64, f64)> = None;
     let mut warnings = Vec::new();
+    // Pixels per canvas pixel come from the document's own canvas width, so
+    // the nearest-filter check below judges the scale as configured today.
+    let configured_filter = document
+        .projection
+        .as_ref()
+        .map(|projection| projection.filter)
+        .unwrap_or_default();
+    let configured_render_width = document
+        .projection
+        .as_ref()
+        .and_then(|projection| projection.canvas.as_ref())
+        .map(|canvas| canvas.render_width)
+        .or_else(|| {
+            converted
+                .as_ref()
+                .map(|candidate| candidate.canvas.render_width)
+        })
+        .map(f64::from)
+        .filter(|width| *width > 0.0);
+    let mut nearest_non_whole = false;
     for (output, geometry) in geometries {
         let mode = output.effective_mode().ok_or_else(|| {
             format!(
@@ -568,9 +588,35 @@ pub fn recommend_for_state(
             let dy = f64::from(height) * rh * (2.0 * cy).max(2.0 * (1.0 - cy)) / slice.height;
             let (max_dx, max_dy) = exact_density.unwrap_or((0.0, 0.0));
             exact_density = Some((max_dx.max(dx), max_dy.max(dy)));
+            if let Some(render_width) = configured_render_width {
+                nearest_non_whole |=
+                    !is_whole_scale(dx / render_width) || !is_whole_scale(dy / render_width);
+            }
         } else {
+            // A warped or keystoned mapping has no single whole-number scale.
+            nearest_non_whole = true;
             let density = sample_density(&warp, slice.width, slice.height)?;
             sampled_density = Some(sampled_density.map_or(density, |best| best.max(density)));
+        }
+    }
+    if configured_filter == ResampleFilter::Nearest && nearest_non_whole {
+        warnings.push(NEAREST_NON_WHOLE_WARNING.to_string());
+    }
+    let renderer = document
+        .projection
+        .as_ref()
+        .map(|projection| projection.renderer)
+        .unwrap_or_default();
+    if renderer == Renderer::Cpu {
+        let gpu_only = match configured_filter {
+            ResampleFilter::Lanczos => Some("lanczos"),
+            ResampleFilter::Easu => Some("easu"),
+            _ => None,
+        };
+        if let Some(name) = gpu_only {
+            warnings.push(format!(
+                "the {name} filter needs the GPU renderer; the renderer is set to cpu, so this filter is not used"
+            ));
         }
     }
     let approximate = sampled_density.is_some();
@@ -657,6 +703,15 @@ pub fn recommend_for_state(
         warnings,
         approximate,
     })
+}
+
+/// Warning text for the nearest filter at a scale that is not a whole number.
+pub const NEAREST_NON_WHOLE_WARNING: &str = "nearest filter at a non-whole scale will alias";
+
+/// Whether an output-pixels-per-canvas-pixel ratio is a whole number (at
+/// least 1), within rounding noise.
+fn is_whole_scale(ratio: f64) -> bool {
+    ratio >= 1.0 - 1e-6 && (ratio - ratio.round()).abs() < 1e-6
 }
 
 fn canvas_height(width: u32, aspect: f64) -> Result<u32, String> {
@@ -1121,6 +1176,64 @@ mod tests {
             recommend_for_state(&grid_state(ProjectionMode::Simple, KEYSTONE_PINS), 0).unwrap();
         assert_eq!((rec.ideal_width, rec.ideal_height), (3840, 2160));
         assert!(!rec.approximate);
+    }
+
+    #[test]
+    fn recommendation_warns_about_filters_that_do_not_fit() {
+        let with = |render_width: u32, filter: ResampleFilter, renderer: Renderer| {
+            let mut state = grid_state(ProjectionMode::Simple, IDENTITY_PINS);
+            let projection = state.projection.as_mut().unwrap();
+            projection.canvas.as_mut().unwrap().render_width = render_width;
+            projection.filter = filter;
+            projection.renderer = renderer;
+            recommend_for_state(&state, 0).unwrap().warnings
+        };
+        let aliases = |warnings: &[String]| warnings.iter().any(|w| w == NEAREST_NON_WHOLE_WARNING);
+        // 3840 wide gives 1:1 and 1920 wide gives 2x: both whole.
+        assert!(!aliases(&with(
+            3840,
+            ResampleFilter::Nearest,
+            Renderer::Auto
+        )));
+        assert!(!aliases(&with(
+            1920,
+            ResampleFilter::Nearest,
+            Renderer::Auto
+        )));
+        // 1920 / 1440 is 1.33x.
+        assert!(aliases(&with(
+            2880,
+            ResampleFilter::Nearest,
+            Renderer::Auto
+        )));
+        // Other filters never raise it.
+        assert!(!aliases(&with(
+            2880,
+            ResampleFilter::Bilinear,
+            Renderer::Auto
+        )));
+        // GPU-only filters with the CPU renderer requested.
+        let gpu_only = |warnings: &[String]| {
+            warnings
+                .iter()
+                .any(|w| w.contains("needs the GPU renderer"))
+        };
+        assert!(gpu_only(&with(
+            3840,
+            ResampleFilter::Lanczos,
+            Renderer::Cpu
+        )));
+        assert!(gpu_only(&with(3840, ResampleFilter::Easu, Renderer::Cpu)));
+        assert!(!gpu_only(&with(
+            3840,
+            ResampleFilter::Lanczos,
+            Renderer::Auto
+        )));
+        assert!(!gpu_only(&with(
+            3840,
+            ResampleFilter::Bicubic,
+            Renderer::Cpu
+        )));
     }
 
     #[test]
