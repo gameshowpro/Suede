@@ -40,7 +40,7 @@ See the [screenshots](screenshots.md) of the bundled web UI.
 
 -   :material-projector-screen:{ .lg .middle } **Projection and edge blending**
 
-    Overlap outputs instead of tiling them and Suede slices one shared canvas into gamma-correct blended seams, with optional per-output corner and center Warp correction for curved or misaligned surfaces.
+    Overlap outputs instead of tiling them and Suede slices one shared canvas into gamma-correct blended seams, with optional per-output corner and center Warp correction for curved or misaligned surfaces. See [Projection modes](projection-modes.md).
 
 </div>
 

@@ -175,7 +175,8 @@ say - and Suede switches to projection mode automatically: it renders the app
 once into a shared canvas and slices it per projector, gamma-correct blending
 the seams. Add per-output corner-pin and center-line calibration
 (`"projection": {"mode": "warp", ...}`) to fit the picture to a curved,
-tilted, or imperfectly rigged surface. See [projection and edge
+tilted, or imperfectly rigged surface. See [projection
+modes](https://suede.gameshow.pro/projection-modes/) and [projection and edge
 blending](https://suede.gameshow.pro/configuration/#projection-edge-blending).
 
 The configuration is persisted immediately: reboot the machine and it comes back exactly like this, no operator required. Watch it happen live:

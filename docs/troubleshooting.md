@@ -12,7 +12,7 @@ Then look at `GET /api/v1/status`, which lists every piece of desired state that
 
 Suede raises two kinds of complaint, and both are built so that they end somewhere you can act.
 
-[![Warning banners at the top of the Displays tab when no outputs are connected](assets/screenshots/details/warning-banners.avif){ width="820" height="384" loading=lazy }](screenshots.md#displays-disconnected)
+[![Warning banners at the top of the Displays tab when no outputs are connected](assets/screenshots/details/warning-banners.avif){ width="1816" height="414" loading=lazy }](screenshots.md#displays-disconnected)
 
 See the [Health checks](screenshots.md#health-checks) list and the [Displays tab with nothing connected](screenshots.md#displays-disconnected) for examples.
 
@@ -175,7 +175,8 @@ but should no longer be necessary.
 ## Warp mode will not activate
 
 Only relevant to an overlapping (edge-blended) layout with `projection.mode`
-set to `warp`. Check `geometry.warpAvailable` and `geometry.reason` in
+set to `warp`; [Projection modes](projection-modes.md#warp) describes what Warp
+needs and how it falls back to Simple. Check `geometry.warpAvailable` and `geometry.reason` in
 `GET /api/v1/projection/stats`:
 
 ```bash

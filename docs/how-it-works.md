@@ -605,40 +605,16 @@ To bypass the compositor presentation pass entirely and eliminate driver spin lo
 
 ## Warping and Display Modes {: #warping }
 
-Suede provides three projection display modes: **Exact mode**, **Simple mode** and **Warp mode**. All three operate on a unified **shared virtual canvas** architecture, allowing operators to switch seamlessly between a strictly one-to-one layout, rectangular layouts and non-linear projection mapping without losing content alignment.
+What Exact, Simple and Warp are, when to use each, their rules, how to switch
+between them, and Warp's automatic fallback to Simple are described on
+[Projection modes](projection-modes.md). All three work on one shared virtual
+canvas: the headless browser renders to an isotropic continuous canvas
+`[0, 1] × [0, 1/aspect]`, and each output selects a rectangular region of it
+(`geometry.slice`), stored as fractions of the canvas or as whole canvas
+pixels and always cropped in whole canvas pixels. This section covers the
+pipeline underneath Warp.
 
 See the [Displays tab](screenshots.md#displays) for the modes in the web UI.
-
-### Exact vs. Simple vs. Warp Concept
-
-**Exact mode** is the strict one: every output shows exactly its own raster's worth of canvas pixels at whole-pixel positions, at output scale 1, with no correction and no resampling, so what you author is what each panel lights. The canvas may be larger than the outputs. It is the choice when pixel fidelity matters and it is unavailable on a tiling appliance. [Exact mode](configuration.md#exact-mode) lists its rules, what switching does, and the whole-pixel arrangement.
-
-| Capability / Aspect | Exact Mode | Simple Mode | Warp Mode |
-|---|---|---|---|
-| **Primary Use Case** | LED walls, tiled panels and content authored at the wall's resolution | Flat displays, LED walls, planar multi-display arrays, zero-distortion setups | Projectors on curved, tilted, or angled physical surfaces; multi-projector blended arrays |
-| **Mapping Geometry** | Strict 1:1 placement at whole-pixel canvas coordinates; no correction | Pure rectangular crop and scale | Non-linear 4-corner destination pinning and 2-fraction optical center remap |
-| **Edge Blending & Seams** | Same blending ramps on overlapping seams; overlaps are whole pixels | Pairwise blending ramps, one per seam, with gamma-shaped falloff, same as Warp (`blend: true` by default; `blend: false` still duplicates overlapping regions without ramps) | Pairwise blending ramps, one per seam, with gamma-shaped falloff |
-| **Border Anti-Aliasing** | Not applicable | Not applicable (aligned to raster) | Continuous sub-pixel border coverage attenuating gain and black lift |
-| **Black Level Compensation** | Fixed or adaptive black lift, same as Simple | Fixed or adaptive black lift (see [Adaptive black lift](configuration.md#adaptive-black-lift)) | Fixed or adaptive black lift, same as Simple |
-| **Pipeline Overhead** | Minimal (integer copy) | Minimal (direct hardware scanning or rectangular blit) | Low GPU fragment shader pass with inverse homography and precomputed transfer tables |
-| **Renderer Compatibility** | Canvas slicer, GPU and CPU; unavailable on a tiling appliance | GPU and CPU fallback pipelines | Requires the GPU (Vulkan) pipeline; there is no EGL/GLES path |
-| **Sampling Precision** | Always an exact integer copy; the [resampling filter](configuration.md#resampling-filter) is irrelevant | Exact integer texel sampling | Exact integer sampling on identity, including 1:1 rotated or flipped outputs; the configured [resampling filter](configuration.md#resampling-filter) on non-identity pins or any non-1:1 scale |
-
-#### The Shared Virtual Canvas Architecture
-In previous architectures, changing display modes or cropping required separate independent configurations. In Suede, **Exact, Simple and Warp share one virtual canvas and identical output slice crops (`geometry.slice`)**:
-- The headless browser renders to an isotropic continuous canvas `[0, 1] × [0, 1/aspect]`.
-- Each output display selects its rectangular content region of the canvas, stored as fractions of the canvas (`percent`) or as whole canvas pixels (`pixels`). Either way the slicer crops whole canvas pixels, rounding the region's edges, never a sub-pixel crop. See [Slice units](configuration.md#slice-units).
-- In **Exact mode**, that content rectangle is exactly the output's raster at whole-pixel coordinates, so the mapping is an integer copy.
-- In **Simple mode**, that content rectangle is mapped directly to the output raster.
-- In **Warp mode**, the exact same content rectangle is geometrically warped to the destination corner pins in the output raster.
-- **Workflow Benefit**: An operator can arrange output positions and crops in Simple mode, and then switch to Warp mode to calibrate corner pins and center fractions against the physical projection surface without losing their content layout.
-
-#### Automatic Capability Fallback and Retention
-Warp mode requires `allow_overlaps = true`, the GPU renderer (`auto` or `gpu`, never `cpu`), output scale `1.0`. Any output transform is allowed: the slicer composes it. If any of that is not met, or the GPU pipeline itself is unavailable:
-- Suede automatically forces the **effective mode to `simple`**.
-- The operator's saved **`warp` settings are safely retained** in configuration.
-- There is no `GET /api/v1/health` route (only `/healthz`, a liveness probe). Warp unavailability is reported as a `warp_unavailable` divergence in `GET /api/v1/status`, and as `geometry.warpAvailable`/`geometry.reason` in `GET /api/v1/projection/stats` — see [Warp mode will not activate](troubleshooting.md#warp-mode-will-not-activate) for the exact reason strings.
-- When capability is restored, Warp rendering resumes automatically using the retained geometry.
 
 ---
 

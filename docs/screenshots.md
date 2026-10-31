@@ -4,21 +4,37 @@ title: Screenshots
 
 # Screenshots
 
-These are captures of the bundled reference web UI, which the daemon serves at `http://<machine>:9088/`. Select any image to open it at full size.
+These are captures of the bundled reference web UI, which the daemon serves at `http://<machine>:9088/`. Select any image to open it at full size. The Displays tab captures are taken with `scripts/capture-screenshots.sh` at 100% scale and the narrowest width that shows two columns; `scripts/screenshots/README.md` describes how to retake them.
 
 ## Displays {: #displays }
 
-The **Displays** tab on a healthy system: the layout and canvas settings, the test pattern picker, a preview of the canvas with the overlap regions drawn in, the outputs table, the edge blending and frame timing cards, and the per-output settings, the Slice from canvas panel and Warp pin editor further down.
+The **Displays** tab on a healthy system in Warp mode: the layout and canvas settings, the test pattern picker, a preview of the canvas with a **1:1 verified** chip on each output, the **Exact | Simple | Warp** toggle, the outputs table, the edge blending and frame timing cards, and, for the selected output, its settings, the **Slice from canvas** panel and the Warp pin editor.
 
-[![The Displays tab with four connected outputs, the canvas preview, edge blending and frame timing cards, and the Warp geometry editor](assets/screenshots/displays.avif){ width="1852" height="2070" loading=lazy }](assets/screenshots/displays.avif)
+[![The Displays tab with four connected, verified outputs, the canvas preview, the mode toggle, edge blending and frame timing cards, and the Slice from canvas panel and Warp geometry editor](assets/screenshots/displays.avif){ width="1856" height="3452" loading=lazy }](assets/screenshots/displays.avif)
 
-Read more: [Projection and edge blending](configuration.md#projection-edge-blending), [Editing geometry in the web UI](configuration.md#geometry-editor), [Test patterns](configuration.md#projection-test-patterns), [Calibrate an overlapping or warped layout](getting-started.md#calibration).
+Read more: [Projection modes](projection-modes.md), [Projection and edge blending](configuration.md#projection-edge-blending), [The whole-number chip](configuration.md#whole-number-chip), [Editing geometry in the web UI](configuration.md#geometry-editor), [Test patterns](configuration.md#projection-test-patterns), [Calibrate an overlapping or warped layout](getting-started.md#calibration).
+
+## Arrange automatically in Exact {: #arrange-exact }
+
+The **Arrange automatically** dialog in Exact mode. Overlaps are whole pixels, content scale is fixed at 100%, and the canvas is derived from the arrangement.
+
+[![The Arrange outputs dialog in Exact mode, with rows, columns, overlaps in px, a fixed 100% content scale and the output order](assets/screenshots/details/arrange-exact.avif){ width="630" height="616" loading=lazy }](assets/screenshots/details/arrange-exact.avif)
+
+Read more: [Arranging automatically in Exact](projection-modes.md#arrangement-exact).
+
+## Arrange automatically in Simple and Warp {: #arrange-simple }
+
+The same dialog in Simple and Warp. It chooses whether overlap or content scale is kept fixed and whether the arrangement uses all canvas pixels or keeps slices inside the canvas, and overlaps are percentages.
+
+[![The Arrange outputs dialog in Simple and Warp mode, with the Overlap or Scale choice, the canvas coverage choice, rows, columns, content scale and overlaps in percent](assets/screenshots/details/arrange-simple.avif){ width="630" height="596" loading=lazy }](assets/screenshots/details/arrange-simple.avif)
+
+Read more: [Arranging automatically in Simple and Warp](projection-modes.md#arrangement-free), [Grid arrangement](configuration.md#grid-arrangement).
 
 ## Displays with nothing connected {: #displays-disconnected }
 
 The same tab with every output unplugged. Warnings at the top explain what is unavailable, the preview shows each output as not connected, and the Warp intent and calibration are retained while Simple mode is in effect.
 
-[![The Displays tab with every output disconnected, showing warning banners and dashed placeholders in the canvas preview](assets/screenshots/displays-disconnected.avif){ width="1853" height="2065" loading=lazy }](assets/screenshots/displays-disconnected.avif)
+[![The Displays tab with every output disconnected, showing warning banners and dashed placeholders in the canvas preview](assets/screenshots/displays-disconnected.avif){ width="1856" height="2894" loading=lazy }](assets/screenshots/displays-disconnected.avif)
 
 Read more: [An unplugged display changes nothing else](configuration.md#unplugged), [How warnings reach you](troubleshooting.md#how-warnings-reach-you).
 
@@ -53,27 +69,3 @@ The list of health checks, here all passing. Each one links to its documentation
 [![The health checks list with every check passing](assets/screenshots/health-checks.avif){ width="823" height="1977" loading=lazy }](assets/screenshots/health-checks.avif)
 
 Read more: [How warnings reach you](troubleshooting.md#how-warnings-reach-you), [First run](getting-started.md#first-run).
-
-## Screenshots that need refreshing {: #refresh }
-
-The Displays tab gained the **Exact** mode button, first in the **Exact | Simple | Warp** toggle, and the Exact-only controls behind it. These captures predate that and show the old two-button toggle, so they need retaking:
-
-- `assets/screenshots/displays.avif`
-- `assets/screenshots/displays-disconnected.avif`
-- `assets/screenshots/details/unplugged-outputs.avif`
-
-`assets/screenshots/details/warp-editor.avif` was checked and does not need retaking: its crop is the Warp and geometry pin editor and does not include the mode toggle. The other captures are on other tabs. No procedure for retaking screenshots is documented in this repository, so this note does not give one.
-
-The Displays tab also gained the whole-number chip: a green **1:1 verified** (or **N× whole-number verified**, or **1:1 (tiled)**) pill on each verified output's box in the layout diagram and in the header of the output's settings, and a muted hint under that header when an output is not verified. These captures predate it, so they need retaking once the chip can show on a verified system:
-
-- `assets/screenshots/displays.avif`
-- `assets/screenshots/details/unplugged-outputs.avif`
-
-Read more: [The whole-number chip](configuration.md#whole-number-chip).
-
-The Displays tab's content panel was renamed **Slice from canvas** and gained the **Percent | Pixels** choice; the diagram now hatches the part of a slice that lies outside the canvas. These captures predate both, so they need retaking:
-
-- `assets/screenshots/displays.avif`
-- `assets/screenshots/displays-disconnected.avif`
-
-Read more: [Slice units](configuration.md#slice-units).
