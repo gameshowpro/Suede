@@ -142,17 +142,54 @@ const mapping = (over = {}) => ({
     assert.equal(await page.locator('#output-mapping-chip .mapping-chip').count(), 0);
     assert.doesNotMatch(await canvasLine(), /1:1|not verified/);
 
-    // The requested generation moves ahead: every chip and hint disappears.
+    // The requested generation moves ahead (a drag writes the working copy
+    // repeatedly): chips, hint and canvas line keep their last current state.
+    const bump = n => page.evaluate(n => { configGeneration = String(n); renderLayout(); renderWarpStatus(); renderCanvas(); }, n);
     await page.evaluate(n => selectOutput(n), names[0]);
     assert.equal(await chips().count(), 1);
-    await page.evaluate(() => { configGeneration = String(Number(configGeneration) + 1); renderLayout(); renderWarpStatus(); });
-    assert.equal(await chips().count(), 0, 'hidden while the requested generation is newer');
-    assert.equal(await page.locator('#output-mapping-chip .mapping-chip').count(), 0);
+    await bump(HELD + 1);
+    assert.deepEqual(await chipTexts(), ['1:1 verified'], 'chip kept while the requested generation is newer');
+    assert.equal(await page.locator('#output-mapping-chip .mapping-chip').count(), 1, 'editor chip kept');
+    assert.match(await canvasLine(), /Selected output: 1:1 verified\./);
     await page.evaluate(n => selectOutput(n), names[1]);
-    assert(await page.locator('#output-mapping-hint').isHidden(), 'hint hidden while pending');
+    assert.equal(await page.locator('#output-mapping-hint').textContent(),
+      'Not verified as whole-number scaling: rotated by the compositor.', 'hint kept while pending');
+    assert(await page.locator('#output-mapping-hint').isVisible());
+    await bump(HELD + 2);
+    assert.equal(await chips().count(), 1, 'still kept across several pending generations');
+    // The output that never had a current verdict claims nothing while pending.
+    await page.evaluate(n => selectOutput(n), names[3]);
+    assert.equal(await page.locator('#output-mapping-chip .mapping-chip').count(), 0);
     assert.doesNotMatch(await canvasLine(), /1:1|not verified/);
-    await page.evaluate(g => { configGeneration = g; renderLayout(); renderWarpStatus(); }, String(HELD));
-    assert.equal(await chips().count(), 1, 'back in step: chip returns');
+
+    // A current verdict that is not verified clears the chip.
+    control = { ...control, outputs: control.outputs.map(o => o.name === names[0]
+      ? { name: o.name, mapping: mapping({ generation: HELD + 2, verified: false, unverified: ['fractional crop origin'] }) }
+      : o) };
+    await refresh();
+    assert.equal(await chips().count(), 0, 'current not-verified verdict clears the chip');
+    await page.evaluate(n => selectOutput(n), names[0]);
+    assert.equal(await page.locator('#output-mapping-hint').textContent(),
+      'Not verified as whole-number scaling: fractional crop origin.');
+    // The next edit leaves the hint standing, not the old chip.
+    await bump(HELD + 3);
+    assert.equal(await chips().count(), 0);
+    assert(await page.locator('#output-mapping-hint').isVisible(), 'hint kept while pending');
+
+    // A current verified verdict brings the chip back; then no telemetry clears it.
+    control = { ...control, outputs: control.outputs.map(o => o.name === names[0]
+      ? { name: o.name, mapping: mapping({ generation: HELD + 3 }) } : o) };
+    await refresh();
+    assert.deepEqual(await chipTexts(), ['1:1 verified']);
+    assert(await page.locator('#output-mapping-hint').isHidden());
+    await bump(HELD + 4);
+    assert.equal(await chips().count(), 1, 'kept while pending');
+    control = { session: 's', outputs: names.map(name => ({ name })) };
+    await refresh();
+    assert.equal(await chips().count(), 0, 'no mapping clears the chip even while pending');
+    assert.equal(await page.locator('#output-mapping-chip .mapping-chip').count(), 0);
+    assert.doesNotMatch(await canvasLine(), /1:1|not verified/);
+    await bump(HELD);
 
     // Whole-number labels.
     control = {

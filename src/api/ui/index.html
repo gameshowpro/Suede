@@ -440,6 +440,10 @@ button.pin-toggle:disabled { opacity: 0.3; cursor: not-allowed; }
 #output-table tr { cursor: pointer; }
 #output-table tr.selected { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 #canvas-presets[hidden], #canvas-fit[hidden], #arrange-mode-row[hidden], #slice-units-row[hidden] { display: none; }
+/* Radio labels sit beside their button, not stacked like field labels. */
+#slice-units-row label { display: inline-flex; align-items: center; gap: 6px; margin: 0 16px 0 0; font-size: 13px; color: var(--ink); cursor: pointer; }
+#slice-units-row input { width: auto; padding: 0; margin: 0; flex: none; }
+#slice-units-row { margin-bottom: 12px; }
 dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; max-width: min(34em, calc(100vw - 32px)); }
 #arrange-dialog { max-width: min(42em, calc(100vw - 32px)); border-radius: 12px; }
 #arrange-dialog form { padding: 24px 28px; }
@@ -2188,10 +2192,12 @@ function renderLayout() {
 // projected twice — so no arithmetic beyond the bounding box is needed.
 // The whole-number chip (see "The whole-number chip" in the configuration
 // reference). It states only what the daemon's per-output `mapping` verdict
-// says, and only while that verdict describes the working copy this page
-// holds: the verdict carries the configuration generation it was made for,
-// and a newer requested generation hides the chip so the existing pending
-// indicator stands alone. Without telemetry nothing is claimed.
+// says. The verdict carries the configuration generation it was made for.
+// While the page's requested generation is newer (a drag writes the working
+// copy many times a second, so the verdict is pending most of the time), each
+// output keeps what its chip last showed under a current verdict, so the chip
+// does not flicker. A current verdict that is not verified clears it, and so
+// does the absence of a mapping. Without telemetry nothing is claimed.
 const TILED_CHIP_LABEL = "1:1 (tiled)";
 function outputMapping(name) {
   return projectionStats?.control?.outputs?.find((o) => o.name === name)?.mapping ?? null;
@@ -2199,6 +2205,16 @@ function outputMapping(name) {
 function mappingIsCurrent(mapping) {
   return !!mapping && mapping.generation != null && configGeneration != null &&
     String(mapping.generation) === String(configGeneration);
+}
+// The last mapping seen under a current verdict, per output name.
+const lastCurrentMappings = new Map();
+// The mapping the chip and hint describe: the live verdict when it is current,
+// the remembered current one while a newer generation is pending.
+function shownMapping(name) {
+  const m = outputMapping(name);
+  if (!m) { lastCurrentMappings.delete(name); return null; }
+  if (mappingIsCurrent(m)) { lastCurrentMappings.set(name, m); return m; }
+  return lastCurrentMappings.get(name) ?? null;
 }
 function mappingLabel(m) {
   if (m.samplingPath === "tiled") return TILED_CHIP_LABEL;
@@ -2225,8 +2241,8 @@ function mappingTooltip(m) {
   ].join("\n");
 }
 function mappingChipHtml(name) {
-  const m = outputMapping(name);
-  if (!m || !m.verified || !mappingIsCurrent(m)) return "";
+  const m = shownMapping(name);
+  if (!m || !m.verified) return "";
   return `<span class="pill ok mapping-chip" title="${escape(mappingTooltip(m))}">${escape(mappingLabel(m))}</span>`;
 }
 function renderMappingChips() {
@@ -2237,8 +2253,8 @@ function renderMappingChips() {
   const chip = $("output-mapping-chip"), hint = $("output-mapping-hint");
   if (!chip || !hint) return;
   chip.innerHTML = selected ? mappingChipHtml(selected) : "";
-  const m = selected ? outputMapping(selected) : null;
-  const show = !!m && !m.verified && mappingIsCurrent(m) && m.unverified?.length > 0;
+  const m = selected ? shownMapping(selected) : null;
+  const show = !!m && !m.verified && m.unverified?.length > 0;
   hint.hidden = !show;
   hint.textContent = show ? `Not verified as whole-number scaling: ${m.unverified.join("; ")}.` : "";
 }
@@ -2737,10 +2753,12 @@ function scaleText(scale) {
   const ratio = scale >= 1 ? `${displayNumber(scale, 2)}:1` : `1:${displayNumber(1 / scale, 2)}`;
   return `${displayNumber(scale * 100, 2)}% · ${ratio}`;
 }
+// Constants only: set with innerHTML. The mode name is bold, as control names
+// are elsewhere. Each link path is a literal so the docs link test sees it.
 const SLICE_EXPLANATION = {
-  exact: "Exact copies this rectangle of the canvas to the output one-to-one, in whole pixels.",
-  simple: "Simple stretches this rectangle of the canvas over the output without geometric correction.",
-  warp: "Warp stretches this rectangle of the canvas over the output, then the destination pins below correct the picture.",
+  exact: 'In <strong>Exact</strong> mode, this rectangle of the canvas is copied to the output one-to-one, in whole pixels. <a data-docs-path="projection-modes/#exact" target="_blank" rel="noopener noreferrer">Learn about Exact mode</a>.',
+  simple: 'In <strong>Simple</strong> mode, this rectangle of the canvas is stretched over the output without geometric correction. <a data-docs-path="projection-modes/#simple" target="_blank" rel="noopener noreferrer">Learn about Simple mode</a>.',
+  warp: 'In <strong>Warp</strong> mode, this rectangle of the canvas is stretched over the output, then the destination pins below correct the picture. <a data-docs-path="projection-modes/#warp" target="_blank" rel="noopener noreferrer">Learn about Warp mode</a>.',
 };
 function renderSharedContent() {
   const geometry = selectedGeometry(), mode = rasterDimensions(configEntry(selected)), pixels = canvasPixels();
@@ -2755,7 +2773,7 @@ function renderSharedContent() {
   $("slice-units-percent").checked = !inPixels;
   $("slice-units-pixels").checked = inPixels;
   const requested = config?.projection?.mode;
-  $("slice-explain").textContent = SLICE_EXPLANATION[requested] ?? SLICE_EXPLANATION.simple;
+  $("slice-explain").innerHTML = SLICE_EXPLANATION[requested] ?? SLICE_EXPLANATION.simple;
   for (const id of ["slice-x", "slice-y", "slice-width", "slice-height"]) {
     $(id).step = inPixels ? "1" : "any";
     $(id).min = id.endsWith("width") || id.endsWith("height") ? (inPixels ? "1" : "0") : "";
@@ -3929,9 +3947,10 @@ function renderWarpStatus() {
   renderDirtyStatus();
 }
 function oneToOneStatus() {
-  // Telemetry only: nothing is claimed without a current verdict.
-  const m = outputMapping(warpOutput()?.match?.name);
-  if (!m || !mappingIsCurrent(m)) return "";
+  // Telemetry only: nothing is claimed without a current verdict, and a
+  // pending one leaves the last current claim standing, as the chip does.
+  const m = shownMapping(warpOutput()?.match?.name);
+  if (!m) return "";
   return m.verified ? `Selected output: ${mappingLabel(m)}.` : "Selected output: not verified as whole-number scaling.";
 }
 function renderCanvas() {

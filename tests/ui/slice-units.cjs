@@ -171,7 +171,7 @@ function outOfCanvas(document) {
     assert.equal(await field('content-scale'), '100');
     assert.equal(await page.locator('#slice-x').getAttribute('step'), 'any');
     assert.match(await page.locator('#source-size').textContent(), /Crop 1920 × 1080 px; scale 100% · 1:1/);
-    assert.match(await page.locator('#slice-explain').textContent(), /^Simple /);
+    assert.match(await page.locator('#slice-explain').textContent(), /^In Simple mode, /);
     assert.equal(await overhangs(), 0, 'a percent fixture inside the canvas has no hatching');
     const widths = await page.locator('#layout .display-box').evaluateAll(boxes => boxes.map(b => b.getBoundingClientRect().width));
     const frame = await page.locator('#layout .canvas-frame').evaluate(f => f.getBoundingClientRect().width);
@@ -312,7 +312,7 @@ function outOfCanvas(document) {
     assert(!(await visible('content-scale')));
     assert.equal(await field('slice-x'), '1920');
     assert(await page.locator('#slice-width').evaluate(e => e.readOnly));
-    assert.match(await page.locator('#slice-explain').textContent(), /^Exact /);
+    assert.match(await page.locator('#slice-explain').textContent(), /^In Exact mode, /);
     assert.match(await page.locator('#source-size').textContent(), /Crop 1920 × 1080 px.*scale 100% · 1:1/);
   } catch (error) {
     failures.push(error.stack || String(error));
