@@ -57,6 +57,7 @@ nav:
   - Screenshots: screenshots.md
   - Configuration: configuration.md
   - Projection modes: projection-modes.md
+  - System profiles: system-profiles.md
   - How it works: how-it-works.md
   - Behind a reverse proxy: reverse-proxy.md
   - Multiple clients: multi-user.md

@@ -4,7 +4,7 @@ title: Screenshots
 
 # Screenshots
 
-These are captures of the bundled reference web UI, which the daemon serves at `http://<machine>:9088/`. Select any image to open it at full size. The Displays tab captures are taken with `scripts/capture-screenshots.sh` at 100% scale and the narrowest width that shows two columns; `scripts/screenshots/README.md` describes how to retake them.
+These are captures of the bundled reference web UI, which the daemon serves at `http://<machine>:9088/`. Select any image to open it at full size. The Displays and System Profiles captures are taken with `scripts/capture-screenshots.sh` at 100% scale and the narrowest width that shows two columns; `scripts/screenshots/README.md` describes how to retake them.
 
 ## Displays {: #displays }
 
@@ -69,3 +69,35 @@ The list of health checks, here all passing. Each one links to its documentation
 [![The health checks list with every check passing](assets/screenshots/health-checks.avif){ width="823" height="1977" loading=lazy }](assets/screenshots/health-checks.avif)
 
 Read more: [How warnings reach you](troubleshooting.md#how-warnings-reach-you), [First run](getting-started.md#first-run).
+
+## System Profiles {: #system-profiles }
+
+The **System Profiles** tab with two saved profiles, the sections each one includes, and the buttons to activate, update, duplicate, download and delete it.
+
+[![The System Profiles tab listing two saved profiles, each with the sections it includes and buttons to activate, update, duplicate, download and delete it](assets/screenshots/profiles.avif){ width="920" height="414" loading=lazy }](assets/screenshots/profiles.avif)
+
+Read more: [System profiles](system-profiles.md), [System Profiles API](configuration.md#system-profiles).
+
+## Saving a profile with some apps {: #profile-save }
+
+The **Save new profile** editor with the **Apps** checkbox in its mixed state: ten of the thirteen apps are chosen, and the summary names the first few.
+
+[![The Save new profile editor with the Apps checkbox in its mixed state and the summary "10 of 13 apps"](assets/screenshots/details/profile-save.avif){ width="920" height="323" loading=lazy }](assets/screenshots/details/profile-save.avif)
+
+Read more: [Saving a profile](system-profiles.md#saving), [Choosing apps](system-profiles.md#choosing-apps).
+
+## Choosing apps to save {: #profile-apps-picker }
+
+The app picker that **Choose apps…** opens, with each app's launcher and target, the active app marked, and a live count.
+
+[![The Choose apps to save dialog, listing every app with its launcher and target, three of them unchecked, the active app marked, and "10 of 13 selected"](assets/screenshots/details/profile-apps-picker.avif){ width="510" height="638" loading=lazy }](assets/screenshots/details/profile-apps-picker.avif)
+
+Read more: [Choosing apps](system-profiles.md#choosing-apps).
+
+## Activating a profile {: #profile-activate }
+
+The **Activate** dialog: the sections to apply, with Apps narrowed to two of the profile's three apps, and a device mapping row for each saved display, each matched to a connected display.
+
+[![The Activate dialog for a profile, with the five section checkboxes, the Apps checkbox mixed at "2 of 3 apps", the apps hint, and a device mapping row for each saved display, each matching a connected display](assets/screenshots/details/profile-activate.avif){ width="660" height="966" loading=lazy }](assets/screenshots/details/profile-activate.avif)
+
+Read more: [Activating a profile](system-profiles.md#activating), [Device mapping](system-profiles.md#device-mapping).

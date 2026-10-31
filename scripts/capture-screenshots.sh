@@ -4,7 +4,7 @@
 # their width and height attributes in the docs. See
 # scripts/screenshots/README.md.
 #
-# Usage: scripts/capture-screenshots.sh <base-url> <healthy|disconnected>
+# Usage: scripts/capture-screenshots.sh <base-url> <healthy|disconnected|profiles>
 #   e.g. scripts/capture-screenshots.sh http://appliance:9088 healthy
 #
 # SCREENSHOT_ONLY=name,name retakes only those captures of the phase.
@@ -20,8 +20,8 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-base="${1:?usage: $0 <base-url> <healthy|disconnected>}"
-phase="${2:?usage: $0 <base-url> <healthy|disconnected>}"
+base="${1:?usage: $0 <base-url> <healthy|disconnected|profiles>}"
+phase="${2:?usage: $0 <base-url> <healthy|disconnected|profiles>}"
 out="${SCREENSHOT_OUT:-$(mktemp -d -t suede-screenshots.XXXXXX)}"
 rules=".claude/screenshot-redactions.tsv"
 beds=".claude/test-beds.md"

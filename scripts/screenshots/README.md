@@ -7,6 +7,7 @@ instead of a hand-made one.
 ```sh
 scripts/capture-screenshots.sh http://<appliance>:9088 healthy
 scripts/capture-screenshots.sh http://<appliance>:9088 disconnected
+scripts/capture-screenshots.sh http://<appliance>:9088 profiles
 ```
 
 Each run:
@@ -43,6 +44,10 @@ committing it.
   `displays`, the Displays-tab crops and both arrange dialogs.
 - **disconnected:** every output unplugged. Takes `displays-disconnected`, the
   diagram and outputs table, and the warning banners.
+- **profiles:** a saved (clean) working copy, because the page will not
+  activate over unsaved edits. Saves a temporary profile with three of the
+  apps, captures the System Profiles tab, the app picker, the Save editor and
+  the Activate dialog, and deletes the profile afterwards.
 
 ## Redaction
 

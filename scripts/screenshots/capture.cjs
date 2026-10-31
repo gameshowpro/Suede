@@ -2,14 +2,15 @@
 // Run through scripts/capture-screenshots.sh, which encodes the results and
 // updates the image sizes in the docs; see README.md in this directory.
 //
-// Usage: node capture.cjs <base-url> <out-dir> <healthy|disconnected>
+// Usage: node capture.cjs <base-url> <out-dir> <healthy|disconnected|profiles>
 //
 // The viewport is the narrowest width at which the page shows two columns,
 // read from the page's own stylesheet, at 100% scale, so the captures follow
 // the layout if the breakpoint moves. The healthy phase switches the page's
 // mode toggle to take each mode's captures; that edits the appliance's working
 // copy, which is put back exactly as it was afterwards (an unsaved working copy
-// is rewritten, a clean one is reverted) and checked.
+// is rewritten, a clean one is reverted) and checked. The profiles phase saves
+// a temporary profile on the appliance and deletes it afterwards.
 //
 // SCREENSHOT_REDACTIONS is a JSON array of [pattern, replacement] pairs
 // (case-insensitive regular expressions, matched only where not touching other
@@ -21,8 +22,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const [base, out, phase] = process.argv.slice(2);
-if (!base || !out || !['healthy', 'disconnected'].includes(phase)) {
-  console.error('usage: node capture.cjs <base-url> <out-dir> <healthy|disconnected>');
+if (!base || !out || !['healthy', 'disconnected', 'profiles'].includes(phase)) {
+  console.error('usage: node capture.cjs <base-url> <out-dir> <healthy|disconnected|profiles>');
   process.exit(2);
 }
 const api = (p) => new URL(`/api/v1${p}`, base).href;
@@ -30,12 +31,20 @@ const redactions = JSON.parse(process.env.SCREENSHOT_REDACTIONS || '[]');
 // SCREENSHOT_ONLY: comma-separated shot names to take instead of the whole phase.
 const only = process.env.SCREENSHOT_ONLY ? process.env.SCREENSHOT_ONLY.split(',').map(s => s.trim()) : null;
 
+// The temporary profile the profiles phase saves and shows.
+const TEMP_PROFILE = { name: 'Evening show', description: 'Quad split with three apps' };
+
 // What each phase captures. `full` is the whole page; `el` is the union of the
-// listed elements' boxes plus `pad`; `dialog` opens the arrange dialog first.
-// The mode a capture needs is set before it is taken. `pins` types destination
+// listed elements' boxes plus `pad`; `dialog` is a modal dialog, captured on
+// its own. `tab` is the tab to show, `open` runs before the capture and `close`
+// after it. The mode a capture needs is set before it is taken. `pins` types destination
 // pins into the warp editor's fields for that capture only (corners in
 // top-left, top-right, bottom-right, bottom-left order, then the center
 // fractions), so the editor shows a warped picture; the pins are reset after.
+const ARRANGE = { dialog: '#arrange-dialog',
+  open: async (page) => { await page.click('#arrange-outputs'); await page.waitForTimeout(1500); },
+  close: async (page) => { await page.click('#arrange-cancel'); await page.waitForTimeout(500); } };
+
 const SHOTS = {
   healthy: [
     { name: 'displays', mode: 'warp', full: true },
@@ -44,13 +53,51 @@ const SHOTS = {
     { name: 'details/warp-editor', mode: 'warp', el: ['#output-warp'], pad: 10,
       pins: { corners: [[0.06, 0.05], [0.96, 0.01], [0.99, 0.97], [0.02, 0.92]], center: [0.46, 0.54] } },
     { name: 'details/slice-from-canvas', mode: 'warp', el: ['#shared-content'], pad: 10 },
-    { name: 'details/arrange-simple', mode: 'warp', dialog: true },
-    { name: 'details/arrange-exact', mode: 'exact', dialog: true },
+    { name: 'details/arrange-simple', mode: 'warp', ...ARRANGE },
+    { name: 'details/arrange-exact', mode: 'exact', ...ARRANGE },
   ],
   disconnected: [
     { name: 'displays-disconnected', full: true },
     { name: 'details/unplugged-outputs', el: ['#layout', '#output-table'], pad: 12 },
     { name: 'details/warning-banners', el: ['#alerts'], pad: 0 },
+  ],
+  // Needs a clean working copy: the page refuses to activate over unsaved edits.
+  profiles: [
+    { name: 'profiles', tab: 'profiles', el: ['#tab-profiles > .panel:first-child'], pad: 10 },
+    { name: 'details/profile-apps-picker', tab: 'profiles', dialog: '#profile-apps-picker',
+      open: async (page) => {
+        await page.click('#profile-new');
+        await page.fill('#profile-name', 'Late show');
+        await page.click('#profile-apps-choose');
+        await page.locator('#profile-apps-picker').waitFor({ state: 'visible' });
+        // Leave out the second to fourth apps, keeping the active one, and
+        // show the top of the list.
+        const active = (await getJson('/config')).activeApp;
+        const boxes = page.locator(`#profile-apps-picker-list input[type=checkbox]:not(:disabled):not([data-pick-app="${active}"])`);
+        for (const i of [1, 2, 3]) await boxes.nth(i).uncheck();
+        await page.evaluate(() => { document.querySelector('#profile-apps-picker-list').scrollTop = 0; });
+      },
+      close: async (page) => {
+        await page.click('#profile-apps-picker-ok');
+        await page.locator('#profile-apps-picker').waitFor({ state: 'hidden' });
+        await page.waitForTimeout(300);
+      } },
+    { name: 'details/profile-save', tab: 'profiles', el: ['#profile-editor'], pad: 10,
+      close: async (page) => { await page.click('#profile-editor-cancel'); } },
+    { name: 'details/profile-activate', tab: 'profiles', dialog: '#profile-activate-dialog',
+      open: async (page) => {
+        await page.locator('#profile-table tr', { hasText: TEMP_PROFILE.name }).getByRole('button', { name: 'Activate' }).click();
+        await page.locator('#profile-activate-dialog').waitFor({ state: 'visible' });
+        await page.click('#profile-activate-apps-choose');
+        await page.locator('#profile-apps-picker').waitFor({ state: 'visible' });
+        const active = (await getJson('/config')).activeApp;
+        await page.locator(`#profile-apps-picker-list input[type=checkbox]:not([data-pick-app="${active}"])`).first().uncheck();
+        await page.click('#profile-apps-picker-ok');
+        await page.locator('#profile-apps-picker').waitFor({ state: 'hidden' });
+        await page.waitForTimeout(500);
+        await page.mouse.move(0, 0);
+      },
+      close: async (page) => { await page.click('#profile-activate-dialog [data-profile-cancel]'); } },
   ],
 };
 
@@ -158,21 +205,42 @@ async function setPins(page, pins) {
   await page.waitForTimeout(3000);
 }
 
+async function showTab(page, tab) {
+  await page.click(`[role=tab][data-tab="${tab}"]`);
+  await page.locator(`#tab-${tab}`).waitFor({ state: 'visible' });
+  await page.waitForTimeout(500);
+}
+
+// Saves the temporary profile from the live configuration, with a subset of
+// its apps that keeps the active one, and returns its id.
+async function saveTempProfile(config) {
+  const ids = (config.apps ?? []).map(a => a.id);
+  const apps = [...new Set([config.activeApp, ...ids].filter(Boolean))].slice(0, 3);
+  const id = crypto.randomUUID();
+  const res = await fetch(api('/profiles'), { method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, ...TEMP_PROFILE, includes: { displays: true, backgrounds: true, apps, activeApp: true, settings: true } }) });
+  if (!res.ok) throw new Error(`saving the temporary profile: ${res.status} ${await res.text()}`);
+  return id;
+}
+
+async function deleteTempProfile(id) {
+  const res = await fetch(api(`/profiles/${encodeURIComponent(id)}`), { method: 'DELETE' });
+  if (!res.ok) throw new Error(`deleting the temporary profile ${id}: ${res.status} ${await res.text()}`);
+  console.log('temporary profile deleted');
+}
+
 async function capture(page, shot) {
   const file = path.join(out, `${shot.name}.png`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
+  if (shot.tab) await showTab(page, shot.tab);
   await setMode(page, shot.mode);
   if (shot.pins) await setPins(page, shot.pins);
+  if (shot.open) await shot.open(page);
   await checkRedacted(page, shot.name);
   if (shot.full) {
     await page.screenshot({ path: file, fullPage: true });
   } else if (shot.dialog) {
-    await page.click('#arrange-outputs');
-    await page.waitForTimeout(1500);
-    await checkRedacted(page, shot.name);
-    await page.locator('#arrange-dialog').screenshot({ path: file });
-    await page.click('#arrange-cancel');
-    await page.waitForTimeout(500);
+    await page.locator(shot.dialog).screenshot({ path: file });
   } else {
     const boxes = [];
     for (const s of shot.el) {
@@ -189,6 +257,7 @@ async function capture(page, shot) {
     await page.screenshot({ path: file, fullPage: true,
       clip: { x: Math.round(x0), y: Math.round(y0), width: Math.round(x1 - x0), height: Math.round(y1 - y0) } });
   }
+  if (shot.close) await shot.close(page);
   if (shot.pins) {
     await page.click('#warp-reset-pins');
     await page.click('#warp-reset-centers');
@@ -200,11 +269,16 @@ async function capture(page, shot) {
 (async () => {
   const before = await getJson('/config');
   fs.writeFileSync(path.join(out, 'working-copy-backup.json'), JSON.stringify(before, null, 2));
+  if (phase === 'profiles' && before.committed === false) {
+    console.error('the profiles phase needs a clean working copy; save or revert the appliance first');
+    process.exit(1);
+  }
   const browser = await chromium.launch({ headless: true });
-  let failed = null;
+  let failed = null, tempProfile = null;
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 1200 }, colorScheme: 'dark', deviceScaleFactor: 1 });
     const page = await context.newPage();
+    if (phase === 'profiles') tempProfile = await saveTempProfile(before);
     const errors = [];
     page.on('pageerror', e => errors.push(e.message));
     page.on('dialog', d => { console.log(`page dialog accepted: ${d.message()}`); d.accept(); });
@@ -235,6 +309,7 @@ async function capture(page, shot) {
     failed = e;
   } finally {
     await browser.close();
+    if (tempProfile) try { await deleteTempProfile(tempProfile); } catch (e) { failed ??= e; console.error(e.message); }
     try { await restore(before); } catch (e) { failed ??= e; console.error(e.message); }
   }
   if (failed) { console.error(failed.message ?? failed); process.exit(1); }
