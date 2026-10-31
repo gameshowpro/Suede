@@ -2242,7 +2242,7 @@ shared content crop, and Warp correction use that one selection. Missing
 calibration is initialized with identity pins and neutral centers; switching
 modes preserves the shared composition and retained calibration.
 
-[![Warp and geometry pin editor on the Displays tab, with draggable corner and center handles](assets/screenshots/details/warp-editor.avif){ width="886" height="1015" loading=lazy }](screenshots.md#displays)
+[![Warp and geometry pin editor on the Displays tab, with the corner pins pulled in to a slight keystone and the center lines moved off center](assets/screenshots/details/warp-editor.avif){ width="886" height="1015" loading=lazy }](screenshots.md#displays)
 
 See the [Displays tab](screenshots.md#displays) for the Warp pin editor.
 

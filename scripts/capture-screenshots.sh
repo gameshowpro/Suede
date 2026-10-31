@@ -7,6 +7,8 @@
 # Usage: scripts/capture-screenshots.sh <base-url> <healthy|disconnected>
 #   e.g. scripts/capture-screenshots.sh http://appliance:9088 healthy
 #
+# SCREENSHOT_ONLY=name,name retakes only those captures of the phase.
+#
 # Private words are rewritten before every capture. The rules come from two
 # local files that are not in the repository: the machine names in the alias
 # table of .claude/test-beds.md (each replaced by its alias, "system-a"), and

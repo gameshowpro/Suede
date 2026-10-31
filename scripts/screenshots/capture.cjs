@@ -27,16 +27,22 @@ if (!base || !out || !['healthy', 'disconnected'].includes(phase)) {
 }
 const api = (p) => new URL(`/api/v1${p}`, base).href;
 const redactions = JSON.parse(process.env.SCREENSHOT_REDACTIONS || '[]');
+// SCREENSHOT_ONLY: comma-separated shot names to take instead of the whole phase.
+const only = process.env.SCREENSHOT_ONLY ? process.env.SCREENSHOT_ONLY.split(',').map(s => s.trim()) : null;
 
 // What each phase captures. `full` is the whole page; `el` is the union of the
 // listed elements' boxes plus `pad`; `dialog` opens the arrange dialog first.
-// The mode a capture needs is set before it is taken.
+// The mode a capture needs is set before it is taken. `pins` types destination
+// pins into the warp editor's fields for that capture only (corners in
+// top-left, top-right, bottom-right, bottom-left order, then the center
+// fractions), so the editor shows a warped picture; the pins are reset after.
 const SHOTS = {
   healthy: [
     { name: 'displays', mode: 'warp', full: true },
     { name: 'details/edge-blending', mode: 'warp', el: ['#edge-blending-panel'], pad: 0 },
     { name: 'details/test-pattern', mode: 'warp', el: ['#pattern-row'], pad: 10 },
-    { name: 'details/warp-editor', mode: 'warp', el: ['#output-warp'], pad: 10 },
+    { name: 'details/warp-editor', mode: 'warp', el: ['#output-warp'], pad: 10,
+      pins: { corners: [[0.06, 0.05], [0.96, 0.01], [0.99, 0.97], [0.02, 0.92]], center: [0.46, 0.54] } },
     { name: 'details/slice-from-canvas', mode: 'warp', el: ['#shared-content'], pad: 10 },
     { name: 'details/arrange-simple', mode: 'warp', dialog: true },
     { name: 'details/arrange-exact', mode: 'exact', dialog: true },
@@ -131,10 +137,32 @@ async function setMode(page, mode) {
   await page.waitForTimeout(4000);
 }
 
+async function setField(page, id, value) {
+  // The editor rebuilds its fields after every accepted edit, so look each one
+  // up afresh.
+  await page.evaluate(([id, value]) => {
+    const input = document.getElementById(id);
+    input.value = String(value);
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }, [id, value]);
+  await page.waitForTimeout(200);
+}
+
+async function setPins(page, pins) {
+  for (const [i, corner] of pins.corners.entries()) {
+    for (const [a, v] of corner.entries()) await setField(page, `pin-${i}-${a}`, v);
+  }
+  for (const [a, v] of pins.center.entries()) await setField(page, `center-${a}`, v);
+  const shown = await page.evaluate(() => document.querySelector('#warp-error')?.textContent?.trim());
+  if (shown) throw new Error(`the warp editor rejected the pins: ${shown}`);
+  await page.waitForTimeout(3000);
+}
+
 async function capture(page, shot) {
   const file = path.join(out, `${shot.name}.png`);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   await setMode(page, shot.mode);
+  if (shot.pins) await setPins(page, shot.pins);
   await checkRedacted(page, shot.name);
   if (shot.full) {
     await page.screenshot({ path: file, fullPage: true });
@@ -160,6 +188,11 @@ async function capture(page, shot) {
     const x1 = Math.max(...boxes.map(b => b.x + b.width)) + pad, y1 = Math.max(...boxes.map(b => b.y + b.height)) + pad;
     await page.screenshot({ path: file, fullPage: true,
       clip: { x: Math.round(x0), y: Math.round(y0), width: Math.round(x1 - x0), height: Math.round(y1 - y0) } });
+  }
+  if (shot.pins) {
+    await page.click('#warp-reset-pins');
+    await page.click('#warp-reset-centers');
+    await page.waitForTimeout(1500);
   }
   console.log(`captured ${shot.name}.png`);
 }
@@ -194,7 +227,9 @@ async function capture(page, shot) {
     await page.locator('#layout .display-box').first().click();
     await page.waitForTimeout(2000);
     await page.mouse.move(0, 0);
-    for (const shot of SHOTS[phase]) await capture(page, shot);
+    const shots = SHOTS[phase].filter(s => !only || only.includes(s.name));
+    if (!shots.length) throw new Error(`no ${phase} shot is named ${only.join(', ')}`);
+    for (const shot of shots) await capture(page, shot);
     if (errors.length) throw new Error(`page errors: ${errors.join('; ')}`);
   } catch (e) {
     failed = e;

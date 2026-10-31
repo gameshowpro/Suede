@@ -26,6 +26,13 @@ Each run:
    `docs/assets/screenshots/`, and updates the `width` and `height`
    attributes of every docs image that shows it.
 
+To retake only some of a phase's captures, list their names in
+`SCREENSHOT_ONLY`, separated by commas:
+
+```sh
+SCREENSHOT_ONLY=details/warp-editor scripts/capture-screenshots.sh http://<appliance>:9088 healthy
+```
+
 The PNGs and the working-copy backup stay in `$SCREENSHOT_OUT` (a new
 temporary directory by default) for review. Look at every capture before
 committing it.
@@ -67,6 +74,7 @@ cannot be rewritten or checked, so review those parts by eye.
 Edit `SHOTS` in `capture.cjs`. A shot names its output file (relative to
 `docs/assets/screenshots/`, without the extension), the projection mode it
 needs, and either `full: true`, `dialog: true` or `el` (CSS selectors whose
-union is the crop) with `pad` pixels around it. A new image still has to be
+union is the crop) with `pad` pixels around it. `pins` sets destination pins in
+the warp editor for that capture only, so it shows a warped picture. A new image still has to be
 placed in the docs by hand the first time; after that the script keeps its size
 attributes current.
