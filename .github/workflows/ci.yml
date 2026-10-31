@@ -457,12 +457,27 @@ jobs:
             echo "new=true" >> $GITHUB_OUTPUT
           fi
 
+      # The written summary in release-notes/<tag>.md heads the release, with
+      # GitHub's generated list of changes below it. A release without one
+      # still gets the generated list, and a warning.
+      - name: Find the release notes
+        id: notes
+        if: steps.tag.outputs.new == 'true'
+        run: |
+          notes="release-notes/${{ needs.build.outputs.tag }}.md"
+          if [ -f "$notes" ]; then
+            echo "path=$notes" >> $GITHUB_OUTPUT
+          else
+            echo "::warning title=No release notes::$notes is missing; the release has only GitHub's generated list."
+          fi
+
       - name: Create the GitHub release
         if: steps.tag.outputs.new == 'true'
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.build.outputs.tag }}
           name: Suede ${{ needs.build.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.path }}
           generate_release_notes: true
           files: suede_*.deb
           fail_on_unmatched_files: true

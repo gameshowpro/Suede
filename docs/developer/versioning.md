@@ -17,6 +17,14 @@ Pushing that bump to `main` is what makes a release: CI tags `v{version}`,
 builds both architectures, and attaches the packages. Pushing anything else
 builds and tests but publishes nothing.
 
+**Write the release notes in the same commit.** `release-notes/v{version}.md`
+heads the GitHub release, above GitHub's generated list of changes. It is a
+summary for operators of everything new since the previous release, not a
+list of commits. Read the commits since the last tag (`git log
+v{previous}..HEAD`), group them by what an operator can now do, and say what
+changes on upgrade and what a rollback needs. A release without the file
+still publishes, with only the generated list and a warning in the run.
+
 ## Which number to move
 
 Features go in the second, fixes in the third, and packaging-only changes
