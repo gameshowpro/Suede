@@ -558,10 +558,9 @@ catalog, `activeApp` covers the selected app, and `settings` covers daemon
 settings. Omitted switches default to `true`; an omitted description defaults
 to an empty string.
 
-In the web UI, open **System Profiles** and choose **Save new profile**. Pick
-the sections to capture, then save. Before activating a profile, use the
-header's **Save** or **Revert** controls to resolve any unsaved configuration
-edits. API clients can save the working copy with `PUT /api/v1/config` and
+[System profiles](system-profiles.md) describes saving and activating profiles
+in the web UI, including choosing apps and mapping devices. Before
+activating, unsaved configuration edits must be saved or reverted. API clients can save the working copy with `PUT /api/v1/config` and
 `committed: true`, or discard it with `POST /api/v1/config/revert`.
 Profile creation and update capture the
 effective configuration only when explicitly requested; ordinary edits never
@@ -579,6 +578,38 @@ metadata from the current effective configuration.
 `DELETE /api/v1/profiles/{id}` removes one. Profiles are stored under
 `<state_dir>/system-profiles`; exported and imported profile documents are
 limited to 128 MiB of serialized data.
+
+On create and update, `includes.apps` is `true` (every current app), `false`
+(none), or an array of app IDs from the current configuration, which saves
+only those apps. An empty array is the same as `false`, and repeated IDs count
+once. The saved apps keep the order of the current catalog, whatever order the
+array lists them in. The stored profile always records `includes.apps` as a
+boolean: an array of one or more IDs stores as `true` with only the chosen
+apps in `config.apps`.
+
+```json
+{
+  "id": "6c1f1c1e-6f3b-4d7e-9a2e-0d2f1a9b7c11",
+  "name": "Game night",
+  "description": "Scoreboard and lobby only",
+  "includes": {
+    "displays": true,
+    "backgrounds": true,
+    "apps": ["scoreboard", "lobby-loop", "intermission"],
+    "activeApp": true,
+    "settings": false
+  }
+}
+```
+
+Create and update return `422` when the array names an app that is not in
+the current configuration, and when `activeApp` is included but the current
+active app is not among the chosen apps. Activating that profile would
+replace the catalog with one that lacks its active app and fail every time,
+so the request is refused while it can still be fixed: choose the active app
+too, or leave out the `activeApp` section. A profile that includes
+`activeApp` but not `apps` is allowed; its active app is checked against
+whatever catalog exists when it is activated.
 
 `GET /api/v1/profiles/{id}` exports a portable document:
 
@@ -619,17 +650,67 @@ configuration or wallpaper files. Existing wallpaper files with the same ID
 are preserved, and an activation that would require replacing a conflicting
 image is rejected before changing configuration or files.
 
-Activate with `POST /api/v1/profiles/{id}/activate`, optionally supplying
-`outputMappings` and `audioMappings` to adapt saved device names to this
-machine. Output mapping keys match the saved output match key and values name
-the destination connector; audio mapping keys are saved sink names and values
-are destination sink names. The selected sections are merged into the
-effective configuration and committed. Excluded sections remain untouched;
-an included empty section clears the corresponding current section. In
+Activate with `POST /api/v1/profiles/{id}/activate`. Every field of the body
+is optional; an empty object applies every section the profile includes with
+the saved device names:
+
+```json
+{
+  "sections": {
+    "displays": true,
+    "backgrounds": false,
+    "apps": ["scoreboard", "lobby-loop"],
+    "activeApp": false,
+    "settings": false
+  },
+  "outputMappings": { "edid:HDMI-A-1:Acme:Panel:42": "DP-1" },
+  "audioMappings": {
+    "alsa_output.pci-0000_01_00.1.hdmi-stereo": "alsa_output.usb-Vendor_Interface-00.analog-stereo"
+  }
+}
+```
+
+`sections` chooses which of the profile's sections to apply. Its keys are the
+five `includes` switches. A key that is omitted or `null` means whatever the
+profile includes, so a request without `sections` behaves as it always has:
+
+| `sections` value | Effect on the live configuration |
+|---|---|
+| omitted, profile includes the section | the stored section replaces the live one |
+| omitted, profile excludes the section | untouched |
+| `false` | untouched |
+| `true` | the stored section replaces the live one |
+| `apps: [ids]` | the chosen stored apps are added: each replaces the live app with the same ID in place, or is appended, in the profile's order; live apps that are not chosen are kept |
+
+`apps: true` makes the live catalog exactly the stored one, removing live
+apps the profile does not have, while an array only adds or updates the apps
+it names. `apps: []` is the same as `false`. Activation returns `422` when
+`sections` asks for a section the profile does not include (`true`, or an
+`apps` array with at least one ID), and when `sections.apps` names an app that
+the profile does not store. Only the wallpapers that the applied sections
+refer to are installed.
+
+The profile refers to displays and audio outputs by the names they had on the
+system where it was saved. `outputMappings` and `audioMappings` choose, for
+each saved name, the device on this system that should take its place. An
+output mapping key is the saved output match key and its value names the
+destination connector; the saved rule then matches that connector by name,
+and the values adopted from the original display are dropped. An audio
+mapping key is a saved sink name and its value is the destination sink name.
+A saved name without a mapping is kept as it is. A mapping whose key is not in
+the profile, or whose value is blank, returns `422`. Mappings are checked
+against the whole stored profile, so a mapping for a section that `sections`
+leaves out is accepted and has no effect.
+
+The chosen sections are merged into the effective configuration and
+committed. Sections that are excluded or not chosen remain untouched; an
+included empty section clears the corresponding current section. In
 particular, applications in the catalog and `activeApp` are separate, so a
 profile can preserve either independently. The merged configuration is
 validated before it is saved: structurally invalid state, such as an active
-app missing from the resulting catalog, returns `422`. Valid configuration
+app missing from the resulting catalog, returns `422`. That includes applying
+`activeApp` with an `apps` array when the resulting catalog lacks the active
+app. Valid configuration
 that cannot currently be applied because a display or audio device is absent
 is saved and reported through the usual status divergences. Activation while
 a dirty working copy exists returns `409`. As with other desired-state

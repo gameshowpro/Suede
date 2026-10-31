@@ -51,9 +51,21 @@ node tests/ui/system-profiles.cjs
 ```
 
 The fixture intercepts every API request and never connects to an appliance.
-It checks profile include flags, import without activation, the unsaved-edit
-guard, output and audio mappings, activation precondition headers, and visible
-recovery from a stale activation response.
+It checks profile include flags, the Save editor's tri-state Apps checkbox and
+shared app picker (subset, all, none, Escape, the active-app refusal, the
+Update snapshot preselection, and the no-apps state), import without
+activation, the unsaved-edit guard, the Activate dialog's section checkboxes
+(disabled when the profile lacks a section), the Apps subset choice with its
+hint and audio rows, the active-app check, hidden display rows, the `sections`
+request body, activation precondition headers, and visible recovery from a
+stale activation response. For device mapping it checks the combo boxes and
+their detected-device lists (daemon order, null sink left out), row labels,
+placeholders and status lines, the default assignment (exact match first,
+then the next unassigned device, blank when none is left), that a display the
+saved rule already selects sends no mapping while a different display or a
+cleared field does what it says, the refusal of one display chosen for two
+saved displays, typed values surviving hidden rows and an Apps round trip,
+Reset to suggested, and the assignment function on its own.
 
 ## Exact mode browser check
 

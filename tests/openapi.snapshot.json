@@ -25,6 +25,62 @@
               "type": "string"
             },
             "type": "object"
+          },
+          "sections": {
+            "default": {},
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ActivateSections",
+                "description": "Sections to apply. Omitted, every section the profile includes."
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ActivateSections": {
+        "additionalProperties": false,
+        "description": "Which stored sections an activation applies. An omitted or `null` field\nmeans whatever the profile includes; `false` leaves this system's section\nuntouched; `true` applies a section the profile includes.",
+        "properties": {
+          "activeApp": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "apps": {
+            "default": null,
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SectionSelection",
+                "description": "`true` replaces the live catalog with the stored one. An array of\nstored app ids adds those apps: each replaces the live app with the\nsame id in place, or is appended, and other live apps are kept."
+              }
+            ]
+          },
+          "backgrounds": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "displays": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "settings": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -1356,6 +1412,38 @@
         ],
         "type": "object"
       },
+      "CaptureIncludes": {
+        "additionalProperties": false,
+        "description": "The sections to capture. Omitted switches default to `true`. The stored\nprofile always records `apps` as a boolean: a nonempty subset stores as\n`true` with only the chosen apps in its catalog.",
+        "properties": {
+          "activeApp": {
+            "default": true,
+            "type": "boolean"
+          },
+          "apps": {
+            "default": true,
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SectionSelection",
+                "description": "`true` for every current app, `false` or `[]` for none, or the ids of\napps in the current configuration."
+              }
+            ]
+          },
+          "backgrounds": {
+            "default": true,
+            "type": "boolean"
+          },
+          "displays": {
+            "default": true,
+            "type": "boolean"
+          },
+          "settings": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "CaptureIntervals": {
         "description": "How many canvas periods elapsed between one capture reaching the slicer\nand the previous one, bucketed over the reporting interval. A period is\n`1000 / canvas refresh` when the canvas output reports one, else the\n16.667 ms of an assumed 60 Hz. A healthy capture loop that keeps up with\nevery canvas frame counts almost entirely in `one`; a loop that can only\nmanage every second frame (the four-projector rig's CPU path before the\nGPU one existed — see `crate::projection::gpu`'s module doc) counts\nalmost entirely in `two`.",
         "properties": {
@@ -1409,7 +1497,7 @@
             "type": "string"
           },
           "includes": {
-            "$ref": "#/components/schemas/ProfileIncludes"
+            "$ref": "#/components/schemas/CaptureIncludes"
           },
           "name": {
             "type": "string"
@@ -5430,6 +5518,20 @@
         ],
         "type": "object"
       },
+      "SectionSelection": {
+        "description": "A section choice in a request: `true` selects every item, `false` or an\nempty array selects none, and an array of ids selects exactly those items\n(duplicates are ignored). Only the `apps` section accepts an array.",
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
       "Settings": {
         "additionalProperties": false,
         "description": "Daemon-level settings that belong to desired state.",
@@ -5863,7 +5965,7 @@
             "type": "string"
           },
           "includes": {
-            "$ref": "#/components/schemas/ProfileIncludes"
+            "$ref": "#/components/schemas/CaptureIncludes"
           },
           "name": {
             "type": "string"
@@ -7959,6 +8061,9 @@
           },
           "409": {
             "description": "Profile identifier or name already exists"
+          },
+          "422": {
+            "description": "Invalid name, an app id not in the current configuration, or an active app outside the selected apps"
           }
         },
         "tags": [
@@ -8087,6 +8192,9 @@
           },
           "409": {
             "description": "Another profile already uses this name"
+          },
+          "422": {
+            "description": "Invalid name, an app id not in the current configuration, or an active app outside the selected apps"
           }
         },
         "tags": [
@@ -8170,7 +8278,7 @@
             "description": "Unsaved configuration, stale precondition, or conflicting wallpaper"
           },
           "422": {
-            "description": "The combined configuration is invalid"
+            "description": "A section or app the profile does not include, an invalid mapping, or an invalid combined configuration"
           }
         },
         "tags": [

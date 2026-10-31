@@ -445,6 +445,17 @@ button.pin-toggle:disabled { opacity: 0.3; cursor: not-allowed; }
 #slice-units-row input { width: auto; padding: 0; margin: 0; flex: none; }
 #slice-units-row { margin-bottom: 12px; }
 dialog { color: var(--ink); background: var(--panel); border: 1px solid var(--line); border-radius: 9px; max-width: min(34em, calc(100vw - 32px)); }
+/* Checkbox labels in the profile dialogs sit beside their box, not stacked like field labels. */
+.check { display: inline-flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--ink); cursor: pointer; }
+.check input { width: auto; padding: 0; margin: 0; flex: none; }
+.check input:disabled, .check:has(input:disabled) { cursor: not-allowed; }
+#profile-apps-picker .pick-list { list-style: none; margin: 8px 0; padding: 0; max-height: 40vh; overflow-y: auto; }
+#profile-apps-picker .pick-list li { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding: 4px 0; }
+/* Each mapping row carries a label, a combo and a status line, so this dialog is wider than the base one. */
+#profile-activate-dialog { max-width: min(44em, calc(100vw - 32px)); }
+.profile-map-row { margin-top: 10px; }
+.profile-map-row [data-profile-map-status] { display: block; margin-top: 4px; }
+#profile-map-reset { margin-top: 12px; }
 #arrange-dialog { max-width: min(42em, calc(100vw - 32px)); border-radius: 12px; }
 #arrange-dialog form { padding: 24px 28px; }
 #arrange-dialog h2 { margin-top: 0; margin-bottom: 8px; }
@@ -1053,7 +1064,7 @@ window.addEventListener("error", (event) => {
   <section id="tab-profiles" class="panel-grid hidden">
     <div class="panel">
       <h2>System Profiles</h2>
-      <p class="hint">Save and activate reusable snapshots of this system configuration. Activating a profile merges only its selected sections.</p>
+      <p class="hint">Save and activate reusable snapshots of this system configuration. Activating a profile merges only its selected sections. <a data-docs-path="system-profiles/" target="_blank" rel="noopener noreferrer">Learn about system profiles</a>.</p>
       <div class="row" style="margin-bottom:12px">
         <button class="action" id="profile-new">Save new profile</button>
         <button class="action ghost" id="profile-import-button">Import</button>
@@ -1079,6 +1090,54 @@ window.addEventListener("error", (event) => {
         <button class="action" type="button" id="profile-import-save">Import profile</button>
       </div>
     </dialog>
+    <dialog id="profile-apps-picker" aria-labelledby="profile-apps-picker-heading">
+      <form method="dialog">
+        <div class="dialog-body">
+          <h2 id="profile-apps-picker-heading">Choose apps</h2>
+          <p class="hint" id="profile-apps-picker-hint"></p>
+          <div class="row">
+            <button type="button" class="action ghost" id="profile-apps-picker-all">Select all</button>
+            <button type="button" class="action ghost" id="profile-apps-picker-none">Select none</button>
+          </div>
+          <ul class="pick-list" id="profile-apps-picker-list"></ul>
+          <p class="hint" id="profile-apps-picker-count" role="status"></p>
+        </div>
+        <div class="dialog-foot">
+          <button class="action ghost" type="button" id="profile-apps-picker-cancel" autofocus>Cancel</button>
+          <button class="action" type="submit" value="ok" id="profile-apps-picker-ok">OK</button>
+        </div>
+      </form>
+    </dialog>
+    <dialog id="profile-activate-dialog" aria-labelledby="profile-activate-heading">
+      <div class="dialog-body">
+        <h2 id="profile-activate-heading">Activate</h2>
+        <fieldset><legend>Sections to activate</legend>
+          <p class="hint">Choose which parts of this profile to apply. Sections the profile does not contain are unavailable. Everything else on this system is left as it is.</p>
+          <div class="row">
+            <label class="check"><input type="checkbox" data-profile-section="displays"> <span>Displays</span></label>
+            <label class="check"><input type="checkbox" data-profile-section="backgrounds"> <span>Backgrounds</span></label>
+            <label class="check"><input type="checkbox" data-profile-section="apps"> <span>Apps</span></label>
+            <span class="hint" id="profile-activate-apps-summary" role="status"></span>
+            <button type="button" class="action ghost" id="profile-activate-apps-choose" aria-describedby="profile-activate-apps-summary">Choose apps…</button>
+            <label class="check"><input type="checkbox" data-profile-section="activeApp"> <span>Active app</span></label>
+            <label class="check"><input type="checkbox" data-profile-section="settings"> <span>System settings</span></label>
+          </div>
+          <p class="hint" id="profile-activate-apps-hint" role="status"></p>
+        </fieldset>
+        <fieldset id="profile-map-fieldset"><legend>Device mapping</legend>
+          <p class="hint">The profile refers to displays and audio outputs by the names they had on the system where it was saved. For each saved name, choose the device on this system that should take its place: pick a detected device from the list or type a name. Leave a field blank to keep the saved name.</p>
+          <div id="profile-map-displays-rows"></div>
+          <div id="profile-map-audio-rows"></div>
+          <datalist id="profile-map-displays"></datalist>
+          <datalist id="profile-map-audio"></datalist>
+          <button type="button" class="action ghost" id="profile-map-reset">Reset to suggested</button>
+        </fieldset>
+        <p class="hint" id="profile-map-none" hidden>This profile has no display or audio device names to map.</p>
+        <p class="hint" id="profile-activate-error" role="alert"></p>
+        <p class="hint">Activation replaces only the selected sections. Save or Revert any unsaved edits first.</p>
+      </div>
+      <div class="dialog-foot"><button class="action ghost" type="button" data-profile-cancel autofocus>Cancel</button><button class="action" type="button" data-profile-activate>Activate profile</button></div>
+    </dialog>
     <div class="panel" id="profile-editor" hidden>
       <h2 id="profile-editor-title">Save profile</h2>
       <div class="fields">
@@ -1087,13 +1146,16 @@ window.addEventListener("error", (event) => {
       </div>
       <fieldset style="margin-top:12px"><legend>Configuration sections</legend>
         <div class="row">
-          <label><input type="checkbox" data-profile-include="displays" checked> Displays</label>
-          <label><input type="checkbox" data-profile-include="backgrounds" checked> Backgrounds</label>
-          <label><input type="checkbox" data-profile-include="apps" checked> Apps</label>
-          <label><input type="checkbox" data-profile-include="activeApp" checked> Active app</label>
-          <label><input type="checkbox" data-profile-include="settings" checked> System settings</label>
+          <label class="check"><input type="checkbox" data-profile-include="displays" checked> Displays</label>
+          <label class="check"><input type="checkbox" data-profile-include="backgrounds" checked> Backgrounds</label>
+          <label class="check"><input type="checkbox" data-profile-include="apps" checked> Apps</label>
+          <span class="hint" id="profile-apps-summary" role="status">All 0 apps</span>
+          <button type="button" class="action ghost" id="profile-apps-choose" aria-describedby="profile-apps-summary">Choose apps…</button>
+          <label class="check"><input type="checkbox" data-profile-include="activeApp" checked> Active app</label>
+          <label class="check"><input type="checkbox" data-profile-include="settings" checked> System settings</label>
         </div>
       </fieldset>
+      <p class="hint" id="profile-editor-note" role="status"></p>
       <div class="row" style="margin-top:12px">
         <button class="action" id="profile-save">Save profile</button>
         <button class="action ghost" id="profile-editor-cancel">Cancel</button>
@@ -4874,9 +4936,74 @@ function renderChecks() {
 
 let systemProfiles = [], editingProfileId = null, pendingImportedProfile = null;
 const profileIncludes = ["displays", "backgrounds", "apps", "activeApp", "settings"];
+// Apps are a tri-state: all, none, or a subset chosen in the shared picker.
+// The state lives in a variable and is only mirrored onto the checkbox.
+let profileAppSelection = { kind: "all" }, profileStoredApps = [], profileEditorNote = "";
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+const selectionFromIds = (ids, total) => ids.length === total ? { kind: "all" } : ids.length === 0 ? { kind: "none" } : { kind: "subset", ids };
+const selectionIds = (selection, all) => selection.kind === "all" ? all : selection.kind === "subset" ? selection.ids : [];
+function setTriState(input, selection) {
+  input.indeterminate = selection.kind === "subset"; input.checked = selection.kind === "all";
+}
+// A short hint for a picker row: a URL's host, or a program's file name.
+function profileAppDescription(app) {
+  const launcher = app.launcher ?? {}, exec = launcher.kind === "exec", target = (exec ? launcher.command : launcher.uri) ?? "";
+  let host = exec ? target.split("/").pop() : target;
+  if (!exec) try { host = new URL(target.replace(/\{[^}]*\}/g, "x")).host || target; } catch { /* not a URL: show it as given */ }
+  return [launcher.kind, host].filter(Boolean).join(" · ");
+}
+// Resolves to the chosen ids in list order, or null when canceled.
+// decorate(app) returns { pills: [text], disabled }.
+function pickApps({ title, hint, apps, selectedIds, decorate, invoker = document.activeElement }) {
+  const dialog = $("profile-apps-picker"), list = $("profile-apps-picker-list"), chosen = new Set(selectedIds);
+  $("profile-apps-picker-heading").textContent = title;
+  $("profile-apps-picker-hint").textContent = hint;
+  list.replaceChildren();
+  for (const app of apps) {
+    const { pills = [], disabled = false } = decorate?.(app) ?? {};
+    const li = document.createElement("li");
+    li.innerHTML = `<label class="check"><input type="checkbox" data-pick-app="${escape(app.id)}"${disabled ? " disabled" : ""}> <span>${escape(app.id)}</span></label>` +
+      `<span class="hint">${escape(profileAppDescription(app))}</span>${pills.map((text) => `<span class="pill muted">${escape(text)}</span>`).join("")}`;
+    li.querySelector("input").checked = !disabled && chosen.has(app.id);
+    list.append(li);
+  }
+  const boxes = () => [...list.querySelectorAll("input:not(:disabled)")];
+  const count = () => { $("profile-apps-picker-count").textContent = `${boxes().filter((box) => box.checked).length} of ${boxes().length} selected`; };
+  list.onchange = count;
+  $("profile-apps-picker-all").onclick = () => { boxes().forEach((box) => { box.checked = true; }); count(); };
+  $("profile-apps-picker-none").onclick = () => { boxes().forEach((box) => { box.checked = false; }); count(); };
+  $("profile-apps-picker-cancel").onclick = () => dialog.close();
+  count(); dialog.returnValue = "";
+  return new Promise((resolve) => {
+    dialog.addEventListener("close", () => {
+      resolve(dialog.returnValue === "ok" ? boxes().filter((box) => box.checked).map((box) => box.dataset.pickApp) : null);
+      if (invoker?.isConnected) invoker.focus();
+    }, { once: true });
+    dialog.showModal();
+  });
+}
 function selectedProfileIncludes() {
-  return Object.fromEntries(profileIncludes.map((key) => [key,
-    document.querySelector(`[data-profile-include="${key}"]`).checked]));
+  return Object.fromEntries(profileIncludes.map((key) => [key, key === "apps"
+    ? ({ all: true, none: false }[profileAppSelection.kind] ?? [...profileAppSelection.ids])
+    : document.querySelector(`[data-profile-include="${key}"]`).checked]));
+}
+function profileActiveAppProblem() {
+  const active = config?.activeApp, selection = profileAppSelection;
+  if (!document.querySelector('[data-profile-include="activeApp"]').checked || !active ||
+    selection.kind !== "subset" || selection.ids.includes(active)) return "";
+  return `The active app "${active}" is not among the selected apps. Select it, or uncheck Active app.`;
+}
+function renderProfileEditorApps() {
+  const total = (config?.apps ?? []).length, selection = profileAppSelection;
+  setTriState(document.querySelector('[data-profile-include="apps"]'), selection);
+  $("profile-apps-summary").textContent = selection.kind === "none" ? "Apps are not saved."
+    : selection.kind === "subset" ? `${selection.ids.length} of ${total} apps: ${selection.ids.slice(0, 3).join(", ")}${selection.ids.length > 3 ? ` +${selection.ids.length - 3} more` : ""}`
+    : total === 0 ? "No apps are configured on this system; the profile will store an empty app list."
+    : `All ${plural(total, "app", "apps")}`;
+  $("profile-apps-choose").disabled = total === 0;
+  const problem = profileActiveAppProblem(), note = $("profile-editor-note");
+  note.textContent = problem || profileEditorNote;
+  note.setAttribute("role", problem ? "alert" : "status");
 }
 function profileMessage(message, error = false) {
   const el = $("profile-message"); el.textContent = message || "";
@@ -4928,22 +5055,54 @@ function profileNameConflict(name, exceptId = null) {
   const key = profileNameKey(name);
   return systemProfiles.find((profile) => profile.id !== exceptId && profileNameKey(profile.name) === key);
 }
-function openProfileEditor(profile = null) {
+async function openProfileEditor(profile = null) {
+  const stored = profile ? await api(`/profiles/${encodeURIComponent(profile.id)}`) : null;
   editingProfileId = profile?.id ?? null;
   $("profile-editor-title").textContent = profile ? "Update profile snapshot" : "Save new profile";
   $("profile-name").value = profile?.name || "";
   $("profile-description").value = profile?.description || "";
-  for (const key of profileIncludes) document.querySelector(`[data-profile-include="${key}"]`).checked =
+  for (const key of profileIncludes) if (key !== "apps") document.querySelector(`[data-profile-include="${key}"]`).checked =
     profile ? Boolean(profile.includes?.[key]) : true;
+  // An update starts from the stored apps that still exist here, so it keeps
+  // the profile's shape instead of silently widening to every current app.
+  const currentIds = (config?.apps ?? []).map((app) => app.id);
+  profileStoredApps = profile?.includes?.apps ? stored.config?.apps ?? [] : [];
+  const storedIds = profileStoredApps.map((app) => app.id), kept = currentIds.filter((id) => storedIds.includes(id));
+  profileEditorNote = "";
+  if (!profile) profileAppSelection = { kind: "all" };
+  else if (!profile.includes?.apps) profileAppSelection = { kind: "none" };
+  else if (kept.length === currentIds.length) profileAppSelection = { kind: "all" };
+  else if (kept.length === 0) {
+    profileAppSelection = { kind: "none" };
+    if (storedIds.length) profileEditorNote = storedIds.length === 1 ? "The app in this profile is not configured on this system."
+      : `None of the ${storedIds.length} apps in this profile are configured on this system.`;
+  } else profileAppSelection = { kind: "subset", ids: kept };
+  renderProfileEditorApps();
   $("profile-editor").hidden = false; $("profile-name").focus();
 }
-function editSystemProfile(profile) { openProfileEditor(profile); }
+function editSystemProfile(profile) { return openProfileEditor(profile); }
+document.querySelector('[data-profile-include="apps"]').onchange = (event) => {
+  profileAppSelection = { kind: event.target.checked ? "all" : "none" }; profileEditorNote = ""; renderProfileEditorApps();
+};
+document.querySelector('[data-profile-include="activeApp"]').onchange = renderProfileEditorApps;
+$("profile-apps-choose").onclick = () => profileTask(async () => {
+  const current = config?.apps ?? [], currentIds = current.map((app) => app.id);
+  const ids = await pickApps({ title: "Choose apps to save", hint: "Only the selected apps are stored in the profile.",
+    apps: [...current, ...profileStoredApps.filter((app) => !currentIds.includes(app.id))],
+    selectedIds: selectionIds(profileAppSelection, currentIds), invoker: $("profile-apps-choose"),
+    decorate: (app) => currentIds.includes(app.id) ? { pills: app.id === config.activeApp ? ["active"] : [] }
+      : { pills: ["not on this system"], disabled: true } });
+  if (!ids) return;
+  profileAppSelection = selectionFromIds(ids, currentIds.length); profileEditorNote = ""; renderProfileEditorApps();
+});
 $("profile-new").onclick = () => openProfileEditor();
 $("profile-editor-cancel").onclick = () => { $("profile-editor").hidden = true; };
 $("profile-save").onclick = () => profileTask(async () => {
   if (!loaded()) return;
   const name = $("profile-name").value.trim();
   if (!name) throw new Error("Enter a profile name.");
+  const appsProblem = profileActiveAppProblem();
+  if (appsProblem) throw new Error(appsProblem);
   await loadSystemProfiles();
   if (profileNameConflict(name, editingProfileId)) throw new Error(`A profile named “${name}” already exists. Choose an unused name.`);
   const body = { name, description: $("profile-description").value.trim(), includes: selectedProfileIncludes() };
@@ -5018,14 +5177,68 @@ function profileOutputMatchKey(match = {}) {
   return match.name != null && match.make == null && match.model == null && match.serial == null ? match.name :
     `edid:${match.name ?? ""}:${match.make ?? ""}:${match.model ?? ""}:${match.serial ?? ""}`;
 }
+const profileAudioNames = (apps) => [...new Set(apps.map((a) => a.audio?.output).filter((v) => typeof v === "string" && v))];
 function profileNames(profile, kind) {
   const config = profile.config || profile;
   if (kind === "display") return [...new Map((config.outputs || []).filter((o) => o.match &&
     ["name", "make", "model", "serial"].some((key) => o.match[key] != null)).map((o) => [profileOutputMatchKey(o.match), {
-      key: profileOutputMatchKey(o.match), name: o.match.name || "",
-      label: [o.match.name, o.match.make, o.match.model, o.match.serial].filter(Boolean).join(" · ")
+      key: profileOutputMatchKey(o.match), name: o.match.name || "", match: o.match,
+      label: [o.match.name, profileEdidLabel(o.match)].filter(Boolean).join(" · ")
     }])).values()];
-  return [...new Set((config.apps || []).map((a) => a.audio?.output).filter((v) => typeof v === "string" && v))];
+  return profileAudioNames(config.apps || []);
+}
+const profileEdidLabel = (device) => [device.make, device.model, device.serial].filter(Boolean).join(" ");
+const profileDetectedSinks = (list) => (list || []).filter((sink) => !sink.isNullSink);
+// Whether a saved OutputMatch selects a detected output: every field the rule
+// specifies must be equal, exactly and case-sensitively. This mirrors
+// OutputMatch::matches in src/model/desired.rs, including that an empty rule
+// selects nothing.
+function profileMatchSelects(match = {}, output = {}) {
+  const fields = ["name", "make", "model", "serial"];
+  return fields.some((key) => match[key] != null) &&
+    fields.every((key) => match[key] == null || (output[key] != null && output[key] === match[key]));
+}
+const profileMapStatus = {
+  display: { exact: "matches a connected display", next: "suggested: the next unassigned display",
+    none: "no unassigned display is connected; the saved name is kept" },
+  audio: { exact: "matches a detected audio output", next: "suggested: the next unassigned audio output",
+    none: "no unassigned audio output is detected; the saved name is kept" },
+};
+// The suggested device for each Activate mapping row. `rows` are
+// `{ kind: "display", match }` or `{ kind: "audio", name }` in dialog order;
+// a row with a `held` value keeps it (the operator already has it in the
+// field) and that device counts as assigned. Displays and audio are assigned
+// independently, each against its detected devices in the daemon's order:
+// pass 1 gives every row the lowest-index unassigned device that its saved
+// name selects exactly, then pass 2 gives each row still blank the
+// lowest-index device no row holds yet. Returns `{ value, status }` per row,
+// with `status: null` for a held row.
+function profileDefaultMappings(rows, detectedOutputs, detectedSinks) {
+  const displays = detectedOutputs || [];
+  const pools = { display: displays.map((output) => output.name), audio: profileDetectedSinks(detectedSinks).map((sink) => sink.id) };
+  const result = rows.map((row) => row.held != null ? { value: row.held, status: null } : null);
+  for (const kind of ["display", "audio"]) {
+    const devices = pools[kind], text = profileMapStatus[kind], taken = new Set();
+    const own = rows.flatMap((row, i) => row.kind === kind ? [i] : []);
+    for (const i of own) if (rows[i].held != null) taken.add(String(rows[i].held).trim());
+    for (const i of own) {
+      if (result[i]) continue;
+      // Two audio rows may share a sink, so an exact audio match is never
+      // passed over; two display rows may not share a connector.
+      const at = kind === "display"
+        ? displays.findIndex((output) => !taken.has(output.name) && profileMatchSelects(rows[i].match, output))
+        : devices.indexOf(rows[i].name);
+      if (at < 0) continue;
+      taken.add(devices[at]); result[i] = { value: devices[at], status: text.exact };
+    }
+    for (const i of own) {
+      if (result[i]) continue;
+      const next = devices.find((device) => !taken.has(device));
+      if (next == null) { result[i] = { value: "", status: text.none }; continue; }
+      taken.add(next); result[i] = { value: next, status: text.next };
+    }
+  }
+  return result;
 }
 async function activateSystemProfile(profile) {
   if (isDirty() || previewQueued || previewFlight) {
@@ -5033,45 +5246,156 @@ async function activateSystemProfile(profile) {
     return;
   }
   const exported = await api(`/profiles/${encodeURIComponent(profile.id)}`);
-  const mappings = { outputMappings: {}, audioMappings: {} };
-  const pairs = [["Display names", profileNames(exported, "display"), profileNames(config || {}, "display"), mappings.outputMappings],
-    ["Audio sink names", profileNames(exported, "audio"), profileNames(config || {}, "audio"), mappings.audioMappings]];
-  const rows = pairs.flatMap(([title, names, current, target]) => names.map((name) => ({ title,
-    key: title === "Display names" ? name.key : name, label: title === "Display names" ? name.label : name,
-    current: title === "Display names" ? current.map((entry) => entry.key) : current,
-    target,
-    suggested: title === "Display names"
-      ? (current.some((entry) => entry.key === name.key) ? name.key
-        : current.some((entry) => entry.key === name.name) ? name.name : "")
-      : (current.includes(name) ? name : "") })));
-  const invoker = document.activeElement;
-  const dialog = document.createElement("dialog");
-  dialog.setAttribute("aria-labelledby", "profile-activate-heading");
-  dialog.innerHTML = `<div class="dialog-body"><h2 id="profile-activate-heading">Activate ${escape(profile.name || profile.id)}</h2>
-    <p class="hint">Map names from this profile to names on this system. Leave a value unchanged to keep the same name.</p>
-    ${rows.length ? rows.map((row, i) => `<div class="fields"><div><label for="profile-map-${i}">${escape(row.title)}: ${escape(row.label)}</label><input id="profile-map-${i}" value="${escape(row.suggested)}" placeholder="Leave blank to keep the profile value"></div></div>`).join("") : "<p class=\"hint\">No display or audio names need mapping.</p>"}
-    <p class="hint">Activation replaces only included sections. Save or Revert any unsaved edits first.</p></div>
-    <div class="dialog-foot"><button class="action ghost" type="button" data-profile-cancel autofocus>Cancel</button><button class="action" type="button" data-profile-activate>Activate profile</button></div>`;
-  document.body.append(dialog);
+  const includes = exported.includes ?? profile.includes ?? {};
+  const stored = exported.config?.apps ?? [], storedIds = stored.map((app) => app.id);
+  const liveIds = (config?.apps ?? []).map((app) => app.id);
+  // Each mapping row keeps its own state: `value` is what the field holds
+  // (undefined until a suggestion is made), `suggested` and `status` are the
+  // default assignment the status line describes while the field still holds it.
+  const displayRows = profileNames(exported, "display").map((name, i) => ({ kind: "display", key: name.key, match: name.match,
+    id: `profile-map-${i}`, list: "profile-map-displays", label: `Saved display ${name.label}`, keep: name.name || name.label }));
+  const audioState = new Map();
+  const audioRow = (name) => {
+    const description = profileDetectedSinks(sinks).find((sink) => sink.id === name)?.description;
+    return { kind: "audio", key: name, name, list: "profile-map-audio", keep: name,
+      label: `Saved audio output ${name}${description ? ` (${description})` : ""}` };
+  };
+  const mapRow = (row) => `<div class="profile-map-row"><label for="${row.id}">${escape(row.label)}</label>` +
+    `<input id="${row.id}" list="${row.list}" placeholder="${escape(`Keep ${row.keep}`)}" aria-describedby="${row.id}-status">` +
+    `<span class="hint" id="${row.id}-status" data-profile-map-status role="status"></span></div>`;
+  const showStatus = (row) => {
+    $(`${row.id}-status`).textContent = $(row.id).value.trim() === (row.suggested ?? "") ? row.status ?? "" : "";
+  };
+  const paintRows = (container, rows) => {
+    $(container).innerHTML = rows.map(mapRow).join("");
+    for (const row of rows) { $(row.id).value = row.value ?? ""; showStatus(row); }
+  };
+  // Rows that already hold a value keep it, and it counts as assigned.
+  const suggest = (rows) => {
+    const defaults = profileDefaultMappings(rows.map((row) => ({ ...row, held: row.value })), outputs, sinks);
+    rows.forEach((row, i) => {
+      if (defaults[i].status != null) Object.assign(row, { value: defaults[i].value, suggested: defaults[i].value, status: defaults[i].status });
+    });
+  };
+  const dialog = $("profile-activate-dialog"), invoker = document.activeElement;
+  const box = (key) => dialog.querySelector(`[data-profile-section="${key}"]`);
+  const sectionOn = (key) => !box(key).disabled && box(key).checked;
+  const appsAvailable = Boolean(includes.apps);
+  let apps = { kind: appsAvailable ? "all" : "none" }, audioRows = [];
+  $("profile-activate-heading").textContent = `Activate “${profile.name || profile.id}”`;
+  for (const key of profileIncludes) {
+    const input = box(key), label = input.closest("label");
+    label.querySelector("[data-missing]")?.remove();
+    input.disabled = !includes[key]; input.checked = Boolean(includes[key]);
+    if (!includes[key]) label.insertAdjacentHTML("beforeend", ' <span class="hint" data-missing>(not in this profile)</span>');
+  }
+  // The lists are of detected devices in the daemon's order, rebuilt on each
+  // open; an SSE update while the dialog is open does not change them.
+  $("profile-map-displays").innerHTML = (outputs || []).map((output) =>
+    `<option value="${escape(output.name)}">${escape(profileEdidLabel(output))}</option>`).join("");
+  $("profile-map-audio").innerHTML = profileDetectedSinks(sinks).map((sink) =>
+    `<option value="${escape(sink.id)}">${escape([sink.description, sink.isDefault ? "(default)" : ""].filter(Boolean).join(" "))}</option>`).join("");
+  suggest(displayRows);
+  paintRows("profile-map-displays-rows", displayRows);
+  const noNames = displayRows.length === 0 && profileAudioNames(stored).length === 0;
+  $("profile-map-fieldset").hidden = noNames; $("profile-map-none").hidden = !noNames;
+  const appsProblem = () => {
+    const active = exported.config?.activeApp;
+    if (!sectionOn("activeApp") || !active) return "";
+    const ids = apps.kind === "all" ? storedIds : apps.kind === "subset" ? [...apps.ids, ...liveIds] : liveIds;
+    return ids.includes(active) ? "" : `The profile's active app "${active}" would not be in this system's app list after activation. Select it under Apps, or uncheck Active app.`;
+  };
+  // Two saved displays cannot become one connector; the server would reject
+  // the merged document as a duplicate output key. Audio rows may share a sink.
+  const displayProblem = () => {
+    if (!sectionOn("displays")) return "";
+    const seen = new Set();
+    for (const row of displayRows) {
+      const value = $(row.id).value.trim();
+      if (!value) continue;
+      if (seen.has(value)) return `${value} is chosen for two saved displays. Each display on this system can take the place of one saved display.`;
+      seen.add(value);
+    }
+    return "";
+  };
+  const problem = () => appsProblem() || displayProblem();
+  const refresh = () => {
+    setTriState(box("apps"), apps);
+    $("profile-activate-apps-summary").textContent = !appsAvailable ? "" : apps.kind === "subset" ? `${apps.ids.length} of ${storedIds.length} apps`
+      : apps.kind === "all" && storedIds.length ? `All ${plural(storedIds.length, "app", "apps")}` : "No apps";
+    $("profile-activate-apps-choose").hidden = !appsAvailable; $("profile-activate-apps-choose").disabled = storedIds.length === 0;
+    $("profile-activate-apps-hint").textContent = !appsAvailable ? ""
+      : apps.kind === "none" ? "Leaves this system's apps unchanged."
+      : apps.kind === "subset" ? `Adds or updates the ${plural(apps.ids.length, "selected app", "selected apps")}. The other apps on this system are kept.`
+      : storedIds.length ? `Replaces this system's app list with the ${plural(storedIds.length, "app", "apps")} in this profile.`
+      : "This profile stores an empty app list, so activating Apps removes every app from this system.";
+    // Audio rows follow the Apps choice. A row that stays (or comes back)
+    // keeps whatever its field held; only rows new to this dialog get a
+    // suggestion, and the kept values count as assigned when it is made.
+    const used = apps.kind === "all" ? stored : apps.kind === "subset" ? stored.filter((app) => apps.ids.includes(app.id)) : [];
+    audioRows = profileAudioNames(used).map((name, j) => {
+      if (!audioState.has(name)) audioState.set(name, audioRow(name));
+      return Object.assign(audioState.get(name), { id: `profile-map-${displayRows.length + j}` });
+    });
+    if (audioRows.some((row) => row.value === undefined)) suggest(audioRows);
+    paintRows("profile-map-audio-rows", audioRows);
+    $("profile-map-displays-rows").hidden = !sectionOn("displays");
+    $("profile-map-reset").hidden = !(sectionOn("displays") && displayRows.length) && !audioRows.length;
+    $("profile-activate-error").textContent = problem();
+  };
+  $("profile-map-fieldset").oninput = (event) => {
+    const row = [...displayRows, ...audioRows].find((entry) => entry.id === event.target.id);
+    if (!row) return;
+    row.value = event.target.value; showStatus(row);
+    $("profile-activate-error").textContent = problem();
+  };
+  $("profile-map-reset").onclick = () => {
+    for (const row of [...displayRows, ...audioState.values()]) row.value = undefined;
+    suggest([...displayRows, ...audioRows]);
+    paintRows("profile-map-displays-rows", displayRows); paintRows("profile-map-audio-rows", audioRows);
+    $("profile-activate-error").textContent = problem();
+  };
+  box("apps").onchange = () => { apps = { kind: box("apps").checked ? "all" : "none" }; refresh(); };
+  for (const key of profileIncludes) if (key !== "apps") box(key).onchange = refresh;
+  $("profile-activate-apps-choose").onclick = () => profileTask(async () => {
+    const ids = await pickApps({ title: "Choose apps to activate",
+      hint: "Selected apps are added to this system or replace the app with the same id. Apps you leave unselected are not changed.",
+      apps: stored, selectedIds: selectionIds(apps, storedIds), invoker: $("profile-activate-apps-choose"),
+      decorate: (app) => ({ pills: [liveIds.includes(app.id) ? "on this system" : "new"] }) });
+    if (!ids) return;
+    apps = selectionFromIds(ids, storedIds.length); refresh();
+  });
   dialog.querySelector("[data-profile-cancel]").onclick = () => dialog.close();
   dialog.querySelector("[data-profile-activate]").onclick = () => run(async () => {
-    if (isDirty() || previewQueued || previewFlight) throw new Error("The working configuration became unsaved. Save or Revert it, then retry activation.");
-    for (const key of Object.keys(mappings.outputMappings)) delete mappings.outputMappings[key];
-    for (const key of Object.keys(mappings.audioMappings)) delete mappings.audioMappings[key];
-    rows.forEach((row, i) => { const mapped = dialog.querySelector(`#profile-map-${i}`).value.trim();
-      if (mapped && mapped !== row.key) row.target[row.key] = mapped; });
-    const headers = { "content-type": "application/json" };
-    if (config?.revision != null) headers["if-match"] = String(config.revision);
-    if (configGeneration != null) headers["if-config-generation"] = String(configGeneration);
-    if (configEpoch != null) headers["if-config-epoch"] = String(configEpoch);
-    await api(`/profiles/${encodeURIComponent(profile.id)}/activate`, {
-      method: "POST", headers, body: JSON.stringify(mappings) });
-    dialog.close(); profileMessage(`Activated “${profile.name || profile.id}”.`);
+    try {
+      if (isDirty() || previewQueued || previewFlight) throw new Error("The working configuration became unsaved. Save or Revert it, then retry activation.");
+      const refusal = problem();
+      if (refusal) throw new Error(refusal);
+      const outputMappings = {}, audioMappings = {};
+      // No mapping is sent for a display the saved rule already selects:
+      // the server would rewrite the rule to a bare connector name and drop
+      // its adopted values, which is only wanted when the operator points
+      // the rule at a different display. Typing the saved name also keeps it.
+      if (sectionOn("displays")) for (const row of displayRows) {
+        const mapped = $(row.id).value.trim();
+        if (!mapped || mapped === row.key) continue;
+        if ((outputs || []).some((output) => output.name === mapped && profileMatchSelects(row.match, output))) continue;
+        outputMappings[row.key] = mapped;
+      }
+      for (const row of audioRows) { const mapped = $(row.id).value.trim(); if (mapped && mapped !== row.name) audioMappings[row.name] = mapped; }
+      const sections = Object.fromEntries(profileIncludes.map((key) => [key, key === "apps"
+        ? (!appsAvailable ? false : apps.kind === "subset" ? [...apps.ids] : apps.kind === "all") : sectionOn(key)]));
+      const headers = { "content-type": "application/json" };
+      if (config?.revision != null) headers["if-match"] = String(config.revision);
+      if (configGeneration != null) headers["if-config-generation"] = String(configGeneration);
+      if (configEpoch != null) headers["if-config-epoch"] = String(configEpoch);
+      await api(`/profiles/${encodeURIComponent(profile.id)}/activate`, {
+        method: "POST", headers, body: JSON.stringify({ sections, outputMappings, audioMappings }) });
+      dialog.close(); profileMessage(`Activated “${profile.name || profile.id}”.`);
+    } catch (error) { $("profile-activate-error").textContent = error.message; throw error; }
   }, "");
-  dialog.addEventListener("close", () => {
-    dialog.remove();
-    if (invoker?.isConnected) invoker.focus();
-  }, { once: true });
+  dialog.addEventListener("close", () => { if (invoker?.isConnected) invoker.focus(); }, { once: true });
+  refresh();
   dialog.showModal();
 }
 

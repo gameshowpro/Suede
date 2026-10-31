@@ -42,6 +42,85 @@ impl Default for ProfileIncludes {
     }
 }
 
+/// A section choice in a request: `true` selects every item, `false` or an
+/// empty array selects none, and an array of ids selects exactly those items
+/// (duplicates are ignored). Only the `apps` section accepts an array.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum SectionSelection {
+    Flag(bool),
+    Subset(Vec<String>),
+}
+
+impl Default for SectionSelection {
+    fn default() -> Self {
+        Self::Flag(true)
+    }
+}
+
+impl SectionSelection {
+    pub fn is_none(&self) -> bool {
+        match self {
+            Self::Flag(selected) => !selected,
+            Self::Subset(ids) => ids.is_empty(),
+        }
+    }
+
+    pub fn is_all(&self) -> bool {
+        matches!(self, Self::Flag(true))
+    }
+
+    /// The chosen ids when the selection is a nonempty subset. `None` for
+    /// `true`, `false`, and `[]`, which [`Self::is_all`] and
+    /// [`Self::is_none`] already describe.
+    pub fn ids(&self) -> Option<BTreeSet<&str>> {
+        match self {
+            Self::Subset(ids) if !ids.is_empty() => Some(ids.iter().map(String::as_str).collect()),
+            _ => None,
+        }
+    }
+}
+
+/// Which stored sections an activation applies. An omitted or `null` field
+/// means whatever the profile includes; `false` leaves this system's section
+/// untouched; `true` applies a section the profile includes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+pub struct ActivateSections {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub displays: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backgrounds: Option<bool>,
+    /// `true` replaces the live catalog with the stored one. An array of
+    /// stored app ids adds those apps: each replaces the live app with the
+    /// same id in place, or is appended, and other live apps are kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apps: Option<SectionSelection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_app: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<bool>,
+}
+
+impl ActivateSections {
+    /// The sections that will actually be merged. A section the profile does
+    /// not include is never merged, because normalization emptied it.
+    pub fn chosen(&self, includes: ProfileIncludes) -> ProfileIncludes {
+        let pick = |selected: Option<bool>, included: bool| included && selected.unwrap_or(true);
+        ProfileIncludes {
+            displays: pick(self.displays, includes.displays),
+            backgrounds: pick(self.backgrounds, includes.backgrounds),
+            apps: includes.apps
+                && self
+                    .apps
+                    .as_ref()
+                    .is_none_or(|selection| !selection.is_none()),
+            active_app: pick(self.active_app, includes.active_app),
+            settings: pick(self.settings, includes.settings),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SystemProfile {
@@ -129,15 +208,31 @@ impl SystemProfile {
 
     /// Wallpaper identifiers referenced by the selected background section.
     pub fn referenced_wallpapers(&self) -> BTreeSet<String> {
+        self.wallpapers_referenced_by(self.includes)
+    }
+
+    /// Embedded wallpapers that the chosen sections of an activation
+    /// reference. Installing the others would touch wallpaper files on
+    /// behalf of sections the activation leaves untouched.
+    pub fn assets_for(&self, sections: &ActivateSections) -> BTreeMap<String, Vec<u8>> {
+        let referenced = self.wallpapers_referenced_by(sections.chosen(self.includes));
+        self.assets
+            .iter()
+            .filter(|(id, _)| referenced.contains(*id))
+            .map(|(id, bytes)| (id.clone(), bytes.clone()))
+            .collect()
+    }
+
+    fn wallpapers_referenced_by(&self, includes: ProfileIncludes) -> BTreeSet<String> {
         let mut ids = BTreeSet::new();
-        if self.includes.backgrounds {
+        if includes.backgrounds {
             for preset in &self.config.backgrounds {
                 if let Some(id) = &preset.background.wallpaper {
                     ids.insert(id.clone());
                 }
             }
         }
-        if self.includes.displays {
+        if includes.displays {
             for output in &self.config.outputs {
                 match &output.background {
                     Some(BackgroundRef::Inline(background)) => {
@@ -150,10 +245,10 @@ impl SystemProfile {
             }
         }
         // Output references can name presets; collect their image references too.
-        if self.includes.displays {
+        if includes.displays {
             for output in &self.config.outputs {
                 if let Some(BackgroundRef::Preset(name)) = &output.background {
-                    if !self.includes.backgrounds {
+                    if !includes.backgrounds {
                         continue;
                     }
                     if let Some(preset) = self.config.backgrounds.iter().find(|p| &p.id == name) {
@@ -169,21 +264,48 @@ impl SystemProfile {
 
     /// Apply the selected sections over a live document, preserving excluded sections.
     pub fn merge(&self, current: &DesiredState) -> DesiredState {
+        self.merge_selected(current, &ActivateSections::default())
+    }
+
+    /// Apply the chosen sections over a live document. An app subset is an
+    /// upsert so that picking a few apps never removes the others; `true`
+    /// keeps the long-standing replace-the-catalog behavior.
+    pub fn merge_selected(
+        &self,
+        current: &DesiredState,
+        sections: &ActivateSections,
+    ) -> DesiredState {
+        let chosen = sections.chosen(self.includes);
         let mut merged = current.clone();
-        if self.includes.displays {
+        if chosen.displays {
             merged.outputs = self.config.outputs.clone();
             merged.projection = self.config.projection.clone();
         }
-        if self.includes.backgrounds {
+        if chosen.backgrounds {
             merged.backgrounds = self.config.backgrounds.clone();
         }
-        if self.includes.apps {
-            merged.apps = self.config.apps.clone();
+        if chosen.apps {
+            match sections.apps.as_ref().and_then(SectionSelection::ids) {
+                Some(ids) => {
+                    for app in self
+                        .config
+                        .apps
+                        .iter()
+                        .filter(|app| ids.contains(app.id.as_str()))
+                    {
+                        match merged.apps.iter_mut().find(|live| live.id == app.id) {
+                            Some(live) => *live = app.clone(),
+                            None => merged.apps.push(app.clone()),
+                        }
+                    }
+                }
+                None => merged.apps = self.config.apps.clone(),
+            }
         }
-        if self.includes.active_app {
+        if chosen.active_app {
             merged.active_app = self.config.active_app.clone();
         }
-        if self.includes.settings {
+        if chosen.settings {
             merged.settings = self.config.settings;
         }
         merged
@@ -476,6 +598,96 @@ mod tests {
         assert_eq!(merged.active_app, Some("keep".into()));
         assert!(merged.outputs.is_empty());
         assert_eq!(merged.settings, current.settings);
+    }
+
+    fn app(id: &str, uri: &str) -> crate::model::AppConfig {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "launcher": {"kind": "chromium-kiosk", "uri": uri}
+        }))
+        .unwrap()
+    }
+
+    fn app_ids(state: &DesiredState) -> Vec<&str> {
+        state.apps.iter().map(|app| app.id.as_str()).collect()
+    }
+
+    #[test]
+    fn merge_selected_upsert_replaces_in_place_and_appends_in_stored_order() {
+        let mut p = profile();
+        p.config.apps = vec![
+            app("extra-b", "https://example.test/extra-b"),
+            app("shared", "https://example.test/new"),
+            app("unused", "https://example.test/unused"),
+            app("extra-a", "https://example.test/extra-a"),
+        ];
+        let current = DesiredState {
+            apps: vec![
+                app("first", "https://example.test/first"),
+                app("shared", "https://example.test/old"),
+                app("last", "https://example.test/last"),
+            ],
+            ..Default::default()
+        };
+        let sections = ActivateSections {
+            apps: Some(SectionSelection::Subset(vec![
+                "extra-a".into(),
+                "shared".into(),
+                "extra-b".into(),
+            ])),
+            ..Default::default()
+        };
+        let merged = p.merge_selected(&current, &sections);
+        assert_eq!(
+            app_ids(&merged),
+            ["first", "shared", "last", "extra-b", "extra-a"]
+        );
+        assert_eq!(merged.apps[1], p.config.apps[1]);
+
+        let replaced = p.merge_selected(
+            &current,
+            &ActivateSections {
+                apps: Some(SectionSelection::Flag(true)),
+                ..Default::default()
+            },
+        );
+        assert_eq!(replaced.apps, p.config.apps);
+        assert_eq!(p.merge(&current), replaced);
+
+        for none in [
+            SectionSelection::Flag(false),
+            SectionSelection::Subset(Vec::new()),
+        ] {
+            let untouched = p.merge_selected(
+                &current,
+                &ActivateSections {
+                    apps: Some(none),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(untouched.apps, current.apps);
+        }
+    }
+
+    #[test]
+    fn section_selection_deserializes_true_false_and_lists() {
+        let parse = |value: serde_json::Value| -> SectionSelection {
+            serde_json::from_value(value).unwrap()
+        };
+        let all = parse(serde_json::json!(true));
+        assert!(all.is_all() && !all.is_none() && all.ids().is_none());
+        let none = parse(serde_json::json!(false));
+        assert!(none.is_none() && !none.is_all() && none.ids().is_none());
+        let empty = parse(serde_json::json!([]));
+        assert!(empty.is_none() && !empty.is_all() && empty.ids().is_none());
+        let subset = parse(serde_json::json!(["b", "a", "b"]));
+        assert!(!subset.is_none() && !subset.is_all());
+        assert_eq!(
+            subset.ids().unwrap().into_iter().collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert!(serde_json::from_value::<SectionSelection>(serde_json::json!("a")).is_err());
+        assert!(serde_json::from_value::<SectionSelection>(serde_json::json!([1])).is_err());
     }
 
     #[test]

@@ -675,3 +675,463 @@ async fn new_profiles_require_nonempty_unique_names() {
     assert_eq!(profiles.as_array().unwrap().len(), 1);
     assert_eq!(current_config(&harness).await.1, before);
 }
+
+fn app_at(id: &str, uri: &str) -> Value {
+    json!({"id": id, "launcher": {"kind": "chromium-kiosk", "uri": uri}})
+}
+
+fn app_ids(document: &Value) -> Vec<&str> {
+    document["apps"]
+        .as_array()
+        .expect("apps is an array")
+        .iter()
+        .map(|app| app["id"].as_str().expect("app id is a string"))
+        .collect()
+}
+
+/// Commit a change to the live document and return the result.
+async fn commit_live(harness: &Harness, edit: impl FnOnce(&mut Value)) -> Value {
+    let (_, mut config) = current_config(harness).await;
+    edit(&mut config);
+    config["committed"] = json!(true);
+    let (status, _, body) = call(harness, "PUT", "/api/v1/config", Some(config), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    current_config(harness).await.1
+}
+
+async fn import_profile(harness: &Harness, id: &str, includes: Value, config: Value) {
+    let profile = json!({
+        "formatVersion": 1,
+        "name": "Game night",
+        "includes": includes,
+        "config": config,
+        "assets": {}
+    });
+    let (status, _, body) = call(
+        harness,
+        "POST",
+        "/api/v1/profiles/import",
+        Some(json!({"id": id, "profile": profile})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+async fn activate(harness: &Harness, id: &str, body: Value) -> (StatusCode, Value) {
+    let (headers, _) = current_config(harness).await;
+    let conditions = condition_headers(&headers);
+    let request_headers = borrowed_headers(&conditions);
+    let (status, _, response) = call(
+        harness,
+        "POST",
+        &format!("/api/v1/profiles/{id}/activate"),
+        Some(body),
+        &request_headers,
+    )
+    .await;
+    (status, response)
+}
+
+fn apps_only() -> Value {
+    json!({"displays": false, "backgrounds": false, "apps": true, "activeApp": false, "settings": false})
+}
+
+#[tokio::test]
+async fn capture_with_an_app_subset_stores_only_those_apps_in_catalog_order() {
+    let harness = harness(None);
+    commit_live(&harness, |config| {
+        config["apps"] = json!([app("a"), app("b"), app("c")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+
+    let (status, _, created) = call(
+        &harness,
+        "POST",
+        "/api/v1/profiles",
+        Some(json!({"id": "subset", "name": "Subset", "includes": {"apps": ["c", "a"]}})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(app_ids(&created["config"]), ["a", "c"]);
+
+    let (status, _, exported) = call(&harness, "GET", "/api/v1/profiles/subset", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{exported}");
+    assert_eq!(exported["includes"]["apps"], true);
+    assert_eq!(app_ids(&exported["config"]), ["a", "c"]);
+}
+
+#[tokio::test]
+async fn capture_rejects_an_app_id_that_is_not_in_the_current_configuration() {
+    let harness = harness(None);
+    commit_live(&harness, |config| {
+        config["apps"] = json!([app("a")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+
+    let (status, _, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/profiles",
+        Some(json!({"id": "unknown", "name": "Unknown", "includes": {"apps": ["a", "zzz"]}})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["detail"],
+        "app \"zzz\" is not in the current configuration"
+    );
+    let (_, _, listed) = call(&harness, "GET", "/api/v1/profiles", None, &[]).await;
+    assert_eq!(listed, json!([]));
+}
+
+#[tokio::test]
+async fn capture_with_an_empty_app_list_excludes_the_apps_section() {
+    let harness = harness(None);
+    commit_live(&harness, |config| {
+        config["apps"] = json!([app("a")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+
+    let (status, _, _) = call(
+        &harness,
+        "POST",
+        "/api/v1/profiles",
+        Some(json!({"id": "no-apps", "name": "No apps", "includes": {"apps": []}})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (_, _, exported) = call(&harness, "GET", "/api/v1/profiles/no-apps", None, &[]).await;
+    assert_eq!(exported["includes"]["apps"], false);
+    assert_eq!(exported["config"]["apps"], json!([]));
+}
+
+#[tokio::test]
+async fn capture_rejects_an_active_app_outside_the_selected_subset() {
+    let harness = harness(None);
+    commit_live(&harness, |config| {
+        config["apps"] = json!([app("a"), app("b")]);
+        config["activeApp"] = json!("a");
+    })
+    .await;
+
+    let (status, _, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/profiles",
+        Some(json!({"id": "outside", "name": "Outside", "includes": {"apps": ["b"], "activeApp": true}})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["detail"],
+        "the active app \"a\" is not among the selected apps; select it or leave out the Active app section"
+    );
+
+    let (status, _, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/profiles",
+        Some(json!({"id": "outside", "name": "Outside", "includes": {"apps": ["b"], "activeApp": false}})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn capture_still_accepts_a_boolean_apps_flag() {
+    let harness = harness(None);
+    commit_live(&harness, |config| {
+        config["apps"] = json!([app("a"), app("b")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+
+    for (id, flag, expected) in [("without", false, vec![]), ("with", true, vec!["a", "b"])] {
+        let (status, _, body) = call(
+            &harness,
+            "POST",
+            "/api/v1/profiles",
+            Some(json!({"id": id, "name": id, "includes": {"apps": flag}})),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (_, _, exported) = call(
+            &harness,
+            "GET",
+            &format!("/api/v1/profiles/{id}"),
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(exported["includes"]["apps"], flag);
+        assert_eq!(app_ids(&exported["config"]), expected);
+    }
+}
+
+#[tokio::test]
+async fn activation_without_sections_behaves_as_before() {
+    let harness = harness(None);
+    let live = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(live["schemaVersion"].clone());
+    stored["apps"] = json!([app("stored")]);
+    import_profile(&harness, "plain", apps_only(), stored).await;
+
+    for body in [json!({}), json!({"sections": {}})] {
+        commit_live(&harness, |config| config["apps"] = json!([app("live")])).await;
+        let (status, response) = activate(&harness, "plain", body).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(app_ids(&current_config(&harness).await.1), ["stored"]);
+    }
+}
+
+#[tokio::test]
+async fn activation_with_an_app_subset_upserts_and_keeps_other_live_apps() {
+    let harness = harness(None);
+    let live = commit_live(&harness, |config| {
+        config["apps"] = json!([
+            app_at("keep", "https://example.test/keep"),
+            app_at("shared", "https://example.test/old")
+        ]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(live["schemaVersion"].clone());
+    stored["apps"] = json!([
+        app_at("shared", "https://example.test/new"),
+        app_at("extra", "https://example.test/extra"),
+        app_at("unused", "https://example.test/unused")
+    ]);
+    import_profile(&harness, "upsert", apps_only(), stored).await;
+
+    let (status, response) = activate(
+        &harness,
+        "upsert",
+        json!({"sections": {"apps": ["extra", "shared"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (_, after) = current_config(&harness).await;
+    assert_eq!(app_ids(&after), ["keep", "shared", "extra"]);
+    assert_eq!(
+        after["apps"][0]["launcher"]["uri"],
+        "https://example.test/keep"
+    );
+    assert_eq!(
+        after["apps"][1]["launcher"]["uri"],
+        "https://example.test/new"
+    );
+}
+
+#[tokio::test]
+async fn activation_with_apps_false_leaves_the_live_catalog_untouched() {
+    let harness = harness(None);
+    let live = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+        config["settings"]["hideCursor"] = json!(true);
+    })
+    .await;
+    let mut stored = profile_config(live["schemaVersion"].clone());
+    stored["apps"] = json!([app("stored")]);
+    stored["settings"]["hideCursor"] = json!(false);
+    let includes = json!({"displays": false, "backgrounds": false, "apps": true, "activeApp": false, "settings": true});
+    import_profile(&harness, "keep-apps", includes, stored).await;
+
+    let (status, response) =
+        activate(&harness, "keep-apps", json!({"sections": {"apps": false}})).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (_, after) = current_config(&harness).await;
+    assert_eq!(after["apps"], live["apps"]);
+    assert_eq!(after["settings"]["hideCursor"], false);
+}
+
+#[tokio::test]
+async fn activation_with_apps_true_replaces_the_live_catalog() {
+    let harness = harness(None);
+    let live = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(live["schemaVersion"].clone());
+    stored["apps"] = json!([app("stored-a"), app("stored-b")]);
+    import_profile(&harness, "replace", apps_only(), stored).await;
+
+    let (status, response) =
+        activate(&harness, "replace", json!({"sections": {"apps": true}})).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        app_ids(&current_config(&harness).await.1),
+        ["stored-a", "stored-b"]
+    );
+}
+
+#[tokio::test]
+async fn activation_rejects_a_section_the_profile_does_not_include() {
+    let harness = harness(None);
+    let before = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(before["schemaVersion"].clone());
+    stored["apps"] = json!([app("stored")]);
+    import_profile(&harness, "no-displays", apps_only(), stored).await;
+
+    let (status, response) = activate(
+        &harness,
+        "no-displays",
+        json!({"sections": {"displays": true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(
+        response["detail"],
+        "profile \"Game night\" does not include displays"
+    );
+    assert_eq!(current_config(&harness).await.1, before);
+}
+
+#[tokio::test]
+async fn activation_rejects_an_app_id_the_profile_does_not_store() {
+    let harness = harness(None);
+    let before = commit_live(&harness, |config| {
+        config["apps"] = json!([app("trivia")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(before["schemaVersion"].clone());
+    stored["apps"] = json!([app("stored")]);
+    import_profile(&harness, "no-trivia", apps_only(), stored).await;
+
+    let (status, response) = activate(
+        &harness,
+        "no-trivia",
+        json!({"sections": {"apps": ["stored", "trivia"]}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert_eq!(response["detail"], "app \"trivia\" is not in this profile");
+    assert_eq!(current_config(&harness).await.1, before);
+}
+
+#[tokio::test]
+async fn activation_with_sections_false_leaves_those_sections_untouched() {
+    let harness = harness(None);
+    let live = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+        config["backgrounds"] = json!([{"id": "live-color", "color": "#102030"}]);
+        config["settings"]["hideCursor"] = json!(true);
+    })
+    .await;
+    let mut stored = profile_config(live["schemaVersion"].clone());
+    stored["outputs"] = json!([{"match": {"name": "Saved-A"}, "enable": true}]);
+    stored["apps"] = json!([app("stored")]);
+    stored["activeApp"] = json!("stored");
+    stored["backgrounds"] = json!([{"id": "stored-image", "wallpaper": "wall", "mode": "fill"}]);
+    stored["settings"]["hideCursor"] = json!(false);
+    let profile = json!({
+        "formatVersion": 1,
+        "name": "Everything",
+        "includes": {"displays": true, "backgrounds": true, "apps": true, "activeApp": true, "settings": true},
+        "config": stored,
+        "assets": {"wall": PNG_A}
+    });
+    let (status, _, body) = call(
+        &harness,
+        "POST",
+        "/api/v1/profiles/import",
+        Some(json!({"id": "everything", "profile": profile})),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, response) = activate(
+        &harness,
+        "everything",
+        json!({"sections": {"settings": false, "backgrounds": false}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (_, after) = current_config(&harness).await;
+    assert_eq!(after["settings"], live["settings"]);
+    assert_eq!(after["backgrounds"], live["backgrounds"]);
+    assert_eq!(after["outputs"][0]["match"]["name"], "Saved-A");
+    assert_eq!(app_ids(&after), ["stored"]);
+    assert_eq!(after["activeApp"], "stored");
+    // The skipped backgrounds section is the only one using the image.
+    assert!(harness.state.wallpapers.read("wall").is_err());
+}
+
+#[tokio::test]
+async fn activation_with_an_app_subset_that_drops_the_active_app_is_invalid() {
+    let harness = harness(None);
+    let before = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(before["schemaVersion"].clone());
+    stored["apps"] = json!([app("a"), app("b")]);
+    stored["activeApp"] = json!("a");
+    let includes = json!({"displays": false, "backgrounds": false, "apps": true, "activeApp": true, "settings": false});
+    import_profile(&harness, "drops-active", includes, stored).await;
+
+    let (status, response) = activate(
+        &harness,
+        "drops-active",
+        json!({"sections": {"apps": ["b"], "activeApp": true}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response}");
+    assert!(
+        response["detail"]
+            .as_str()
+            .unwrap()
+            .contains("activeApp \"a\" does not name a listed app"),
+        "{response}"
+    );
+    assert_eq!(current_config(&harness).await.1, before);
+}
+
+#[tokio::test]
+async fn activation_accepts_a_mapping_for_a_deselected_section() {
+    let harness = harness(None);
+    let live = commit_live(&harness, |config| {
+        config["apps"] = json!([app("live")]);
+        config["activeApp"] = Value::Null;
+    })
+    .await;
+    let mut stored = profile_config(live["schemaVersion"].clone());
+    stored["outputs"] = json!([{"match": {"name": "Saved-A"}, "enable": true}]);
+    stored["apps"] = json!([app("stored")]);
+    let includes = json!({"displays": true, "backgrounds": false, "apps": true, "activeApp": false, "settings": false});
+    import_profile(&harness, "mapped-off", includes, stored).await;
+
+    let (status, response) = activate(
+        &harness,
+        "mapped-off",
+        json!({"sections": {"displays": false}, "outputMappings": {"Saved-A": "DP-1"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let (_, after) = current_config(&harness).await;
+    assert_eq!(after["outputs"], live["outputs"]);
+    assert_eq!(app_ids(&after), ["stored"]);
+}
